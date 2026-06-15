@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "crates/tomoxide-core",
     "crates/tomoxide-cpu",
+    "crates/tomoxide-cuda",
 ]
 
 [workspace.package]

@@ -242,6 +242,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tomoxide-cuda"
+version = "0.0.0"
+dependencies = [
+ "log",
+ "tomoxide-core",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"

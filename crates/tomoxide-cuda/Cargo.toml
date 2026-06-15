@@ -1,0 +1,20 @@
+[package]
+name = "tomoxide-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CUDA backend for tomoxide (FFI to tomocupy's .cu kernels via nvcc)"
+build = "build.rs"
+
+[features]
+# Off by default: the workspace builds on machines without an NVIDIA toolkit.
+# Enabling `cuda` makes build.rs invoke nvcc on the vendored kernels.
+default = []
+cuda = []
+
+[dependencies]
+tomoxide-core.workspace = true
+log.workspace = true
