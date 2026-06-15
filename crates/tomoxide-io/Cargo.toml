@@ -12,3 +12,10 @@ description = "Data I/O for tomoxide: DXchange/HDF5, TIFF, zarr readers and writ
 tomoxide-core.workspace = true
 ndarray.workspace = true
 log.workspace = true
+# Pure-Rust HDF5 reader/writer (physwkim/rust-hdf5) — no C/libhdf5 dependency.
+# Default features include `deflate` (flate2), so gzip-compressed DXchange
+# datasets read out of the box.
+rust-hdf5 = "0.2"
+
+[dev-dependencies]
+ndarray-npy.workspace = true
