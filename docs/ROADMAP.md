@@ -109,7 +109,8 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   Δ≈2.4e-7); ✅ `median_filter3d` + `remove_outlier3d` dezinger (clamp-to-center
   `(2r+1)³` median; bit-exact tomopy parity); ✅ `remove_stripe_sf` (smoothing-
   filter stripe removal; bit-exact tomopy parity); ✅ `remove_ring` (polar-
-  transform median/mean ring removal, WRAP mode; bit-exact tomopy parity); ✅
+  transform median/mean ring removal, both `int_mode` = WRAP and REFLECT;
+  bit-exact tomopy parity Δ=0); ✅
   `remove_all_stripe` (Vo algorithms 3+5+6: dead/large-stripe detection +
   bilinear column fill + sorting; matches tomopy to the f32 round-off floor,
   max rel Δ≈5.8e-7); ✅ `remove_stripe_ti` (Titarenko/Miqueles: per-slice f64

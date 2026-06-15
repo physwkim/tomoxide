@@ -123,7 +123,7 @@ Paganin params (shared): `pixel_size` [cm], `dist` [cm], `energy` [keV],
 
 | tomoxide                    | Upstream                                              | Status |
 |-----------------------------|-------------------------------------------------------|--------|
-| `ring::remove_ring`         | tomopy `misc/corr.py:751`; `libtomo/misc/remove_ring.c` | CPU ✓ — tomopy parity (bit-exact, WRAP) |
+| `ring::remove_ring`         | tomopy `misc/corr.py:751`; `libtomo/misc/remove_ring.c` | CPU ✓ — tomopy parity Δ=0 (bit-exact, `int_mode` WRAP + REFLECT) |
 | `filters::median_filter3d`  | tomopy `misc/corr.py:355`; `libtomo/misc/median_filt3d.c` | CPU ✓ — tomopy parity (bit-exact) |
 | `filters::remove_outlier3d` | tomopy `misc/corr.py:413` (dezinger); tomocupy `remove_outliers` | CPU ✓ — tomopy parity (bit-exact) |
 | `filters::gaussian_filter`  | tomopy `misc/corr.py:118`                             | stub   |

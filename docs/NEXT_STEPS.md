@@ -160,13 +160,14 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
-- ✅ **`remove_ring` — done.** Full port of tomopy `libtomo/misc/remove_ring.c`
-  (polar transform → 3-band radial median → subtract/threshold → 3-band
-  azimuthal mean → inverse transform → subtract). The exact float/double cast
-  chain plus the shared libm make it **bit-for-bit** with tomopy 1.15.3 (Δ = 0)
-  on rwidth 2/4 (`ring_parity.rs`, golden from `tools/gen_tomopy_ring_golden.py`).
-  Only tomopy's default `int_mode="WRAP"` is exposed (no `int_mode` param);
-  `REFLECT` is the remaining variant.
+- ✅ **`remove_ring` — done (both `int_mode`).** Full port of tomopy
+  `libtomo/misc/remove_ring.c` (polar transform → 3-band radial median →
+  subtract/threshold → 3-band azimuthal mean → inverse transform → subtract).
+  The exact float/double cast chain plus the shared libm make it **bit-for-bit**
+  with tomopy 1.15.3 (Δ = 0) on rwidth 2/4 for both `int_mode` values —
+  `WRAP` (default, cyclic azimuth) and `REFLECT` (each polar half mirrored at
+  its 0/π and π/2π edges, via `RingIntMode`); `ring_parity.rs`, golden from
+  `tools/gen_tomopy_ring_golden.py`.
 
 ### B7. Lower-priority polish (M3 tail)
 
