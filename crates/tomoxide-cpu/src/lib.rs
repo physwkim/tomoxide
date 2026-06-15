@@ -292,15 +292,60 @@ impl Fft for CpuBackend {
         }
         Ok(())
     }
+    /// In-place batched 2-D FFT via separable row–column 1-D transforms.
+    /// `inverse` divides each image by `rows·cols`.
     fn fft_2d(
         &self,
-        _b: &mut [Complex32],
-        _rows: usize,
-        _cols: usize,
-        _batch: usize,
-        _inv: bool,
+        buf: &mut [Complex32],
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        inverse: bool,
     ) -> Result<()> {
-        Err(Error::todo("cpu Fft::fft_2d", "use rustfft (milestone M1)"))
+        if rows == 0 || cols == 0 || batch == 0 {
+            return Ok(());
+        }
+        if buf.len() != rows * cols * batch {
+            return Err(Error::ShapeMismatch {
+                expected: (rows * cols * batch).to_string(),
+                found: buf.len().to_string(),
+            });
+        }
+        let mut planner = FftPlanner::<f32>::new();
+        let row_fft = if inverse {
+            planner.plan_fft_inverse(cols)
+        } else {
+            planner.plan_fft_forward(cols)
+        };
+        let col_fft = if inverse {
+            planner.plan_fft_inverse(rows)
+        } else {
+            planner.plan_fft_forward(rows)
+        };
+        let mut col = vec![Complex32::new(0.0, 0.0); rows];
+        for img in buf.chunks_mut(rows * cols) {
+            // Transform each contiguous row (length `cols`).
+            for row in img.chunks_mut(cols) {
+                row_fft.process(row);
+            }
+            // Transform each column (length `rows`, stride `cols`).
+            for c in 0..cols {
+                for (r, slot) in col.iter_mut().enumerate() {
+                    *slot = img[r * cols + c];
+                }
+                col_fft.process(&mut col);
+                for (r, &v) in col.iter().enumerate() {
+                    img[r * cols + c] = v;
+                }
+            }
+        }
+        if inverse {
+            let norm = 1.0 / (rows * cols) as f32;
+            for c in buf.iter_mut() {
+                *c *= norm;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -523,6 +568,20 @@ mod tests {
         for (a, b) in buf.iter().zip(orig.iter()) {
             assert!((a.re - b.re).abs() < 1e-4, "re {} vs {}", a.re, b.re);
             assert!((a.im - b.im).abs() < 1e-4, "im {} vs {}", a.im, b.im);
+        }
+    }
+
+    #[test]
+    fn fft_2d_roundtrips() {
+        // 3x4 image; inverse(forward(x)) == x.
+        let orig: Vec<Complex32> = (0..12)
+            .map(|k| Complex32::new(k as f32, -(k as f32)))
+            .collect();
+        let mut buf = orig.clone();
+        CpuBackend.fft_2d(&mut buf, 3, 4, 1, false).unwrap();
+        CpuBackend.fft_2d(&mut buf, 3, 4, 1, true).unwrap();
+        for (a, b) in buf.iter().zip(orig.iter()) {
+            assert!((a.re - b.re).abs() < 1e-4 && (a.im - b.im).abs() < 1e-4);
         }
     }
 
