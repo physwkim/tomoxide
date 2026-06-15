@@ -96,16 +96,13 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B4. Phase retrieval — `tomoxide-prep::phase`
 
-- **Stubs:** `crates/tomoxide-prep/src/phase.rs:15` Paganin, `:19` GPaganin,
-  `:23` Farago.
-- **Upstream:** tomopy `prep/phase.py:80`; tomocupy
-  `retrieve_phase.paganin_filter:59`, `farago_filter:110`.
-- **Note:** Paganin is an FFT-domain `1/(1+α k²)` filter — reuses the existing
-  `Fft` capability; mind the same real-FFT/normalization conventions as the FBP
-  filter.
-- **Done =** Paganin filter on a flat projection is a no-op up to DC; on an
-  edge phantom it monotonically reduces high-frequency content; matches a
-  checked-in tomopy golden within projector-model tolerance.
+- ✅ **Paganin — done.** FFT-domain `1/(λ·dist·w2/(4π)+α)` low-pass on
+  power-of-2-padded radiographs (reuses `Fft`); matches tomopy 1.15.3 to the f32
+  round-off floor (max relative Δ ≈ 2.4e-7), `phase_parity.rs` golden from
+  `tools/gen_tomopy_phase_golden.py`.
+- **Remaining stubs:** `crates/tomoxide-prep/src/phase.rs` — `GPaganin`
+  (tomocupy generalized Paganin), `Farago` (tomocupy
+  `retrieve_phase.farago_filter:110`).
 
 ### B5. Rank filters — `CpuBackend: RankFilter`  (completes the prep family)
 
@@ -160,13 +157,14 @@ pipeline integration test.
 ## Suggested sequence
 
 1. ✅ **B2 `find_center_vo`** — done (tomopy parity Δ=0).
-2. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
+2. ✅ **B4 Paganin** — done (tomopy parity, max rel Δ≈2.4e-7).
+3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
-3. **B1 HDF5 reader** — real data in; closes the bookends.
-4. **B3 stripe (Vo-all or Sf)** → **B4 Paganin** → **B5 rank filters** →
-   **B6 ring** — the artifact-correction family, highest-value first.
-5. Wire the **M3 end-to-end pipeline integration test**.
-6. B7 polish, then M4+.
+4. **B1 HDF5 reader** — real data in; closes the bookends.
+5. **B3 stripe (Vo-all or Sf)** → **B5 rank filters** → **B6 ring** — the rest
+   of the artifact-correction family, highest-value first.
+6. Wire the **M3 end-to-end pipeline integration test**.
+7. B7 polish, then M4+.
 
 Each step is one commit + one test, full-workspace pass before any push, and
 push only on explicit confirmation.

@@ -104,9 +104,10 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
 
 ## M3 — Preprocessing & center finding (CPU) 🟡 started
 
-- `prep`: `minus_log`, `normalize*`, the stripe-removal family
-  (`fw`, `ti`, `sf`, Vo sorting/filtering/fitting), Paganin `retrieve_phase`,
-  `remove_ring`, `median_filter3d`, dezinger.
+- `prep`: `minus_log`, `normalize*` done; ✅ Paganin `retrieve_phase` (FFT
+  low-pass on padded radiographs; matches tomopy to f32 round-off, max rel
+  Δ≈2.4e-7). ⬜ stripe-removal family (`fw`, `ti`, `sf`, Vo
+  sorting/filtering/fitting), `remove_ring`, `median_filter3d`, dezinger.
 - `center`: ✅ `find_center_vo` (Nghia Vo, the primary/workhorse) — sinogram-
   domain Fourier method (anisotropic-Gaussian denoise → double-wedge-masked
   `mean(|fftshift(fft2)|)` metric → coarse 0.5-px + fine cubic-B-spline search,

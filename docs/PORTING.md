@@ -109,7 +109,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `stripe::remove_stripe_based_fitting` | tomopy `prep/stripe.py:520` (Vo alg. 1)       | CPU     | stub    |
 | `stripe::remove_all_stripe`       | tomocupy `remove_stripe.remove_all_stripe` (vo-all) | GPU   | stub    |
 | `stripe::stripes_detect3d`        | tomopy `prep/stripe.py:984`; `libtomo/prep/stripes_detect3d.c` | CPU | stub |
-| `phase::retrieve_phase` (Paganin) | tomopy `prep/phase.py:80`; tomocupy `retrieve_phase.paganin_filter:59` | all | stub |
+| `phase::retrieve_phase` (Paganin) | tomopy `prep/phase.py:80`; tomocupy `retrieve_phase.paganin_filter:59` | CPU | ✓ — tomopy parity (max rel Δ≈2.4e-7) |
 | `phase::retrieve_phase_g` (Gpaganin/farago) | tomocupy `retrieve_phase.farago_filter:110`  | GPU | stub |
 | `hardening::beam_correct`         | tomocupy `processing/external/hardening.py:50`    | GPU     | stub    |
 | `align::align_seq/align_joint`    | tomopy `prep/alignment.py:89,216`                 | CPU     | stub    |
