@@ -96,8 +96,9 @@ fn iterative(
         .ok_or_else(|| missing("FilteredBackproject", backend))?;
     match algorithm {
         Algorithm::Sirt => sirt(sino, geom, params, proj, bp),
+        Algorithm::Mlem => mlem(sino, geom, params, proj, bp),
         // ART/BART/OSEM and the regularized family (ospml_*, pml_*, tv, tikh,
-        // grad, vector) land in M2; the SIRT loop above is the shared skeleton.
+        // grad, vector) land later in M2; SIRT/MLEM above are the shared skeleton.
         _ => Err(Error::todo(
             "recon iterative (ART/BART/OSEM + regularized family)",
             "tomopy libtomo/recon/{art,bart,osem,ospml_hybrid,ospml_quad,pml_hybrid,pml_quad,tv,tikh,grad,vector}.c",
@@ -150,6 +151,54 @@ fn sirt(
         resid *= &rw; // R ∘ (b − A x)
         bp.backproject(&Tomo::new(resid, Layout::Sinogram), geom, &mut corr)?;
         vol.array += &(&cw * &corr.array); // x += C ∘ Aᵀ(…)
+    }
+    Ok(vol)
+}
+
+/// Maximum-Likelihood Expectation-Maximization.
+///
+/// Multiplicative update `x ← x ∘ Aᵀ(b ⊘ A x) ⊘ Aᵀ(1)`, positivity-preserving
+/// from a positive initial guess; requires a non-negative sinogram. Ports the
+/// EM update of tomopy `accel/cxx/mlem.cc`. `A` = forward projector,
+/// `Aᵀ` = back-projector.
+fn mlem(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let nz = sino.n_rows();
+    let b = sino.to_layout(Layout::Sinogram);
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    // Sensitivity Aᵀ(1).
+    let ones_sino = Tomo::new(Array3::from_elem((nz, nang, ncols), 1.0), Layout::Sinogram);
+    let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+    bp.backproject(&ones_sino, geom, &mut sens)?;
+
+    let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
+    let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    for _ in 0..params.num_iter.max(1) {
+        proj.project(&vol, geom, &mut ax)?; // A x
+        let mut ratio = b.array.clone();
+        ndarray::Zip::from(&mut ratio)
+            .and(&ax.array)
+            .for_each(|r, &a| {
+                *r = if a.abs() > 1e-6 { *r / a } else { 0.0 }; // b ⊘ A x
+            });
+        bp.backproject(&Tomo::new(ratio, Layout::Sinogram), geom, &mut corr)?;
+        ndarray::Zip::from(&mut vol.array)
+            .and(&corr.array)
+            .and(&sens.array)
+            .for_each(|x, &c, &s| {
+                if s.abs() > 1e-6 {
+                    *x = *x * c / s; // x ∘ Aᵀ(ratio) ⊘ sens
+                }
+            });
     }
     Ok(vol)
 }

@@ -1,9 +1,9 @@
-//! End-to-end CPU iterative (SIRT) round-trip.
+//! End-to-end CPU iterative round-trips (SIRT, MLEM).
 //!
-//! Forward-project a Shepp-Logan phantom, reconstruct it with SIRT, and assert
-//! the reconstruction (a) correlates strongly with the phantom and (b) the data
-//! residual decreases monotonically over iterations (the convergence property
-//! SIRT guarantees on consistent data).
+//! Forward-project a Shepp-Logan phantom, reconstruct it, and assert the result
+//! correlates strongly with the phantom. SIRT additionally must drive the data
+//! residual down monotonically (convergence on consistent data); MLEM must
+//! preserve non-negativity.
 
 use ndarray::{Array2, Axis};
 use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
@@ -85,5 +85,36 @@ fn sirt_reconstructs_and_converges() {
     assert!(
         corr > 0.9,
         "SIRT correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+#[test]
+fn mlem_reconstructs_nonnegative_phantom() {
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    // MLEM is multiplicative/positivity-preserving and needs a non-negative
+    // object (hence sinogram), so clamp the phantom's negative ellipses to 0.
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 120,
+        ..Default::default()
+    };
+    let rec = recon::recon(&sino, &geom, Algorithm::Mlem, &params, &cpu).unwrap();
+    let slice = rec.array.index_axis(Axis(0), 0).to_owned();
+
+    // Positivity is preserved by construction.
+    assert!(slice.iter().all(|&v| v >= -1e-6), "MLEM produced negatives");
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("MLEM (120 iters) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "MLEM correlates poorly with phantom: r = {corr:.4}"
     );
 }
