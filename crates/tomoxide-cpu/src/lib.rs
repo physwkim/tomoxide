@@ -390,11 +390,78 @@ impl FilteredBackproject for CpuBackend {
 }
 
 impl ForwardProject for CpuBackend {
-    fn project(&self, _vol: &Volume<f32>, _geom: &Geometry, _out: &mut Tomo<f32>) -> Result<()> {
-        Err(Error::todo(
-            "cpu ForwardProject::project",
-            "tomopy libtomo/recon/project.c",
-        ))
+    /// Parallel-beam pixel-driven forward projection (the Radon transform).
+    ///
+    /// Each object pixel `(iy, ix)` with value `f` splats onto detector column
+    /// `t = (ix − cx)·cosθ + (iy − cy)·sinθ + center` for every angle, splitting
+    /// `f` linearly between the two nearest columns. This is the exact adjoint
+    /// of the back-projector's linear interpolation (same boundary rule), so the
+    /// two round-trip. `out` is overwritten with a fresh `[row, angle, col]`
+    /// sinogram; slices run in parallel with a per-row `center`.
+    ///
+    /// Ports tomopy `libtomo/recon/project.c`.
+    fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
+        if geom.beam != Beam::Parallel {
+            return Err(Error::InvalidParam(
+                "cpu forward projection currently supports parallel beam only".into(),
+            ));
+        }
+        let (nz, ny, nx) = vol.dims();
+        let nang = geom.angles.0.len();
+        let ncols = geom.detector.width;
+        if nang == 0 || ncols == 0 {
+            return Err(Error::InvalidParam(
+                "geometry has no angles or zero detector width".into(),
+            ));
+        }
+        let trig: Vec<(f32, f32)> = geom
+            .angles
+            .0
+            .iter()
+            .map(|&a| {
+                let (sn, c) = a.sin_cos();
+                (c, sn)
+            })
+            .collect();
+        let cx = nx as f32 / 2.0;
+        let cy = ny as f32 / 2.0;
+
+        let vol_slice = vol
+            .array
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous volume".into()))?;
+        let mut data = vec![0.0f32; nz * nang * ncols];
+        data.par_chunks_mut(nang * ncols)
+            .enumerate()
+            .for_each(|(row, slab)| {
+                let center = geom.center.at(row);
+                let vbase = row * ny * nx;
+                for iy in 0..ny {
+                    let gy = iy as f32 - cy;
+                    for ix in 0..nx {
+                        let f = vol_slice[vbase + iy * nx + ix];
+                        if f == 0.0 {
+                            continue;
+                        }
+                        let gx = ix as f32 - cx;
+                        for (ia, &(c, sn)) in trig.iter().enumerate() {
+                            let t = gx * c + gy * sn + center;
+                            let t0 = t.floor();
+                            let i0 = t0 as isize;
+                            if i0 >= 0 && (i0 as usize) + 1 < ncols {
+                                let frac = t - t0;
+                                let off = ia * ncols + i0 as usize;
+                                slab[off] += f * (1.0 - frac);
+                                slab[off + 1] += f * frac;
+                            }
+                        }
+                    }
+                }
+            });
+        let array = ndarray::Array3::from_shape_vec((nz, nang, ncols), data)
+            .map_err(|e| Error::InvalidParam(format!("forward-projection shape: {e}")))?;
+        *out = Tomo::new(array, Layout::Sinogram);
+        Ok(())
     }
 }
 
@@ -520,13 +587,20 @@ mod tests {
     }
 
     #[test]
-    fn forward_project_stub_reports_not_implemented() {
-        let v = Volume::new(Array3::<f32>::zeros((1, 4, 4)));
+    fn forward_project_center_pixel_hits_center_column() {
+        // A single pixel at the grid center (cx = cy = 2) projects to t = center
+        // = width/2 = 2 for every angle, so column 2 holds the value everywhere.
+        let mut varr = Array3::<f32>::zeros((1, 4, 4));
+        varr[[0, 2, 2]] = 1.0;
+        let v = Volume::new(varr);
         let geom = Geometry::parallel(Angles::uniform(4, 0.0, PI), 4, 1, 1.0);
-        let mut s = Tomo::new(Array3::<f32>::zeros((4, 1, 4)), Layout::Projection);
-        assert!(matches!(
-            CpuBackend.project(&v, &geom, &mut s),
-            Err(Error::NotImplemented { .. })
-        ));
+        let mut s = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Sinogram);
+        CpuBackend.project(&v, &geom, &mut s).unwrap();
+        assert_eq!(s.layout, Layout::Sinogram);
+        assert_eq!(s.array.dim(), (1, 4, 4));
+        for ia in 0..4 {
+            assert!((s.array[[0, ia, 2]] - 1.0).abs() < 1e-4, "ia={ia}");
+            assert!(s.array[[0, ia, 0]].abs() < 1e-6);
+        }
     }
 }
