@@ -17,6 +17,7 @@ members = [
     "crates/tomoxide-recon",
     "crates/tomoxide-prep",
     "crates/tomoxide-io",
+    "crates/tomoxide-sim",
 ]
 
 [workspace.package]

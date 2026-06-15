@@ -914,6 +914,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tomoxide-sim"
+version = "0.0.0"
+dependencies = [
+ "ndarray",
+ "tomoxide-core",
+]
+
+[[package]]
 name = "tomoxide-wgpu"
 version = "0.0.0"
 dependencies = [

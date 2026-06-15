@@ -1,0 +1,13 @@
+[package]
+name = "tomoxide-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Phantoms and forward projection for tomoxide (ports tomopy sim/phantom)"
+
+[dependencies]
+tomoxide-core.workspace = true
+ndarray.workspace = true
