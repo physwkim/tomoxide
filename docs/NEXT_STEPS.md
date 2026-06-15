@@ -68,8 +68,15 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `{prefix}_{i:05}.tiff` (tomocupy `dataio/writer.py:281`). Bit-exact
   round-trip test; output verified readable by Python tifffile. Both I/O
   bookends are now closed.
-- **Remaining stub:** `create_writer` for `H5` / `Zarr` output — tomocupy
-  `dataio/writer.py:282,294`. Lower priority (TIFF covers the M3 pipeline).
+- ✅ **HDF5 writer done** — `create_writer(.., SaveFormat::H5)` via pure-Rust
+  `rust-hdf5` (no libhdf5). Single `{base}.h5` with one contiguous
+  `/exchange/data` f32 `[nz,ny,nx]` dataset + `axes`/`description`/`units`
+  attrs (tomocupy `dataio/writer.py` `h5nolinks`); chunks fill `[start,end)`
+  via HDF5 hyperslab. Bit-exact round-trip (`tests/h5_write.rs`) + verified
+  readable by reference libhdf5 (h5py).
+- **Remaining stub:** `create_writer` for `Zarr` output — tomocupy
+  `dataio/writer.py:294`. Needs a zarr crate (new dependency, sign-off);
+  lower priority (TIFF + H5 cover the M3 pipeline).
 
 ### B2. Center finding — `tomoxide-recon::center`  (unblocks correct recon)
 
