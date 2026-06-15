@@ -196,7 +196,10 @@ pub enum StripeMethod {
     },
     /// Titarenko (tomopy `remove_stripe_ti`; tomocupy `ti`).
     Ti {
-        /// Damping factor `beta`/`alpha`.
+        /// Number of blocks (`nblock`); `0` corrects the whole sinogram at once
+        /// (tomopy default).
+        nblock: usize,
+        /// Damping factor `beta` (tomopy's `alpha`, default `1.5`).
         beta: f32,
     },
     /// Smoothing filter (tomopy `remove_stripe_sf`).
