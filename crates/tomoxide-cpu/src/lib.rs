@@ -9,7 +9,7 @@
 //! [`Error::NotImplemented`] with the upstream `file:line` to port from.
 #![forbid(unsafe_code)]
 
-use ndarray::Axis;
+use ndarray::{Array3, Axis};
 use rayon::prelude::*;
 use rustfft::FftPlanner;
 use tomoxide_core::backend::{
@@ -567,18 +567,107 @@ impl RayProject for CpuBackend {
     }
 }
 
+/// Core 3-D median / dezinger kernel — a direct port of tomopy
+/// `libtomo/misc/median_filt3d.c::medfilt3D_float` (the `dimZ > 0` branch the
+/// Python wrappers always hit). For every voxel of `input` `[z, y, x]` it
+/// gathers the `(2·radius+1)³` neighbourhood with **clamp-to-center** boundary
+/// handling (an out-of-range index on any axis reverts to that axis's *center*
+/// index, not the edge), sorts it, and takes the value at `total/2`.
+///
+/// `mu_threshold == 0` → plain median at every voxel. Otherwise (dezinger) the
+/// median replaces the original only where `|input − median| ≥ mu_threshold`;
+/// elsewhere the original passes through unchanged (matching the C, which
+/// pre-copies `Output = Input` and writes only on the threshold hit).
+fn medfilt3d_core(input: &Array3<f32>, radius: usize, mu_threshold: f32) -> Array3<f32> {
+    let (dz, dy, dx) = input.dim();
+    let r = radius as isize;
+    let diameter = 2 * radius + 1;
+    let total = diameter * diameter * diameter;
+    let midval = total / 2; // tomopy: int division → lower-middle of the sorted window
+    let (dzi, dyi, dxi) = (dz as isize, dy as isize, dx as isize);
+
+    let out: Vec<f32> = (0..dz * dy * dx)
+        .into_par_iter()
+        .map(|flat| {
+            // Flat index → (z, y, x) for a C-contiguous `[z, y, x]` array.
+            let z = (flat / (dy * dx)) as isize;
+            let rem = flat % (dy * dx);
+            let y = (rem / dx) as isize;
+            let x = (rem % dx) as isize;
+            let center = input[[z as usize, y as usize, x as usize]];
+
+            let mut window = Vec::with_capacity(total);
+            // Axis mapping mirrors the C call (dimX = x, dimY = y, dimZ = z);
+            // each axis clamps to its own center independently.
+            for di in -r..=r {
+                let xi = {
+                    let v = x + di;
+                    if v < 0 || v >= dxi {
+                        x
+                    } else {
+                        v
+                    }
+                };
+                for dj in -r..=r {
+                    let yj = {
+                        let v = y + dj;
+                        if v < 0 || v >= dyi {
+                            y
+                        } else {
+                            v
+                        }
+                    };
+                    for dk in -r..=r {
+                        let zk = {
+                            let v = z + dk;
+                            if v < 0 || v >= dzi {
+                                z
+                            } else {
+                                v
+                            }
+                        };
+                        window.push(input[[zk as usize, yj as usize, xi as usize]]);
+                    }
+                }
+            }
+            // `total_cmp` orders finite floats identically to C's `floatcomp`
+            // (`<`) and is panic-free on the off-chance of a NaN.
+            window.sort_by(|a, b| a.total_cmp(b));
+            let median = window[midval];
+
+            // One uniform rule covers both C branches: with `mu_threshold == 0`
+            // the median always wins (`|Δ| ≥ 0` is always true → plain median),
+            // and with a positive threshold only deviations ≥ it are replaced.
+            if (center - median).abs() >= mu_threshold {
+                median
+            } else {
+                center
+            }
+        })
+        .collect();
+
+    Array3::from_shape_vec((dz, dy, dx), out)
+        .expect("medfilt3d_core: output length matches input dims")
+}
+
 impl RankFilter for CpuBackend {
-    fn median3d(&self, _vol: &mut Volume<f32>, _size: usize) -> Result<()> {
-        Err(Error::todo(
-            "cpu RankFilter::median3d",
-            "tomopy libtomo/misc/median_filt3d.c",
-        ))
+    /// 3-D median filter (tomopy `misc/corr.py::median_filter3d` →
+    /// `median_filt3d.c`). `size` is the cubic window width: the radius is
+    /// `(max(size, 3) − 1) / 2`, so the minimum kernel is 3³ (radius 1).
+    fn median3d(&self, vol: &mut Volume<f32>, size: usize) -> Result<()> {
+        let radius = (size.max(3) - 1) / 2;
+        vol.array = medfilt3d_core(&vol.array, radius, 0.0);
+        Ok(())
     }
-    fn remove_outlier(&self, _data: &mut Tomo<f32>, _diff: f32, _size: usize) -> Result<()> {
-        Err(Error::todo(
-            "cpu RankFilter::remove_outlier",
-            "tomopy misc/corr.py:413 remove_outlier3d",
-        ))
+
+    /// Outlier (zinger) removal (tomopy `misc/corr.py::remove_outlier3d`).
+    /// Same kernel as [`median3d`] but with the dezinger threshold `diff`: a
+    /// voxel is replaced by the local median only when it deviates from it by
+    /// at least `diff`; all others pass through unchanged.
+    fn remove_outlier(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()> {
+        let radius = (size.max(3) - 1) / 2;
+        data.array = medfilt3d_core(&data.array, radius, diff);
+        Ok(())
     }
 }
 
