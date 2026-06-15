@@ -106,15 +106,14 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B5. Rank filters — `CpuBackend: RankFilter`  (completes the prep family)
 
-- **Stubs:** `crates/tomoxide-cpu/src/lib.rs:570` `median3d`, `:577`
-  `remove_outlier`. (The `prep::median_filter3d` / `prep::remove_outlier`
-  wrappers already exist at `filters.rs:50,61` but error because this backend
-  capability is unimplemented.)
+- ✅ **`median3d` + `remove_outlier` — done.** Direct port of tomopy
+  `median_filt3d.c::medfilt3D_float` (clamp-to-center boundary, `(2·radius+1)³`
+  window, sorted median at `total/2`; one uniform rule covers the pure-median
+  and dezinger-threshold paths). Matches tomopy 1.15.3 **bit-for-bit** on 4
+  parity cases — median size 3/5 and dezinger dif 0.5/5.0 (`rankfilter_parity.rs`,
+  golden from `tools/gen_tomopy_rankfilter_golden.py`).
 - **Upstream:** tomopy `libtomo/misc/median_filt3d.c`;
-  `misc/corr.py:413` `remove_outlier3d`.
-- **Done =** `median3d` removes salt-and-pepper spikes from a volume (spike
-  count → 0) while preserving a smooth ramp; `remove_outlier` replaces only
-  pixels exceeding `diff` from the local median.
+  `misc/corr.py:355,413` (`median_filter3d`, `remove_outlier3d`).
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
@@ -161,8 +160,9 @@ pipeline integration test.
 3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
 4. **B1 HDF5 reader** — real data in; closes the bookends.
-5. **B3 stripe (Vo-all or Sf)** → **B5 rank filters** → **B6 ring** — the rest
-   of the artifact-correction family, highest-value first.
+5. ✅ **B5 rank filters** — done (tomopy parity, bit-exact). Remaining
+   artifact-correction family, highest-value first: **B3 stripe (Vo-all or Sf)**
+   → **B6 ring**.
 6. Wire the **M3 end-to-end pipeline integration test**.
 7. B7 polish, then M4+.
 
