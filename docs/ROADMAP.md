@@ -16,16 +16,25 @@ shippable on its own and keeps `cargo build --workspace` + `cargo nextest run
 
 **Done = workspace builds and tests pass with the CPU backend selected.**
 
-## M1 — CPU analytic core (parity target: tomopy FBP/gridrec)
+## M1 — CPU analytic core (parity target: tomopy FBP/gridrec) 🟡 in progress
 
-- `tomoxide-cpu`: real `Fft` (rustfft), `FbpFilter`, `FilteredBackproject`.
-- `recon::fbp` and `recon::gridrec` produce correct slices.
-- `sim::project` forward projector (port `project.c`) for round-trip tests.
-- Verification: phantom → project → reconstruct → SSIM/MSE vs phantom; and
-  numeric diff against tomopy `recon(..., algorithm='fbp'/'gridrec')` on a
-  fixed phantom.
+FBP path complete and verified by self-consistent round-trip; gridrec and
+tomopy golden-data parity remain.
 
-**Done = `fbp`/`gridrec` within tolerance of tomopy on shepp2d.**
+- ✅ `tomoxide-cpu` `Fft::fft_1d` (rustfft, normalized inverse).
+- ✅ `FbpFilter`: full padded ramp×window kernel + FFT-domain `apply`.
+- ✅ `FilteredBackproject::backproject` (parallel-beam, voxel-driven, rayon).
+- ✅ `ForwardProject::project` (parallel-beam, pixel-driven; exact adjoint of
+  the back-projector) and `sim::project` wired to it.
+- ✅ Round-trip gate: shepp2d → project → FBP(ramp) → Pearson r = 0.96 over a
+  central disk (`crates/tomoxide/tests/fbp_roundtrip.rs`).
+- ⬜ `Fft::fft_2d` and `recon::gridrec` (Fourier-grid) — next M1 round.
+- ⬜ Numeric diff vs tomopy `recon(..., algorithm='fbp'/'gridrec')` on a fixed
+  phantom — **deferred**: needs a tomopy install / checked-in golden, not
+  available on the offline dev box (see verification harness below).
+
+**Done = `fbp`/`gridrec` within tolerance of tomopy on shepp2d.** FBP is
+self-round-trip-correct; absolute tomopy parity is gated on golden data.
 
 ## M2 — CPU iterative family (parity target: tomopy ART/SIRT/MLEM…)
 

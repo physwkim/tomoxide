@@ -18,12 +18,12 @@ Upstream roots (this machine):
 
 | tomoxide                     | Upstream                                                    | Backend  | Status |
 |------------------------------|------------------------------------------------------------|----------|--------|
-| `recon::fbp`                 | tomopy `libtomo/recon/fbp.c`; `extern/recon.py:238`         | CPU      | stub   |
+| `recon::fbp`                 | tomopy `libtomo/recon/fbp.c`; `extern/recon.py:238`         | CPU      | partial |
 | `recon::gridrec`             | tomopy `libtomo/gridrec/gridrec.c:195`; `extern/gridrec.py:64` | CPU   | stub   |
 | `recon::fourierrec`          | tomocupy `reconstruction/fourierrec.py:46`; `cuda/cfunc_fourierrec.cu`, `include/cfunc_fourierrec.cuh:10` | CUDA, wgpu | stub |
 | `recon::lprec`               | tomocupy `reconstruction/lprec.py:292`; `cuda/cfunc_lprec.cu`, `include/cfunc_lprec.cuh:9` | CUDA, wgpu | stub |
 | `recon::linerec`             | tomocupy `reconstruction/linerec.py:47`; `cuda/cfunc_linerec.cu`, `include/cfunc_linerec.cuh:9` | CUDA, wgpu | stub |
-| `recon::filter` (FBP filter) | tomocupy `reconstruction/fbp_filter.py:46`; `cuda/cfunc_filter.cu`; tomopy filter in `fbp.c` | all | stub |
+| `recon::filter` (FBP filter) | tomocupy `reconstruction/fbp_filter.py:46`; `cuda/cfunc_filter.cu`; tomopy filter in `fbp.c` | all | partial (CPU done) |
 | `recon::lamino` (USFFT)      | tomocupy `reconstruction/lamfourierrec.py`; `cuda/cfunc_usfft1d.cu`, `cfunc_usfft2d.cu`, `cfunc_fft2d.cu` | CUDA | stub |
 
 ### C-extern signatures to match (tomopy `include/libtomo/recon.h`)
@@ -154,7 +154,7 @@ void medianfilter_main_float(float* in,float* out,int kernel_half_size,float abs
 | `phantom::shepp3d`        | tomopy `misc/phantom.py`                | stub    |
 | `phantom::{baboon,…}`     | tomopy `misc/phantom.py:89…`            | stub    |
 | `sim::angles`             | tomopy `sim/project.py:241`             | done    |
-| `sim::project`            | tomopy `sim/project.py:268`; `libtomo/recon/project.c` | stub |
+| `sim::project`            | tomopy `sim/project.py:268`; `libtomo/recon/project.c` | partial (CPU parallel-beam) |
 | `sim::add_{gaussian,poisson,rings,zingers}` | tomopy `sim/project.py:110,136,153,211` | stub |
 
 ---
@@ -202,9 +202,14 @@ inference. Reconstruction algorithms exposed: `fourierrec`, `lprec`, `linerec`
 - **Array order.** tomopy passes `(dy,dt,dx)` (sinogram order) or `(dt,dy,dx)`
   (projection order) via `sinogram_order`; tomocupy is sinogram-chunked. Keep
   `Layout` explicit (ARCHITECTURE §1) and never transpose silently.
-- **Center convention.** Both treat `center` as the detector-column coordinate
-  of the rotation axis; FBP filtering applies the sub-pixel shift
-  `exp(-2πi·(-center+n/2)·freq)` (tomocupy `fbp_filter_center`).
+- **Center convention.** All treat `center` as the detector-column coordinate
+  of the rotation axis. tomocupy folds the sub-pixel shift
+  `exp(-2πi·(-center+n/2)·freq)` into the FBP filter (`fbp_filter_center`). The
+  CPU backend instead keeps the filter a pure shift-invariant ramp and applies
+  `center` directly in the back-projector's `t = …+center` sampling — the
+  filter's `geom` argument is unused on CPU. The CUDA port can keep tomocupy's
+  in-filter shift; results must match within tolerance regardless of where the
+  shift lives.
 - **f16.** tomocupy compiles `*fp16` kernel variants; tomoxide selects them by
   `Dtype::F16` on the CUDA/wgpu backends only (CPU stays f32).
 - **Filters.** Same named set on both sides: `ramp/shepp/cosine/cosine2/
