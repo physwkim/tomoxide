@@ -10,8 +10,8 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use ndarray::{Array3, Axis};
-use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, Hdf5Error};
+use ndarray::{Array3, Axis, Slice};
+use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, Hdf5Error, VarLenUnicode};
 use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
 use tomoxide_core::data::{Dataset, Frames, Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
@@ -344,18 +344,18 @@ fn ensure_le(byte_order: ByteOrder) -> Result<()> {
 
 /// Create a writer for the given output format.
 ///
-/// Only [`SaveFormat::Tiff`] is implemented (per-slice 32-bit float TIFF, the
-/// tomocupy default output); `H5`/`Zarr` remain stubs. For TIFF, `path` is the
-/// filename **prefix** — slice `i` is written to `{path}_{i:05}.tiff`, matching
-/// tomocupy `dataio/writer.py:281` (`{fnameout}_{fid:05}.tiff`). The parent
-/// directory of `path` is created if missing.
+/// [`SaveFormat::Tiff`] and [`SaveFormat::H5`] are implemented; `Zarr` remains a
+/// stub. `path` is the output **base**, and each writer appends its own suffix:
+/// - TIFF — slice `i` → `{path}_{i:05}.tiff` (tomocupy `dataio/writer.py:281`,
+///   `{fnameout}_{fid:05}.tiff`).
+/// - H5 — a single `{path}.h5` file holding one `/exchange/data` dataset
+///   (tomocupy `dataio/writer.py` `h5nolinks`; `fnameout += '.h5'`).
+///
+/// The parent directory of `path` is created if missing.
 pub fn create_writer(path: &str, format: SaveFormat) -> Result<Box<dyn VolumeWriter>> {
     match format {
         SaveFormat::Tiff => Ok(Box::new(TiffWriter::new(path)?)),
-        SaveFormat::H5 => Err(Error::todo(
-            "io::create_writer (h5)",
-            "tomocupy dataio/writer.py:282",
-        )),
+        SaveFormat::H5 => Ok(Box::new(H5Writer::new(path)?)),
         SaveFormat::Zarr => Err(Error::todo(
             "io::create_writer (zarr)",
             "tomocupy dataio/writer.py:294",
@@ -406,6 +406,135 @@ impl VolumeWriter for TiffWriter {
             enc.write_image::<Gray32Float>(nx as u32, ny as u32, &buf)
                 .map_err(|e| Error::Io(format!("tiff write {fname}: {e}")))?;
         }
+        Ok(())
+    }
+}
+
+/// Single-file HDF5 reconstruction writer (tomocupy `dataio/writer.py`,
+/// `h5nolinks` variant).
+///
+/// Writes one **contiguous** `/exchange/data` dataset of shape `[nz, ny, nx]`
+/// (float32) under an `exchange` group, carrying tomocupy's
+/// `axes`/`description`/`units` attributes. The dataset is sized on the first
+/// `write_chunk` from the volume's full extents; each chunk fills its
+/// `[start, end)` slice range via an HDF5 hyperslab, and the file is flushed so
+/// a streaming caller's partial output is durable. `path` is the output base —
+/// `.h5` is appended if absent (mirroring tomocupy `fnameout += '.h5'`).
+///
+/// Contiguous (not chunked) layout is required: `write_slice` hyperslabs are
+/// only valid on contiguous datasets, and `h5nolinks` output is uncompressed.
+struct H5Writer {
+    /// Resolved `.h5` output path.
+    path: std::path::PathBuf,
+    /// File + dataset, created lazily on the first `write_chunk`.
+    state: Option<H5WriteState>,
+}
+
+/// The open file and its `/exchange/data` dataset, fixed to the first volume's
+/// extents.
+struct H5WriteState {
+    /// Kept open for `flush`; closing it would invalidate `dataset`.
+    file: H5File,
+    dataset: H5Dataset,
+    dims: (usize, usize, usize),
+}
+
+impl H5Writer {
+    fn new(path: &str) -> Result<Self> {
+        // Append `.h5` to the base (tomocupy `fnameout += '.h5'`), mirroring the
+        // way TiffWriter treats `path` as a base and adds its own suffix.
+        let out = if path.ends_with(".h5") {
+            std::path::PathBuf::from(path)
+        } else {
+            std::path::PathBuf::from(format!("{path}.h5"))
+        };
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::Io(format!("create dir {}: {e}", parent.display())))?;
+            }
+        }
+        Ok(Self {
+            path: out,
+            state: None,
+        })
+    }
+
+    /// Create `{path}.h5` with an `exchange/data` dataset of shape `(nz, ny, nx)`.
+    fn create_dataset(&self, nz: usize, ny: usize, nx: usize) -> Result<H5WriteState> {
+        let file = H5File::create(&self.path)
+            .map_err(|e| Error::Io(format!("create {}: {e}", self.path.display())))?;
+        let group = file
+            .create_group("exchange")
+            .map_err(|e| Error::Io(format!("create group exchange: {e}")))?;
+        // No `.chunk()` → contiguous, so write_slice hyperslabs are allowed.
+        let dataset = group
+            .new_dataset::<f32>()
+            .shape([nz, ny, nx])
+            .create("data")
+            .map_err(|e| Error::Io(format!("create dataset /exchange/data: {e}")))?;
+        for (name, value) in [
+            ("axes", "z:y:x"),
+            ("description", "ReconData"),
+            ("units", "counts"),
+        ] {
+            dataset
+                .new_attr::<VarLenUnicode>()
+                .shape(())
+                .create(name)
+                .map_err(|e| Error::Io(format!("create attr {name}: {e}")))?
+                .write_string(value)
+                .map_err(|e| Error::Io(format!("write attr {name}: {e}")))?;
+        }
+        Ok(H5WriteState {
+            file,
+            dataset,
+            dims: (nz, ny, nx),
+        })
+    }
+}
+
+impl VolumeWriter for H5Writer {
+    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()> {
+        let (nz, ny, nx) = vol.dims();
+        if start > end || end > nz {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: slice range [{start}, {end}) out of bounds for {nz} slices"
+            )));
+        }
+        // The dataset is fixed to the first volume's full extents; every later
+        // chunk must come from a volume of the same shape (tomocupy pre-allocates
+        // the whole `/exchange/data` before filling chunks).
+        if self.state.is_none() {
+            self.state = Some(self.create_dataset(nz, ny, nx)?);
+        }
+        let state = self.state.as_ref().unwrap();
+        if state.dims != (nz, ny, nx) {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: volume dims {:?} differ from the created dataset {:?}",
+                (nz, ny, nx),
+                state.dims
+            )));
+        }
+        if start == end {
+            return Ok(());
+        }
+        // Row-major [z, y, x] slab for rows [start, end), written into the same
+        // rows of the dataset (tomocupy `dset[st:end] = rec`).
+        let slab: Vec<f32> = vol
+            .array
+            .slice_axis(Axis(0), Slice::from(start..end))
+            .iter()
+            .copied()
+            .collect();
+        state
+            .dataset
+            .write_slice(&[start, 0, 0], &[end - start, ny, nx], &slab)
+            .map_err(|e| Error::Io(format!("write /exchange/data[{start}..{end}]: {e}")))?;
+        state
+            .file
+            .flush()
+            .map_err(|e| Error::Io(format!("flush {}: {e}", self.path.display())))?;
         Ok(())
     }
 }
