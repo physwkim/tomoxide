@@ -45,6 +45,7 @@ tomoxide = { path = "crates/tomoxide", version = "0.0.0" }
 
 # --- numerics ---
 ndarray = "0.16"
+ndarray-npy = "0.9"
 num-complex = "0.4"
 num-traits = "0.2"
 half = { version = "2", features = ["num-traits"] }

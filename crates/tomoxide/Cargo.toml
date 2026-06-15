@@ -27,3 +27,4 @@ log.workspace = true
 
 [dev-dependencies]
 ndarray.workspace = true
+ndarray-npy.workspace = true
