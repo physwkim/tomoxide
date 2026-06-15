@@ -1,0 +1,14 @@
+[package]
+name = "tomoxide-prep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Preprocessing for tomoxide: normalize, stripe/phase/ring removal, filters"
+
+[dependencies]
+tomoxide-core.workspace = true
+ndarray.workspace = true
+log.workspace = true
