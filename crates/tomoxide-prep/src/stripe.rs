@@ -1,21 +1,21 @@
 //! Stripe-artifact removal (ports tomopy `prep/stripe.py` + tomocupy
-//! `processing/remove_stripe.py`). The smoothing-filter (`Sf`), Titarenko
-//! (`Ti`), and Vo all-stripe (`VoAll`) methods are implemented; `Fw` is a stub.
-//! See `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
+//! `processing/remove_stripe.py`). The Fourier-Wavelet (`Fw`), smoothing-filter
+//! (`Sf`), Titarenko (`Ti`), and Vo all-stripe (`VoAll`) methods are
+//! implemented. See `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
 
 use ndarray::Array2;
+use std::f64::consts::PI;
 use tomoxide_core::data::{Layout, Tomo};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::params::StripeMethod;
+
+use crate::wavelet;
 
 /// Remove stripes from a sinogram stack using the selected method.
 pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
     match method {
         StripeMethod::None => Ok(()),
-        StripeMethod::Fw { .. } => Err(Error::todo(
-            "stripe::remove_stripe_fw",
-            "tomopy prep/stripe.py:88 (Fourier-Wavelet)",
-        )),
+        StripeMethod::Fw { sigma, level } => remove_stripe_fw(data, sigma, level),
         StripeMethod::Ti { nblock, beta } => {
             if nblock != 0 {
                 // tomopy's block path `_ringb` is unrunnable on modern numpy —
@@ -95,6 +95,185 @@ fn remove_stripe_sf(data: &mut Tomo<f32>, size: usize) -> Result<()> {
         for p in 0..dx {
             for j in 0..dz {
                 arr[[p, s, j]] -= average_row[j] - smooth_row[j];
+            }
+        }
+    }
+
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Fourier-Wavelet stripe removal (tomopy `prep/stripe.py::_remove_stripe_fw`,
+// Münch 2009). Per sinogram slice: pad the projection axis, run a `level`-deep
+// `db5` 2-D wavelet decomposition, damp the vertical-detail bands in Fourier
+// space along the projection direction, reconstruct, and crop back. The forward
+// decomposition mirrors tomopy's float32 `pywt` path (each band rounded to f32),
+// while damping and reconstruction run in f64 exactly as tomopy's numpy/pywt
+// promotion does, so the result matches to the f32 round-off floor.
+// Projector-independent. The wavelet kernels live in `crate::wavelet`.
+//
+// NOTE: the Fourier damping uses a self-contained O(n²) direct DFT (no external
+// FFT dependency, arbitrary length). That is fine for parity-sized data but is a
+// known performance cost for large stacks — see `docs/PORTING.md` §D.
+// ----------------------------------------------------------------------------
+
+/// Round every element of an `f64` band to `f32` precision (emulating tomopy's
+/// float32 `pywt` forward pass), keeping the `f64` storage type.
+fn round_to_f32(a: &Array2<f64>) -> Array2<f64> {
+    a.mapv(|v| v as f32 as f64)
+}
+
+/// Damp one real column of length `n` in Fourier space: `real(ifft(fft(col) ·
+/// D))`, where `D = ifftshift(damp)`. Equivalent to tomopy's
+/// `real(ifft(ifftshift(fftshift(fft(col)) · damp)))` because a permutation
+/// distributes over the elementwise product, so `fftshift`/`ifftshift` cancel
+/// around the multiply. Direct DFT (matches numpy `fft` to f64 round-off).
+fn damp_column(col: &[f64], d: &[f64]) -> Vec<f64> {
+    let n = col.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let nf = n as f64;
+    // G[k] = fft(col)[k] · D[k]   (col real, D real).
+    let mut gre = vec![0.0f64; n];
+    let mut gim = vec![0.0f64; n];
+    for k in 0..n {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (m, &cv) in col.iter().enumerate() {
+            let ang = -2.0 * PI * (k as f64) * (m as f64) / nf;
+            re += cv * ang.cos();
+            im += cv * ang.sin();
+        }
+        gre[k] = re * d[k];
+        gim[k] = im * d[k];
+    }
+    // out[t] = real(ifft(G))[t] = (1/n) Σ_k Re(G[k]·e^{+2πi k t/n}).
+    (0..n)
+        .map(|t| {
+            let mut s = 0.0f64;
+            for k in 0..n {
+                let ang = 2.0 * PI * (k as f64) * (t as f64) / nf;
+                s += gre[k] * ang.cos() - gim[k] * ang.sin();
+            }
+            s / nf
+        })
+        .collect()
+}
+
+/// Münch damping factor `D = ifftshift(damp)` for a band with `my` rows, where
+/// `damp[k] = 1 − exp(−ŷ²/(2σ²))` and `ŷ = (arange(−my, my, 2) + 1)/2`. Computed
+/// in f32 like tomopy (`y_hat`/`damp` are float32 there), returned as f64.
+fn damp_vector(my: usize, sigma: f32) -> Vec<f64> {
+    let two_sig2 = 2.0f32 * sigma * sigma;
+    // damp in natural (fftshift) order.
+    let damp: Vec<f32> = (0..my)
+        .map(|k| {
+            // arange(-my, my, 2)[k] == -my + 2k.
+            let y_hat = ((-(my as i64) + 2 * k as i64) as f32 + 1.0) / 2.0;
+            1.0f32 - (-(y_hat * y_hat) / two_sig2).exp()
+        })
+        .collect();
+    // ifftshift: D[i] = damp[(i + my/2) mod my]  (np.roll(damp, -(my//2))).
+    let half = my / 2;
+    (0..my).map(|i| damp[(i + half) % my] as f64).collect()
+}
+
+/// Damp the vertical-detail band `cv` (shape `[my, mx]`) along axis 0, in place
+/// on a fresh array. Matches tomopy `fcV = fftshift(fft(cV, axis=0)); fcV *=
+/// damp; cV = real(ifft(ifftshift(fcV), axis=0))`.
+fn damp_vertical(cv: &Array2<f64>, sigma: f32) -> Array2<f64> {
+    let (my, mx) = cv.dim();
+    let d = damp_vector(my, sigma);
+    let mut out = Array2::<f64>::zeros((my, mx));
+    let mut col = vec![0.0f64; my];
+    for c in 0..mx {
+        for (r, v) in col.iter_mut().enumerate() {
+            *v = cv[[r, c]];
+        }
+        let damped = damp_column(&col, &d);
+        for r in 0..my {
+            out[[r, c]] = damped[r];
+        }
+    }
+    out
+}
+
+/// Crop `a` to its top-left `[rows, cols]` sub-block (tomopy `sli[0:r, 0:c]`).
+fn crop(a: &Array2<f64>, rows: usize, cols: usize) -> Array2<f64> {
+    Array2::from_shape_fn((rows, cols), |(r, c)| a[[r, c]])
+}
+
+/// Process one `[nproj, ncol]` sinogram through the Fourier-Wavelet filter.
+fn fw_slice(sino: &Array2<f64>, sigma: f32, level: usize, nx: usize, xshift: usize) -> Array2<f64> {
+    let (nproj, ncol) = sino.dim();
+    // Pad the projection axis to `nx`, sinogram placed at rows [xshift, xshift+nproj).
+    let mut approx = Array2::<f64>::zeros((nx, ncol));
+    for p in 0..nproj {
+        for c in 0..ncol {
+            approx[[xshift + p, c]] = sino[[p, c]];
+        }
+    }
+    // Forward: `level`-deep db5 decomposition, each band rounded to f32.
+    let mut chs = Vec::with_capacity(level);
+    let mut cvs = Vec::with_capacity(level);
+    let mut cds = Vec::with_capacity(level);
+    for _ in 0..level {
+        let (ca, ch, cv, cd) = wavelet::dwt2(&approx);
+        approx = round_to_f32(&ca);
+        chs.push(round_to_f32(&ch));
+        cvs.push(round_to_f32(&cv));
+        cds.push(round_to_f32(&cd));
+    }
+    // Damp every vertical-detail band (f64, exactly as tomopy after numpy promotion).
+    for cv in cvs.iter_mut() {
+        *cv = damp_vertical(cv, sigma);
+    }
+    // Reconstruct: crop the running approximation to each level's band shape,
+    // then inverse-transform with the (damped) details.
+    let mut sli = approx;
+    for n in (0..level).rev() {
+        let (hr, hc) = chs[n].dim();
+        let cropped = crop(&sli, hr, hc);
+        sli = wavelet::idwt2(&cropped, &chs[n], &cvs[n], &cds[n]);
+    }
+    // Crop back to the original sinogram region.
+    Array2::from_shape_fn((nproj, ncol), |(p, c)| sli[[xshift + p, c]])
+}
+
+/// Fourier-Wavelet stripe removal (`remove_stripe_fw`). `level = None` selects
+/// `ceil(log2(max(nproj, nrows, ncol)))`, matching tomopy. `pad` is always on
+/// (tomopy's default): the projection axis is padded to `nproj + nproj/8`.
+fn remove_stripe_fw(data: &mut Tomo<f32>, sigma: f32, level: Option<usize>) -> Result<()> {
+    let target = data.layout;
+    // tomopy operates on `tomo[:, m, :]` = `[proj, col]` slices of the
+    // `[proj, row, col]` projection-layout stack.
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, nrows, ncol) = proj.array.dim();
+    if nproj == 0 || nrows == 0 || ncol == 0 {
+        return Ok(());
+    }
+    let level = level.unwrap_or_else(|| {
+        let size = nproj.max(nrows).max(ncol);
+        (size as f64).log2().ceil() as usize
+    });
+    if level == 0 {
+        return Ok(());
+    }
+    let nx = nproj + nproj / 8; // pad=True
+    let xshift = (nx - nproj) / 2;
+
+    for m in 0..nrows {
+        let mut sino = Array2::<f64>::zeros((nproj, ncol));
+        for p in 0..nproj {
+            for c in 0..ncol {
+                sino[[p, c]] = proj.array[[p, m, c]] as f64;
+            }
+        }
+        let out = fw_slice(&sino, sigma, level, nx, xshift);
+        for p in 0..nproj {
+            for c in 0..ncol {
+                proj.array[[p, m, c]] = out[[p, c]] as f32;
             }
         }
     }

@@ -15,6 +15,7 @@ pub mod hardening;
 pub mod normalize;
 pub mod phase;
 pub mod stripe;
+mod wavelet;
 
 pub use normalize::{minus_log, normalize, normalize_dataset};
 pub use phase::retrieve_phase;
