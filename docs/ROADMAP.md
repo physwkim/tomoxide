@@ -125,8 +125,17 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   0°/mirrored-180° pair — a port of skimage `phase_cross_correlation`, phase
   normalization + `1/tol` upsampled-DFT subpixel refinement; projector-
   independent, matches tomopy **exactly (Δ = 0)** across 4 cases incl. two
-  subpixel; `rotc_guess` pre-alignment not yet ported). ⬜ `find_center`,
-  `write_center`, `find_center_sift` (still stubs).
+  subpixel; `rotc_guess` pre-alignment not yet ported). ✅ `find_center`
+  (entropy + Nelder-Mead, `rotation.py:82`) — reconstructs a slice with gridrec
+  at candidate centers and minimises the masked reconstruction's histogram
+  entropy via a faithful scalar Nelder-Mead. Projector-coupled (it goes through
+  gridrec), so it is held to recovery, not bit parity: it lands on the true axis
+  (the projector-independent `find_center_vo`) within ±0.5 px and agrees with
+  tomopy's own `find_center` within ±1 px. Exposed a latent gridrec bug — the
+  Fourier recentering shift used the raw FFT bin index instead of the signed
+  frequency, collapsing reconstructions at sub-pixel centers (invisible at the
+  integer default center); fixed (M1 gridrec, bit-identical at integer centers).
+  ⬜ `write_center`, `find_center_sift` (still stubs).
 - `tomoxide-io`: DXchange HDF5 reader/writer + TIFF.
 
 **Done = a full CPU pipeline: HDF in → preprocess → center → FBP → TIFF out.**

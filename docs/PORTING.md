@@ -19,7 +19,7 @@ Upstream roots (this machine):
 | tomoxide                     | Upstream                                                    | Backend  | Status |
 |------------------------------|------------------------------------------------------------|----------|--------|
 | `recon::fbp`                 | tomopy `libtomo/recon/fbp.c`; `extern/recon.py:238`         | CPU      | CPU done (golden: recovers phantom from tomopy sinogram r=0.87; tomopy's own `fbp` is a weak reference) |
-| `recon::gridrec`             | tomopy `libtomo/gridrec/gridrec.c:195`; `extern/gridrec.py:64` | CPU   | CPU done (DFI/Kaiser-Bessel not PSWF; golden: vs tomopy gridrec r=0.98) |
+| `recon::gridrec`             | tomopy `libtomo/gridrec/gridrec.c:195`; `extern/gridrec.py:64` | CPU   | CPU done (DFI/Kaiser-Bessel not PSWF; golden: vs tomopy gridrec r=0.98; Fourier recenter shift uses signed freq — correct at sub-pixel centers) |
 | `recon::fourierrec`          | tomocupy `reconstruction/fourierrec.py:46`; `cuda/cfunc_fourierrec.cu`, `include/cfunc_fourierrec.cuh:10` | CUDA, wgpu | stub |
 | `recon::lprec`               | tomocupy `reconstruction/lprec.py:292`; `cuda/cfunc_lprec.cu`, `include/cfunc_lprec.cuh:9` | CUDA, wgpu | stub |
 | `recon::linerec`             | tomocupy `reconstruction/linerec.py:47`; `cuda/cfunc_linerec.cu`, `include/cfunc_linerec.cuh:9` | CUDA, wgpu | stub |
@@ -83,7 +83,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 
 | tomoxide                | Upstream                                  | Status |
 |-------------------------|-------------------------------------------|--------|
-| `center::find_center`   | tomopy `recon/rotation.py:82` (entropy)   | stub   |
+| `center::find_center`   | tomopy `recon/rotation.py:82` (entropy)   | CPU ✓ — recovery (projector-coupled via gridrec): true axis ±0.5 px, tomopy `find_center` ±1 px |
 | `center::find_center_vo`| tomopy `recon/rotation.py:205` (Vo coarse+fine) | CPU ✓ — tomopy parity Δ=0 |
 | `center::find_center_pc`| tomopy `recon/rotation.py:391` (phase corr; skimage `phase_cross_correlation`) | CPU ✓ — tomopy parity Δ=0 (`rotc_guess` path not ported) |
 | `center::write_center`  | tomopy `recon/rotation.py:438`            | stub   |

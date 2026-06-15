@@ -80,12 +80,21 @@ below by dependency and value — the first three close the end-to-end pipeline.
   including two subpixel (`center_pc_parity.rs`, golden from
   `tools/gen_tomopy_center_pc_golden.py`). The `rotc_guess` pre-alignment
   (`ndimage.shift`) is not yet ported — `Some(_)` returns `NotImplemented`.
-- **Remaining stubs:** `crates/tomoxide-recon/src/center.rs` — `find_center`
-  (entropy, `rotation.py:82`), `write_center` (`rotation.py:438`),
-  `find_center_sift` (defer to M7, needs SIFT/AI; tomocupy `find_center.py:99`).
-- **Done (each) =** for `find_center`, recover a known injected center offset on
-  a phantom sinogram within ±0.5 px (compare to tomopy where a golden can be
-  generated, as `find_center_vo`/`find_center_pc` do).
+- ✅ **`find_center` — done.** Entropy + Nelder-Mead (`rotation.py:82`):
+  reconstructs a slice with gridrec at candidate centers and minimises the masked
+  reconstruction's 64-bin histogram entropy with a faithful scalar Nelder-Mead
+  (validated to reproduce scipy's result exactly on tomopy's own cost). It goes
+  *through* the projector (gridrec), so it is held to recovery, not bit parity:
+  it lands on the true axis (`find_center_vo`) within ±0.5 px and agrees with
+  tomopy's `find_center` within ±1 px (`center_entropy_parity.rs`, golden from
+  `tools/gen_tomopy_center_entropy_golden.py`). Surfaced and fixed a latent
+  gridrec defect — the Fourier recentering shift keyed off the raw FFT bin index
+  rather than the signed frequency, collapsing reconstructions at sub-pixel
+  centers (invisible at the integer default center; `gridrec_subpixel_center.rs`
+  regresses it), bit-identical at integer centers.
+- **Remaining stubs:** `crates/tomoxide-recon/src/center.rs` —
+  `write_center` (`rotation.py:438`), `find_center_sift` (defer to M7, needs
+  SIFT/AI; tomocupy `find_center.py:99`).
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 
