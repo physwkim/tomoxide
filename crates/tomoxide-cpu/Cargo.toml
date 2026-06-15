@@ -12,5 +12,6 @@ description = "CPU backend for tomoxide (ndarray + rayon) — ports tomopy's lib
 tomoxide-core.workspace = true
 ndarray.workspace = true
 num-complex.workspace = true
+rustfft.workspace = true
 rayon.workspace = true
 log.workspace = true

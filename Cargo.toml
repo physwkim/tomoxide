@@ -49,6 +49,7 @@ num-complex = "0.4"
 num-traits = "0.2"
 half = { version = "2", features = ["num-traits"] }
 rayon = "1.10"
+rustfft = "6"
 
 # --- diagnostics / config ---
 thiserror = "2"

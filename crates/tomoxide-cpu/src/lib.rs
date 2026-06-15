@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 use ndarray::Axis;
+use rustfft::FftPlanner;
 use tomoxide_core::backend::{
     Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
     ForwardProject, RankFilter,
@@ -215,8 +216,34 @@ impl FbpFilter for CpuBackend {
 // ----------------------------------------------------------------------------
 
 impl Fft for CpuBackend {
-    fn fft_1d(&self, _b: &mut [Complex32], _len: usize, _batch: usize, _inv: bool) -> Result<()> {
-        Err(Error::todo("cpu Fft::fft_1d", "use rustfft (milestone M1)"))
+    /// In-place batched 1-D FFT via `rustfft`. `inverse` divides by `len` so
+    /// `ifft(fft(x)) == x` (rustfft itself applies no normalization).
+    fn fft_1d(&self, buf: &mut [Complex32], len: usize, batch: usize, inverse: bool) -> Result<()> {
+        if len == 0 || batch == 0 {
+            return Ok(());
+        }
+        if buf.len() != len * batch {
+            return Err(Error::ShapeMismatch {
+                expected: (len * batch).to_string(),
+                found: buf.len().to_string(),
+            });
+        }
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = if inverse {
+            planner.plan_fft_inverse(len)
+        } else {
+            planner.plan_fft_forward(len)
+        };
+        for chunk in buf.chunks_mut(len) {
+            fft.process(chunk);
+        }
+        if inverse {
+            let norm = 1.0 / len as f32;
+            for c in buf.iter_mut() {
+                *c *= norm;
+            }
+        }
+        Ok(())
     }
     fn fft_2d(
         &self,
@@ -297,6 +324,28 @@ mod tests {
         for v in t.array.iter() {
             assert!((v - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn fft_1d_roundtrips() {
+        // Two independent length-4 transforms; inverse(forward(x)) == x.
+        let orig: Vec<Complex32> = (0..8).map(|k| Complex32::new(k as f32, 0.0)).collect();
+        let mut buf = orig.clone();
+        CpuBackend.fft_1d(&mut buf, 4, 2, false).unwrap();
+        CpuBackend.fft_1d(&mut buf, 4, 2, true).unwrap();
+        for (a, b) in buf.iter().zip(orig.iter()) {
+            assert!((a.re - b.re).abs() < 1e-4, "re {} vs {}", a.re, b.re);
+            assert!((a.im - b.im).abs() < 1e-4, "im {} vs {}", a.im, b.im);
+        }
+    }
+
+    #[test]
+    fn fft_1d_rejects_wrong_buffer_len() {
+        let mut buf = vec![Complex32::new(0.0, 0.0); 5];
+        assert!(matches!(
+            CpuBackend.fft_1d(&mut buf, 4, 2, false),
+            Err(Error::ShapeMismatch { .. })
+        ));
     }
 
     #[test]
