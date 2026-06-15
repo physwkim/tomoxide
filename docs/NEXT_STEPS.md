@@ -99,12 +99,22 @@ below by dependency and value — the first three close the end-to-end pipeline.
   avoided in the fixture: argsort tie order is numpy-quicksort-defined (not
   portable), so a perfectly constant column is outside the well-defined parity
   domain; the injected dead column is a strictly monotonic near-flat ramp.
-- **Remaining stubs:** `crates/tomoxide-prep/src/stripe.rs` — Fw (Fourier-
-  Wavelet), Ti (Titarenko).
-- **Upstream:** tomopy `prep/stripe.py:88` (Fw), `:179` (Ti). Fw needs a 1-D
-  wavelet (db-family) — check if a Rust crate is acceptable or port the lifting
-  scheme (sign-off on the dependency).
-- **Order:** Fw last (wavelet dependency); Ti before it.
+- ✅ **Ti (Titarenko/Miqueles) — done.** Port of tomopy `prep/stripe.py:179`
+  `remove_stripe_ti`: per slice solve a finite-difference normal-equations system
+  by conjugate gradient (f64) for the per-detector-column offset, then combine
+  the first/second-difference corrected sinograms as `sqrt(d1·d2 + β·|min|)`,
+  rounding each `_ring` to f32. Reproduces the f64 CG + f32 cast in the upstream
+  op order, so it matches tomopy 1.15.3 to the **f32 round-off floor**
+  (max rel Δ≈5.2e-7) — `stripe_ti_parity.rs`, golden from
+  `tools/gen_tomopy_stripe_ti_golden.py`. Only the default `nblock=0`
+  (whole-sinogram) path is supported/verified: tomopy's block path `_ringb`
+  (nblock>0) is unrunnable on modern numpy (its NaN guard
+  `np.where(np.isnan(...) is True)` raises), so there is no reference output —
+  tomoxide returns `NotImplemented` for nblock>0 rather than guessing.
+- **Remaining stub:** `crates/tomoxide-prep/src/stripe.rs` — Fw (Fourier-Wavelet).
+- **Upstream:** tomopy `prep/stripe.py:88` (Fw). Fw needs a 1-D wavelet
+  (db-family) — check if a Rust crate is acceptable or port the lifting scheme
+  (sign-off on the dependency).
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
@@ -179,9 +189,9 @@ pipeline integration test.
    dep).
 4. **B1 HDF5 reader** — real data in; closes the bookends.
 5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** + ✅ **B6 ring** + ✅ **B3 stripe
-   Vo-all** — done (tomopy parity; bit-exact for rank/Sf/ring, ≈f32 floor for
-   Vo-all). Remaining artifact-correction family: **B3 Ti**, then **B3 Fw**
-   (wavelet dependency).
+   Vo-all** + ✅ **B3 stripe Ti** — done (tomopy parity; bit-exact for
+   rank/Sf/ring, ≈f32 floor for Vo-all/Ti). Remaining artifact-correction
+   family: **B3 Fw** (wavelet dependency, needs sign-off).
 6. Wire the **M3 end-to-end pipeline integration test**.
 7. B7 polish, then M4+.
 

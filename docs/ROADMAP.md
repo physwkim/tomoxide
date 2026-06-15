@@ -112,7 +112,10 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   transform median/mean ring removal, WRAP mode; bit-exact tomopy parity); ✅
   `remove_all_stripe` (Vo algorithms 3+5+6: dead/large-stripe detection +
   bilinear column fill + sorting; matches tomopy to the f32 round-off floor,
-  max rel Δ≈5.8e-7). ⬜ rest of the stripe family (`fw`, `ti`).
+  max rel Δ≈5.8e-7); ✅ `remove_stripe_ti` (Titarenko/Miqueles: per-slice f64
+  finite-difference CG offset solve, `sqrt(d1·d2 + β·|min|)`; f32-floor parity,
+  max rel Δ≈5.2e-7; default `nblock=0` only — tomopy's block `_ringb` is
+  unrunnable on modern numpy). ⬜ rest of the stripe family (`fw`).
 - `center`: ✅ `find_center_vo` (Nghia Vo, the primary/workhorse) — sinogram-
   domain Fourier method (anisotropic-Gaussian denoise → double-wedge-masked
   `mean(|fftshift(fft2)|)` metric → coarse 0.5-px + fine cubic-B-spline search,

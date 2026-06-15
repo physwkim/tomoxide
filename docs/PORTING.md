@@ -102,7 +102,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `normalize::minus_log`            | tomopy `prep/normalize.py:72`; tomocupy `proc_functions.minus_log` | all | partial |
 | `normalize::darkflat`             | tomocupy `proc_functions.darkflat_correction:55`  | all     | partial |
 | `stripe::remove_stripe_fw`        | tomopy `prep/stripe.py:88`; tomocupy `remove_stripe.remove_stripe_fw` | CPU/GPU | stub |
-| `stripe::remove_stripe_ti`        | tomopy `prep/stripe.py:179`; tomocupy `remove_stripe_ti` | CPU/GPU | stub |
+| `stripe::remove_stripe_ti`        | tomopy `prep/stripe.py:179` (Titarenko/Miqueles) | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈5.2e-7); default `nblock=0` only (`_ringb` block path unrunnable on modern numpy) |
 | `stripe::remove_stripe_sf`        | tomopy `prep/stripe.py:333`; `libtomo/prep/stripe.c` (`remove_stripe_sf`) | CPU | CPU ✓ — tomopy parity (bit-exact) |
 | `stripe::remove_stripe_based_sorting` | tomopy `prep/stripe.py:363` (Vo alg. 3)       | CPU     | stub    |
 | `stripe::remove_stripe_based_filtering` | tomopy `prep/stripe.py:437` (Vo alg. 2)     | CPU     | stub    |
