@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# build artefacts from the CUDA backend (nvcc output)
+*.ptx
+*.cubin
+*.fatbin
+*.o
+
+# editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# reconstruction outputs and sample data
+/data
+*.h5
+*.tiff
+*.tif
+*.zarr

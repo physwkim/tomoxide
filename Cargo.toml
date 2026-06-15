@@ -1,0 +1,65 @@
+# tomoxide — a Rust tomographic reconstruction toolkit.
+#
+# Combines the algorithmic breadth of tomopy (CPU `libtomo`) with the
+# GPU-accelerated streaming reconstruction of tomocupy (CUDA), behind a
+# single tri-backend abstraction: CPU / CUDA / wgpu(Metal).
+#
+# See docs/ARCHITECTURE.md for the backend model and docs/PORTING.md for the
+# upstream -> tomoxide mapping that each module stub references.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/tomoxide-core",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "BSD-3-Clause"
+repository = "https://github.com/stevek/tomoxide"
+authors = ["tomoxide contributors"]
+description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in Rust)"
+
+[workspace.dependencies]
+# --- internal crates ---
+tomoxide-core = { path = "crates/tomoxide-core", version = "0.0.0" }
+tomoxide-cpu = { path = "crates/tomoxide-cpu", version = "0.0.0" }
+tomoxide-cuda = { path = "crates/tomoxide-cuda", version = "0.0.0" }
+tomoxide-wgpu = { path = "crates/tomoxide-wgpu", version = "0.0.0" }
+tomoxide-recon = { path = "crates/tomoxide-recon", version = "0.0.0" }
+tomoxide-prep = { path = "crates/tomoxide-prep", version = "0.0.0" }
+tomoxide-io = { path = "crates/tomoxide-io", version = "0.0.0" }
+tomoxide-sim = { path = "crates/tomoxide-sim", version = "0.0.0" }
+tomoxide = { path = "crates/tomoxide", version = "0.0.0" }
+
+# --- numerics ---
+ndarray = "0.16"
+num-complex = "0.4"
+num-traits = "0.2"
+half = { version = "2", features = ["num-traits"] }
+rayon = "1.10"
+
+# --- diagnostics / config ---
+thiserror = "2"
+log = "0.4"
+
+# --- CLI ---
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# --- optional GPU backend (wgpu / Metal) ---
+# Pulled only when a crate enables its `gpu-wgpu` feature; the default
+# workspace build never compiles it.
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
