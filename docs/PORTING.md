@@ -164,7 +164,7 @@ void medianfilter_main_float(float* in,float* out,int kernel_half_size,float abs
 
 | tomoxide              | Upstream                              | Status |
 |-----------------------|---------------------------------------|--------|
-| `dxchange::Reader`    | tomocupy `dataio/reader.py:59`        | stub   |
+| `dxchange::Reader`    | tomocupy `dataio/reader.py:59`        | done (`open_dxchange`; pure-Rust `rust-hdf5`, no libhdf5; bit-exact, gzip/uint16 fixture) |
 | `dxchange::Writer`    | tomocupy `dataio/writer.py:73`        | stub   |
 | `tiff::{read,write}`  | tomocupy `--save-format tiff`         | stub   |
 | `zarr::write`         | tomocupy `--save-format zarr`         | stub   |

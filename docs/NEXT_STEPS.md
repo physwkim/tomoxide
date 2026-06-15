@@ -57,14 +57,17 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B1. I/O bookends — `tomoxide-io`  (unblocks real data in/out)
 
-- **Stubs:** `crates/tomoxide-io/src/lib.rs:57` `open_dxchange` (HDF5 reader),
-  `:65` `create_writer` (TIFF / HDF5 / Zarr).
-- **Upstream:** tomocupy `dataio/reader.py:59`, `dataio/writer.py:103`.
-- **Needs sign-off (dependency):** HDF5 binding crate (`hdf5`/`hdf5-metno`) and
-  a TIFF crate (`tiff`). Pick TIFF-writer first (no native lib, pure Rust) so a
-  reconstruction can be saved before the HDF5 reader lands.
-- **Done =** write a `Volume` to per-slice TIFF and read it back bit-equal;
-  open a checked-in small DXchange `.h5` and recover the known data/theta shapes.
+- ✅ **HDF5 reader done** — `open_dxchange` (`crates/tomoxide-io/src/lib.rs`)
+  via the pure-Rust `rust-hdf5` crate (no libhdf5/C dep). Reads DXchange
+  `/exchange/{data,data_white,data_dark,theta}`, casts any on-disk numeric
+  dtype to f32, converts theta degrees→radians (or linspace fallback).
+  Bit-exact parity test against a gzip-compressed uint16 fixture
+  (`tools/gen_dxchange_fixture.py`).
+- **Remaining stub:** `create_writer` (TIFF / HDF5 / Zarr) — tomocupy
+  `dataio/writer.py:103`. TIFF writer is next (needs a `tiff` crate sign-off);
+  it closes the output bookend so a reconstruction can be saved.
+- **Done (writer) =** write a `Volume` to per-slice TIFF and read it back
+  bit-equal.
 
 ### B2. Center finding — `tomoxide-recon::center`  (unblocks correct recon)
 
@@ -208,7 +211,8 @@ pipeline integration test.
 2. ✅ **B4 Paganin** — done (tomopy parity, max rel Δ≈2.4e-7).
 3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
-4. **B1 HDF5 reader** — real data in; closes the bookends.
+4. ✅ **B1 HDF5 reader** — done (`open_dxchange`, pure-Rust `rust-hdf5`,
+   bit-exact). Real data in; the input bookend is closed.
 5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** + ✅ **B6 ring** + ✅ **B3 stripe
    Vo-all** + ✅ **B3 stripe Ti** — done (tomopy parity; bit-exact for
    rank/Sf/ring, ≈f32 floor for Vo-all/Ti). Remaining artifact-correction
