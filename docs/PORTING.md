@@ -64,9 +64,9 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 | `Sirt`                 | `num_iter`                          | `recon/sirt.c` (+`accel/cxx/sirt.cc`) | partial (R/C-weighted) |
 | `Mlem`                 | `num_iter`                          | `accel/cxx/mlem.cc`  | CPU done (r=0.99) |
 | `Osem`                 | `num_iter,num_block,ind_block`      | `recon/osem.c`       | CPU done (MLEM over ordered subsets; r=0.99, num_block=1 ≡ MLEM) |
-| `OspmlHybrid`          | `num_iter,reg_par,num_block,ind_block` | `recon/ospml_hybrid.c` | stub |
+| `OspmlHybrid`          | `num_iter,reg_par,num_block,ind_block` | `recon/ospml_hybrid.c` | CPU done (edge-preserving prior; no reg_par[1] ≡ ospml_quad) |
 | `OspmlQuad`            | `num_iter,reg_par,num_block,ind_block` | `recon/ospml_quad.c`   | CPU done (De Pierro quad prior; reg=0 ≡ OSEM) |
-| `PmlHybrid`            | `num_iter,reg_par`                  | `recon/pml_hybrid.c` | stub   |
+| `PmlHybrid`            | `num_iter,reg_par`                  | `recon/ospml_hybrid.c` (num_block=1) | CPU done (reg=0 ≡ MLEM) |
 | `PmlQuad`              | `num_iter,reg_par`                  | `recon/ospml_quad.c` (num_block=1) | CPU done (reg=0 ≡ MLEM) |
 | `Tv`                   | `num_iter,reg_par`                  | `recon/tv.c`         | stub   |
 | `Grad`                 | `num_iter,reg_par`                  | `recon/grad.c`       | stub   |

@@ -98,15 +98,34 @@ fn iterative(
         Algorithm::Sirt => sirt(sino, geom, params, proj, bp),
         Algorithm::Mlem => mlem(sino, geom, params, proj, bp),
         Algorithm::Osem => osem(sino, geom, params, proj, bp),
-        // pml_quad is ospml_quad with a single block (tomopy extern/recon.py).
-        Algorithm::OspmlQuad => ospml_quad(sino, geom, params, proj, bp, params.num_block),
-        Algorithm::PmlQuad => ospml_quad(sino, geom, params, proj, bp, 1),
-        // ART/BART (row-action, need a single-ray primitive) and the remaining
-        // regularized methods (ospml_hybrid, pml_hybrid, tv, tikh, grad, vector)
-        // land later in M2.
+        // pml_* are ospml_* with a single block (tomopy extern/recon.py). The
+        // quadratic prior is delta=None; the hybrid prior uses reg_par[1] as the
+        // edge threshold (None if absent ⇒ degenerates to the quadratic prior).
+        Algorithm::OspmlQuad => ospml(sino, geom, params, proj, bp, params.num_block, None),
+        Algorithm::PmlQuad => ospml(sino, geom, params, proj, bp, 1, None),
+        Algorithm::OspmlHybrid => ospml(
+            sino,
+            geom,
+            params,
+            proj,
+            bp,
+            params.num_block,
+            params.reg_par.get(1).copied(),
+        ),
+        Algorithm::PmlHybrid => ospml(
+            sino,
+            geom,
+            params,
+            proj,
+            bp,
+            1,
+            params.reg_par.get(1).copied(),
+        ),
+        // ART/BART are row-action (Kaczmarz) and need a single-ray primitive;
+        // tv/tikh/grad/vector land later in M2.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART + ospml_hybrid/pml_hybrid/tv/tikh/grad/vector)",
-            "tomopy libtomo/recon/{art,bart,ospml_hybrid,pml_hybrid,tv,tikh,grad,vector}.c",
+            "recon iterative (ART/BART + tv/tikh/grad/vector)",
+            "tomopy libtomo/recon/{art,bart,tv,tikh,grad,vector}.c",
         )),
     }
 }
@@ -341,21 +360,30 @@ fn osem(
 /// solves the De Pierro quadratic `2F·xʹ² + G·xʹ + E = 0` (positive root), where
 ///
 /// - `E = −x·corr`            (data term),
-/// - `F = 2·reg`,
-/// - `G = sens − 2·reg·(x + ⟨neighbors⟩)`,
+/// - `F = Σ_g 2·reg·w_g·γ_g`,
+/// - `G = sens − Σ_g 2·reg·w_g·γ_g·(x + x_g)`,
 ///
-/// and `⟨neighbors⟩` is the in-grid 8-neighbour mean weighted `1` (cardinal) /
-/// `1/√2` (diagonal), normalized — the uniform form of tomopy's separate
-/// interior/edge/corner weight tables (each already sums to one). At `reg = 0`
-/// (`F = 0`) the quadratic degenerates to the linear root `x·corr/sens`, i.e.
-/// exactly the MLEM/OSEM step (tomopy instead leaves `reg = 0` pixels untouched;
-/// taking the correct limit makes `reg = 0` reduce to [`osem`]). All reads use
-/// the pre-update slice `old`, matching tomopy's read-then-write ordering.
-fn pml_quad_update(
+/// over the in-grid 8-neighbours `g`, where `w_g` is `1` (cardinal) / `1/√2`
+/// (diagonal) normalized by the present-weight sum — the uniform form of
+/// tomopy's separate interior/edge/corner weight tables (each already sums to
+/// one). The edge factor `γ_g` selects the prior:
+///
+/// - `delta = None` → `γ_g = 1`: the plain quadratic prior (`ospml_quad`), where
+///   `F` collapses to `2·reg` and `G` to `sens − 2·reg·(x + ⟨neighbours⟩)`.
+/// - `delta = Some(δ)` → `γ_g = 1/(1 + |x − x_g|/δ)`: the edge-preserving hybrid
+///   prior (`ospml_hybrid`), which down-weights smoothing across large jumps.
+///
+/// At `reg = 0` (`F = 0`) the quadratic degenerates to the linear root
+/// `x·corr/sens`, i.e. exactly the MLEM/OSEM step (tomopy instead leaves
+/// `reg = 0` pixels untouched; taking the correct limit makes `reg = 0` reduce
+/// to [`osem`]). All reads use the pre-update slice `old`, matching tomopy's
+/// read-then-write ordering.
+fn penalized_ml_update(
     x: &mut ndarray::ArrayViewMut2<f32>,
     corr: &ndarray::ArrayView2<f32>,
     sens: &ndarray::ArrayView2<f32>,
     reg: f32,
+    delta: Option<f32>,
 ) {
     const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
     const NEIGHBORS: [(isize, isize, f32); 8] = [
@@ -374,21 +402,30 @@ fn pml_quad_update(
         for j in 0..w {
             let xij = old[[i, j]];
             let e = -xij * corr[[i, j]];
-            let f = 2.0 * reg;
-            let g = if reg != 0.0 {
-                let (mut wtot, mut wval) = (0.0f32, 0.0f32);
-                for (di, dj, wt) in NEIGHBORS {
+            let (mut f, mut g) = (0.0f32, sens[[i, j]]);
+            if reg != 0.0 {
+                // Normalize the neighbour weights by the present-weight sum.
+                let mut wtot = 0.0f32;
+                for (di, dj, raw) in NEIGHBORS {
                     let (ni, nj) = (i as isize + di, j as isize + dj);
                     if ni >= 0 && ni < h as isize && nj >= 0 && nj < w as isize {
-                        wtot += wt;
-                        wval += wt * old[[ni as usize, nj as usize]];
+                        wtot += raw;
                     }
                 }
-                let neigh_mean = if wtot > 0.0 { wval / wtot } else { 0.0 };
-                sens[[i, j]] - 2.0 * reg * (xij + neigh_mean)
-            } else {
-                sens[[i, j]]
-            };
+                for (di, dj, raw) in NEIGHBORS {
+                    let (ni, nj) = (i as isize + di, j as isize + dj);
+                    if ni >= 0 && ni < h as isize && nj >= 0 && nj < w as isize {
+                        let xg = old[[ni as usize, nj as usize]];
+                        let gamma = match delta {
+                            Some(d) => 1.0 / (1.0 + ((xij - xg) / d).abs()),
+                            None => 1.0,
+                        };
+                        let coef = 2.0 * reg * (raw / wtot) * gamma;
+                        f += coef;
+                        g -= coef * (xij + xg);
+                    }
+                }
+            }
             x[[i, j]] = if f != 0.0 {
                 (-g + (g * g - 8.0 * f * e).sqrt()) / (4.0 * f)
             } else if g.abs() > 1e-6 {
@@ -400,27 +437,30 @@ fn pml_quad_update(
     }
 }
 
-/// Ordered-Subset Penalized Maximum-Likelihood with a quadratic prior.
+/// Ordered-Subset Penalized Maximum-Likelihood (quadratic or hybrid prior).
 ///
-/// OSEM with a quadratic smoothness penalty applied at each subset update via
-/// [`pml_quad_update`] (the De Pierro one-step-late form). Ports tomopy
-/// `libtomo/recon/ospml_quad.c`; tomopy's `pml_quad` is this with `num_block =
-/// 1` (`extern/recon.py`), so the caller passes `block_count`. The penalty
-/// strength is `reg_par[0]` (0 if unset, which reduces this to [`osem`]).
-fn ospml_quad(
+/// OSEM with a smoothness penalty applied at each subset update via
+/// [`penalized_ml_update`] (the De Pierro one-step-late form). Ports tomopy
+/// `libtomo/recon/ospml_quad.c` (`delta = None`) and `ospml_hybrid.c`
+/// (`delta = Some`); tomopy's `pml_quad`/`pml_hybrid` are these with `num_block
+/// = 1` (`extern/recon.py`), so the caller passes `block_count`. The penalty
+/// strength is `reg_par[0]` (0 ⇒ reduces to [`osem`]); the hybrid edge threshold
+/// is `reg_par[1]` (passed in as `delta`).
+fn ospml(
     sino: &Tomo<f32>,
     geom: &Geometry,
     params: &ReconParams,
     proj: &dyn ForwardProject,
     bp: &dyn FilteredBackproject,
     block_count: usize,
+    delta: Option<f32>,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
     let b = sino.to_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let reg = params.reg_par.first().copied().unwrap_or(0.0);
 
-    // Reuse the ordering rule but force the requested block count (pml_quad ⇒ 1).
+    // Reuse the ordering rule but force the requested block count (pml_* ⇒ 1).
     let block_params = ReconParams {
         num_block: block_count,
         ..params.clone()
@@ -433,11 +473,12 @@ fn ospml_quad(
         for sub in &subsets {
             subset_em_correction(&vol, sub, proj, bp, &mut corr)?; // Aₛᵀ(b ⊘ Aₛ x)
             for z in 0..nz {
-                pml_quad_update(
+                penalized_ml_update(
                     &mut vol.array.index_axis_mut(Axis(0), z),
                     &corr.array.index_axis(Axis(0), z),
                     &sub.sens.index_axis(Axis(0), z),
                     reg,
+                    delta,
                 );
             }
         }

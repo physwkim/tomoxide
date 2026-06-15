@@ -365,3 +365,122 @@ fn ospml_quad_regularization_reconstructs_and_smooths() {
         "quadratic penalty did not smooth: roughness {rough_reg:.4} >= unreg {rough_unreg:.4}"
     );
 }
+
+#[test]
+fn pml_hybrid_with_zero_reg_equals_mlem() {
+    // The hybrid prior also vanishes at reg=0, so pml_hybrid(reg=0) ≡ MLEM.
+    let n = 64;
+    let nang = 90;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 15,
+        ..Default::default() // reg_par empty ⇒ 0
+    };
+    let mlem = recon::recon(&sino, &geom, Algorithm::Mlem, &params, &cpu).unwrap();
+    let pml = recon::recon(&sino, &geom, Algorithm::PmlHybrid, &params, &cpu).unwrap();
+
+    let d = max_abs_diff(&mlem, &pml);
+    eprintln!("max |MLEM − pml_hybrid(reg=0)| = {d:e}");
+    assert_eq!(d, 0.0, "pml_hybrid(reg=0) is not identical to MLEM: {d:e}");
+}
+
+#[test]
+fn ospml_hybrid_without_delta_equals_ospml_quad() {
+    // With no edge threshold (reg_par has only the strength), the hybrid edge
+    // factor γ = 1, so the hybrid prior is exactly the quadratic prior.
+    let n = 64;
+    let nang = 90;
+    let num_block = 6;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 12,
+        num_block,
+        ind_block: interleaved_ind_block(nang, num_block),
+        reg_par: vec![0.3], // strength only, no delta
+        ..Default::default()
+    };
+    let quad = recon::recon(&sino, &geom, Algorithm::OspmlQuad, &params, &cpu).unwrap();
+    let hybrid = recon::recon(&sino, &geom, Algorithm::OspmlHybrid, &params, &cpu).unwrap();
+
+    let d = max_abs_diff(&quad, &hybrid);
+    eprintln!("max |ospml_quad − ospml_hybrid(no δ)| = {d:e}");
+    assert_eq!(
+        d, 0.0,
+        "ospml_hybrid without delta differs from ospml_quad: {d:e}"
+    );
+}
+
+#[test]
+fn ospml_hybrid_preserves_edges_better_than_quad() {
+    // At matched penalty strength, the edge-preserving hybrid prior should track
+    // the sharp phantom better than the plain quadratic prior, which blurs edges.
+    let n = 96;
+    let nang = 150;
+    let num_block = 10;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let common = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 18,
+        num_block,
+        ind_block: interleaved_ind_block(nang, num_block),
+        ..Default::default()
+    };
+    // Strong, blurring quadratic penalty (strength only).
+    let quad = recon::recon(
+        &sino,
+        &geom,
+        Algorithm::OspmlQuad,
+        &ReconParams {
+            reg_par: vec![0.3],
+            ..common.clone()
+        },
+        &cpu,
+    )
+    .unwrap();
+    // Same strength, but with a small edge threshold to preserve jumps.
+    let hybrid = recon::recon(
+        &sino,
+        &geom,
+        Algorithm::OspmlHybrid,
+        &ReconParams {
+            reg_par: vec![0.3, 0.05],
+            ..common
+        },
+        &cpu,
+    )
+    .unwrap();
+
+    let quad_s = quad.array.index_axis(Axis(0), 0).to_owned();
+    let hybrid_s = hybrid.array.index_axis(Axis(0), 0).to_owned();
+    assert!(
+        hybrid_s.iter().all(|&v| v >= -1e-6),
+        "ospml_hybrid produced negatives"
+    );
+    let corr_quad = pearson_disk(&quad_s, &phantom, n, 0.85);
+    let corr_hybrid = pearson_disk(&hybrid_s, &phantom, n, 0.85);
+    eprintln!("edge preservation: quad r = {corr_quad:.4}, hybrid r = {corr_hybrid:.4}");
+    assert!(
+        corr_hybrid > corr_quad,
+        "hybrid did not preserve edges better than quad: {corr_hybrid:.4} <= {corr_quad:.4}"
+    );
+}

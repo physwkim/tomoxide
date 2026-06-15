@@ -60,7 +60,11 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
 - ✅ `PmlQuad`/`OspmlQuad` — penalized ML with a quadratic neighbour prior (De
   Pierro update); `reg_par = 0` is bit-identical to MLEM/OSEM, `reg_par > 0`
   smooths (roughness −42% at r = 0.95). `pml_quad` = `ospml_quad` w/ one block.
-- ⬜ `ospml_hybrid`/`pml_hybrid`, then `tv`/`tikh`/`grad`/`vector`.
+- ✅ `PmlHybrid`/`OspmlHybrid` — edge-preserving hybrid prior (per-neighbour
+  factor `γ = 1/(1+|Δ|/reg_par[1])`); shares the De Pierro update, so with no
+  `reg_par[1]` it is bit-identical to the quadratic prior, and at a small
+  threshold it tracks edges far better (r = 0.99 vs quad's 0.90 at equal strength).
+- ⬜ `tv`/`tikh`/`grad`/`vector`.
 - ⬜ `art`/`bart` — row-action (Kaczmarz) methods: recon is updated after every
   single ray, so they need a single-ray projector primitive (not the
   whole-sinogram `ForwardProject`/`FilteredBackproject` the others compose).
