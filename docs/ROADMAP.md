@@ -57,11 +57,17 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
   preserved, Pearson r = 0.99.
 - ✅ `Osem` — MLEM over ordered angle-subsets (`num_block`, `ind_block`); 18
   iters × 10 blocks → r = 0.99, and `num_block = 1` is bit-identical to MLEM.
-- ⬜ `art/bart` then the regularized set (`ospml_*`, `pml_*`, `tv`, `tikh`,
-  `grad`, `vector`).
+- ✅ `PmlQuad`/`OspmlQuad` — penalized ML with a quadratic neighbour prior (De
+  Pierro update); `reg_par = 0` is bit-identical to MLEM/OSEM, `reg_par > 0`
+  smooths (roughness −42% at r = 0.95). `pml_quad` = `ospml_quad` w/ one block.
+- ⬜ `ospml_hybrid`/`pml_hybrid`, then `tv`/`tikh`/`grad`/`vector`.
+- ⬜ `art`/`bart` — row-action (Kaczmarz) methods: recon is updated after every
+  single ray, so they need a single-ray projector primitive (not the
+  whole-sinogram `ForwardProject`/`FilteredBackproject` the others compose).
 - ✅ Block/ordered-subset handling (`num_block`, `ind_block`) — `ordered_subsets`
   tiles the angle order into contiguous blocks (tomopy `osem.c`).
-- Verification: per-algorithm round-trip + non-negativity; OSEM↔MLEM boundary.
+- Verification: per-algorithm round-trip + non-negativity; OSEM↔MLEM and
+  penalized↔unpenalized boundaries are bit-identical.
 
 ## M3 — Preprocessing & center finding (CPU)
 

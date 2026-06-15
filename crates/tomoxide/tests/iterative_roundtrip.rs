@@ -1,10 +1,13 @@
-//! End-to-end CPU iterative round-trips (SIRT, MLEM, OSEM).
+//! End-to-end CPU iterative round-trips (SIRT, MLEM, OSEM, OSPML-quad).
 //!
 //! Forward-project a Shepp-Logan phantom, reconstruct it, and assert the result
 //! correlates strongly with the phantom. SIRT additionally must drive the data
 //! residual down monotonically (convergence on consistent data); MLEM and OSEM
 //! must preserve non-negativity. OSEM with a single block must equal MLEM (the
 //! ordered-subset generalization collapses to plain EM at `num_block = 1`).
+//! The penalized-ML methods reduce exactly to their unpenalized counterparts at
+//! `reg_par = 0` (pml_quad → MLEM, ospml_quad → OSEM), and a positive `reg_par`
+//! must smooth the reconstruction.
 
 use ndarray::{Array2, Axis};
 use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
@@ -210,5 +213,155 @@ fn osem_with_one_block_equals_mlem() {
     assert!(
         max_abs < 1e-4,
         "OSEM(num_block=1) diverges from MLEM: max abs diff = {max_abs:e}"
+    );
+}
+
+/// Largest absolute element-wise difference between two volumes.
+fn max_abs_diff(a: &Volume<f32>, b: &Volume<f32>) -> f32 {
+    a.array
+        .iter()
+        .zip(b.array.iter())
+        .map(|(&x, &y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// Contrast-normalized roughness over a centered disk: mean squared
+/// cardinal-neighbor difference divided by the variance, so it is comparable
+/// across reconstructions with different amplitude scales. Lower = smoother.
+fn roughness_disk(a: &Array2<f32>, n: usize, radius_frac: f32) -> f32 {
+    let c = (n as f32 - 1.0) / 2.0;
+    let r2 = (radius_frac * n as f32 / 2.0).powi(2);
+    let inside = |iy: usize, ix: usize| {
+        let (dy, dx) = (iy as f32 - c, ix as f32 - c);
+        dx * dx + dy * dy <= r2
+    };
+    let (mut vals, mut diff2, mut npair) = (Vec::new(), 0.0f32, 0.0f32);
+    for iy in 0..n {
+        for ix in 0..n {
+            if !inside(iy, ix) {
+                continue;
+            }
+            vals.push(a[[iy, ix]]);
+            if iy + 1 < n && inside(iy + 1, ix) {
+                diff2 += (a[[iy + 1, ix]] - a[[iy, ix]]).powi(2);
+                npair += 1.0;
+            }
+            if ix + 1 < n && inside(iy, ix + 1) {
+                diff2 += (a[[iy, ix + 1]] - a[[iy, ix]]).powi(2);
+                npair += 1.0;
+            }
+        }
+    }
+    let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+    let var = vals.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / vals.len() as f32;
+    (diff2 / npair) / var
+}
+
+#[test]
+fn pml_quad_with_zero_reg_equals_mlem() {
+    // pml_quad is ospml_quad with num_block=1; at reg=0 its quadratic update
+    // degenerates to the linear MLEM step, so the two must be identical.
+    let n = 64;
+    let nang = 90;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 15,
+        ..Default::default() // reg_par empty ⇒ 0
+    };
+    let mlem = recon::recon(&sino, &geom, Algorithm::Mlem, &params, &cpu).unwrap();
+    let pml = recon::recon(&sino, &geom, Algorithm::PmlQuad, &params, &cpu).unwrap();
+
+    let d = max_abs_diff(&mlem, &pml);
+    eprintln!("max |MLEM − pml_quad(reg=0)| = {d:e}");
+    assert_eq!(d, 0.0, "pml_quad(reg=0) is not identical to MLEM: {d:e}");
+}
+
+#[test]
+fn ospml_quad_with_zero_reg_equals_osem() {
+    // The ordered-subset penalized method at reg=0 must reproduce OSEM exactly.
+    let n = 64;
+    let nang = 90;
+    let num_block = 6;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 12,
+        num_block,
+        ind_block: interleaved_ind_block(nang, num_block),
+        ..Default::default() // reg_par empty ⇒ 0
+    };
+    let osem = recon::recon(&sino, &geom, Algorithm::Osem, &params, &cpu).unwrap();
+    let ospml = recon::recon(&sino, &geom, Algorithm::OspmlQuad, &params, &cpu).unwrap();
+
+    let d = max_abs_diff(&osem, &ospml);
+    eprintln!("max |OSEM − ospml_quad(reg=0)| = {d:e}");
+    assert_eq!(d, 0.0, "ospml_quad(reg=0) is not identical to OSEM: {d:e}");
+}
+
+#[test]
+fn ospml_quad_regularization_reconstructs_and_smooths() {
+    let n = 96;
+    let nang = 150;
+    let num_block = 10;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let common = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 18,
+        num_block,
+        ind_block: interleaved_ind_block(nang, num_block),
+        ..Default::default()
+    };
+    let unreg = recon::recon(&sino, &geom, Algorithm::OspmlQuad, &common, &cpu).unwrap();
+    let reg = recon::recon(
+        &sino,
+        &geom,
+        Algorithm::OspmlQuad,
+        &ReconParams {
+            reg_par: vec![0.1],
+            ..common
+        },
+        &cpu,
+    )
+    .unwrap();
+
+    let reg_slice = reg.array.index_axis(Axis(0), 0).to_owned();
+    let unreg_slice = unreg.array.index_axis(Axis(0), 0).to_owned();
+
+    assert!(
+        reg_slice.iter().all(|&v| v >= -1e-6),
+        "ospml_quad produced negatives"
+    );
+    let corr = pearson_disk(&reg_slice, &phantom, n, 0.85);
+    let rough_reg = roughness_disk(&reg_slice, n, 0.85);
+    let rough_unreg = roughness_disk(&unreg_slice, n, 0.85);
+    eprintln!(
+        "ospml_quad reg=0.1: r = {corr:.4}, roughness {rough_reg:.4} vs unreg {rough_unreg:.4}"
+    );
+    assert!(
+        corr > 0.9,
+        "ospml_quad (reg) correlates poorly with phantom: r = {corr:.4}"
+    );
+    assert!(
+        rough_reg < rough_unreg,
+        "quadratic penalty did not smooth: roughness {rough_reg:.4} >= unreg {rough_unreg:.4}"
     );
 }

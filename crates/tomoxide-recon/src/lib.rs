@@ -98,11 +98,15 @@ fn iterative(
         Algorithm::Sirt => sirt(sino, geom, params, proj, bp),
         Algorithm::Mlem => mlem(sino, geom, params, proj, bp),
         Algorithm::Osem => osem(sino, geom, params, proj, bp),
-        // ART/BART and the regularized family (ospml_*, pml_*, tv, tikh, grad,
-        // vector) land later in M2; SIRT/MLEM/OSEM above are the shared skeleton.
+        // pml_quad is ospml_quad with a single block (tomopy extern/recon.py).
+        Algorithm::OspmlQuad => ospml_quad(sino, geom, params, proj, bp, params.num_block),
+        Algorithm::PmlQuad => ospml_quad(sino, geom, params, proj, bp, 1),
+        // ART/BART (row-action, need a single-ray primitive) and the remaining
+        // regularized methods (ospml_hybrid, pml_hybrid, tv, tikh, grad, vector)
+        // land later in M2.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART + regularized family)",
-            "tomopy libtomo/recon/{art,bart,ospml_hybrid,ospml_quad,pml_hybrid,pml_quad,tv,tikh,grad,vector}.c",
+            "recon iterative (ART/BART + ospml_hybrid/pml_hybrid/tv/tikh/grad/vector)",
+            "tomopy libtomo/recon/{art,bart,ospml_hybrid,pml_hybrid,tv,tikh,grad,vector}.c",
         )),
     }
 }
@@ -229,6 +233,70 @@ fn ordered_subsets(nang: usize, params: &ReconParams) -> Vec<Vec<usize>> {
     subsets
 }
 
+/// One ordered subset: its sub-geometry, measured sinogram slice `[nz, len,
+/// ncols]`, and the iteration-invariant sensitivity `Aₛᵀ(1)` `[nz, n, n]`.
+struct OsSubset {
+    geom: Geometry,
+    b: Array3<f32>,
+    sens: Array3<f32>,
+}
+
+/// Build the ordered subsets for a sinogram: each carries its sub-geometry, the
+/// gathered sinogram slice, and the precomputed (geometry-only) sensitivity
+/// `Aₛᵀ(1)`. Single owner of subset construction for OSEM and the OS-penalized
+/// methods. `block_params` supplies `num_block`/`ind_block` to [`ordered_subsets`].
+fn build_subsets(
+    b: &Tomo<f32>,
+    geom: &Geometry,
+    n: usize,
+    block_params: &ReconParams,
+    bp: &dyn FilteredBackproject,
+) -> Result<Vec<OsSubset>> {
+    let nz = b.n_rows();
+    let ncols = b.n_cols();
+    let nang = b.n_angles();
+    let mut subsets = Vec::new();
+    for idx in ordered_subsets(nang, block_params) {
+        let len = idx.len();
+        let mut sub_geom = geom.clone();
+        sub_geom.angles = Angles(idx.iter().map(|&p| geom.angles.0[p]).collect());
+        let sub_b = b.array.select(Axis(1), &idx);
+        let ones = Tomo::new(Array3::from_elem((nz, len, ncols), 1.0), Layout::Sinogram);
+        let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+        bp.backproject(&ones, &sub_geom, &mut sens)?;
+        subsets.push(OsSubset {
+            geom: sub_geom,
+            b: sub_b,
+            sens: sens.array,
+        });
+    }
+    Ok(subsets)
+}
+
+/// `corr ← Aₛᵀ(b_s ⊘ Aₛ x)`, the EM correction backprojected over one subset's
+/// rays. Shared by OSEM (multiplicative update) and the OS-penalized methods
+/// (where it feeds the data term `E`).
+fn subset_em_correction(
+    vol: &Volume<f32>,
+    sub: &OsSubset,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+    corr: &mut Volume<f32>,
+) -> Result<()> {
+    let nz = vol.dims().0;
+    let len = sub.geom.angles.0.len();
+    let ncols = sub.b.shape()[2];
+    let mut ax = Tomo::new(Array3::zeros((nz, len, ncols)), Layout::Sinogram);
+    proj.project(vol, &sub.geom, &mut ax)?; // Aₛ x
+    let mut ratio = sub.b.clone();
+    ndarray::Zip::from(&mut ratio)
+        .and(&ax.array)
+        .for_each(|r, &a| {
+            *r = if a.abs() > 1e-6 { *r / a } else { 0.0 }; // b ⊘ Aₛ x
+        });
+    bp.backproject(&Tomo::new(ratio, Layout::Sinogram), &sub.geom, corr)
+}
+
 /// Ordered-Subset Expectation-Maximization.
 ///
 /// MLEM restricted to ordered angle-subsets: each subset `s` applies one
@@ -246,48 +314,15 @@ fn osem(
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let nz = sino.n_rows();
     let b = sino.to_layout(Layout::Sinogram);
-    let nang = b.n_angles();
-    let ncols = b.n_cols();
-
-    /// One ordered subset: its sub-geometry, measured sinogram slice, and the
-    /// (iteration-invariant) sensitivity `Aₛᵀ(1)`.
-    struct Subset {
-        geom: Geometry,
-        b: Array3<f32>,    // [nz, len, ncols]
-        sens: Array3<f32>, // [nz, n, n]
-    }
-    let mut subsets = Vec::new();
-    for idx in ordered_subsets(nang, params) {
-        let len = idx.len();
-        let mut sub_geom = geom.clone();
-        sub_geom.angles = Angles(idx.iter().map(|&p| geom.angles.0[p]).collect());
-        let sub_b = b.array.select(Axis(1), &idx);
-        let ones = Tomo::new(Array3::from_elem((nz, len, ncols), 1.0), Layout::Sinogram);
-        let mut sens = Volume::new(Array3::zeros((nz, n, n)));
-        bp.backproject(&ones, &sub_geom, &mut sens)?;
-        subsets.push(Subset {
-            geom: sub_geom,
-            b: sub_b,
-            sens: sens.array,
-        });
-    }
+    let nz = b.n_rows();
+    let subsets = build_subsets(&b, geom, n, params, bp)?;
 
     let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
     let mut corr = Volume::new(Array3::zeros((nz, n, n)));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
-            let len = sub.geom.angles.0.len();
-            let mut ax = Tomo::new(Array3::zeros((nz, len, ncols)), Layout::Sinogram);
-            proj.project(&vol, &sub.geom, &mut ax)?; // Aₛ x
-            let mut ratio = sub.b.clone();
-            ndarray::Zip::from(&mut ratio)
-                .and(&ax.array)
-                .for_each(|r, &a| {
-                    *r = if a.abs() > 1e-6 { *r / a } else { 0.0 }; // b ⊘ Aₛ x
-                });
-            bp.backproject(&Tomo::new(ratio, Layout::Sinogram), &sub.geom, &mut corr)?;
+            subset_em_correction(&vol, sub, proj, bp, &mut corr)?;
             ndarray::Zip::from(&mut vol.array)
                 .and(&corr.array)
                 .and(&sub.sens)
@@ -296,6 +331,115 @@ fn osem(
                         *x = *x * c / s; // x ∘ Aₛᵀ(ratio) ⊘ Aₛᵀ(1)
                     }
                 });
+        }
+    }
+    Ok(vol)
+}
+
+/// One penalized-ML, quadratic-prior pixel update over a slice (tomopy
+/// `ospml_quad.c`). With `corr = Aₛᵀ(b ⊘ Aₛ x)` and `sens = Aₛᵀ(1)`, each pixel
+/// solves the De Pierro quadratic `2F·xʹ² + G·xʹ + E = 0` (positive root), where
+///
+/// - `E = −x·corr`            (data term),
+/// - `F = 2·reg`,
+/// - `G = sens − 2·reg·(x + ⟨neighbors⟩)`,
+///
+/// and `⟨neighbors⟩` is the in-grid 8-neighbour mean weighted `1` (cardinal) /
+/// `1/√2` (diagonal), normalized — the uniform form of tomopy's separate
+/// interior/edge/corner weight tables (each already sums to one). At `reg = 0`
+/// (`F = 0`) the quadratic degenerates to the linear root `x·corr/sens`, i.e.
+/// exactly the MLEM/OSEM step (tomopy instead leaves `reg = 0` pixels untouched;
+/// taking the correct limit makes `reg = 0` reduce to [`osem`]). All reads use
+/// the pre-update slice `old`, matching tomopy's read-then-write ordering.
+fn pml_quad_update(
+    x: &mut ndarray::ArrayViewMut2<f32>,
+    corr: &ndarray::ArrayView2<f32>,
+    sens: &ndarray::ArrayView2<f32>,
+    reg: f32,
+) {
+    const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const NEIGHBORS: [(isize, isize, f32); 8] = [
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, S),
+        (-1, 1, S),
+        (1, -1, S),
+        (1, 1, S),
+    ];
+    let (h, w) = x.dim();
+    let old = x.to_owned();
+    for i in 0..h {
+        for j in 0..w {
+            let xij = old[[i, j]];
+            let e = -xij * corr[[i, j]];
+            let f = 2.0 * reg;
+            let g = if reg != 0.0 {
+                let (mut wtot, mut wval) = (0.0f32, 0.0f32);
+                for (di, dj, wt) in NEIGHBORS {
+                    let (ni, nj) = (i as isize + di, j as isize + dj);
+                    if ni >= 0 && ni < h as isize && nj >= 0 && nj < w as isize {
+                        wtot += wt;
+                        wval += wt * old[[ni as usize, nj as usize]];
+                    }
+                }
+                let neigh_mean = if wtot > 0.0 { wval / wtot } else { 0.0 };
+                sens[[i, j]] - 2.0 * reg * (xij + neigh_mean)
+            } else {
+                sens[[i, j]]
+            };
+            x[[i, j]] = if f != 0.0 {
+                (-g + (g * g - 8.0 * f * e).sqrt()) / (4.0 * f)
+            } else if g.abs() > 1e-6 {
+                -e / g // reg = 0 ⟹ MLEM/OSEM step
+            } else {
+                xij
+            };
+        }
+    }
+}
+
+/// Ordered-Subset Penalized Maximum-Likelihood with a quadratic prior.
+///
+/// OSEM with a quadratic smoothness penalty applied at each subset update via
+/// [`pml_quad_update`] (the De Pierro one-step-late form). Ports tomopy
+/// `libtomo/recon/ospml_quad.c`; tomopy's `pml_quad` is this with `num_block =
+/// 1` (`extern/recon.py`), so the caller passes `block_count`. The penalty
+/// strength is `reg_par[0]` (0 if unset, which reduces this to [`osem`]).
+fn ospml_quad(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+    block_count: usize,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let b = sino.to_layout(Layout::Sinogram);
+    let nz = b.n_rows();
+    let reg = params.reg_par.first().copied().unwrap_or(0.0);
+
+    // Reuse the ordering rule but force the requested block count (pml_quad ⇒ 1).
+    let block_params = ReconParams {
+        num_block: block_count,
+        ..params.clone()
+    };
+    let subsets = build_subsets(&b, geom, n, &block_params, bp)?;
+
+    let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
+    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    for _ in 0..params.num_iter.max(1) {
+        for sub in &subsets {
+            subset_em_correction(&vol, sub, proj, bp, &mut corr)?; // Aₛᵀ(b ⊘ Aₛ x)
+            for z in 0..nz {
+                pml_quad_update(
+                    &mut vol.array.index_axis_mut(Axis(0), z),
+                    &corr.array.index_axis(Axis(0), z),
+                    &sub.sens.index_axis(Axis(0), z),
+                    reg,
+                );
+            }
         }
     }
     Ok(vol)
