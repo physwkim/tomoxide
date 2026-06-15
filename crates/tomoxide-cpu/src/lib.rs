@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use rustfft::FftPlanner;
 use tomoxide_core::backend::{
     Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
-    ForwardProject, RankFilter,
+    ForwardProject, RankFilter, RayProject, RayRow,
 };
 use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
 use tomoxide_core::dtype::{Complex32, Dtype, Element};
@@ -96,6 +96,9 @@ impl Backend for CpuBackend {
         Some(self)
     }
     fn projector(&self) -> Option<&dyn ForwardProject> {
+        Some(self)
+    }
+    fn ray_projector(&self) -> Option<&dyn RayProject> {
         Some(self)
     }
     fn elementwise(&self) -> Option<&dyn Elementwise> {
@@ -507,6 +510,60 @@ impl ForwardProject for CpuBackend {
             .map_err(|e| Error::InvalidParam(format!("forward-projection shape: {e}")))?;
         *out = Tomo::new(array, Layout::Sinogram);
         Ok(())
+    }
+}
+
+impl RayProject for CpuBackend {
+    /// Sparse forward-operator rows for the row-action methods (ART/BART).
+    ///
+    /// Transposes the pixel-driven splat of [`ForwardProject::project`] into
+    /// per-detector rows: each pixel `(iy, ix)` projects to
+    /// `t = (ix − cx)·cosθ + (iy − cy)·sinθ + center` and splits linearly between
+    /// detector columns `⌊t⌋` and `⌊t⌋+1`, so `rows[p][⌊t⌋]` gains weight
+    /// `1 − frac` and `rows[p][⌊t⌋+1]` gains `frac` (same boundary rule). The rows
+    /// are therefore exactly the rows of the same operator `R` the other iterative
+    /// methods use. A single `center` (row 0) is used for all slices, matching
+    /// tomopy `art`.
+    fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>> {
+        if geom.beam != Beam::Parallel {
+            return Err(Error::InvalidParam(
+                "cpu row-action projection currently supports parallel beam only".into(),
+            ));
+        }
+        let nang = geom.angles.0.len();
+        let ncols = geom.detector.width;
+        if nang == 0 || ncols == 0 {
+            return Err(Error::InvalidParam(
+                "geometry has no angles or zero detector width".into(),
+            ));
+        }
+        let center = geom.center.at(0);
+        let c0 = n as f32 / 2.0; // cx == cy == n/2
+        let mut rows: Vec<Vec<RayRow>> =
+            (0..nang).map(|_| vec![RayRow::default(); ncols]).collect();
+        for (ia, &a) in geom.angles.0.iter().enumerate() {
+            let (sn, cs) = a.sin_cos();
+            let arows = &mut rows[ia];
+            for iy in 0..n {
+                let gy = iy as f32 - c0;
+                for ix in 0..n {
+                    let gx = ix as f32 - c0;
+                    let t = gx * cs + gy * sn + center;
+                    let t0 = t.floor();
+                    let i0 = t0 as isize;
+                    if i0 >= 0 && (i0 as usize) + 1 < ncols {
+                        let frac = t - t0;
+                        let pix = (iy * n + ix) as u32;
+                        let d0 = i0 as usize;
+                        arows[d0].pixels.push(pix);
+                        arows[d0].weights.push(1.0 - frac);
+                        arows[d0 + 1].pixels.push(pix);
+                        arows[d0 + 1].weights.push(frac);
+                    }
+                }
+            }
+        }
+        Ok(rows)
     }
 }
 

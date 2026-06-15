@@ -99,7 +99,7 @@ the subset it supports; missing ones return `Error::NotImplemented`.
 | `FbpFilter`         | `make_filter(name, n)`, `apply(sino, filter, center)` | tomocupy `cfunc_filter`; tomopy `fbp.c` |
 | `FilteredBackproject` | `backproject(sino, geom, out)`                     | `fourierrec` / `lprec` / `linerec` / `gridrec.c` |
 | `ForwardProject`    | `project(volume, geom, out)`                         | tomopy `project.c` |
-| `IterativeSolver`   | `step(state, sino, geom)` (one ART/SIRT/MLEM iter)   | tomopy `art.c`, `sirt.c`, … |
+| `RayProject`        | `ray_rows(geom, n)` (sparse single-ray rows of `R`)  | tomopy `art.c`, `bart.c` (row-action Kaczmarz) |
 | `Elementwise`       | `darkflat`, `minus_log`, `clip`, `axpy`              | tomocupy `proc_functions`; tomopy `normalize` |
 | `RankFilter`        | `median3d`, `remove_outlier`                         | tomopy `median_filt3d.c` |
 
@@ -179,9 +179,11 @@ the same set.
 | `Tikh`           | `num_iter, reg_data, reg_par`            | tomopy `tikh.c` |
 | `Vector{,2,3}`   | `num_iter, axis…`                        | tomopy `vector.c` |
 
-All iterative solvers reduce to `ForwardProject` + `FilteredBackproject`
+Most iterative solvers reduce to `ForwardProject` + `FilteredBackproject`
 (unfiltered backproject) capability calls, so the same solver loop runs on any
-backend that provides those two primitives.
+backend that provides those two primitives. The row-action methods (`Art`,
+`Bart`) are the exception: they update the reconstruction one ray at a time, so
+they use the `RayProject` (single-ray) capability instead.
 
 ### 3.3 Center finding (`tomoxide-recon::center`)
 

@@ -740,3 +740,102 @@ fn tv_stronger_lambda_smooths() {
         "strong-TV reconstruction degraded too far: r = {corr_strong:.4}"
     );
 }
+
+#[test]
+fn art_reconstructs_and_converges() {
+    // ART is row-action Kaczmarz with immediate per-ray updates and no positivity
+    // constraint, so the full signed phantom is the target. The data residual must
+    // shrink with iterations and the result correlate strongly with the phantom.
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |iters| ReconParams {
+        num_gridx: Some(n),
+        num_iter: iters,
+        ..Default::default()
+    };
+    let r5 = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Art, &p(5), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    let rec = recon::recon(&sino, &geom, Algorithm::Art, &p(20), &cpu).unwrap();
+    let r20 = residual_norm(&rec, &sino, &geom, &cpu);
+    eprintln!("ART residual: 5 iters = {r5:.1}, 20 iters = {r20:.1}");
+    assert!(r20 < r5, "ART residual did not decrease: {r5} -> {r20}");
+
+    let slice = rec.array.index_axis(Axis(0), 0).to_owned();
+    assert!(
+        slice.iter().all(|v| v.is_finite()),
+        "ART produced non-finite"
+    );
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("ART (20 iters) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.95,
+        "ART correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+#[test]
+fn bart_ordered_subsets_reconstruct_and_accelerate() {
+    // BART is ordered-subset SART. It reconstructs the phantom, and more subsets
+    // accelerate convergence (lower residual at matched iterations) the same way
+    // OSEM accelerates MLEM.
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |iters, nb| ReconParams {
+        num_gridx: Some(n),
+        num_iter: iters,
+        num_block: nb,
+        ind_block: interleaved_ind_block(nang, nb),
+        ..Default::default()
+    };
+
+    let rec = recon::recon(&sino, &geom, Algorithm::Bart, &p(15, 15), &cpu).unwrap();
+    let slice = rec.array.index_axis(Axis(0), 0).to_owned();
+    assert!(
+        slice.iter().all(|v| v.is_finite()),
+        "BART produced non-finite"
+    );
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("BART (15 iters × 15 blocks) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.95,
+        "BART correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    // Ordered-subset acceleration: 15 blocks reach a lower residual than 1 block
+    // at the same iteration count.
+    let res_many = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Bart, &p(8, 15), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    let res_one = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Bart, &p(8, 1), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    eprintln!("BART residual at 8 iters: 15 blocks = {res_many:.1}, 1 block = {res_one:.1}");
+    assert!(
+        res_many < res_one,
+        "ordered subsets did not accelerate: 15-block {res_many:.1} >= 1-block {res_one:.1}"
+    );
+}

@@ -15,7 +15,7 @@ mod gridrec;
 pub mod ring;
 
 use ndarray::{Array3, Axis};
-use tomoxide_core::backend::{Backend, FilteredBackproject, ForwardProject};
+use tomoxide_core::backend::{Backend, FilteredBackproject, ForwardProject, RayProject, RayRow};
 use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Angles, Geometry};
@@ -88,6 +88,18 @@ fn iterative(
     params: &ReconParams,
     backend: &dyn Backend,
 ) -> Result<Volume<f32>> {
+    // ART/BART are row-action (Kaczmarz) — they consume the single-ray rows, not
+    // the whole-sinogram forward/back-projectors the other methods compose.
+    if matches!(algorithm, Algorithm::Art | Algorithm::Bart) {
+        let rp = backend
+            .ray_projector()
+            .ok_or_else(|| missing("RayProject", backend))?;
+        return match algorithm {
+            Algorithm::Art => art(sino, geom, params, rp),
+            _ => bart(sino, geom, params, rp),
+        };
+    }
+
     let proj = backend
         .projector()
         .ok_or_else(|| missing("ForwardProject", backend))?;
@@ -124,11 +136,11 @@ fn iterative(
         Algorithm::Grad => grad(sino, geom, params, proj, bp),
         Algorithm::Tikh => tikh(sino, geom, params, proj, bp),
         Algorithm::Tv => tv(sino, geom, params, proj, bp),
-        // ART/BART are row-action (Kaczmarz) and need a single-ray primitive;
-        // vector lands later in M2.
+        // vector tomography (vector/vector2/vector3) needs a different API
+        // (multi-dataset in, vector-field out); not part of the scalar dispatch.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART + vector)",
-            "tomopy libtomo/recon/{art,bart,vector}.c",
+            "recon iterative (vector tomography)",
+            "tomopy libtomo/recon/vector.c",
         )),
     }
 }
@@ -729,6 +741,147 @@ fn tv(
 
     xbar.array.mapv_inplace(|v| v * r); // back to the unscaled domain
     Ok(xbar)
+}
+
+/// Squared row norms `‖a‖²` for every ray, matching the `rows` layout. Computed
+/// once and reused across all ART/BART iterations (geometry-invariant).
+fn ray_norms(rows: &[Vec<RayRow>]) -> Vec<Vec<f32>> {
+    rows.iter()
+        .map(|ang| {
+            ang.iter()
+                .map(|r| r.weights.iter().map(|w| w * w).sum())
+                .collect()
+        })
+        .collect()
+}
+
+/// Algebraic Reconstruction Technique (tomopy `art.c`), a row-action Kaczmarz
+/// solver of `R x = b`.
+///
+/// For each ray (angle `p`, detector `d`) in natural order, project onto the
+/// ray's hyperplane `⟨a, x⟩ = b`: `x ← x + (b − ⟨a, x⟩)/‖a‖² · a`, where `a` is
+/// the ray's sparse row of `R`. The reconstruction is updated immediately, so the
+/// next ray sees it — this sequential per-ray update is what distinguishes ART
+/// from the simultaneous methods and is why it consumes the [`RayProject`]
+/// single-ray rows. Rows (and their `‖a‖²`) are geometry-only, so they are built
+/// once and reused across iterations. No positivity constraint.
+fn art(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    rp: &dyn RayProject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let b = sino.to_layout(Layout::Sinogram);
+    let nz = b.n_rows();
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    let rows = rp.ray_rows(geom, n)?;
+    let norms = ray_norms(&rows);
+    let bslab = b
+        .array
+        .as_slice()
+        .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+    let npix = n * n;
+    let mut recon = vec![0.0f32; nz * npix];
+    for _ in 0..params.num_iter.max(1) {
+        for ia in 0..nang {
+            for d in 0..ncols {
+                let row = &rows[ia][d];
+                let norm2 = norms[ia][d];
+                if norm2 == 0.0 {
+                    continue;
+                }
+                for s in 0..nz {
+                    let sl = &mut recon[s * npix..(s + 1) * npix];
+                    let mut sim = 0.0f32;
+                    for (k, &pix) in row.pixels.iter().enumerate() {
+                        sim += sl[pix as usize] * row.weights[k];
+                    }
+                    let upd = (bslab[(s * nang + ia) * ncols + d] - sim) / norm2;
+                    for (k, &pix) in row.pixels.iter().enumerate() {
+                        sl[pix as usize] += upd * row.weights[k];
+                    }
+                }
+            }
+        }
+    }
+    let array = Array3::from_shape_vec((nz, n, n), recon)
+        .map_err(|e| Error::InvalidParam(format!("art shape: {e}")))?;
+    Ok(Volume::new(array))
+}
+
+/// Block Algebraic Reconstruction Technique (tomopy `bart.c`), ordered-subset
+/// SART.
+///
+/// Like [`art`] but block-simultaneous: within an ordered subset every ray reads
+/// the same (subset-start) reconstruction, the per-ray corrections accumulate
+/// into `update[pix]` and the per-pixel total weights into `sum_dist[pix]`, and
+/// the block is applied once at the subset end as
+/// `x[pix] += update[pix] / sum_dist[pix]`. The subsets use the same `num_block`/
+/// `ind_block` tiling as OSEM ([`ordered_subsets`]); `num_block = 1` is one
+/// full-angle simultaneous update. No positivity constraint.
+fn bart(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    rp: &dyn RayProject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let b = sino.to_layout(Layout::Sinogram);
+    let nz = b.n_rows();
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    let rows = rp.ray_rows(geom, n)?;
+    let norms = ray_norms(&rows);
+    let subsets = ordered_subsets(nang, params);
+    let bslab = b
+        .array
+        .as_slice()
+        .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+    let npix = n * n;
+    let mut recon = vec![0.0f32; nz * npix];
+    let mut update = vec![0.0f32; npix];
+    let mut sum_dist = vec![0.0f32; npix];
+    for _ in 0..params.num_iter.max(1) {
+        for s in 0..nz {
+            let sl = &mut recon[s * npix..(s + 1) * npix];
+            for subset in &subsets {
+                update.iter_mut().for_each(|u| *u = 0.0);
+                sum_dist.iter_mut().for_each(|u| *u = 0.0);
+                for &p in subset {
+                    for d in 0..ncols {
+                        let row = &rows[p][d];
+                        let mut sim = 0.0f32;
+                        for (k, &pix) in row.pixels.iter().enumerate() {
+                            let pix = pix as usize;
+                            sim += sl[pix] * row.weights[k];
+                            sum_dist[pix] += row.weights[k]; // accumulated for every ray
+                        }
+                        let norm2 = norms[p][d];
+                        if norm2 != 0.0 {
+                            let upd = (bslab[(s * nang + p) * ncols + d] - sim) / norm2;
+                            for (k, &pix) in row.pixels.iter().enumerate() {
+                                update[pix as usize] += upd * row.weights[k];
+                            }
+                        }
+                    }
+                }
+                for pix in 0..npix {
+                    if sum_dist[pix] != 0.0 {
+                        sl[pix] += update[pix] / sum_dist[pix];
+                    }
+                }
+            }
+        }
+    }
+    let array = Array3::from_shape_vec((nz, n, n), recon)
+        .map_err(|e| Error::InvalidParam(format!("bart shape: {e}")))?;
+    Ok(Volume::new(array))
 }
 
 #[cfg(test)]

@@ -83,9 +83,15 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
   flat regions (roughness 0.34 → 0.22). Stable for this projector across the
   tested λ/iteration range despite the `grad` normalization caveat.
 - ⬜ `vector`.
-- ⬜ `art`/`bart` — row-action (Kaczmarz) methods: recon is updated after every
-  single ray, so they need a single-ray projector primitive (not the
-  whole-sinogram `ForwardProject`/`FilteredBackproject` the others compose).
+- ✅ `Art`/`Bart` — row-action (Kaczmarz) methods via a new single-ray projector
+  capability (`RayProject`, CPU backend): the sparse rows of the same operator
+  `R` the other methods use, built once and reused. ART updates after every ray
+  (`x ← x + (b−⟨a,x⟩)/‖a‖²·a`), r = 0.99 at 20 iters; BART is ordered-subset SART
+  (block-simultaneous, `update`/`sum_dist` accumulation applied per block),
+  r = 0.98, and more subsets accelerate convergence (residual 689 vs 39792 at 8
+  iters, 15 vs 1 block). CUDA/wgpu inherit the `None` accessor until ported.
+- ⬜ `vector`/`vector2`/`vector3` — vector tomography (multi-dataset in,
+  vector-field out); a separate API outside the scalar `recon()` dispatch.
 - ✅ Block/ordered-subset handling (`num_block`, `ind_block`) — `ordered_subsets`
   tiles the angle order into contiguous blocks (tomopy `osem.c`).
 - Verification: per-algorithm round-trip + non-negativity; OSEM↔MLEM and

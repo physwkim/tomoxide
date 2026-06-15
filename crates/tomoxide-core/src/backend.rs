@@ -69,6 +69,10 @@ pub trait Backend: Send + Sync {
     fn projector(&self) -> Option<&dyn ForwardProject> {
         None
     }
+    /// Row-action (single-ray) projection for ART/BART.
+    fn ray_projector(&self) -> Option<&dyn RayProject> {
+        None
+    }
     /// Elementwise preprocessing (dark/flat, minus-log, …).
     fn elementwise(&self) -> Option<&dyn Elementwise> {
         None
@@ -120,6 +124,34 @@ pub trait FilteredBackproject {
 pub trait ForwardProject {
     /// Project `vol` into `out` using `geom`.
     fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()>;
+}
+
+/// One row of the forward operator: the pixels a single ray touches and the
+/// weight each contributes. This is the sparse `d`-th row of [`ForwardProject`]
+/// for one (angle, detector) pair.
+#[derive(Clone, Debug, Default)]
+pub struct RayRow {
+    /// Linear pixel indices into an `n × n` slice (`iy·n + ix`).
+    pub pixels: Vec<u32>,
+    /// Projection weights, one per entry of `pixels`.
+    pub weights: Vec<f32>,
+}
+
+/// Row-action (Kaczmarz) projection: the sparse rows of the forward operator.
+///
+/// The row-action reconstructors (ART, BART) read and update the reconstruction
+/// one ray at a time, so they cannot compose the whole-sinogram
+/// [`ForwardProject`]/[`FilteredBackproject`]. They instead consume the explicit
+/// per-ray rows produced here.
+pub trait RayProject {
+    /// Build the per-ray rows for an `n × n` grid: `rows[p][d]` lists the pixels
+    /// (and weights) that project onto detector column `d` at angle index `p`.
+    ///
+    /// The rows are geometry-only (reconstruction-independent), so one call is
+    /// reused across every iteration. A single rotation center is used (the
+    /// `geom` center at row 0), matching tomopy's row-action `art` (which takes
+    /// `center[0]` for all slices); per-slice center variation is not modeled.
+    fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>>;
 }
 
 /// Elementwise preprocessing kernels.

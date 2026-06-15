@@ -59,8 +59,8 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 
 | tomoxide `Algorithm::` | extra params                        | Upstream `.c`        | Status |
 |------------------------|-------------------------------------|----------------------|--------|
-| `Art`                  | `num_iter`                          | `recon/art.c`        | stub (row-action; needs single-ray primitive) |
-| `Bart`                 | `num_iter,num_block,ind_block`      | `recon/bart.c`       | stub (row-action; needs single-ray primitive) |
+| `Art`                  | `num_iter`                          | `recon/art.c`        | CPU done (row-action Kaczmarz via `RayProject`; r=0.99) |
+| `Bart`                 | `num_iter,num_block,ind_block`      | `recon/bart.c`       | CPU done (ordered-subset SART via `RayProject`; r=0.98) |
 | `Sirt`                 | `num_iter`                          | `recon/sirt.c` (+`accel/cxx/sirt.cc`) | partial (R/C-weighted) |
 | `Mlem`                 | `num_iter`                          | `accel/cxx/mlem.cc`  | CPU done (r=0.99) |
 | `Osem`                 | `num_iter,num_block,ind_block`      | `recon/osem.c`       | CPU done (MLEM over ordered subsets; r=0.99, num_block=1 ≡ MLEM) |
