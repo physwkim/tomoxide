@@ -122,11 +122,13 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
-- **Stub:** `crates/tomoxide-recon/src/ring.rs:16` `remove_ring`
-  (polar-transform, full C signature already mirrored).
-- **Upstream:** tomopy `libtomo/misc/remove_ring.c`; `misc/corr.py:751`.
-- **Done =** a reconstructed slice with an injected ring has the ring removed
-  (radial-profile spike flattened) without smearing real structure.
+- ✅ **`remove_ring` — done.** Full port of tomopy `libtomo/misc/remove_ring.c`
+  (polar transform → 3-band radial median → subtract/threshold → 3-band
+  azimuthal mean → inverse transform → subtract). The exact float/double cast
+  chain plus the shared libm make it **bit-for-bit** with tomopy 1.15.3 (Δ = 0)
+  on rwidth 2/4 (`ring_parity.rs`, golden from `tools/gen_tomopy_ring_golden.py`).
+  Only tomopy's default `int_mode="WRAP"` is exposed (no `int_mode` param);
+  `REFLECT` is the remaining variant.
 
 ### B7. Lower-priority polish (M3 tail)
 
@@ -165,9 +167,9 @@ pipeline integration test.
 3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
 4. **B1 HDF5 reader** — real data in; closes the bookends.
-5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** — done (tomopy parity, bit-exact).
-   Remaining artifact-correction family, highest-value first: **B3 stripe
-   (Vo-all, then Fw)** → **B6 ring**.
+5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** + ✅ **B6 ring** — done (tomopy
+   parity, bit-exact). Remaining artifact-correction family, highest-value
+   first: **B3 stripe Vo-all**, then **B3 Fw** (wavelet dependency).
 6. Wire the **M3 end-to-end pipeline integration test**.
 7. B7 polish, then M4+.
 
