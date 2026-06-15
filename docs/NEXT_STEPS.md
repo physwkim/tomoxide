@@ -174,9 +174,12 @@ below by dependency and value — the first three close the end-to-end pipeline.
 - **Beam hardening** — `crates/tomoxide-prep/src/hardening.rs:11`
   `beam_correct`; tomocupy `processing/external/hardening.py:50`. Needs
   material/spectrum config; defer unless a dataset needs it.
-- **Sim noise** — `crates/tomoxide-sim/src/lib.rs:43` `add_gaussian`, `:51`
-  `add_poisson`; tomopy `sim/project.py:110,136`. Small; useful for robustness
-  tests of the iterative solvers.
+- ✅ **Sim noise** — `add_gaussian` / `add_poisson` (`crates/tomoxide-sim/src/noise.rs`;
+  tomopy `sim/project.py:110,136`). Done. Distribution parity (matched moments),
+  not Δ=0: numpy's MT19937 stream is not reproducible from Rust. Self-contained
+  seeded SplitMix64 (no `rand` dep); Poisson ports numpy's Knuth-mult / Hörmann
+  PTRS selection. Tested by moments incl. Poisson skewness in
+  `tests/noise_stats.rs`.
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
@@ -211,7 +214,8 @@ pipeline integration test.
    rank/Sf/ring, ≈f32 floor for Vo-all/Ti). Remaining artifact-correction
    family: **B3 Fw** (wavelet dependency, needs sign-off).
 6. Wire the **M3 end-to-end pipeline integration test**.
-7. B7 polish, then M4+.
+7. ✅ **B7 sim noise** — done (distribution parity). Remaining B7: beam
+   hardening (needs material/spectrum config). Then M4+.
 
 Each step is one commit + one test, full-workspace pass before any push, and
 push only on explicit confirmation.
