@@ -42,7 +42,7 @@ pub fn reconstruct(
     tomoxide_prep::normalize_dataset(&mut ds, backend)?;
 
     // 2. Optional projection-domain corrections.
-    tomoxide_prep::retrieve_phase(&mut ds.data, prep.phase)?;
+    tomoxide_prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
 
     // 3. To sinogram order, then stripe removal, then reconstruct.
     let mut sino = ds.data.to_layout(Layout::Sinogram);
