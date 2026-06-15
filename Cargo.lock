@@ -1186,6 +1186,7 @@ name = "tomoxide"
 version = "0.0.0"
 dependencies = [
  "log",
+ "ndarray",
  "tomoxide-core",
  "tomoxide-cpu",
  "tomoxide-cuda",

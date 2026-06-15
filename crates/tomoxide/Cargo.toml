@@ -24,3 +24,6 @@ tomoxide-prep.workspace = true
 tomoxide-io.workspace = true
 tomoxide-sim.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+ndarray.workspace = true
