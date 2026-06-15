@@ -1,0 +1,26 @@
+[package]
+name = "tomoxide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "tomoxide — GPU/CPU tomographic reconstruction (umbrella crate)"
+
+[features]
+default = []
+# Forward backend features to the backend crates.
+cuda = ["tomoxide-cuda/cuda"]
+gpu-wgpu = ["tomoxide-wgpu/gpu-wgpu"]
+
+[dependencies]
+tomoxide-core.workspace = true
+tomoxide-cpu.workspace = true
+tomoxide-cuda.workspace = true
+tomoxide-wgpu.workspace = true
+tomoxide-recon.workspace = true
+tomoxide-prep.workspace = true
+tomoxide-io.workspace = true
+tomoxide-sim.workspace = true
+log.workspace = true
