@@ -1440,6 +1440,7 @@ dependencies = [
  "log",
  "ndarray",
  "ndarray-npy",
+ "tiff",
  "tomoxide-core",
  "tomoxide-cpu",
  "tomoxide-cuda",

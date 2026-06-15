@@ -28,3 +28,6 @@ log.workspace = true
 [dev-dependencies]
 ndarray.workspace = true
 ndarray-npy.workspace = true
+# Read back the per-slice TIFF the pipeline writes (same version tomoxide-io
+# writes with); reused approved dep, no new third-party crate.
+tiff = "0.11"
