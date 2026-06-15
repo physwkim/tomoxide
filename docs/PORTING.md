@@ -19,7 +19,7 @@ Upstream roots (this machine):
 | tomoxide                     | Upstream                                                    | Backend  | Status |
 |------------------------------|------------------------------------------------------------|----------|--------|
 | `recon::fbp`                 | tomopy `libtomo/recon/fbp.c`; `extern/recon.py:238`         | CPU      | partial |
-| `recon::gridrec`             | tomopy `libtomo/gridrec/gridrec.c:195`; `extern/gridrec.py:64` | CPU   | stub   |
+| `recon::gridrec`             | tomopy `libtomo/gridrec/gridrec.c:195`; `extern/gridrec.py:64` | CPU   | partial (DFI, Kaiser-Bessel not PSWF) |
 | `recon::fourierrec`          | tomocupy `reconstruction/fourierrec.py:46`; `cuda/cfunc_fourierrec.cu`, `include/cfunc_fourierrec.cuh:10` | CUDA, wgpu | stub |
 | `recon::lprec`               | tomocupy `reconstruction/lprec.py:292`; `cuda/cfunc_lprec.cu`, `include/cfunc_lprec.cuh:9` | CUDA, wgpu | stub |
 | `recon::linerec`             | tomocupy `reconstruction/linerec.py:47`; `cuda/cfunc_linerec.cu`, `include/cfunc_linerec.cuh:9` | CUDA, wgpu | stub |
@@ -61,7 +61,7 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 |------------------------|-------------------------------------|----------------------|--------|
 | `Art`                  | `num_iter`                          | `recon/art.c`        | stub   |
 | `Bart`                 | `num_iter,num_block,ind_block`      | `recon/bart.c`       | stub   |
-| `Sirt`                 | `num_iter`                          | `recon/sirt.c` (+`accel/cxx/sirt.cc`) | stub |
+| `Sirt`                 | `num_iter`                          | `recon/sirt.c` (+`accel/cxx/sirt.cc`) | partial (R/C-weighted) |
 | `Mlem`                 | `num_iter`                          | `accel/cxx/mlem.cc`  | stub   |
 | `Osem`                 | `num_iter,num_block,ind_block`      | `recon/osem.c`       | stub   |
 | `OspmlHybrid`          | `num_iter,reg_par,num_block,ind_block` | `recon/ospml_hybrid.c` | stub |

@@ -26,21 +26,26 @@ tomopy golden-data parity remain.
 - ✅ `FilteredBackproject::backproject` (parallel-beam, voxel-driven, rayon).
 - ✅ `ForwardProject::project` (parallel-beam, pixel-driven; exact adjoint of
   the back-projector) and `sim::project` wired to it.
-- ✅ Round-trip gate: shepp2d → project → FBP(ramp) → Pearson r = 0.96 over a
-  central disk (`crates/tomoxide/tests/fbp_roundtrip.rs`).
-- ⬜ `Fft::fft_2d` and `recon::gridrec` (Fourier-grid) — next M1 round.
+- ✅ `Fft::fft_2d` (separable row–column transforms).
+- ✅ `recon::gridrec` — Fourier-grid / DFI with a Kaiser–Bessel gridding kernel
+  (gridrec-family, not a PSWF bit-port; backend-agnostic via the `Fft`
+  capability).
+- ✅ Round-trip gate over a central disk (`crates/tomoxide/tests/`): FBP(ramp)
+  Pearson r = 0.96, gridrec r = 0.97.
 - ⬜ Numeric diff vs tomopy `recon(..., algorithm='fbp'/'gridrec')` on a fixed
-  phantom — **deferred**: needs a tomopy install / checked-in golden, not
-  available on the offline dev box (see verification harness below).
+  phantom — **blocked**: tomopy source is present but not importable in the
+  dev python; needs a tomopy install / checked-in golden (see harness below).
 
-**Done = `fbp`/`gridrec` within tolerance of tomopy on shepp2d.** FBP is
-self-round-trip-correct; absolute tomopy parity is gated on golden data.
+**Done = `fbp`/`gridrec` within tolerance of tomopy on shepp2d.** Both are
+self-round-trip-correct; absolute tomopy parity is gated on a tomopy runtime.
 
-## M2 — CPU iterative family (parity target: tomopy ART/SIRT/MLEM…)
+## M2 — CPU iterative family (parity target: tomopy ART/SIRT/MLEM…) 🟡 started
 
-- `IterativeSolver` on CPU; port `art/sirt/mlem/osem/bart` then the
-  regularized set (`ospml_*`, `pml_*`, `tv`, `tikh`, `grad`).
-- Block/ordered-subset handling (`num_block`, `ind_block`).
+- ✅ `Sirt` — R/C-weighted SIRT via the forward/back-projection capabilities;
+  round-trip residual decreases monotonically, Pearson r = 0.95.
+- ⬜ `art/mlem/osem/bart` then the regularized set (`ospml_*`, `pml_*`, `tv`,
+  `tikh`, `grad`).
+- ⬜ Block/ordered-subset handling (`num_block`, `ind_block`).
 - Verification: per-algorithm numeric diff vs tomopy at fixed `num_iter`.
 
 ## M3 — Preprocessing & center finding (CPU)
