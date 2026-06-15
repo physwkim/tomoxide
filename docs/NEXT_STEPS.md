@@ -63,11 +63,13 @@ below by dependency and value — the first three close the end-to-end pipeline.
   dtype to f32, converts theta degrees→radians (or linspace fallback).
   Bit-exact parity test against a gzip-compressed uint16 fixture
   (`tools/gen_dxchange_fixture.py`).
-- **Remaining stub:** `create_writer` (TIFF / HDF5 / Zarr) — tomocupy
-  `dataio/writer.py:103`. TIFF writer is next (needs a `tiff` crate sign-off);
-  it closes the output bookend so a reconstruction can be saved.
-- **Done (writer) =** write a `Volume` to per-slice TIFF and read it back
-  bit-equal.
+- ✅ **TIFF writer done** — `create_writer(.., SaveFormat::Tiff)` via the
+  pure-Rust `tiff` crate (no native libtiff). Per-slice 32-bit-float TIFF
+  `{prefix}_{i:05}.tiff` (tomocupy `dataio/writer.py:281`). Bit-exact
+  round-trip test; output verified readable by Python tifffile. Both I/O
+  bookends are now closed.
+- **Remaining stub:** `create_writer` for `H5` / `Zarr` output — tomocupy
+  `dataio/writer.py:282,294`. Lower priority (TIFF covers the M3 pipeline).
 
 ### B2. Center finding — `tomoxide-recon::center`  (unblocks correct recon)
 
@@ -209,10 +211,10 @@ pipeline integration test.
 
 1. ✅ **B2 `find_center_vo`** — done (tomopy parity Δ=0).
 2. ✅ **B4 Paganin** — done (tomopy parity, max rel Δ≈2.4e-7).
-3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
-   dep).
+3. ✅ **B1 TIFF writer** — done (`create_writer`, pure-Rust `tiff`, per-slice
+   f32, bit-exact). Any reconstruction is now saveable.
 4. ✅ **B1 HDF5 reader** — done (`open_dxchange`, pure-Rust `rust-hdf5`,
-   bit-exact). Real data in; the input bookend is closed.
+   bit-exact). Real data in; both I/O bookends are closed.
 5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** + ✅ **B6 ring** + ✅ **B3 stripe
    Vo-all** + ✅ **B3 stripe Ti** — done (tomopy parity; bit-exact for
    rank/Sf/ring, ≈f32 floor for Vo-all/Ti). Remaining artifact-correction
