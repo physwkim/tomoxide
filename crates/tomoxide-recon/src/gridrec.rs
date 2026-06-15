@@ -150,8 +150,14 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
                 if ramp == 0.0 {
                     continue;
                 }
-                // exp(+2πi·k·center/pad) shifts the projection origin to `center`.
-                let phase = two_pi * k as f32 * center / pad as f32;
+                // exp(+2πi·ρ·center/pad) shifts the projection origin to
+                // `center`. The phase must use the SIGNED frequency ρ = rho[k],
+                // not the raw bin index k: for k > pad/2 they differ by pad, an
+                // extra exp(2πi·center) factor that is 1 only for integer
+                // centers — a raw index negates the negative-frequency half at a
+                // half-integer center (collapsing the slice) and corrupts every
+                // sub-pixel center. Integer centers are unchanged.
+                let phase = two_pi * r * center / pad as f32;
                 let shift = Complex32::new(phase.cos(), phase.sin());
                 let val = radial[ia * pad + k] * shift * ramp;
 
