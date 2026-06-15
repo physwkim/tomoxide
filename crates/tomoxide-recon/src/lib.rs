@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod center;
+mod gridrec;
 pub mod ring;
 
 use ndarray::Array3;
@@ -57,25 +58,26 @@ fn analytic(
     params: &ReconParams,
     backend: &dyn Backend,
 ) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let nz = sino.n_rows();
+
+    // gridrec is a Fourier-grid method (needs only the Fft capability); the
+    // others are an FBP filter pass + back-projection.
+    if algorithm == Algorithm::Gridrec {
+        let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
+        return Ok(Volume::new(gridrec::gridrec(sino, geom, n, fft)?));
+    }
     let bp = backend
         .backprojector()
         .ok_or_else(|| missing("FilteredBackproject", backend))?;
-    let n = grid_size(sino, params);
-    let nz = sino.n_rows();
+    let filt = backend
+        .fbp_filter()
+        .ok_or_else(|| missing("FbpFilter", backend))?;
+    let kernel = filt.make_filter(params.filter_name, sino.n_cols())?;
+    let mut filtered = sino.clone();
+    filt.apply(&mut filtered, &kernel, geom)?;
     let mut vol = Volume::new(Array3::zeros((nz, n, n)));
-
-    // gridrec filters internally; the others take an explicit FBP filter pass.
-    if algorithm == Algorithm::Gridrec {
-        bp.backproject(sino, geom, &mut vol)?;
-    } else {
-        let filt = backend
-            .fbp_filter()
-            .ok_or_else(|| missing("FbpFilter", backend))?;
-        let kernel = filt.make_filter(params.filter_name, sino.n_cols())?;
-        let mut filtered = sino.clone();
-        filt.apply(&mut filtered, &kernel, geom)?;
-        bp.backproject(&filtered, geom, &mut vol)?;
-    }
+    bp.backproject(&filtered, geom, &mut vol)?;
     Ok(vol)
 }
 

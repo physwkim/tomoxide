@@ -72,3 +72,30 @@ fn fbp_reconstructs_shepp_logan_phantom() {
         "FBP reconstruction correlates poorly with phantom: r = {corr:.4}"
     );
 }
+
+#[test]
+fn gridrec_reconstructs_shepp_logan_phantom() {
+    let n = 128;
+    let nang = 180;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        ..Default::default()
+    };
+    let recon = recon::recon(&sino, &geom, Algorithm::Gridrec, &params, &cpu).unwrap();
+    assert_eq!(recon.array.dim(), (1, n, n));
+
+    let slice = recon.array.index_axis(Axis(0), 0).to_owned();
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("gridrec round-trip Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "gridrec reconstruction correlates poorly with phantom: r = {corr:.4}"
+    );
+}
