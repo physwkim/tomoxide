@@ -14,6 +14,7 @@ members = [
     "crates/tomoxide-cpu",
     "crates/tomoxide-cuda",
     "crates/tomoxide-wgpu",
+    "crates/tomoxide-recon",
 ]
 
 [workspace.package]
