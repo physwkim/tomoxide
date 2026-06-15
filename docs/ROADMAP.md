@@ -53,10 +53,15 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
 
 - ✅ `Sirt` — R/C-weighted SIRT via the forward/back-projection capabilities;
   round-trip residual decreases monotonically, Pearson r = 0.95.
-- ⬜ `art/mlem/osem/bart` then the regularized set (`ospml_*`, `pml_*`, `tv`,
-  `tikh`, `grad`).
-- ⬜ Block/ordered-subset handling (`num_block`, `ind_block`).
-- Verification: per-algorithm numeric diff vs tomopy at fixed `num_iter`.
+- ✅ `Mlem` — multiplicative EM `x ← x ∘ Aᵀ(b⊘Ax) ⊘ Aᵀ(1)`, positivity
+  preserved, Pearson r = 0.99.
+- ✅ `Osem` — MLEM over ordered angle-subsets (`num_block`, `ind_block`); 18
+  iters × 10 blocks → r = 0.99, and `num_block = 1` is bit-identical to MLEM.
+- ⬜ `art/bart` then the regularized set (`ospml_*`, `pml_*`, `tv`, `tikh`,
+  `grad`, `vector`).
+- ✅ Block/ordered-subset handling (`num_block`, `ind_block`) — `ordered_subsets`
+  tiles the angle order into contiguous blocks (tomopy `osem.c`).
+- Verification: per-algorithm round-trip + non-negativity; OSEM↔MLEM boundary.
 
 ## M3 — Preprocessing & center finding (CPU)
 

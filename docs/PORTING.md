@@ -62,8 +62,8 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 | `Art`                  | `num_iter`                          | `recon/art.c`        | stub   |
 | `Bart`                 | `num_iter,num_block,ind_block`      | `recon/bart.c`       | stub   |
 | `Sirt`                 | `num_iter`                          | `recon/sirt.c` (+`accel/cxx/sirt.cc`) | partial (R/C-weighted) |
-| `Mlem`                 | `num_iter`                          | `accel/cxx/mlem.cc`  | stub   |
-| `Osem`                 | `num_iter,num_block,ind_block`      | `recon/osem.c`       | stub   |
+| `Mlem`                 | `num_iter`                          | `accel/cxx/mlem.cc`  | CPU done (r=0.99) |
+| `Osem`                 | `num_iter,num_block,ind_block`      | `recon/osem.c`       | CPU done (MLEM over ordered subsets; r=0.99, num_block=1 ≡ MLEM) |
 | `OspmlHybrid`          | `num_iter,reg_par,num_block,ind_block` | `recon/ospml_hybrid.c` | stub |
 | `OspmlQuad`            | `num_iter,reg_par,num_block,ind_block` | `recon/ospml_quad.c`   | stub |
 | `PmlHybrid`            | `num_iter,reg_par`                  | `recon/pml_hybrid.c` | stub   |

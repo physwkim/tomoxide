@@ -1,9 +1,10 @@
-//! End-to-end CPU iterative round-trips (SIRT, MLEM).
+//! End-to-end CPU iterative round-trips (SIRT, MLEM, OSEM).
 //!
 //! Forward-project a Shepp-Logan phantom, reconstruct it, and assert the result
 //! correlates strongly with the phantom. SIRT additionally must drive the data
-//! residual down monotonically (convergence on consistent data); MLEM must
-//! preserve non-negativity.
+//! residual down monotonically (convergence on consistent data); MLEM and OSEM
+//! must preserve non-negativity. OSEM with a single block must equal MLEM (the
+//! ordered-subset generalization collapses to plain EM at `num_block = 1`).
 
 use ndarray::{Array2, Axis};
 use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
@@ -116,5 +117,98 @@ fn mlem_reconstructs_nonnegative_phantom() {
     assert!(
         corr > 0.9,
         "MLEM correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+/// Interleaved ordered-subset angle order: `[0, B, 2B, …, 1, 1+B, …]`, so each
+/// contiguous block of `nang/B` angles is angularly distributed (good subsets).
+fn interleaved_ind_block(nang: usize, num_block: usize) -> Vec<i32> {
+    let mut ind = Vec::with_capacity(nang);
+    for s in 0..num_block {
+        let mut a = s;
+        while a < nang {
+            ind.push(a as i32);
+            a += num_block;
+        }
+    }
+    ind
+}
+
+#[test]
+fn osem_reconstructs_nonnegative_phantom() {
+    let n = 96;
+    let nang = 150;
+    let num_block = 10;
+    let cpu = CpuBackend::new();
+
+    // OSEM, like MLEM, is multiplicative/positivity-preserving — clamp the
+    // phantom's negative ellipses so the object (and sinogram) stay non-negative.
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    // 10 blocks → 10 sub-updates per outer iteration, so 18 iters ≈ 180 EM
+    // sub-updates: OSEM reaches MLEM-quality in far fewer outer iterations.
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 18,
+        num_block,
+        ind_block: interleaved_ind_block(nang, num_block),
+        ..Default::default()
+    };
+    let rec = recon::recon(&sino, &geom, Algorithm::Osem, &params, &cpu).unwrap();
+    let slice = rec.array.index_axis(Axis(0), 0).to_owned();
+
+    assert!(slice.iter().all(|&v| v >= -1e-6), "OSEM produced negatives");
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("OSEM (18 iters × {num_block} blocks) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "OSEM correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+#[test]
+fn osem_with_one_block_equals_mlem() {
+    // Boundary invariant: a single ordered subset is the full angle set, so
+    // OSEM(num_block=1) performs exactly MLEM's update each iteration.
+    let n = 64;
+    let nang = 90;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let base = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 15,
+        ..Default::default()
+    };
+    let mlem = recon::recon(&sino, &geom, Algorithm::Mlem, &base, &cpu).unwrap();
+    let osem = recon::recon(
+        &sino,
+        &geom,
+        Algorithm::Osem,
+        &ReconParams {
+            num_block: 1,
+            ..base
+        },
+        &cpu,
+    )
+    .unwrap();
+
+    let max_abs = mlem
+        .array
+        .iter()
+        .zip(osem.array.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("max |MLEM − OSEM(1 block)| = {max_abs:e}");
+    assert!(
+        max_abs < 1e-4,
+        "OSEM(num_block=1) diverges from MLEM: max abs diff = {max_abs:e}"
     );
 }

@@ -14,11 +14,11 @@ pub mod center;
 mod gridrec;
 pub mod ring;
 
-use ndarray::Array3;
+use ndarray::{Array3, Axis};
 use tomoxide_core::backend::{Backend, FilteredBackproject, ForwardProject};
 use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
-use tomoxide_core::geometry::Geometry;
+use tomoxide_core::geometry::{Angles, Geometry};
 use tomoxide_core::params::{Algorithm, ReconParams};
 
 fn missing(capability: &'static str, backend: &dyn Backend) -> Error {
@@ -97,11 +97,12 @@ fn iterative(
     match algorithm {
         Algorithm::Sirt => sirt(sino, geom, params, proj, bp),
         Algorithm::Mlem => mlem(sino, geom, params, proj, bp),
-        // ART/BART/OSEM and the regularized family (ospml_*, pml_*, tv, tikh,
-        // grad, vector) land later in M2; SIRT/MLEM above are the shared skeleton.
+        Algorithm::Osem => osem(sino, geom, params, proj, bp),
+        // ART/BART and the regularized family (ospml_*, pml_*, tv, tikh, grad,
+        // vector) land later in M2; SIRT/MLEM/OSEM above are the shared skeleton.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART/OSEM + regularized family)",
-            "tomopy libtomo/recon/{art,bart,osem,ospml_hybrid,ospml_quad,pml_hybrid,pml_quad,tv,tikh,grad,vector}.c",
+            "recon iterative (ART/BART + regularized family)",
+            "tomopy libtomo/recon/{art,bart,ospml_hybrid,ospml_quad,pml_hybrid,pml_quad,tv,tikh,grad,vector}.c",
         )),
     }
 }
@@ -199,6 +200,103 @@ fn mlem(
                     *x = *x * c / s; // x ∘ Aᵀ(ratio) ⊘ sens
                 }
             });
+    }
+    Ok(vol)
+}
+
+/// Partition the `nang` angle indices into ordered subsets, matching tomopy
+/// `osem.c`: each subset is a contiguous slice of the angle *ordering* — the
+/// caller's `ind_block` permutation when it has length `nang`, else the identity
+/// `0..nang`. Subset `os` has `nang/num_block + (os < nang % num_block)` angles,
+/// so the blocks tile `0..nang` exactly. `num_block` is clamped to `1..=nang`,
+/// and `1` yields the single full-angle subset (i.e. plain MLEM).
+fn ordered_subsets(nang: usize, params: &ReconParams) -> Vec<Vec<usize>> {
+    let num_block = params.num_block.clamp(1, nang.max(1));
+    let order: Vec<usize> = if params.ind_block.len() == nang {
+        params.ind_block.iter().map(|&i| i as usize).collect()
+    } else {
+        (0..nang).collect()
+    };
+    let blocksize = nang / num_block;
+    let remainder = nang % num_block;
+    let mut subsets = Vec::with_capacity(num_block);
+    let mut start = 0;
+    for os in 0..num_block {
+        let len = blocksize + usize::from(os < remainder);
+        subsets.push(order[start..start + len].to_vec());
+        start += len;
+    }
+    subsets
+}
+
+/// Ordered-Subset Expectation-Maximization.
+///
+/// MLEM restricted to ordered angle-subsets: each subset `s` applies one
+/// multiplicative `x ← x ∘ Aₛᵀ(b ⊘ Aₛ x) ⊘ Aₛᵀ(1)` update over only its own
+/// angles, so a single outer iteration performs `num_block` updates (faster
+/// early convergence than MLEM). With `num_block ≤ 1` it is exactly [`mlem`].
+/// The per-subset sensitivity `Aₛᵀ(1)` is geometry-only, so it is precomputed
+/// once. Ports tomopy `libtomo/recon/osem.c`. `Aₛ` = forward projector over
+/// subset `s`'s angles, `Aₛᵀ` = its back-projector.
+fn osem(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let nz = sino.n_rows();
+    let b = sino.to_layout(Layout::Sinogram);
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    /// One ordered subset: its sub-geometry, measured sinogram slice, and the
+    /// (iteration-invariant) sensitivity `Aₛᵀ(1)`.
+    struct Subset {
+        geom: Geometry,
+        b: Array3<f32>,    // [nz, len, ncols]
+        sens: Array3<f32>, // [nz, n, n]
+    }
+    let mut subsets = Vec::new();
+    for idx in ordered_subsets(nang, params) {
+        let len = idx.len();
+        let mut sub_geom = geom.clone();
+        sub_geom.angles = Angles(idx.iter().map(|&p| geom.angles.0[p]).collect());
+        let sub_b = b.array.select(Axis(1), &idx);
+        let ones = Tomo::new(Array3::from_elem((nz, len, ncols), 1.0), Layout::Sinogram);
+        let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+        bp.backproject(&ones, &sub_geom, &mut sens)?;
+        subsets.push(Subset {
+            geom: sub_geom,
+            b: sub_b,
+            sens: sens.array,
+        });
+    }
+
+    let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
+    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    for _ in 0..params.num_iter.max(1) {
+        for sub in &subsets {
+            let len = sub.geom.angles.0.len();
+            let mut ax = Tomo::new(Array3::zeros((nz, len, ncols)), Layout::Sinogram);
+            proj.project(&vol, &sub.geom, &mut ax)?; // Aₛ x
+            let mut ratio = sub.b.clone();
+            ndarray::Zip::from(&mut ratio)
+                .and(&ax.array)
+                .for_each(|r, &a| {
+                    *r = if a.abs() > 1e-6 { *r / a } else { 0.0 }; // b ⊘ Aₛ x
+                });
+            bp.backproject(&Tomo::new(ratio, Layout::Sinogram), &sub.geom, &mut corr)?;
+            ndarray::Zip::from(&mut vol.array)
+                .and(&corr.array)
+                .and(&sub.sens)
+                .for_each(|x, &c, &s| {
+                    if s.abs() > 1e-6 {
+                        *x = *x * c / s; // x ∘ Aₛᵀ(ratio) ⊘ Aₛᵀ(1)
+                    }
+                });
+        }
     }
     Ok(vol)
 }
