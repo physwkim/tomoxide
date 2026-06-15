@@ -122,11 +122,12 @@ fn iterative(
             params.reg_par.get(1).copied(),
         ),
         Algorithm::Grad => grad(sino, geom, params, proj, bp),
+        Algorithm::Tikh => tikh(sino, geom, params, proj, bp),
         // ART/BART are row-action (Kaczmarz) and need a single-ray primitive;
-        // tv/tikh/vector land later in M2.
+        // tv/vector land later in M2.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART + tv/tikh/vector)",
-            "tomopy libtomo/recon/{art,bart,tv,tikh,vector}.c",
+            "recon iterative (ART/BART + tv/vector)",
+            "tomopy libtomo/recon/{art,bart,tv,vector}.c",
         )),
     }
 }
@@ -487,31 +488,39 @@ fn ospml(
     Ok(vol)
 }
 
-/// Least-squares gradient descent (tomopy `libtomo/recon/grad.c`).
+/// Least-squares gradient descent (tomopy `grad.c`) and its Tikhonov variant
+/// (`tikh.c`).
 ///
-/// Minimizes ‖r·R x − b‖² by gradient descent: the gradient is
-/// `g = 2r·Rᵀ(r·R x − b)`, the step `x ← x − λ g`. The step `λ` is either fixed
-/// (`reg_par[0] ≥ 0`) or Barzilai–Borwein adaptive (`reg_par[0] < 0`,
-/// `λ = ⟨Δx, Δg⟩ / ⟨Δg, Δg⟩`, first step `1e-3`). `x` iterates in the r-scaled
-/// domain (tomopy scales the initial guess by `1/r`; from a zero start that is a
-/// no-op) and is multiplied by `r` on return. `R` = forward projector, `Rᵀ` = its
-/// *raw* adjoint — the back-projector bakes in a `π/nang` factor (for FBP), which
-/// is divided back out here so the `r` normalization holds. Unlike the EM methods
-/// this imposes no positivity.
+/// Minimizes ‖r·R x − b‖² (plus the Tikhonov term below) by gradient descent: the
+/// data gradient is `g = 2r·Rᵀ(r·R x − b)`, the step `x ← x − λ g`. The step `λ`
+/// is either fixed (`reg_par[0] ≥ 0`) or Barzilai–Borwein adaptive
+/// (`reg_par[0] < 0`, `λ = ⟨Δx, Δg⟩ / ⟨Δg, Δg⟩`, first step `1e-3`). `x` iterates
+/// in the r-scaled domain (tomopy scales the initial guess by `1/r`; from a zero
+/// start that is a no-op) and is multiplied by `r` on return. `R` = forward
+/// projector, `Rᵀ` = its *raw* adjoint — the back-projector bakes in a `π/nang`
+/// factor (for FBP), which is divided back out here so the `r` normalization
+/// holds. Unlike the EM methods this imposes no positivity.
+///
+/// `tikhonov = Some((reg1, prior))` adds the Tikhonov gradient
+/// `2·reg1·(x − prior)` (penalizing ‖x − prior‖², a ridge term pulling the
+/// r-scaled iterate toward `prior`); `None` is plain `grad`. tomopy's `tikh`
+/// likewise adds the term in the scaled domain and does *not* rescale `reg_data`,
+/// so `prior` is compared to the scaled iterate as-is.
 ///
 /// The operator normalization `r = 1/√(ncols·nang/2)` is tomopy's heuristic,
 /// tuned so `2r²·λmax(RᵀR) ≈ 2` (step-1 stability boundary) for *its* Siddon
 /// projector. This crate's linear-interp adjoint pair has a larger operator norm,
 /// so a unit fixed step diverges; use a smaller fixed step or the projector-
 /// agnostic Barzilai–Borwein path (`reg_par[0] < 0`). The numeric result differs
-/// from tomopy's `grad` for the same reason FBP does — the projector model, not a
-/// porting error.
-fn grad(
+/// from tomopy for the same reason FBP does — the projector model, not a porting
+/// error.
+fn gradient_descent(
     sino: &Tomo<f32>,
     geom: &Geometry,
     params: &ReconParams,
     proj: &dyn ForwardProject,
     bp: &dyn FilteredBackproject,
+    tikhonov: Option<(f32, Array3<f32>)>,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
     let b = sino.to_layout(Layout::Sinogram);
@@ -537,7 +546,15 @@ fn grad(
             .and(&b.array)
             .for_each(|p, &d| *p = *p * r - d); // r·R x − b
         bp.backproject(&Tomo::new(prox1, Layout::Sinogram), geom, &mut bpv)?;
-        let grad = bpv.array.mapv(|v| 2.0 * r * adj_scale * v); // 2r·Rᵀ(…)
+        let mut grad = bpv.array.mapv(|v| 2.0 * r * adj_scale * v); // 2r·Rᵀ(…)
+
+        // Tikhonov gradient 2·reg1·(x − prior), added in the scaled domain.
+        if let Some((reg1, ref prior)) = tikhonov {
+            ndarray::Zip::from(&mut grad)
+                .and(&vol.array)
+                .and(prior)
+                .for_each(|g, &x, &p0| *g += 2.0 * reg1 * (x - p0));
+        }
 
         // Step size per slice (computed from the previous iterate before saving).
         for (z, lam) in lambda.iter_mut().enumerate() {
@@ -575,6 +592,46 @@ fn grad(
 
     vol.array.mapv_inplace(|v| v * r); // back to the unscaled domain
     Ok(vol)
+}
+
+/// Least-squares gradient descent (tomopy `grad.c`): [`gradient_descent`] with no
+/// Tikhonov term.
+fn grad(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    gradient_descent(sino, geom, params, proj, bp, None)
+}
+
+/// Tikhonov-regularized gradient descent (tomopy `tikh.c`): [`gradient_descent`]
+/// with the term `2·reg_par[1]·(x − reg_data)`. `reg_data` is the prior image
+/// `[nz, n, n]` flattened (tomopy defaults it to zeros, a ridge term toward 0);
+/// an empty `reg_data` is that zero prior. With `reg_par[1] = 0` (or absent) the
+/// term vanishes and this is bit-identical to `grad`.
+fn tikh(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let nz = sino.n_rows();
+    let reg1 = params.reg_par.get(1).copied().unwrap_or(0.0);
+    let prior = if params.reg_data.is_empty() {
+        Array3::zeros((nz, n, n))
+    } else {
+        Array3::from_shape_vec((nz, n, n), params.reg_data.clone()).map_err(|_| {
+            Error::ShapeMismatch {
+                expected: format!("reg_data of {nz}·{n}·{n} = {} elements", nz * n * n),
+                found: format!("{} elements", params.reg_data.len()),
+            }
+        })?
+    };
+    gradient_descent(sino, geom, params, proj, bp, Some((reg1, prior)))
 }
 
 #[cfg(test)]

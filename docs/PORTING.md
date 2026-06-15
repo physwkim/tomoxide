@@ -70,7 +70,7 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 | `PmlQuad`              | `num_iter,reg_par`                  | `recon/ospml_quad.c` (num_block=1) | CPU done (reg=0 ≡ MLEM) |
 | `Tv`                   | `num_iter,reg_par`                  | `recon/tv.c`         | stub   |
 | `Grad`                 | `num_iter,reg_par`                  | `recon/grad.c`       | CPU done (LS gradient descent; BB step reg_par[0]<0 → r=0.99; unit fixed step diverges for this projector, see note) |
-| `Tikh`                 | `num_iter,reg_data,reg_par`         | `recon/tikh.c`       | stub   |
+| `Tikh`                 | `num_iter,reg_data,reg_par`         | `recon/tikh.c`       | CPU done (grad + ridge term 2·reg_par[1]·(x−reg_data); no reg_par[1] ≡ grad; shares grad's core) |
 | `Vector{,2,3}`         | `num_iter,axis…`                    | `recon/vector.c`     | stub   |
 
 Forward model shared by all: tomopy `libtomo/recon/project.c`

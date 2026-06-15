@@ -573,3 +573,96 @@ fn grad_fixed_step_decreases_residual() {
         "grad fixed-step residual did not decrease: {r5} -> {r100}"
     );
 }
+
+/// Sum of squares over a centered disk (reconstruction energy).
+fn disk_sumsq(a: &Array2<f32>, n: usize, radius_frac: f32) -> f32 {
+    let c = (n as f32 - 1.0) / 2.0;
+    let r2 = (radius_frac * n as f32 / 2.0).powi(2);
+    let mut s = 0.0f32;
+    for iy in 0..n {
+        for ix in 0..n {
+            let (dy, dx) = (iy as f32 - c, ix as f32 - c);
+            if dx * dx + dy * dy <= r2 {
+                s += a[[iy, ix]].powi(2);
+            }
+        }
+    }
+    s
+}
+
+#[test]
+fn tikh_without_reg_equals_grad() {
+    // tikh adds 2·reg_par[1]·(x − reg_data) to grad's gradient. With no reg_par[1]
+    // (and the default zero prior) that term is identically zero, so tikh must be
+    // bit-identical to grad at the same step.
+    let n = 64;
+    let nang = 90;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 30,
+        reg_par: vec![-1.0],  // BB step, no Tikhonov weight ⇒ term vanishes
+        ..Default::default()  // reg_data empty ⇒ zero prior
+    };
+    let g = recon::recon(&sino, &geom, Algorithm::Grad, &params, &cpu).unwrap();
+    let t = recon::recon(&sino, &geom, Algorithm::Tikh, &params, &cpu).unwrap();
+
+    let d = max_abs_diff(&g, &t);
+    eprintln!("max |grad − tikh(no reg)| = {d:e}");
+    assert_eq!(d, 0.0, "tikh without reg is not identical to grad: {d:e}");
+}
+
+#[test]
+fn tikh_zero_prior_shrinks_energy() {
+    // The Tikhonov term with a zero prior is a ridge penalty ‖x‖², so a positive
+    // weight shrinks the reconstruction's energy relative to plain grad while
+    // still tracking the phantom (damping, not destruction).
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let common = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 120,
+        reg_par: vec![-1.0], // BB step
+        ..Default::default()
+    };
+    let g = recon::recon(&sino, &geom, Algorithm::Grad, &common, &cpu).unwrap();
+    let t = recon::recon(
+        &sino,
+        &geom,
+        Algorithm::Tikh,
+        &ReconParams {
+            reg_par: vec![-1.0, 0.5], // BB step + Tikhonov weight toward zero prior
+            ..common
+        },
+        &cpu,
+    )
+    .unwrap();
+
+    let g_s = g.array.index_axis(Axis(0), 0).to_owned();
+    let t_s = t.array.index_axis(Axis(0), 0).to_owned();
+    let e_g = disk_sumsq(&g_s, n, 0.85);
+    let e_t = disk_sumsq(&t_s, n, 0.85);
+    let corr = pearson_disk(&t_s, &phantom, n, 0.85);
+    eprintln!("tikh ridge: energy grad = {e_g:.1}, tikh = {e_t:.1}, tikh r = {corr:.4}");
+    assert!(
+        e_t < e_g,
+        "Tikhonov ridge did not shrink energy: tikh {e_t:.1} >= grad {e_g:.1}"
+    );
+    assert!(
+        corr > 0.5,
+        "tikh ridge destroyed the reconstruction: r = {corr:.4}"
+    );
+}

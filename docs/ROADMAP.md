@@ -71,7 +71,12 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
   normalization is tuned to its Siddon projector, so a unit fixed step diverges
   with this linear-interp adjoint pair (a stably-small fixed step or BB is used);
   same projector-model gap as FBP.
-- ⬜ `tv`/`tikh`/`vector`.
+- ✅ `Tikh` — Tikhonov-regularized gradient descent (`tikh.c`): `grad` plus a
+  ridge gradient `2·reg_par[1]·(x − reg_data)`. With no `reg_par[1]` (and the
+  default zero prior) it is bit-identical to `grad`; a positive weight toward a
+  zero prior shrinks the reconstruction energy (449 → 102 on the disk) while
+  still tracking the phantom. Shares the `gradient_descent` core with `grad`.
+- ⬜ `tv`/`vector`.
 - ⬜ `art`/`bart` — row-action (Kaczmarz) methods: recon is updated after every
   single ray, so they need a single-ray projector primitive (not the
   whole-sinogram `ForwardProject`/`FilteredBackproject` the others compose).
