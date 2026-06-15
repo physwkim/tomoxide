@@ -7,7 +7,8 @@
 
 pub mod phantom;
 
-use tomoxide_core::data::{Tomo, Volume};
+use tomoxide_core::backend::Backend;
+use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Angles, Geometry};
 
@@ -19,16 +20,24 @@ pub fn angles(nang: usize, ang1: f32, ang2: f32) -> Vec<f32> {
     Angles::uniform(nang, ang1, ang2).0
 }
 
-/// Forward project a volume into a projection stack (the Radon transform).
+/// Forward project a volume into a sinogram (the Radon transform) via a
+/// backend's [`ForwardProject`](tomoxide_core::backend::ForwardProject)
+/// capability.
 ///
-/// Stub — the real projector ports tomopy `libtomo/recon/project.c`. Once the
-/// CPU [`ForwardProject`](tomoxide_core::backend::ForwardProject) capability
-/// lands (M1), this becomes a thin wrapper for round-trip testing.
-pub fn project(_vol: &Volume<f32>, _geom: &Geometry) -> Result<Tomo<f32>> {
-    Err(Error::todo(
-        "sim::project",
-        "tomopy libtomo/recon/project.c",
-    ))
+/// A thin convenience wrapper for round-trip testing — the projection math
+/// lives in the backend (tomoxide-cpu ports tomopy `libtomo/recon/project.c`).
+/// Returns the `[row, angle, col]` sinogram, or
+/// [`Error::MissingCapability`](tomoxide_core::error::Error::MissingCapability)
+/// if `backend` cannot forward-project.
+pub fn project(vol: &Volume<f32>, geom: &Geometry, backend: &dyn Backend) -> Result<Tomo<f32>> {
+    let proj = backend.projector().ok_or(Error::MissingCapability {
+        backend: backend.name(),
+        capability: "ForwardProject",
+    })?;
+    // project() overwrites `out` with the correctly shaped sinogram.
+    let mut out = Tomo::new(ndarray::Array3::zeros((0, 0, 0)), Layout::Sinogram);
+    proj.project(vol, geom, &mut out)?;
+    Ok(out)
 }
 
 /// Add Gaussian noise (tomopy `sim/project.py:110`). Stub.
@@ -65,5 +74,35 @@ mod tests {
         let a = angles(180, 0.0, std::f32::consts::PI);
         assert_eq!(a.len(), 180);
         assert_eq!(a[0], 0.0);
+    }
+
+    #[test]
+    fn project_reports_missing_capability() {
+        use tomoxide_core::backend::DeviceKind;
+        use tomoxide_core::dtype::Dtype;
+
+        // A backend that advertises no ForwardProject capability.
+        struct NullBackend;
+        impl Backend for NullBackend {
+            fn name(&self) -> &'static str {
+                "null"
+            }
+            fn device(&self) -> DeviceKind {
+                DeviceKind::Cpu
+            }
+            fn supports(&self, _dt: Dtype) -> bool {
+                false
+            }
+        }
+
+        let v = Volume::new(ndarray::Array3::<f32>::zeros((1, 4, 4)));
+        let g = Geometry::parallel(Angles::uniform(4, 0.0, std::f32::consts::PI), 4, 1, 1.0);
+        assert!(matches!(
+            project(&v, &g, &NullBackend),
+            Err(Error::MissingCapability {
+                capability: "ForwardProject",
+                ..
+            })
+        ));
     }
 }
