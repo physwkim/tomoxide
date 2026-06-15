@@ -86,14 +86,25 @@ below by dependency and value — the first three close the end-to-end pipeline.
   clamp-to-edge width-`size` moving average → subtract the residual). Same-order
   f32 arithmetic, so it matches tomopy 1.15.3 **bit-for-bit** on size 3/5
   (`stripe_sf_parity.rs`, golden from `tools/gen_tomopy_stripe_sf_golden.py`).
+- ✅ **VoAll (Vo all-stripe) — done.** Port of tomopy `prep/stripe.py:843`
+  `remove_all_stripe` (Vo algorithms 3+5+6): per slice `_rs_dead` (uniform-filter
+  fluctuation detection → bilinear `kx=ky=1` RectBivariateSpline fill of dead
+  columns → `_rs_large` rank-smoothing of large stripes) then `_rs_sort`
+  (argsort-per-column → median-across-columns → unsort). Composes scipy
+  primitives (uniform_filter1d, median_filter, polyfit, RectBivariateSpline) over
+  distinct-valued columns, so it matches tomopy 1.15.3 to the **f32 round-off
+  floor** (max rel Δ≈5.8e-7) on 2 cases — snr=3 (large+sort) and snr=2
+  (adds the dead-column fill path) — `stripe_voall_parity.rs`, golden from
+  `tools/gen_tomopy_stripe_voall_golden.py`. Exact-tie columns are deliberately
+  avoided in the fixture: argsort tie order is numpy-quicksort-defined (not
+  portable), so a perfectly constant column is outside the well-defined parity
+  domain; the injected dead column is a strictly monotonic near-flat ramp.
 - **Remaining stubs:** `crates/tomoxide-prep/src/stripe.rs` — Fw (Fourier-
-  Wavelet), Ti (Titarenko), VoAll (Vo all).
-- **Upstream:** tomopy `prep/stripe.py:88` (Fw), `:179` (Ti); tomocupy
-  `remove_stripe.remove_all_stripe` (Vo-all). Fw needs a 1-D wavelet (db-family)
-  — check if a Rust crate is acceptable or port the lifting scheme (sign-off on
-  the dependency).
-- **Order:** Vo-all (best quality, what real data uses) next; Fw last (wavelet
-  dependency).
+  Wavelet), Ti (Titarenko).
+- **Upstream:** tomopy `prep/stripe.py:88` (Fw), `:179` (Ti). Fw needs a 1-D
+  wavelet (db-family) — check if a Rust crate is acceptable or port the lifting
+  scheme (sign-off on the dependency).
+- **Order:** Fw last (wavelet dependency); Ti before it.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
@@ -167,9 +178,10 @@ pipeline integration test.
 3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
 4. **B1 HDF5 reader** — real data in; closes the bookends.
-5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** + ✅ **B6 ring** — done (tomopy
-   parity, bit-exact). Remaining artifact-correction family, highest-value
-   first: **B3 stripe Vo-all**, then **B3 Fw** (wavelet dependency).
+5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** + ✅ **B6 ring** + ✅ **B3 stripe
+   Vo-all** — done (tomopy parity; bit-exact for rank/Sf/ring, ≈f32 floor for
+   Vo-all). Remaining artifact-correction family: **B3 Ti**, then **B3 Fw**
+   (wavelet dependency).
 6. Wire the **M3 end-to-end pipeline integration test**.
 7. B7 polish, then M4+.
 

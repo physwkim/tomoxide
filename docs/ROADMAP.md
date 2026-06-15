@@ -109,8 +109,10 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   Δ≈2.4e-7); ✅ `median_filter3d` + `remove_outlier3d` dezinger (clamp-to-center
   `(2r+1)³` median; bit-exact tomopy parity); ✅ `remove_stripe_sf` (smoothing-
   filter stripe removal; bit-exact tomopy parity); ✅ `remove_ring` (polar-
-  transform median/mean ring removal, WRAP mode; bit-exact tomopy parity). ⬜
-  rest of the stripe family (`fw`, `ti`, Vo sorting/filtering/fitting, vo-all).
+  transform median/mean ring removal, WRAP mode; bit-exact tomopy parity); ✅
+  `remove_all_stripe` (Vo algorithms 3+5+6: dead/large-stripe detection +
+  bilinear column fill + sorting; matches tomopy to the f32 round-off floor,
+  max rel Δ≈5.8e-7). ⬜ rest of the stripe family (`fw`, `ti`).
 - `center`: ✅ `find_center_vo` (Nghia Vo, the primary/workhorse) — sinogram-
   domain Fourier method (anisotropic-Gaussian denoise → double-wedge-masked
   `mean(|fftshift(fft2)|)` metric → coarse 0.5-px + fine cubic-B-spline search,
