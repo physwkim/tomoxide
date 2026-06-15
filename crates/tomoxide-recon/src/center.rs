@@ -1,24 +1,91 @@
 //! Rotation-center finding (ports tomopy `recon/rotation.py` + tomocupy
-//! `find_center.py`). `find_center_vo` (Nghia Vo's method) is implemented; the
-//! others remain stubs. See `docs/PORTING.md` §C.
+//! `find_center.py`). `find_center` (entropy), `find_center_vo` (Nghia Vo's
+//! method), and `find_center_pc` (phase correlation) are implemented;
+//! `find_center_sift` remains a stub. See `docs/PORTING.md` §C.
 
-use ndarray::{Array2, Axis, Slice};
+use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
 use tomoxide_core::backend::{Backend, Fft};
 use tomoxide_core::data::{Layout, Tomo};
 use tomoxide_core::dtype::Complex32;
 use tomoxide_core::error::{Error, Result};
+use tomoxide_core::geometry::{Angles, Beam, Center, Detector, Geometry};
 
 /// Entropy-based center finding (tomopy `rotation.py:82`).
+///
+/// Reconstructs a single slice with gridrec at candidate centers and minimises
+/// the Shannon entropy of the masked reconstruction's 64-bin histogram with a
+/// Nelder-Mead simplex search (Donath et al. 2006, doi:10.1364/JOSAA.23.001048),
+/// exactly as tomopy does — the systematic artifact a wrong center introduces
+/// raises the reconstruction's entropy, so the entropy minimum near a good
+/// initial guess marks the axis.
+///
+/// Unlike `find_center_vo`/`find_center_pc` this goes *through* the projector
+/// (gridrec), so it inherits the linear-interp-vs-Siddon gridrec gap (see
+/// PORTING): the entropy surface is a near-replica of tomopy's but not bit-exact,
+/// and the result is the local basin Nelder-Mead reaches from `init`. The center
+/// is therefore held to ±~1 px of the injected/tomopy value, not bit parity.
+///
+/// `ind` selects the slice (default `n_rows/2`); `init` is the optimiser start
+/// (default `n_cols/2`, tomopy's `dx//2`); `tol` sets both the x- and
+/// f-tolerance of the simplex termination (tomopy `tol=0.5`).
 pub fn find_center(
-    _sino: &Tomo<f32>,
-    _theta: &[f32],
-    _init: Option<f32>,
-    _tol: f32,
+    tomo: &Tomo<f32>,
+    theta: &[f32],
+    backend: &dyn Backend,
+    ind: Option<usize>,
+    init: Option<f32>,
+    tol: f32,
 ) -> Result<f32> {
-    Err(Error::todo(
-        "center::find_center",
-        "tomopy recon/rotation.py:82",
-    ))
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    let sino = tomo.to_layout(Layout::Sinogram); // [row, angle, col]
+    let (nrows, nang, ncol) = sino.array.dim();
+    if theta.len() != nang {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{nang} angles"),
+            found: format!("{} theta", theta.len()),
+        });
+    }
+    let ind = ind.unwrap_or(nrows / 2).min(nrows.saturating_sub(1));
+
+    // Single-slice sinogram [1, nang, ncol] for the per-center reconstructions.
+    let slc = Tomo::new(
+        sino.array
+            .index_axis(Axis(0), ind)
+            .to_owned()
+            .insert_axis(Axis(0)),
+        Layout::Sinogram,
+    );
+    let n = ncol; // reconstruction grid = detector width (tomopy num_gridx = dx)
+    let init = init.unwrap_or((ncol / 2) as f32) as f64; // dx // 2
+
+    // Histogram limits from a default-center (`dx/2`) reconstruction, masked
+    // (tomopy `_adjust_hist_limits`).
+    let mut rec0 = recon_at(&slc, theta, ncol as f32 / 2.0, n, fft)?;
+    let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+    {
+        let mut img = rec0.index_axis_mut(Axis(0), 0);
+        circ_mask_inplace(&mut img);
+        for &v in img.iter() {
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+    }
+    let hmin = adjust_hist_min(mn) as f64;
+    let hmax = adjust_hist_max(mx) as f64;
+
+    // Entropy of the masked reconstruction at a candidate center (tomopy casts
+    // the center to f32 before reconstructing).
+    let cost = |center: f64| -> Result<f64> {
+        let mut rec = recon_at(&slc, theta, center as f32, n, fft)?;
+        let mut img = rec.index_axis_mut(Axis(0), 0);
+        circ_mask_inplace(&mut img);
+        Ok(entropy64(&img.view(), hmin, hmax))
+    };
+    let center = nelder_mead_1d(&cost, init, tol as f64, tol as f64)?;
+    Ok(center as f32)
 }
 
 /// Nghia Vo's coarse+fine center search — the workhorse (tomopy `rotation.py:205`).
@@ -124,6 +191,183 @@ pub fn find_center_sift(_proj0: &[f32], _proj180: &[f32]) -> Result<f32> {
         "center::find_center_sift",
         "tomocupy find_center.py:99",
     ))
+}
+
+// ----------------------------------------------------------------------------
+// Entropy center-finding internals (private). Mirrors tomopy
+// rotation.py:82-202 (`find_center`, `_adjust_hist_limits`, `_find_center_cost`)
+// plus scipy's scalar Nelder-Mead simplex (`_minimize_neldermead`).
+// ----------------------------------------------------------------------------
+
+/// gridrec a single-slice sinogram at rotation `center` (tomopy default grid =
+/// detector width, parallel beam, unit pixel).
+fn recon_at(
+    sino: &Tomo<f32>,
+    theta: &[f32],
+    center: f32,
+    n: usize,
+    fft: &dyn Fft,
+) -> Result<Array3<f32>> {
+    let geom = Geometry {
+        angles: Angles(theta.to_vec()),
+        center: Center::Scalar(center),
+        beam: Beam::Parallel,
+        detector: Detector {
+            width: sino.n_cols(),
+            height: 1,
+            pixel_size: 1.0,
+        },
+    };
+    crate::gridrec::gridrec(sino, &geom, n, fft)
+}
+
+/// Apply tomopy's `circ_mask(rec, axis=0)` (default `ratio=1`, `val=0`) to one
+/// reconstruction slice: keep where `x²+y² < (n/2)²`, zero outside. Coordinates
+/// match `np.ogrid[0.5-n/2 : 0.5+n/2]`, i.e. cell `(i, j)` sits at
+/// `(i + 0.5 − n/2, j + 0.5 − n/2)`.
+fn circ_mask_inplace(img: &mut ArrayViewMut2<f32>) {
+    let (ny, nx) = img.dim();
+    let half_y = ny as f64 / 2.0;
+    let half_x = nx as f64 / 2.0;
+    let r2 = (ny.min(nx) as f64 / 2.0).powi(2);
+    for i in 0..ny {
+        let y = i as f64 + 0.5 - half_y;
+        for j in 0..nx {
+            let x = j as f64 + 0.5 - half_x;
+            if x * x + y * y >= r2 {
+                img[[i, j]] = 0.0;
+            }
+        }
+    }
+}
+
+/// tomopy `_adjust_hist_min`: stretch the lower histogram bound away from zero.
+fn adjust_hist_min(v: f32) -> f32 {
+    if v < 0.0 {
+        2.0 * v
+    } else {
+        0.5 * v
+    }
+}
+
+/// tomopy `_adjust_hist_max`: stretch the upper histogram bound away from zero.
+fn adjust_hist_max(v: f32) -> f32 {
+    if v < 0.0 {
+        0.5 * v
+    } else {
+        2.0 * v
+    }
+}
+
+/// Shannon entropy of the 64-bin histogram of `img` over `[hmin, hmax]`,
+/// `−Σ p·log2(p)` with `p = count/size + 1e-12` (tomopy `_find_center_cost`).
+/// `size` counts every pixel (including masked and out-of-range ones), and the
+/// `1e-12` floor is added to all 64 bins, exactly as numpy does.
+fn entropy64(img: &ndarray::ArrayView2<f32>, hmin: f64, hmax: f64) -> f64 {
+    const BINS: usize = 64;
+    let size = img.len() as f64;
+    let mut counts = [0.0f64; BINS];
+    let span = hmax - hmin;
+    for &v in img.iter() {
+        let v = v as f64;
+        if v < hmin || v > hmax {
+            continue; // numpy histogram drops out-of-range values
+        }
+        let mut idx = ((v - hmin) / span * BINS as f64) as usize;
+        if idx >= BINS {
+            idx = BINS - 1; // v == hmax lands in the last bin
+        }
+        counts[idx] += 1.0;
+    }
+    let mut val = 0.0f64;
+    for &c in counts.iter() {
+        let p = c / size + 1e-12;
+        val -= p * p.log2();
+    }
+    val
+}
+
+/// scipy's `_minimize_neldermead` specialised to one variable (`tol` sets both
+/// `xatol` and `fatol`). The simplex is `{x0, 1.05·x0}`; reflect/expand/
+/// contract/shrink use scipy's `ρ=1, χ=2, ψ=σ=0.5` coefficients. Returns the
+/// best vertex when the simplex shrinks within tolerance (default 200 evals).
+fn nelder_mead_1d<F>(f: &F, x0: f64, xatol: f64, fatol: f64) -> Result<f64>
+where
+    F: Fn(f64) -> Result<f64>,
+{
+    let (rho, chi, psi, sigma) = (1.0, 2.0, 0.5, 0.5);
+    let (nonzdelt, zdelt) = (0.05, 0.00025);
+    let mut s0 = x0;
+    let mut s1 = if x0 != 0.0 {
+        (1.0 + nonzdelt) * x0
+    } else {
+        zdelt
+    };
+    let mut f0 = f(s0)?;
+    let mut f1 = f(s1)?;
+    if f1 < f0 {
+        std::mem::swap(&mut s0, &mut s1);
+        std::mem::swap(&mut f0, &mut f1);
+    }
+    let (maxiter, maxfun) = (200usize, 200usize);
+    let mut fcalls = 2usize;
+    let mut iters = 1usize;
+    while fcalls < maxfun && iters < maxiter {
+        if (s1 - s0).abs() <= xatol && (f0 - f1).abs() <= fatol {
+            break;
+        }
+        let xbar = s0; // centroid of the best vertex (N = 1)
+        let xr = (1.0 + rho) * xbar - rho * s1;
+        let fxr = f(xr)?;
+        fcalls += 1;
+        let mut doshrink = false;
+        if fxr < f0 {
+            // Reflection improved on the best — try to expand.
+            let xe = (1.0 + rho * chi) * xbar - rho * chi * s1;
+            let fxe = f(xe)?;
+            fcalls += 1;
+            if fxe < fxr {
+                s1 = xe;
+                f1 = fxe;
+            } else {
+                s1 = xr;
+                f1 = fxr;
+            }
+        } else if fxr < f1 {
+            // Reflection between best and worst — outside contraction.
+            let xc = (1.0 + psi * rho) * xbar - psi * rho * s1;
+            let fxc = f(xc)?;
+            fcalls += 1;
+            if fxc <= fxr {
+                s1 = xc;
+                f1 = fxc;
+            } else {
+                doshrink = true;
+            }
+        } else {
+            // Reflection worse than the worst — inside contraction.
+            let xcc = (1.0 - psi) * xbar + psi * s1;
+            let fxcc = f(xcc)?;
+            fcalls += 1;
+            if fxcc < f1 {
+                s1 = xcc;
+                f1 = fxcc;
+            } else {
+                doshrink = true;
+            }
+        }
+        if doshrink {
+            s1 = s0 + sigma * (s1 - s0);
+            f1 = f(s1)?;
+            fcalls += 1;
+        }
+        if f1 < f0 {
+            std::mem::swap(&mut s0, &mut s1);
+            std::mem::swap(&mut f0, &mut f1);
+        }
+        iters += 1;
+    }
+    Ok(s0)
 }
 
 // ----------------------------------------------------------------------------
