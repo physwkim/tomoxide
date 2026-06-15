@@ -484,3 +484,92 @@ fn ospml_hybrid_preserves_edges_better_than_quad() {
         "hybrid did not preserve edges better than quad: {corr_hybrid:.4} <= {corr_quad:.4}"
     );
 }
+
+#[test]
+fn grad_reconstructs_phantom_with_bb_step() {
+    // Least-squares gradient descent with the Barzilai–Borwein self-tuning step
+    // (reg_par[0] < 0). Unlike the EM family it imposes no positivity, so the
+    // full phantom (with negative ellipses) is the right target. The data
+    // residual must shrink as iterations grow, and the result correlate with the
+    // phantom.
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |iters| ReconParams {
+        num_gridx: Some(n),
+        num_iter: iters,
+        reg_par: vec![-1.0], // Barzilai–Borwein adaptive step
+        ..Default::default()
+    };
+
+    let r10 = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Grad, &p(10), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    let rec = recon::recon(&sino, &geom, Algorithm::Grad, &p(200), &cpu).unwrap();
+    let r200 = residual_norm(&rec, &sino, &geom, &cpu);
+    eprintln!("grad (BB) residual: 10 iters = {r10:.3}, 200 iters = {r200:.3}");
+    assert!(
+        r200 < r10,
+        "grad residual did not decrease: {r10} -> {r200}"
+    );
+
+    let slice = rec.array.index_axis(Axis(0), 0).to_owned();
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("grad (BB, 200 iters) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "grad correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+#[test]
+fn grad_fixed_step_decreases_residual() {
+    // The fixed-step path (reg_par[0] ≥ 0) takes a constant step λ = reg_par[0].
+    // A stable λ is projector-dependent: tomopy's r = 1/√(ncols·nang/2) puts the
+    // step-1 iteration right at the stability boundary for its Siddon projector,
+    // but this linear-interp adjoint pair has a larger operator norm, so the
+    // tomopy-default unit step diverges and a smaller step is needed. With a
+    // stably-small step the residual decreases monotonically with iterations.
+    let n = 64;
+    let nang = 90;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |iters| ReconParams {
+        num_gridx: Some(n),
+        num_iter: iters,
+        reg_par: vec![0.05], // stable fixed step for this projector
+        ..Default::default()
+    };
+
+    let r5 = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Grad, &p(5), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    let r100 = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Grad, &p(100), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    eprintln!("grad (fixed step 0.05) residual: 5 iters = {r5:.3}, 100 iters = {r100:.3}");
+    assert!(
+        r100.is_finite() && r100 < r5,
+        "grad fixed-step residual did not decrease: {r5} -> {r100}"
+    );
+}

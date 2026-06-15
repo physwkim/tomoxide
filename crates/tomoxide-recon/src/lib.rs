@@ -121,11 +121,12 @@ fn iterative(
             1,
             params.reg_par.get(1).copied(),
         ),
+        Algorithm::Grad => grad(sino, geom, params, proj, bp),
         // ART/BART are row-action (Kaczmarz) and need a single-ray primitive;
-        // tv/tikh/grad/vector land later in M2.
+        // tv/tikh/vector land later in M2.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART + tv/tikh/grad/vector)",
-            "tomopy libtomo/recon/{art,bart,tv,tikh,grad,vector}.c",
+            "recon iterative (ART/BART + tv/tikh/vector)",
+            "tomopy libtomo/recon/{art,bart,tv,tikh,vector}.c",
         )),
     }
 }
@@ -483,6 +484,96 @@ fn ospml(
             }
         }
     }
+    Ok(vol)
+}
+
+/// Least-squares gradient descent (tomopy `libtomo/recon/grad.c`).
+///
+/// Minimizes ‖r·R x − b‖² by gradient descent: the gradient is
+/// `g = 2r·Rᵀ(r·R x − b)`, the step `x ← x − λ g`. The step `λ` is either fixed
+/// (`reg_par[0] ≥ 0`) or Barzilai–Borwein adaptive (`reg_par[0] < 0`,
+/// `λ = ⟨Δx, Δg⟩ / ⟨Δg, Δg⟩`, first step `1e-3`). `x` iterates in the r-scaled
+/// domain (tomopy scales the initial guess by `1/r`; from a zero start that is a
+/// no-op) and is multiplied by `r` on return. `R` = forward projector, `Rᵀ` = its
+/// *raw* adjoint — the back-projector bakes in a `π/nang` factor (for FBP), which
+/// is divided back out here so the `r` normalization holds. Unlike the EM methods
+/// this imposes no positivity.
+///
+/// The operator normalization `r = 1/√(ncols·nang/2)` is tomopy's heuristic,
+/// tuned so `2r²·λmax(RᵀR) ≈ 2` (step-1 stability boundary) for *its* Siddon
+/// projector. This crate's linear-interp adjoint pair has a larger operator norm,
+/// so a unit fixed step diverges; use a smaller fixed step or the projector-
+/// agnostic Barzilai–Borwein path (`reg_par[0] < 0`). The numeric result differs
+/// from tomopy's `grad` for the same reason FBP does — the projector model, not a
+/// porting error.
+fn grad(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let b = sino.to_layout(Layout::Sinogram);
+    let nz = b.n_rows();
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
+    let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
+    let fixed_step = params.reg_par.first().copied().unwrap_or(1.0);
+
+    let mut vol = Volume::new(Array3::zeros((nz, n, n))); // r-scaled domain, init 0
+    let mut recon0 = vol.array.clone();
+    let mut grad0 = Array3::<f32>::zeros((nz, n, n));
+    let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    let mut bpv = Volume::new(Array3::zeros((nz, n, n)));
+    let mut lambda = vec![0.0f32; nz];
+
+    for it in 0..params.num_iter.max(1) {
+        proj.project(&vol, geom, &mut ax)?; // R x
+        let mut prox1 = ax.array.clone();
+        ndarray::Zip::from(&mut prox1)
+            .and(&b.array)
+            .for_each(|p, &d| *p = *p * r - d); // r·R x − b
+        bp.backproject(&Tomo::new(prox1, Layout::Sinogram), geom, &mut bpv)?;
+        let grad = bpv.array.mapv(|v| 2.0 * r * adj_scale * v); // 2r·Rᵀ(…)
+
+        // Step size per slice (computed from the previous iterate before saving).
+        for (z, lam) in lambda.iter_mut().enumerate() {
+            *lam = if fixed_step >= 0.0 {
+                fixed_step
+            } else if it == 0 {
+                1e-3
+            } else {
+                let (mut num, mut den) = (0.0f32, 0.0f32);
+                ndarray::Zip::from(vol.array.index_axis(Axis(0), z))
+                    .and(recon0.index_axis(Axis(0), z))
+                    .and(grad.index_axis(Axis(0), z))
+                    .and(grad0.index_axis(Axis(0), z))
+                    .for_each(|&x, &x0, &g, &g0| {
+                        let dg = g - g0;
+                        num += (x - x0) * dg;
+                        den += dg * dg;
+                    });
+                if den != 0.0 {
+                    num / den
+                } else {
+                    1e-3
+                }
+            };
+        }
+
+        recon0 = vol.array.clone();
+        grad0 = grad.clone();
+        for (z, &l) in lambda.iter().enumerate() {
+            ndarray::Zip::from(vol.array.index_axis_mut(Axis(0), z))
+                .and(grad.index_axis(Axis(0), z))
+                .for_each(|x, &g| *x -= l * g); // x ← x − λ g
+        }
+    }
+
+    vol.array.mapv_inplace(|v| v * r); // back to the unscaled domain
     Ok(vol)
 }
 

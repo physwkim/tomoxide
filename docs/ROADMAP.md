@@ -64,7 +64,14 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
   factor `γ = 1/(1+|Δ|/reg_par[1])`); shares the De Pierro update, so with no
   `reg_par[1]` it is bit-identical to the quadratic prior, and at a small
   threshold it tracks edges far better (r = 0.99 vs quad's 0.90 at equal strength).
-- ⬜ `tv`/`tikh`/`grad`/`vector`.
+- ✅ `Grad` — least-squares gradient descent (`grad.c`): gradient
+  `g = 2r·Rᵀ(r·R x − b)`, step `x ← x − λ g`, with a fixed step (`reg_par[0] ≥ 0`)
+  or a Barzilai–Borwein self-tuning step (`reg_par[0] < 0`). BB reconstructs the
+  full (signed) phantom to r = 0.99. tomopy's `r = 1/√(ncols·nang/2)` step
+  normalization is tuned to its Siddon projector, so a unit fixed step diverges
+  with this linear-interp adjoint pair (a stably-small fixed step or BB is used);
+  same projector-model gap as FBP.
+- ⬜ `tv`/`tikh`/`vector`.
 - ⬜ `art`/`bart` — row-action (Kaczmarz) methods: recon is updated after every
   single ray, so they need a single-ray projector primitive (not the
   whole-sinogram `ForwardProject`/`FilteredBackproject` the others compose).

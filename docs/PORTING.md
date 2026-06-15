@@ -69,7 +69,7 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 | `PmlHybrid`            | `num_iter,reg_par`                  | `recon/ospml_hybrid.c` (num_block=1) | CPU done (reg=0 ≡ MLEM) |
 | `PmlQuad`              | `num_iter,reg_par`                  | `recon/ospml_quad.c` (num_block=1) | CPU done (reg=0 ≡ MLEM) |
 | `Tv`                   | `num_iter,reg_par`                  | `recon/tv.c`         | stub   |
-| `Grad`                 | `num_iter,reg_par`                  | `recon/grad.c`       | stub   |
+| `Grad`                 | `num_iter,reg_par`                  | `recon/grad.c`       | CPU done (LS gradient descent; BB step reg_par[0]<0 → r=0.99; unit fixed step diverges for this projector, see note) |
 | `Tikh`                 | `num_iter,reg_data,reg_par`         | `recon/tikh.c`       | stub   |
 | `Vector{,2,3}`         | `num_iter,axis…`                    | `recon/vector.c`     | stub   |
 
@@ -214,3 +214,14 @@ inference. Reconstruction algorithms exposed: `fourierrec`, `lprec`, `linerec`
   `Dtype::F16` on the CUDA/wgpu backends only (CPU stays f32).
 - **Filters.** Same named set on both sides: `ramp/shepp/cosine/cosine2/
   hamming/hann/parzen/none` — define once in `tomoxide-recon::filter`.
+- **Projector model (linear-interp vs Siddon).** tomopy's C projectors use Siddon
+  ray–pixel intersection lengths (`calc_dist`); the CPU backend uses a
+  pixel-driven splat / voxel-driven gather pair with linear interpolation (an
+  exact adjoint pair, but a *different* `A`). Numeric reconstructions therefore
+  differ from tomopy by the projector model, not a porting error — this is why
+  `fbp` is gated against the phantom rather than tomopy's `fbp`, and why `grad`'s
+  step-normalization `r = 1/√(ncols·nang/2)` (tuned so a unit step sits at the
+  Siddon stability boundary) overshoots here: a unit fixed step diverges, so a
+  smaller fixed step or the Barzilai–Borwein self-tuning step (`reg_par[0] < 0`)
+  is required. `gridrec` is model-independent (Fourier), so it matches tomopy to
+  r=0.98.
