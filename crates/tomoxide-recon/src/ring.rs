@@ -5,13 +5,30 @@
 //!
 //! The pipeline per slice: forward polar transform (nearest-pixel lookup with
 //! `thresh_min`/`thresh_max` clamping) → radial median filter in three radial
-//! bands → subtract + `thresh` thresholding → azimuthal mean filter (WRAP) in
-//! three bands → inverse polar transform → subtract the resulting ring image
-//! from the original. Only tomopy's default `int_mode="WRAP"` is implemented
-//! (the public API exposes no `int_mode`, matching the stub signature).
+//! bands → subtract + `thresh` thresholding → azimuthal mean filter in three
+//! bands → inverse polar transform → subtract the resulting ring image from the
+//! original. Both `int_mode` values are supported: `Wrap` (tomopy's default —
+//! angle 0 joins 2π cyclically) and `Reflect` (each polar half mirrored about
+//! its 0/π and π/2π edges).
 
 use tomoxide_core::data::Volume;
 use tomoxide_core::error::Result;
+
+/// Azimuthal boundary mode for the polar mean filter (tomopy `int_mode`:
+/// `WRAP` = 0, `REFLECT` = 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingIntMode {
+    /// Wrap angle 0 and 2π cyclically (tomopy default).
+    Wrap,
+    /// Reflect at the 0/π and π/2π edges — each polar half (rows `[0, ph/2)` and
+    /// `[ph/2, ph)`) is mean-filtered independently with mirror boundaries.
+    Reflect,
+}
+
+/// One azimuthal mean-filter band pass: `(src, filtered, start_col, end_col,
+/// kernel_rad, pol_width, pol_height)`. `mean_filter_band_wrap`/`_reflect` share
+/// this shape so `ring_filter` can pick one by `int_mode`.
+type MeanFilterBand = fn(&[f32], &mut [f32], usize, usize, usize, usize, usize);
 
 // tomopy's literal PI (`libtomo/misc/remove_ring.c:54`). Matching the C `#define`
 // keeps the float/double cast chain — and therefore the integer pixel indices
@@ -215,9 +232,98 @@ fn mean_filter_band_wrap(
     }
 }
 
+/// Azimuthal mean filter (`int_mode = REFLECT`) over the column band
+/// `[start_col, end_col]`. Mirrors the C `mean_filter_fast_1D` REFLECT branch:
+/// each polar column is filtered in two independent halves split at
+/// `pol_height/2` (the 0–π and π–2π angular ranges), each with mirror-reflect
+/// boundaries — reflect about the edge sample without repeating it. Same `f64`
+/// running sum and zero-source guard as the WRAP variant. Same signature as
+/// [`mean_filter_band_wrap`] so the two are interchangeable as a `fn` pointer.
+fn mean_filter_band_reflect(
+    src: &[f32],
+    filtered: &mut [f32],
+    start_col: usize,
+    end_col: usize,
+    kernel_rad: usize,
+    pol_width: usize,
+    pol_height: usize,
+) {
+    let h = pol_height as isize;
+    let half = (pol_height / 2) as isize;
+    let kr = kernel_rad as isize;
+    let num_elems = (2 * kernel_rad + 1) as f64;
+    for col in start_col..=end_col {
+        // First half: rows [0, ph/2), mirrored about index 0 and index ph/2-1.
+        let mut sum = 0.0f64;
+        for n in -kr..=kr {
+            let mut row = n;
+            if row < 0 {
+                row = -row;
+            } else if row >= half {
+                row = half - (row - half) - 2;
+            }
+            sum += src[row as usize * pol_width + col] as f64;
+        }
+        filtered[col] = (sum / num_elems) as f32;
+        let mut previous_sum = sum;
+        for row in 1..pol_height / 2 {
+            let ri = row as isize;
+            let mut last_row = (ri - 1) - kr;
+            let mut next_row = ri + kr;
+            if last_row < 0 {
+                last_row = -last_row;
+            }
+            if next_row >= half {
+                next_row = half - (next_row - half) - 2;
+            }
+            let s = previous_sum - src[last_row as usize * pol_width + col] as f64
+                + src[next_row as usize * pol_width + col] as f64;
+            filtered[row * pol_width + col] = if src[row * pol_width + col] != 0.0 {
+                (s / num_elems) as f32
+            } else {
+                0.0
+            };
+            previous_sum = s;
+        }
+
+        // Second half: rows [ph/2, ph), mirrored about index ph/2 and index ph-1.
+        sum = 0.0;
+        for n in -kr..=kr {
+            let mut row = n + half;
+            if row < half {
+                row = half + (half - row);
+            } else if row >= h {
+                row = h - (row - h) - 2;
+            }
+            sum += src[row as usize * pol_width + col] as f64;
+        }
+        filtered[(pol_height / 2) * pol_width + col] = (sum / num_elems) as f32;
+        previous_sum = sum;
+        for row in pol_height / 2 + 1..pol_height {
+            let ri = row as isize;
+            let mut last_row = (ri - 1) - kr;
+            let mut next_row = ri + kr;
+            if last_row < half {
+                last_row = half + (half - last_row);
+            }
+            if next_row >= h {
+                next_row = h - (next_row - h) - 2;
+            }
+            let s = previous_sum - src[last_row as usize * pol_width + col] as f64
+                + src[next_row as usize * pol_width + col] as f64;
+            filtered[row * pol_width + col] = if src[row * pol_width + col] != 0.0 {
+                (s / num_elems) as f32
+            } else {
+                0.0
+            };
+            previous_sum = s;
+        }
+    }
+}
+
 /// Full ring filter on a polar image: three-band radial median, subtract +
-/// threshold, three-band azimuthal mean (WRAP). Overwrites `polar` with the
-/// fully filtered result.
+/// threshold, three-band azimuthal mean (WRAP or REFLECT per `int_mode`).
+/// Overwrites `polar` with the fully filtered result.
 fn ring_filter(
     polar: &mut [f32],
     pol_width: usize,
@@ -225,6 +331,7 @@ fn ring_filter(
     threshold: f32,
     m_rad: i32,
     m_azi: i32,
+    int_mode: RingIntMode,
 ) {
     let (pw, ph) = (pol_width, pol_height);
     let mut filtered = vec![0.0f32; pw * ph];
@@ -261,7 +368,13 @@ fn ring_filter(
         }
     }
 
-    mean_filter_band_wrap(
+    // WRAP and REFLECT share the same band layout; only the boundary handling of
+    // the azimuthal mean differs (tomopy `int_mode`).
+    let mean_fn: MeanFilterBand = match int_mode {
+        RingIntMode::Wrap => mean_filter_band_wrap,
+        RingIntMode::Reflect => mean_filter_band_reflect,
+    };
+    mean_fn(
         polar,
         &mut filtered,
         0,
@@ -270,7 +383,7 @@ fn ring_filter(
         pw,
         ph,
     );
-    mean_filter_band_wrap(
+    mean_fn(
         polar,
         &mut filtered,
         b1,
@@ -279,7 +392,7 @@ fn ring_filter(
         pw,
         ph,
     );
-    mean_filter_band_wrap(polar, &mut filtered, b2, pw - 1, m_azi as usize, pw, ph);
+    mean_fn(polar, &mut filtered, b2, pw - 1, m_azi as usize, pw, ph);
 
     polar.copy_from_slice(&filtered);
 }
@@ -287,10 +400,10 @@ fn ring_filter(
 /// Polar-transform ring removal.
 ///
 /// `thresh`/`thresh_min`/`thresh_max` bound the correction, `rwidth` is the
-/// smoothing width, `theta_min` the minimum arc, matching the C signature
-/// `remove_ring(rec, center_x, center_y, dx, dy, dz, thresh_max, thresh_min,
-/// thresh, theta_min, rwidth, int_mode, istart, iend)` with `int_mode = WRAP`
-/// (tomopy's default).
+/// smoothing width, `theta_min` the minimum arc, `int_mode` the azimuthal
+/// boundary handling ([`RingIntMode::Wrap`] is tomopy's default), matching the C
+/// signature `remove_ring(rec, center_x, center_y, dx, dy, dz, thresh_max,
+/// thresh_min, thresh, theta_min, rwidth, int_mode, istart, iend)`.
 #[allow(clippy::too_many_arguments)]
 pub fn remove_ring(
     vol: &mut Volume<f32>,
@@ -301,6 +414,7 @@ pub fn remove_ring(
     thresh_max: f32,
     theta_min: i32,
     rwidth: i32,
+    int_mode: RingIntMode,
 ) -> Result<()> {
     let (dz, dy, dx) = vol.array.dim();
     if dz == 0 || dy == 0 || dx == 0 {
@@ -328,7 +442,7 @@ pub fn remove_ring(
         }
         let m_azi = ((ph as f64) / 360.0 * (theta_min as f64)).floor() as i32;
 
-        ring_filter(&mut polar, pw, ph, thresh, m_rad, m_azi);
+        ring_filter(&mut polar, pw, ph, thresh, m_rad, m_azi, int_mode);
         let ring_image = inverse_polar_transform(&polar, pw, ph, center_x, center_y, width, height);
 
         for r in 0..dy {
