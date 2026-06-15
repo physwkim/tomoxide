@@ -1,13 +1,15 @@
-//! End-to-end CPU iterative round-trips (SIRT, MLEM, OSEM, OSPML-quad).
+//! End-to-end CPU iterative round-trips for the full scalar family (SIRT, MLEM,
+//! OSEM, PML/OSPML quad & hybrid, grad, tikh, tv, ART, BART).
 //!
 //! Forward-project a Shepp-Logan phantom, reconstruct it, and assert the result
-//! correlates strongly with the phantom. SIRT additionally must drive the data
-//! residual down monotonically (convergence on consistent data); MLEM and OSEM
-//! must preserve non-negativity. OSEM with a single block must equal MLEM (the
-//! ordered-subset generalization collapses to plain EM at `num_block = 1`).
-//! The penalized-ML methods reduce exactly to their unpenalized counterparts at
-//! `reg_par = 0` (pml_quad → MLEM, ospml_quad → OSEM), and a positive `reg_par`
-//! must smooth the reconstruction.
+//! correlates strongly with the phantom. The convergent/least-squares methods
+//! (SIRT, grad, ART, BART) must drive the data residual down monotonically; MLEM
+//! and OSEM must preserve non-negativity. Boundary invariants are bit-identical:
+//! OSEM with one block equals MLEM, and the penalized-ML methods reduce to their
+//! unpenalized counterparts at `reg_par = 0` (pml_quad → MLEM, ospml_quad → OSEM,
+//! ospml_hybrid without δ → ospml_quad) — likewise tikh without a Tikhonov weight
+//! equals grad. A positive `reg_par` smooths (quadratic prior, tv) or shrinks
+//! energy (tikh ridge), and ordered subsets accelerate convergence (OSEM, BART).
 
 use ndarray::{Array2, Axis};
 use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};

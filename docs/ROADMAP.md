@@ -49,7 +49,12 @@ checked-in tomopy golden data.
 **Done = `fbp`/`gridrec` verified vs tomopy on shepp2d.** gridrec matches tomopy
 gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
 
-## M2 — CPU iterative family (parity target: tomopy ART/SIRT/MLEM…) 🟡 started
+## M2 — CPU iterative family (parity target: tomopy ART/SIRT/MLEM…) 🟢 scalar family done
+
+The full scalar iterative family is implemented and verified (sirt, mlem, osem,
+pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
+(`vector{,2,3}`, a separate multi-dataset API) remains, deferred below.
+
 
 - ✅ `Sirt` — R/C-weighted SIRT via the forward/back-projection capabilities;
   round-trip residual decreases monotonically, Pearson r = 0.95.
