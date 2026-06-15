@@ -68,16 +68,16 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B2. Center finding — `tomoxide-recon::center`  (unblocks correct recon)
 
-- **Stubs:** `crates/tomoxide-recon/src/center.rs` — `find_center_vo:21`
-  (the workhorse), `find_center:8` (entropy), `find_center_pc:33`
-  (phase-correlation), `find_center_sift:42` (defer to M7, needs SIFT/AI).
-- **Upstream:** tomopy `recon/rotation.py:205` (`_search_coarse`/`_search_fine`)
-  for Vo; `:82` entropy; `:391` phase-correlation. tomocupy `find_center.py:99`
-  for SIFT.
-- **Order:** `find_center_vo` first — it is what real pipelines call.
-- **Done =** on a phantom sinogram with a known injected center offset,
-  `find_center_vo` recovers it within ±0.5 px; reconstructing at the found
-  center beats reconstructing at `n/2` (sharper edges / lower roughness).
+- ✅ **`find_center_vo` (the workhorse) — done.** Sinogram-domain Vo method,
+  matches tomopy 1.15.3 exactly (Δ = 0) on 4 parity cases
+  (`center_parity.rs`, golden from `tools/gen_tomopy_center_golden.py`).
+- **Remaining stubs:** `crates/tomoxide-recon/src/center.rs` — `find_center`
+  (entropy, `rotation.py:82`), `find_center_pc` (phase-correlation,
+  `rotation.py:391`), `write_center` (`rotation.py:438`), `find_center_sift`
+  (defer to M7, needs SIFT/AI; tomocupy `find_center.py:99`).
+- **Done (each) =** for `find_center`/`find_center_pc`, recover a known injected
+  center offset on a phantom sinogram within ±0.5 px (compare to tomopy where a
+  golden can be generated, as `find_center_vo` does).
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 
@@ -159,9 +159,9 @@ pipeline integration test.
 
 ## Suggested sequence
 
-1. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
+1. ✅ **B2 `find_center_vo`** — done (tomopy parity Δ=0).
+2. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
-2. **B2 `find_center_vo`** — correctness on real geometry.
 3. **B1 HDF5 reader** — real data in; closes the bookends.
 4. **B3 stripe (Vo-all or Sf)** → **B4 Paganin** → **B5 rank filters** →
    **B6 ring** — the artifact-correction family, highest-value first.

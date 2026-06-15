@@ -84,7 +84,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | tomoxide                | Upstream                                  | Status |
 |-------------------------|-------------------------------------------|--------|
 | `center::find_center`   | tomopy `recon/rotation.py:82` (entropy)   | stub   |
-| `center::find_center_vo`| tomopy `recon/rotation.py:205` (Vo coarse+fine) | stub |
+| `center::find_center_vo`| tomopy `recon/rotation.py:205` (Vo coarse+fine) | CPU ✓ — tomopy parity Δ=0 |
 | `center::find_center_pc`| tomopy `recon/rotation.py:391` (phase corr) | stub |
 | `center::write_center`  | tomopy `recon/rotation.py:438`            | stub   |
 | `center::find_center_sift` | tomocupy `find_center.py:99`           | stub   |
