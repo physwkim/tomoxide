@@ -1,10 +1,11 @@
 //! # tomoxide-sim
 //!
 //! Phantoms and forward simulation (ports tomopy `sim/` + `misc/phantom.py`).
-//! `angles` and `phantom::shepp2d` are real; `project` and the noise models are
-//! stubs (see `docs/PORTING.md` §F).
+//! `angles`, `phantom::shepp2d`, and the noise models are real; `project` is a
+//! thin backend wrapper (see `docs/PORTING.md` §F).
 #![forbid(unsafe_code)]
 
+mod noise;
 pub mod phantom;
 
 use tomoxide_core::backend::Backend;
@@ -12,6 +13,7 @@ use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Angles, Geometry};
 
+pub use noise::{add_gaussian, add_poisson};
 pub use phantom::shepp2d;
 
 /// `nang` uniformly spaced angles over `[ang1, ang2)` radians (tomopy
@@ -38,19 +40,6 @@ pub fn project(vol: &Volume<f32>, geom: &Geometry, backend: &dyn Backend) -> Res
     let mut out = Tomo::new(ndarray::Array3::zeros((0, 0, 0)), Layout::Sinogram);
     proj.project(vol, geom, &mut out)?;
     Ok(out)
-}
-
-/// Add Gaussian noise (tomopy `sim/project.py:110`). Stub.
-pub fn add_gaussian(_data: &mut Tomo<f32>, _mean: f32, _std: f32) -> Result<()> {
-    Err(Error::todo(
-        "sim::add_gaussian",
-        "tomopy sim/project.py:110",
-    ))
-}
-
-/// Add Poisson noise (tomopy `sim/project.py:136`). Stub.
-pub fn add_poisson(_data: &mut Tomo<f32>) -> Result<()> {
-    Err(Error::todo("sim::add_poisson", "tomopy sim/project.py:136"))
 }
 
 #[cfg(test)]
