@@ -14,8 +14,8 @@ pub mod center;
 pub mod ring;
 
 use ndarray::Array3;
-use tomoxide_core::backend::Backend;
-use tomoxide_core::data::{Tomo, Volume};
+use tomoxide_core::backend::{Backend, FilteredBackproject, ForwardProject};
+use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::Geometry;
 use tomoxide_core::params::{Algorithm, ReconParams};
@@ -82,7 +82,7 @@ fn analytic(
 fn iterative(
     sino: &Tomo<f32>,
     geom: &Geometry,
-    _algorithm: Algorithm,
+    algorithm: Algorithm,
     params: &ReconParams,
     backend: &dyn Backend,
 ) -> Result<Volume<f32>> {
@@ -92,18 +92,62 @@ fn iterative(
     let bp = backend
         .backprojector()
         .ok_or_else(|| missing("FilteredBackproject", backend))?;
+    match algorithm {
+        Algorithm::Sirt => sirt(sino, geom, params, proj, bp),
+        // ART/BART/OSEM and the regularized family (ospml_*, pml_*, tv, tikh,
+        // grad, vector) land in M2; the SIRT loop above is the shared skeleton.
+        _ => Err(Error::todo(
+            "recon iterative (ART/BART/OSEM + regularized family)",
+            "tomopy libtomo/recon/{art,bart,osem,ospml_hybrid,ospml_quad,pml_hybrid,pml_quad,tv,tikh,grad,vector}.c",
+        )),
+    }
+}
+
+/// Simultaneous Iterative Reconstruction Technique.
+///
+/// R/C-weighted update `x ← x + C ∘ Aᵀ(R ∘ (b − A x))` with `R = 1/A(1)`
+/// (per-ray length) and `C = 1/Aᵀ(1)` (per-pixel sensitivity). This is the
+/// parameter-free, convergent form of tomopy's rotation-based SIRT (which
+/// distributes the per-ray residual by `1/nx` and averages over angles —
+/// exactly `R` and `C` here). `A` = forward projector, `Aᵀ` = back-projector.
+fn sirt(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
     let nz = sino.n_rows();
+    let b = sino.to_layout(Layout::Sinogram);
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    // Ray-length weights R = 1 / A(1).
+    let ones_img = Volume::new(Array3::from_elem((nz, n, n), 1.0));
+    let mut ray = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    proj.project(&ones_img, geom, &mut ray)?;
+    let rw = ray
+        .array
+        .mapv(|v| if v.abs() > 1e-6 { 1.0 / v } else { 0.0 });
+
+    // Sensitivity weights C = 1 / Aᵀ(1).
+    let ones_sino = Tomo::new(Array3::from_elem((nz, nang, ncols), 1.0), Layout::Sinogram);
+    let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+    bp.backproject(&ones_sino, geom, &mut sens)?;
+    let cw = sens
+        .array
+        .mapv(|v| if v.abs() > 1e-6 { 1.0 / v } else { 0.0 });
 
     let mut vol = Volume::new(Array3::zeros((nz, n, n)));
-    let mut sim = sino.clone(); // forward-projection workspace / residual
-
-    // The generic SIRT/ART/MLEM skeleton: project, form a residual, back-project
-    // the correction. The per-algorithm residual/regularization math lands in M2
-    // (see docs/PORTING.md §B); the loop structure is backend-agnostic already.
+    let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
     for _ in 0..params.num_iter.max(1) {
-        proj.project(&vol, geom, &mut sim)?;
-        bp.backproject(&sim, geom, &mut vol)?;
+        proj.project(&vol, geom, &mut ax)?; // A x
+        let mut resid = &b.array - &ax.array; // b − A x
+        resid *= &rw; // R ∘ (b − A x)
+        bp.backproject(&Tomo::new(resid, Layout::Sinogram), geom, &mut corr)?;
+        vol.array += &(&cw * &corr.array); // x += C ∘ Aᵀ(…)
     }
     Ok(vol)
 }
