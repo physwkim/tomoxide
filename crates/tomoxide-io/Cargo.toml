@@ -1,0 +1,14 @@
+[package]
+name = "tomoxide-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Data I/O for tomoxide: DXchange/HDF5, TIFF, zarr readers and writers"
+
+[dependencies]
+tomoxide-core.workspace = true
+ndarray.workspace = true
+log.workspace = true
