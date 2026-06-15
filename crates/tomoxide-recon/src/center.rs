@@ -72,12 +72,50 @@ pub fn find_center_vo(
     Ok(fine_cen)
 }
 
-/// Phase-correlation between a 0°/180° pair (tomopy `rotation.py:391`).
-pub fn find_center_pc(_proj0: &[f32], _proj180: &[f32], _tol: f32) -> Result<f32> {
-    Err(Error::todo(
-        "center::find_center_pc",
-        "tomopy recon/rotation.py:391",
-    ))
+/// Phase-correlation center from a 0°/180° projection pair (tomopy
+/// `rotation.py:391`).
+///
+/// Registers `proj0` against the mirrored `proj180` by subpixel phase
+/// cross-correlation (a port of skimage `phase_cross_correlation` with
+/// `normalization="phase"` and `upsample_factor = 1/tol`) and maps the recovered
+/// column shift to a rotation center `(ncol + shift_col − 1)/2`. Because it is
+/// pure Fourier-domain image registration it never touches a projector, so it
+/// matches tomopy numerically. With the default `tol = 0.5` (upsample 2) the
+/// shift is quantized to half a pixel, so the center lands on a quarter-pixel
+/// grid exactly as tomopy's does.
+///
+/// `rotc_guess` (tomopy's pre-alignment shift) is not yet ported — the default
+/// `None` path is the workhorse; `Some(_)` returns `NotImplemented`.
+pub fn find_center_pc(
+    proj0: &Array2<f32>,
+    proj180: &Array2<f32>,
+    backend: &dyn Backend,
+    tol: f32,
+    rotc_guess: Option<f32>,
+) -> Result<f32> {
+    if rotc_guess.is_some() {
+        return Err(Error::todo(
+            "center::find_center_pc (rotc_guess pre-alignment)",
+            "tomopy recon/rotation.py:419 (ndimage.shift) — not yet ported",
+        ));
+    }
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    let (nrow, ncol) = proj0.dim();
+    if proj180.dim() != (nrow, ncol) {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{nrow}x{ncol}"),
+            found: format!("{}x{}", proj180.dim().0, proj180.dim().1),
+        });
+    }
+    // reference = proj0, moving = fliplr(proj180); imgshift == 0 (rotc_guess None).
+    let mov = fliplr(proj180);
+    let upsample = 1.0f64 / tol as f64;
+    let (_shift_row, shift_col) = phase_cross_correlation(proj0, &mov, upsample, fft)?;
+    let center = (ncol as f64 + shift_col - 1.0) / 2.0;
+    Ok(center as f32)
 }
 
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
@@ -86,6 +124,159 @@ pub fn find_center_sift(_proj0: &[f32], _proj180: &[f32]) -> Result<f32> {
         "center::find_center_sift",
         "tomocupy find_center.py:99",
     ))
+}
+
+// ----------------------------------------------------------------------------
+// Phase-correlation internals (private). Port of skimage
+// `registration/_phase_cross_correlation.py` for the 2-D, real-input,
+// `normalization="phase"`, `disambiguate=False` path that tomopy's
+// `find_center_pc` uses. Only the registration shift is needed (tomopy discards
+// the error/phasediff), so `CCmax`/amplitudes are not computed.
+// ----------------------------------------------------------------------------
+
+/// `numpy.fft.fftfreq(n, d)` — sample frequencies for an `n`-point DFT.
+fn fftfreq(n: usize, d: f64) -> Vec<f64> {
+    let nn = n as f64;
+    let cut = (n - 1) / 2; // (n-1)//2 — last positive-frequency index
+    (0..n)
+        .map(|k| {
+            let idx = if k <= cut { k as f64 } else { k as f64 - nn };
+            idx / (nn * d)
+        })
+        .collect()
+}
+
+/// Register `moving` to `reference` by phase cross-correlation. Returns the
+/// `(row, col)` shift; with `upsample_factor > 1` the half-pixel refinement is a
+/// direct matrix-multiply upsampled DFT (skimage `_upsampled_dft`).
+fn phase_cross_correlation(
+    reference: &Array2<f32>,
+    moving: &Array2<f32>,
+    upsample_factor: f64,
+    fft: &dyn Fft,
+) -> Result<(f64, f64)> {
+    use std::f64::consts::PI;
+    let (nrow, ncol) = reference.dim();
+    let n = nrow * ncol;
+
+    // Forward 2-D FFTs (unnormalized — matches scipy `fftn`).
+    let mut rf = vec![Complex32::new(0.0, 0.0); n];
+    let mut mf = vec![Complex32::new(0.0, 0.0); n];
+    for i in 0..nrow {
+        for j in 0..ncol {
+            rf[i * ncol + j] = Complex32::new(reference[[i, j]], 0.0);
+            mf[i * ncol + j] = Complex32::new(moving[[i, j]], 0.0);
+        }
+    }
+    fft.fft_2d(&mut rf, nrow, ncol, 1, false)?;
+    fft.fft_2d(&mut mf, nrow, ncol, 1, false)?;
+
+    // image_product = rf · conj(mf), phase-normalized: divide by
+    // max(|·|, 100·eps) with f32 eps (scipy uses the complex64 real dtype).
+    let eps100 = 100.0 * f32::EPSILON as f64;
+    let mut pr = vec![0.0f64; n];
+    let mut pi = vec![0.0f64; n];
+    for k in 0..n {
+        let (ar, ai) = (rf[k].re as f64, rf[k].im as f64);
+        let (br, bi) = (mf[k].re as f64, mf[k].im as f64);
+        let re = ar * br + ai * bi; // a · conj(b)
+        let im = ai * br - ar * bi;
+        let denom = (re * re + im * im).sqrt().max(eps100);
+        pr[k] = re / denom;
+        pi[k] = im / denom;
+    }
+
+    // Whole-pixel peak: argmax|ifft2(image_product)| (C-order, first max wins).
+    let mut cc = vec![Complex32::new(0.0, 0.0); n];
+    for k in 0..n {
+        cc[k] = Complex32::new(pr[k] as f32, pi[k] as f32);
+    }
+    fft.fft_2d(&mut cc, nrow, ncol, 1, true)?;
+    let (mut best, mut peak) = (-1.0f64, 0usize);
+    for (k, c) in cc.iter().enumerate() {
+        let m = (c.re as f64).hypot(c.im as f64);
+        if m > best {
+            best = m;
+            peak = k;
+        }
+    }
+    let (r0, c0) = ((peak / ncol) as f64, (peak % ncol) as f64);
+
+    // Wrap to a signed shift about the midpoint `fix(axis/2)`.
+    let mut shift_r = if r0 > (nrow as f64 / 2.0).trunc() {
+        r0 - nrow as f64
+    } else {
+        r0
+    };
+    let mut shift_c = if c0 > (ncol as f64 / 2.0).trunc() {
+        c0 - ncol as f64
+    } else {
+        c0
+    };
+
+    if upsample_factor > 1.0 {
+        // Refine on an upsampled grid via the matrix-multiply DFT of
+        // conj(image_product) — data = (pr, −pi).
+        shift_r = (shift_r * upsample_factor).round() / upsample_factor;
+        shift_c = (shift_c * upsample_factor).round() / upsample_factor;
+        let region_f = (upsample_factor * 1.5).ceil();
+        let region = region_f as usize;
+        let dftshift = (region_f / 2.0).trunc();
+        let off_r = dftshift - shift_r * upsample_factor;
+        let off_c = dftshift - shift_c * upsample_factor;
+        let freq_c = fftfreq(ncol, upsample_factor);
+        let freq_r = fftfreq(nrow, upsample_factor);
+
+        // D1[a][r] = Σ_c exp(−2πi (a−off_c) freq_c[c]) · conj(prod)[r][c].
+        let mut d1r = vec![0.0f64; region * nrow];
+        let mut d1i = vec![0.0f64; region * nrow];
+        for a in 0..region {
+            for r in 0..nrow {
+                let (mut sre, mut sim) = (0.0f64, 0.0f64);
+                for (c, &fc) in freq_c.iter().enumerate() {
+                    let ang = -2.0 * PI * (a as f64 - off_c) * fc;
+                    let (ks, kc) = ang.sin_cos();
+                    let idx = r * ncol + c;
+                    let (dre, dim) = (pr[idx], -pi[idx]); // conj(image_product)
+                    sre += kc * dre - ks * dim;
+                    sim += kc * dim + ks * dre;
+                }
+                d1r[a * nrow + r] = sre;
+                d1i[a * nrow + r] = sim;
+            }
+        }
+        // D2[b][a] = Σ_r exp(−2πi (b−off_r) freq_r[r]) · D1[a][r]; argmax|D2|.
+        let (mut bestup, mut mb, mut ma) = (-1.0f64, 0usize, 0usize);
+        for b in 0..region {
+            for a in 0..region {
+                let (mut sre, mut sim) = (0.0f64, 0.0f64);
+                for (r, &fr) in freq_r.iter().enumerate() {
+                    let ang = -2.0 * PI * (b as f64 - off_r) * fr;
+                    let (ks, kc) = ang.sin_cos();
+                    let (dre, dim) = (d1r[a * nrow + r], d1i[a * nrow + r]);
+                    sre += kc * dre - ks * dim;
+                    sim += kc * dim + ks * dre;
+                }
+                let m = (sre * sre + sim * sim).sqrt();
+                if m > bestup {
+                    bestup = m;
+                    mb = b;
+                    ma = a;
+                }
+            }
+        }
+        shift_r += (mb as f64 - dftshift) / upsample_factor;
+        shift_c += (ma as f64 - dftshift) / upsample_factor;
+    }
+
+    // A unit-length axis carries no shift information.
+    if nrow == 1 {
+        shift_r = 0.0;
+    }
+    if ncol == 1 {
+        shift_c = 0.0;
+    }
+    Ok((shift_r, shift_c))
 }
 
 // ----------------------------------------------------------------------------
