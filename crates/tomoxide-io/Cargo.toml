@@ -16,6 +16,8 @@ log.workspace = true
 # Default features include `deflate` (flate2), so gzip-compressed DXchange
 # datasets read out of the box.
 rust-hdf5 = "0.2"
+# Pure-Rust TIFF encoder/decoder (image-rs) for per-slice reconstruction output.
+tiff = "0.11"
 
 [dev-dependencies]
 ndarray-npy.workspace = true

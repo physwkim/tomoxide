@@ -6,8 +6,13 @@
 //! scaffold; see `docs/PORTING.md` §G.
 #![forbid(unsafe_code)]
 
-use ndarray::Array3;
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::Path;
+
+use ndarray::{Array3, Axis};
 use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, Hdf5Error};
+use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
 use tomoxide_core::data::{Dataset, Frames, Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 
@@ -337,12 +342,72 @@ fn ensure_le(byte_order: ByteOrder) -> Result<()> {
     }
 }
 
-/// Create a writer for the given output format (stub).
-pub fn create_writer(_path: &str, _format: SaveFormat) -> Result<Box<dyn VolumeWriter>> {
-    Err(Error::todo(
-        "io::create_writer",
-        "tomocupy dataio/writer.py:103 (tiff/h5/zarr)",
-    ))
+/// Create a writer for the given output format.
+///
+/// Only [`SaveFormat::Tiff`] is implemented (per-slice 32-bit float TIFF, the
+/// tomocupy default output); `H5`/`Zarr` remain stubs. For TIFF, `path` is the
+/// filename **prefix** — slice `i` is written to `{path}_{i:05}.tiff`, matching
+/// tomocupy `dataio/writer.py:281` (`{fnameout}_{fid:05}.tiff`). The parent
+/// directory of `path` is created if missing.
+pub fn create_writer(path: &str, format: SaveFormat) -> Result<Box<dyn VolumeWriter>> {
+    match format {
+        SaveFormat::Tiff => Ok(Box::new(TiffWriter::new(path)?)),
+        SaveFormat::H5 => Err(Error::todo(
+            "io::create_writer (h5)",
+            "tomocupy dataio/writer.py:282",
+        )),
+        SaveFormat::Zarr => Err(Error::todo(
+            "io::create_writer (zarr)",
+            "tomocupy dataio/writer.py:294",
+        )),
+    }
+}
+
+/// Per-slice 32-bit-float TIFF writer (tomocupy `dataio/writer.py:281`).
+struct TiffWriter {
+    /// Filename prefix; slice `i` → `{prefix}_{i:05}.tiff`.
+    prefix: String,
+}
+
+impl TiffWriter {
+    fn new(path: &str) -> Result<Self> {
+        // Create the prefix's parent directory (tomocupy os.makedirs).
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::Io(format!("create dir {}: {e}", parent.display())))?;
+            }
+        }
+        Ok(Self {
+            prefix: path.to_string(),
+        })
+    }
+}
+
+impl VolumeWriter for TiffWriter {
+    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()> {
+        let (nz, ny, nx) = vol.dims();
+        if start > end || end > nz {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: slice range [{start}, {end}) out of bounds for {nz} slices"
+            )));
+        }
+        for i in start..end {
+            // Slice i is [y, x], contiguous row-major (x fastest) in z-major
+            // Volume storage — exactly TIFF's width=nx, height=ny order.
+            let slice = vol.array.index_axis(Axis(0), i);
+            let buf: Vec<f32> = slice.iter().copied().collect();
+
+            let fname = format!("{}_{i:05}.tiff", self.prefix);
+            let file =
+                File::create(&fname).map_err(|e| Error::Io(format!("create {fname}: {e}")))?;
+            let mut enc = TiffEncoder::new(BufWriter::new(file))
+                .map_err(|e| Error::Io(format!("tiff encoder {fname}: {e}")))?;
+            enc.write_image::<Gray32Float>(nx as u32, ny as u32, &buf)
+                .map_err(|e| Error::Io(format!("tiff write {fname}: {e}")))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
