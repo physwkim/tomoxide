@@ -164,50 +164,96 @@ impl Elementwise for CpuBackend {
 // ----------------------------------------------------------------------------
 
 impl FbpFilter for CpuBackend {
-    /// Build a half-spectrum apodized ramp filter of length `n`.
+    /// Build the full frequency-domain apodized ramp filter for a projection of
+    /// width `n`.
     ///
-    /// Window set matches tomopy/tomocupy. The exact quadrature weighting of
-    /// tomocupy `fbp_filter.calc_filter` (`_wint`) is reconciled in milestone M1;
-    /// this is the standard ramp×window form.
+    /// The returned kernel has length `pad = (2·n).next_power_of_two()` — the
+    /// projection is zero-padded to `pad` before transforming so the ramp
+    /// convolution does not wrap around — and is laid out in `rustfft` (fftfreq)
+    /// order, symmetric about the Nyquist bin. The ramp magnitude `r` runs `0`
+    /// at DC to `1` at Nyquist; `name` apodizes it. The window set matches
+    /// tomopy/tomocupy; exact `_wint` quadrature weighting is reconciled when
+    /// tomopy golden data is available.
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
         if n == 0 {
             return Err(Error::InvalidParam("filter length must be > 0".into()));
         }
-        let mut f = vec![0.0f32; n];
+        let pad = (2 * n).next_power_of_two();
         let pi = std::f32::consts::PI;
-        for (i, slot) in f.iter_mut().enumerate() {
-            // normalized frequency in [0, 1]
-            let w = i as f32 / n as f32;
-            let ramp = w;
+        let mut f = vec![0.0f32; pad];
+        for (k, slot) in f.iter_mut().enumerate() {
+            // |fftfreq| bin index, then r = normalized frequency in [0, 1].
+            let fk = if k <= pad / 2 { k } else { pad - k };
+            let r = 2.0 * fk as f32 / pad as f32;
+            let ramp = r;
             *slot = match name {
                 FilterName::None => 1.0, // identity: no apodization, no ramp
                 FilterName::Ramp => ramp,
                 FilterName::Shepp => {
-                    let x = pi * w / 2.0;
+                    let x = pi * r / 2.0;
                     if x == 0.0 {
                         ramp
                     } else {
                         ramp * (x.sin() / x)
                     }
                 }
-                FilterName::Cosine => ramp * (pi * w / 2.0).cos(),
+                FilterName::Cosine => ramp * (pi * r / 2.0).cos(),
                 FilterName::Cosine2 => {
-                    let c = (pi * w / 2.0).cos();
+                    let c = (pi * r / 2.0).cos();
                     ramp * c * c
                 }
-                FilterName::Hamming => ramp * (0.54 + 0.46 * (pi * w).cos()),
-                FilterName::Hann => ramp * 0.5 * (1.0 + (pi * w).cos()),
-                FilterName::Parzen => ramp * (1.0 - w).powi(3),
+                FilterName::Hamming => ramp * (0.54 + 0.46 * (pi * r).cos()),
+                FilterName::Hann => ramp * 0.5 * (1.0 + (pi * r).cos()),
+                FilterName::Parzen => ramp * (1.0 - r).powi(3),
             };
         }
         Ok(f)
     }
 
-    fn apply(&self, _sino: &mut Tomo<f32>, _filter: &[f32], _geom: &Geometry) -> Result<()> {
-        Err(Error::todo(
-            "cpu FbpFilter::apply (FFT + center shift)",
-            "tomocupy reconstruction/fbp_filter.py:54; cfunc_filter.cu",
-        ))
+    /// Apply `filter` to every projection of `sino` in place.
+    ///
+    /// Each `(row, angle)` line along the detector axis is zero-padded to
+    /// `filter.len()`, forward-transformed, multiplied by the (real) filter,
+    /// inverse-transformed, and the leading `n_cols` real samples are written
+    /// back. Ramp filtering is a shift-invariant 1-D convolution, so the
+    /// rotation center is handled entirely by the back-projector, not here —
+    /// `geom` is unused.
+    fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], _geom: &Geometry) -> Result<()> {
+        let pad = filter.len();
+        if pad == 0 {
+            return Err(Error::InvalidParam("empty filter".into()));
+        }
+        let ncols = sino.n_cols();
+        if pad < ncols {
+            return Err(Error::ShapeMismatch {
+                expected: format!(">= {ncols} (n_cols)"),
+                found: pad.to_string(),
+            });
+        }
+        let mut planner = FftPlanner::<f32>::new();
+        let fwd = planner.plan_fft_forward(pad);
+        let inv = planner.plan_fft_inverse(pad);
+        let norm = 1.0 / pad as f32;
+        let mut buf = vec![Complex32::new(0.0, 0.0); pad];
+        // Axis 2 is the detector column in both layouts, so each lane is one
+        // projection regardless of row/angle ordering.
+        for mut lane in sino.array.lanes_mut(Axis(2)) {
+            for slot in buf.iter_mut() {
+                *slot = Complex32::new(0.0, 0.0);
+            }
+            for (i, &v) in lane.iter().enumerate() {
+                buf[i] = Complex32::new(v, 0.0);
+            }
+            fwd.process(&mut buf);
+            for (c, &w) in buf.iter_mut().zip(filter.iter()) {
+                *c *= w;
+            }
+            inv.process(&mut buf);
+            for (i, slot) in lane.iter_mut().enumerate() {
+                *slot = buf[i].re * norm;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -349,11 +395,37 @@ mod tests {
     }
 
     #[test]
-    fn ramp_filter_is_linear_in_frequency() {
+    fn ramp_filter_is_padded_and_symmetric() {
         let f = CpuBackend.make_filter(FilterName::Ramp, 8).unwrap();
-        assert_eq!(f.len(), 8);
-        assert_eq!(f[0], 0.0);
-        assert!(f[4] > f[2] && f[2] > f[1]);
+        assert_eq!(f.len(), 16); // (2·8) is already a power of two
+        assert_eq!(f[0], 0.0); // DC zeroed by the ramp
+                               // Rises monotonically to the Nyquist bin (k = 8), then mirrors down.
+        assert!(f[8] > f[4] && f[4] > f[2] && f[2] > f[1]);
+        assert!((f[8] - 1.0).abs() < 1e-6); // pure ramp == 1 at Nyquist
+        for k in 1..8 {
+            assert!((f[k] - f[16 - k]).abs() < 1e-6, "asymmetry at {k}");
+        }
+    }
+
+    #[test]
+    fn fbp_none_filter_is_identity() {
+        // The `None` filter is all ones, so apply() must reproduce the input
+        // exactly (this validates the zero-pad / FFT / crop machinery itself;
+        // the ramp's correctness is proven by the FBP round-trip test).
+        let arr = ndarray::Array3::from_shape_fn((1, 1, 16), |(_, _, k)| (k as f32 * 0.4).sin());
+        let orig = arr.clone();
+        let mut s = Tomo::new(arr, Layout::Sinogram);
+        let kernel = CpuBackend.make_filter(FilterName::None, 16).unwrap();
+        let geom = Geometry::parallel(
+            tomoxide_core::geometry::Angles::uniform(1, 0.0, std::f32::consts::PI),
+            16,
+            1,
+            1.0,
+        );
+        CpuBackend.apply(&mut s, &kernel, &geom).unwrap();
+        for (a, b) in s.array.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
     }
 
     #[test]
