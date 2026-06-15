@@ -121,7 +121,11 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   `mean(|fftshift(fft2)|)` metric → coarse 0.5-px + fine cubic-B-spline search,
   with the >4e6 column-downsample fast path). Projector-independent, so it
   matches tomopy 1.15.3 **exactly (Δ = 0)** across 4 parity cases — true
-  cross-impl parity, unlike fbp. ⬜ `find_center`, `find_center_pc`,
+  cross-impl parity, unlike fbp. ✅ `find_center_pc` (phase-correlation of the
+  0°/mirrored-180° pair — a port of skimage `phase_cross_correlation`, phase
+  normalization + `1/tol` upsampled-DFT subpixel refinement; projector-
+  independent, matches tomopy **exactly (Δ = 0)** across 4 cases incl. two
+  subpixel; `rotc_guess` pre-alignment not yet ported). ⬜ `find_center`,
   `write_center`, `find_center_sift` (still stubs).
 - `tomoxide-io`: DXchange HDF5 reader/writer + TIFF.
 

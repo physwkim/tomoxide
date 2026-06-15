@@ -85,7 +85,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 |-------------------------|-------------------------------------------|--------|
 | `center::find_center`   | tomopy `recon/rotation.py:82` (entropy)   | stub   |
 | `center::find_center_vo`| tomopy `recon/rotation.py:205` (Vo coarse+fine) | CPU ✓ — tomopy parity Δ=0 |
-| `center::find_center_pc`| tomopy `recon/rotation.py:391` (phase corr) | stub |
+| `center::find_center_pc`| tomopy `recon/rotation.py:391` (phase corr; skimage `phase_cross_correlation`) | CPU ✓ — tomopy parity Δ=0 (`rotc_guess` path not ported) |
 | `center::write_center`  | tomopy `recon/rotation.py:438`            | stub   |
 | `center::find_center_sift` | tomocupy `find_center.py:99`           | stub   |
 | `center::find_center_ai`| tomocupy `find_center.py:86` (+`ai/inference.py`) | stub |

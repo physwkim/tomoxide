@@ -71,13 +71,21 @@ below by dependency and value — the first three close the end-to-end pipeline.
 - ✅ **`find_center_vo` (the workhorse) — done.** Sinogram-domain Vo method,
   matches tomopy 1.15.3 exactly (Δ = 0) on 4 parity cases
   (`center_parity.rs`, golden from `tools/gen_tomopy_center_golden.py`).
+- ✅ **`find_center_pc` — done.** Phase-correlation of the 0°/mirrored-180°
+  pair: a port of skimage `phase_cross_correlation` (`normalization="phase"`,
+  `upsample_factor = 1/tol`) — forward FFTs, phase-normalized cross-power
+  spectrum, whole-pixel argmax, then a 3×3 matrix-multiply upsampled-DFT subpixel
+  refinement. Projector-independent and (with tol=0.5) quantized to a quarter-
+  pixel center, so it matches tomopy 1.15.3 **exactly (Δ = 0)** on 4 cases
+  including two subpixel (`center_pc_parity.rs`, golden from
+  `tools/gen_tomopy_center_pc_golden.py`). The `rotc_guess` pre-alignment
+  (`ndimage.shift`) is not yet ported — `Some(_)` returns `NotImplemented`.
 - **Remaining stubs:** `crates/tomoxide-recon/src/center.rs` — `find_center`
-  (entropy, `rotation.py:82`), `find_center_pc` (phase-correlation,
-  `rotation.py:391`), `write_center` (`rotation.py:438`), `find_center_sift`
-  (defer to M7, needs SIFT/AI; tomocupy `find_center.py:99`).
-- **Done (each) =** for `find_center`/`find_center_pc`, recover a known injected
-  center offset on a phantom sinogram within ±0.5 px (compare to tomopy where a
-  golden can be generated, as `find_center_vo` does).
+  (entropy, `rotation.py:82`), `write_center` (`rotation.py:438`),
+  `find_center_sift` (defer to M7, needs SIFT/AI; tomocupy `find_center.py:99`).
+- **Done (each) =** for `find_center`, recover a known injected center offset on
+  a phantom sinogram within ±0.5 px (compare to tomopy where a golden can be
+  generated, as `find_center_vo`/`find_center_pc` do).
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 
