@@ -13,6 +13,7 @@ members = [
     "crates/tomoxide-core",
     "crates/tomoxide-cpu",
     "crates/tomoxide-cuda",
+    "crates/tomoxide-wgpu",
 ]
 
 [workspace.package]
