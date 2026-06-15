@@ -123,11 +123,12 @@ fn iterative(
         ),
         Algorithm::Grad => grad(sino, geom, params, proj, bp),
         Algorithm::Tikh => tikh(sino, geom, params, proj, bp),
+        Algorithm::Tv => tv(sino, geom, params, proj, bp),
         // ART/BART are row-action (Kaczmarz) and need a single-ray primitive;
-        // tv/vector land later in M2.
+        // vector lands later in M2.
         _ => Err(Error::todo(
-            "recon iterative (ART/BART + tv/vector)",
-            "tomopy libtomo/recon/{art,bart,tv,vector}.c",
+            "recon iterative (ART/BART + vector)",
+            "tomopy libtomo/recon/{art,bart,vector}.c",
         )),
     }
 }
@@ -632,6 +633,102 @@ fn tikh(
         })?
     };
     gradient_descent(sino, geom, params, proj, bp, Some((reg1, prior)))
+}
+
+/// Total-variation regularized least squares (tomopy `tv.c`), a Chambolle–Pock
+/// primal–dual solver of `min_x ½‖r·R x − b‖² + λ·TV(x)`.
+///
+/// Per iteration: ascend the two dual variables from the extrapolated primal
+/// point `x̄` — the isotropic TV dual `pᵀᵛ ← Π_{‖·‖≤λ}(pᵀᵛ + c·∇x̄)` (forward
+/// differences, pointwise projection onto the λ-ball) and the data dual
+/// `pᵈ ← (pᵈ + c(r·R x̄ − b))/(1+c)` — then a primal step
+/// `xₙ ← x_old − c·r·Rᵀ(pᵈ) + c·div(pᵀᵛ)` and the θ=1 over-relaxation
+/// `x̄ ← 2xₙ − x_old`. `λ = reg_par[0]` is the TV strength; `c = 0.35` is tomopy's
+/// fixed primal–dual step. As in `grad`, `x` lives in the r-scaled domain
+/// (`r = 1/√(ncols·nang/2)`) and is rescaled by `r` on return, the back-projector's
+/// `π/nang` factor is divided back out for the raw adjoint, and the result is the
+/// final extrapolated point `x̄` (matching tomopy, which returns `recon`). No
+/// positivity constraint.
+///
+/// The projector-model caveat from `grad` applies: tomopy's `r` and the hardcoded
+/// `c = 0.35` (the Chambolle–Pock step, where convergence wants `c²·‖K‖² ≤ 1` for
+/// `K = [r·R; ∇]`) are tuned for tomopy's Siddon projector. Unlike `grad`'s unit
+/// fixed step, this iteration stays stable (finite) for this crate's linear-interp
+/// adjoint pair across the tested `λ`/iteration range, but the numeric result
+/// still differs from tomopy by the projector model.
+fn tv(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let b = sino.to_layout(Layout::Sinogram);
+    let nz = b.n_rows();
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
+    let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
+    let lambda = params.reg_par.first().copied().unwrap_or(1.0); // TV strength
+    const C: f32 = 0.35; // tomopy's fixed primal–dual step
+
+    let mut xbar = Volume::new(Array3::zeros((nz, n, n))); // extrapolated primal (recon)
+    let mut x = Array3::<f32>::zeros((nz, n, n)); // primal iterate (update)
+    let mut p0x = Array3::<f32>::zeros((nz, n, n)); // TV dual, x-gradient
+    let mut p0y = Array3::<f32>::zeros((nz, n, n)); // TV dual, y-gradient
+    let mut pd = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram); // data dual
+    let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    let mut bpv = Volume::new(Array3::zeros((nz, n, n)));
+
+    for _ in 0..params.num_iter.max(1) {
+        proj.project(&xbar, geom, &mut ax)?; // R x̄
+
+        // Data dual: pᵈ ← (pᵈ + c·r·R x̄ − c·b)/(1+c).
+        ndarray::Zip::from(&mut pd.array)
+            .and(&ax.array)
+            .and(&b.array)
+            .for_each(|q, &a, &d| *q = (*q + C * r * a - C * d) / (1.0 + C));
+        bp.backproject(&pd, geom, &mut bpv)?; // (π/nang)·Rᵀ(pᵈ)
+
+        for z in 0..nz {
+            // TV dual ascent on x̄, then project onto the λ-ball (interior stencil;
+            // the last row/col of pᵀᵛ stay 0, matching tomopy's loop bounds).
+            let xb = xbar.array.index_axis(Axis(0), z);
+            for iy in 0..n.saturating_sub(1) {
+                for ix in 0..n.saturating_sub(1) {
+                    let px = p0x[[z, iy, ix]] + C * (xb[[iy, ix + 1]] - xb[[iy, ix]]);
+                    let py = p0y[[z, iy, ix]] + C * (xb[[iy + 1, ix]] - xb[[iy, ix]]);
+                    let upd = ((px * px + py * py).sqrt() / lambda).max(1.0);
+                    p0x[[z, iy, ix]] = px / upd;
+                    p0y[[z, iy, ix]] = py / upd;
+                }
+            }
+            // Primal step xₙ = x_old − c·r·Rᵀ(pᵈ) + c·div(pᵀᵛ), then x̄ = 2xₙ − x_old.
+            for iy in 0..n {
+                for ix in 0..n {
+                    let x_old = x[[z, iy, ix]];
+                    let mut u = x_old - C * r * adj_scale * bpv.array[[z, iy, ix]];
+                    u += if ix == 0 {
+                        C * p0x[[z, iy, 0]]
+                    } else {
+                        C * (p0x[[z, iy, ix]] - p0x[[z, iy, ix - 1]])
+                    };
+                    u += if iy == 0 {
+                        C * p0y[[z, 0, ix]]
+                    } else {
+                        C * (p0y[[z, iy, ix]] - p0y[[z, iy - 1, ix]])
+                    };
+                    x[[z, iy, ix]] = u;
+                    xbar.array[[z, iy, ix]] = 2.0 * u - x_old;
+                }
+            }
+        }
+    }
+
+    xbar.array.mapv_inplace(|v| v * r); // back to the unscaled domain
+    Ok(xbar)
 }
 
 #[cfg(test)]

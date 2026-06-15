@@ -666,3 +666,77 @@ fn tikh_zero_prior_shrinks_energy() {
         "tikh ridge destroyed the reconstruction: r = {corr:.4}"
     );
 }
+
+#[test]
+fn tv_reconstructs_phantom() {
+    // Chambolle–Pock TV reconstruction of the piecewise-constant phantom. TV
+    // imposes no positivity, so the full signed phantom is the target.
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 200,
+        reg_par: vec![0.01], // TV strength
+        ..Default::default()
+    };
+    let rec = recon::recon(&sino, &geom, Algorithm::Tv, &params, &cpu).unwrap();
+    let s = rec.array.index_axis(Axis(0), 0).to_owned();
+
+    assert!(
+        s.iter().all(|v| v.is_finite()),
+        "TV produced non-finite values"
+    );
+    let corr = pearson_disk(&s, &phantom, n, 0.85);
+    eprintln!("TV (λ=0.01, 200 iters) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "TV correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+#[test]
+fn tv_stronger_lambda_smooths() {
+    // At matched iterations a larger TV strength yields a smoother reconstruction
+    // (lower roughness over the disk) while still reconstructing the phantom.
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |lambda| ReconParams {
+        num_gridx: Some(n),
+        num_iter: 200,
+        reg_par: vec![lambda],
+        ..Default::default()
+    };
+    let weak = recon::recon(&sino, &geom, Algorithm::Tv, &p(0.01), &cpu).unwrap();
+    let strong = recon::recon(&sino, &geom, Algorithm::Tv, &p(0.5), &cpu).unwrap();
+
+    let weak_s = weak.array.index_axis(Axis(0), 0).to_owned();
+    let strong_s = strong.array.index_axis(Axis(0), 0).to_owned();
+    let rough_weak = roughness_disk(&weak_s, n, 0.85);
+    let rough_strong = roughness_disk(&strong_s, n, 0.85);
+    let corr_strong = pearson_disk(&strong_s, &phantom, n, 0.85);
+    eprintln!(
+        "TV smoothing: roughness weak(λ=0.01) = {rough_weak:.4}, strong(λ=0.5) = {rough_strong:.4}, strong r = {corr_strong:.4}"
+    );
+    assert!(
+        rough_strong < rough_weak,
+        "stronger TV did not smooth: {rough_strong:.4} >= {rough_weak:.4}"
+    );
+    assert!(
+        corr_strong > 0.8,
+        "strong-TV reconstruction degraded too far: r = {corr_strong:.4}"
+    );
+}

@@ -76,7 +76,13 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
   default zero prior) it is bit-identical to `grad`; a positive weight toward a
   zero prior shrinks the reconstruction energy (449 → 102 on the disk) while
   still tracking the phantom. Shares the `gradient_descent` core with `grad`.
-- ⬜ `tv`/`vector`.
+- ✅ `Tv` — total-variation regularized least squares (`tv.c`), a Chambolle–Pock
+  primal–dual solver (isotropic TV dual projected to the `reg_par[0]`-ball, L2
+  data dual, θ=1 over-relaxation, fixed step `c = 0.35`). Reconstructs the
+  piecewise-constant phantom to r = 0.95 (λ=0.01, 200 iters); a larger λ smooths
+  flat regions (roughness 0.34 → 0.22). Stable for this projector across the
+  tested λ/iteration range despite the `grad` normalization caveat.
+- ⬜ `vector`.
 - ⬜ `art`/`bart` — row-action (Kaczmarz) methods: recon is updated after every
   single ray, so they need a single-ray projector primitive (not the
   whole-sinogram `ForwardProject`/`FilteredBackproject` the others compose).
