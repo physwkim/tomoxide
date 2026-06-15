@@ -1,0 +1,172 @@
+# tomoxide — Next Steps
+
+Actionable backlog after the M2 scalar iterative family. This is the working
+to-do list; the milestone framing lives in [`ROADMAP.md`](ROADMAP.md) and the
+per-module upstream map in [`PORTING.md`](PORTING.md). Every task below cites the
+exact stub `file:line` in this repo and the upstream reference to port from.
+
+_Status as of 2026-06-15: M0 (scaffold), M1 (FBP/gridrec, tomopy-verified),
+and the M2 **scalar** iterative family (sirt, mlem, osem, pml/ospml quad &
+hybrid, grad, tikh, tv, art, bart) are complete and pushed to `origin/main`
+(`679828e`)._
+
+---
+
+## Conventions for every task here
+
+Each task is its own commit with a round-trip / parity test, the same way the
+M2 family was done. Before declaring any one done:
+
+- `cargo fmt --all`, then `cargo clippy -p <crate> --all-targets -- -D warnings`
+  and `cargo nextest run -p <crate>` for the touched crate(s); escalate to
+  `--workspace` on cross-crate API changes and before any push.
+- **Define "done" as a verifiable check** (stated per task below), not prose.
+- **Projector-model caveat carries forward.** Anything compared to tomopy
+  numerically inherits the linear-interp-vs-Siddon gap (see PORTING). Prefer
+  self-consistency / golden-data parity; `gridrec` is the only model-independent
+  numeric reference so far.
+- New third-party dependencies (HDF5, TIFF, FFT-of-real helpers) are **not**
+  added without asking first.
+
+---
+
+## Option A — Finish M2: vector tomography (deferred)
+
+The only remaining M2 method. Out of scope of the scalar `recon()` contract:
+it takes **multiple** tilt datasets in and returns a **vector field** out.
+
+- **Stub:** `crates/tomoxide-recon/src/lib.rs:141` (the `_ =>` arm of the
+  iterative dispatch) — `vector` / `vector2` / `vector3`.
+- **Upstream:** tomopy `libtomo/recon/vector.c` (`vector`, `vector2`, `vector3`).
+- **Blocker / needs sign-off:** a separate API surface (multi-dataset in,
+  `Vec`-of-`Volume` or vector-field out) outside `recon()`. Decide the public
+  shape before coding — this is an architectural addition, not a drop-in arm.
+- **Done =** reconstruct a synthetic vector phantom from ≥2 tilt series; each
+  component round-trips to the known field within tolerance.
+
+Niche relative to Option B; recommended only if there is a concrete vector-data
+consumer.
+
+---
+
+## Option B — M3: Preprocessing & center finding (CPU)  ← recommended
+
+This is the milestone that makes tomoxide usable on **real** data. ROADMAP goal:
+_a full CPU pipeline: HDF in → preprocess → center → FBP → TIFF out._ Ordered
+below by dependency and value — the first three close the end-to-end pipeline.
+
+### B1. I/O bookends — `tomoxide-io`  (unblocks real data in/out)
+
+- **Stubs:** `crates/tomoxide-io/src/lib.rs:57` `open_dxchange` (HDF5 reader),
+  `:65` `create_writer` (TIFF / HDF5 / Zarr).
+- **Upstream:** tomocupy `dataio/reader.py:59`, `dataio/writer.py:103`.
+- **Needs sign-off (dependency):** HDF5 binding crate (`hdf5`/`hdf5-metno`) and
+  a TIFF crate (`tiff`). Pick TIFF-writer first (no native lib, pure Rust) so a
+  reconstruction can be saved before the HDF5 reader lands.
+- **Done =** write a `Volume` to per-slice TIFF and read it back bit-equal;
+  open a checked-in small DXchange `.h5` and recover the known data/theta shapes.
+
+### B2. Center finding — `tomoxide-recon::center`  (unblocks correct recon)
+
+- **Stubs:** `crates/tomoxide-recon/src/center.rs` — `find_center_vo:21`
+  (the workhorse), `find_center:8` (entropy), `find_center_pc:33`
+  (phase-correlation), `find_center_sift:42` (defer to M7, needs SIFT/AI).
+- **Upstream:** tomopy `recon/rotation.py:205` (`_search_coarse`/`_search_fine`)
+  for Vo; `:82` entropy; `:391` phase-correlation. tomocupy `find_center.py:99`
+  for SIFT.
+- **Order:** `find_center_vo` first — it is what real pipelines call.
+- **Done =** on a phantom sinogram with a known injected center offset,
+  `find_center_vo` recovers it within ±0.5 px; reconstructing at the found
+  center beats reconstructing at `n/2` (sharper edges / lower roughness).
+
+### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
+
+- **Stubs:** `crates/tomoxide-prep/src/stripe.rs:13` Fw (Fourier-Wavelet),
+  `:17` Ti (Titarenko), `:21` Sf (smoothing-filter), `:25` VoAll (Vo all).
+- **Upstream:** tomopy `prep/stripe.py:88` (Fw), `:179` (Ti),
+  `libtomo/prep/stripe.c` (Sf); tomocupy `remove_stripe.remove_all_stripe`
+  (Vo-all). Fw needs a 1-D wavelet (db-family) — check if a Rust crate is
+  acceptable or port the lifting scheme (sign-off on the dependency).
+- **Order:** Vo-all (best quality, what real data uses) or Sf (simplest, no
+  wavelet) first.
+- **Done =** inject a synthetic stripe into a sinogram; the chosen method
+  reduces the column-variance of the stripe by a stated factor without blurring
+  legitimate features; reconstruction shows fewer ring artifacts (roughness over
+  a flat annulus drops).
+
+### B4. Phase retrieval — `tomoxide-prep::phase`
+
+- **Stubs:** `crates/tomoxide-prep/src/phase.rs:15` Paganin, `:19` GPaganin,
+  `:23` Farago.
+- **Upstream:** tomopy `prep/phase.py:80`; tomocupy
+  `retrieve_phase.paganin_filter:59`, `farago_filter:110`.
+- **Note:** Paganin is an FFT-domain `1/(1+α k²)` filter — reuses the existing
+  `Fft` capability; mind the same real-FFT/normalization conventions as the FBP
+  filter.
+- **Done =** Paganin filter on a flat projection is a no-op up to DC; on an
+  edge phantom it monotonically reduces high-frequency content; matches a
+  checked-in tomopy golden within projector-model tolerance.
+
+### B5. Rank filters — `CpuBackend: RankFilter`  (completes the prep family)
+
+- **Stubs:** `crates/tomoxide-cpu/src/lib.rs:570` `median3d`, `:577`
+  `remove_outlier`. (The `prep::median_filter3d` / `prep::remove_outlier`
+  wrappers already exist at `filters.rs:50,61` but error because this backend
+  capability is unimplemented.)
+- **Upstream:** tomopy `libtomo/misc/median_filt3d.c`;
+  `misc/corr.py:413` `remove_outlier3d`.
+- **Done =** `median3d` removes salt-and-pepper spikes from a volume (spike
+  count → 0) while preserving a smooth ramp; `remove_outlier` replaces only
+  pixels exceeding `diff` from the local median.
+
+### B6. Ring removal — `tomoxide-recon::ring`
+
+- **Stub:** `crates/tomoxide-recon/src/ring.rs:16` `remove_ring`
+  (polar-transform, full C signature already mirrored).
+- **Upstream:** tomopy `libtomo/misc/remove_ring.c`; `misc/corr.py:751`.
+- **Done =** a reconstructed slice with an injected ring has the ring removed
+  (radial-profile spike flattened) without smearing real structure.
+
+### B7. Lower-priority polish (M3 tail)
+
+- **Beam hardening** — `crates/tomoxide-prep/src/hardening.rs:11`
+  `beam_correct`; tomocupy `processing/external/hardening.py:50`. Needs
+  material/spectrum config; defer unless a dataset needs it.
+- **Sim noise** — `crates/tomoxide-sim/src/lib.rs:43` `add_gaussian`, `:51`
+  `add_poisson`; tomopy `sim/project.py:110,136`. Small; useful for robustness
+  tests of the iterative solvers.
+
+**M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
+→ fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
+pipeline integration test.
+
+---
+
+## After M3 (context, not yet actionable)
+
+- **M4 — CUDA backend** (parity: tomocupy): C-ABI shim over `cfunc_*`, `nvcc`
+  gated on the `cuda` feature. `crates/tomoxide-cuda` currently advertises the
+  device but has no compute path.
+- **M5 — Streaming pipeline:** `crates/tomoxide/src/pipeline.rs:60`
+  `ReconSteps::run` (tomocupy `rec_steps.py:116`). Chunking, double buffering,
+  3-stage overlap.
+- **M6 — wgpu/Metal:** WGSL ports of the FBP filter, backprojection,
+  elementwise; runs the GPU path on Apple Silicon.
+- **M7 — Laminography, beam hardening, AI center (`find_center_sift`), f16,
+  zarr, benchmarks.**
+
+---
+
+## Suggested sequence
+
+1. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
+   dep).
+2. **B2 `find_center_vo`** — correctness on real geometry.
+3. **B1 HDF5 reader** — real data in; closes the bookends.
+4. **B3 stripe (Vo-all or Sf)** → **B4 Paganin** → **B5 rank filters** →
+   **B6 ring** — the artifact-correction family, highest-value first.
+5. Wire the **M3 end-to-end pipeline integration test**.
+6. B7 polish, then M4+.
+
+Each step is one commit + one test, full-workspace pass before any push, and
+push only on explicit confirmation.
