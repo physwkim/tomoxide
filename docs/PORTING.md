@@ -103,7 +103,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `normalize::darkflat`             | tomocupy `proc_functions.darkflat_correction:55`  | all     | partial |
 | `stripe::remove_stripe_fw`        | tomopy `prep/stripe.py:88`; tomocupy `remove_stripe.remove_stripe_fw` | CPU/GPU | stub |
 | `stripe::remove_stripe_ti`        | tomopy `prep/stripe.py:179`; tomocupy `remove_stripe_ti` | CPU/GPU | stub |
-| `stripe::remove_stripe_sf`        | tomopy `prep/stripe.py:333`; `libtomo/prep/stripe.c` (`remove_stripe_sf`) | CPU | stub |
+| `stripe::remove_stripe_sf`        | tomopy `prep/stripe.py:333`; `libtomo/prep/stripe.c` (`remove_stripe_sf`) | CPU | CPU ✓ — tomopy parity (bit-exact) |
 | `stripe::remove_stripe_based_sorting` | tomopy `prep/stripe.py:363` (Vo alg. 3)       | CPU     | stub    |
 | `stripe::remove_stripe_based_filtering` | tomopy `prep/stripe.py:437` (Vo alg. 2)     | CPU     | stub    |
 | `stripe::remove_stripe_based_fitting` | tomopy `prep/stripe.py:520` (Vo alg. 1)       | CPU     | stub    |

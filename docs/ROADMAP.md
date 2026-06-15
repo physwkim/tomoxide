@@ -107,8 +107,9 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
 - `prep`: `minus_log`, `normalize*` done; ✅ Paganin `retrieve_phase` (FFT
   low-pass on padded radiographs; matches tomopy to f32 round-off, max rel
   Δ≈2.4e-7); ✅ `median_filter3d` + `remove_outlier3d` dezinger (clamp-to-center
-  `(2r+1)³` median; bit-exact tomopy parity). ⬜ stripe-removal family (`fw`,
-  `ti`, `sf`, Vo sorting/filtering/fitting), `remove_ring`.
+  `(2r+1)³` median; bit-exact tomopy parity); ✅ `remove_stripe_sf` (smoothing-
+  filter stripe removal; bit-exact tomopy parity). ⬜ rest of the stripe family
+  (`fw`, `ti`, Vo sorting/filtering/fitting, vo-all), `remove_ring`.
 - `center`: ✅ `find_center_vo` (Nghia Vo, the primary/workhorse) — sinogram-
   domain Fourier method (anisotropic-Gaussian denoise → double-wedge-masked
   `mean(|fftshift(fft2)|)` metric → coarse 0.5-px + fine cubic-B-spline search,

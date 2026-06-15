@@ -81,15 +81,20 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 
-- **Stubs:** `crates/tomoxide-prep/src/stripe.rs:13` Fw (Fourier-Wavelet),
-  `:17` Ti (Titarenko), `:21` Sf (smoothing-filter), `:25` VoAll (Vo all).
-- **Upstream:** tomopy `prep/stripe.py:88` (Fw), `:179` (Ti),
-  `libtomo/prep/stripe.c` (Sf); tomocupy `remove_stripe.remove_all_stripe`
-  (Vo-all). Fw needs a 1-D wavelet (db-family) — check if a Rust crate is
-  acceptable or port the lifting scheme (sign-off on the dependency).
-- **Order:** Vo-all (best quality, what real data uses) or Sf (simplest, no
-  wavelet) first.
-- **Done =** inject a synthetic stripe into a sinogram; the chosen method
+- ✅ **Sf (smoothing-filter) — done.** Direct port of tomopy
+  `libtomo/prep/stripe.c::remove_stripe_sf` (per-slice column-mean over angles →
+  clamp-to-edge width-`size` moving average → subtract the residual). Same-order
+  f32 arithmetic, so it matches tomopy 1.15.3 **bit-for-bit** on size 3/5
+  (`stripe_sf_parity.rs`, golden from `tools/gen_tomopy_stripe_sf_golden.py`).
+- **Remaining stubs:** `crates/tomoxide-prep/src/stripe.rs` — Fw (Fourier-
+  Wavelet), Ti (Titarenko), VoAll (Vo all).
+- **Upstream:** tomopy `prep/stripe.py:88` (Fw), `:179` (Ti); tomocupy
+  `remove_stripe.remove_all_stripe` (Vo-all). Fw needs a 1-D wavelet (db-family)
+  — check if a Rust crate is acceptable or port the lifting scheme (sign-off on
+  the dependency).
+- **Order:** Vo-all (best quality, what real data uses) next; Fw last (wavelet
+  dependency).
+- **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
   a flat annulus drops).
@@ -160,9 +165,9 @@ pipeline integration test.
 3. **B1 TIFF writer** — so any reconstruction is saveable (smallest, no native
    dep).
 4. **B1 HDF5 reader** — real data in; closes the bookends.
-5. ✅ **B5 rank filters** — done (tomopy parity, bit-exact). Remaining
-   artifact-correction family, highest-value first: **B3 stripe (Vo-all or Sf)**
-   → **B6 ring**.
+5. ✅ **B5 rank filters** + ✅ **B3 stripe Sf** — done (tomopy parity, bit-exact).
+   Remaining artifact-correction family, highest-value first: **B3 stripe
+   (Vo-all, then Fw)** → **B6 ring**.
 6. Wire the **M3 end-to-end pipeline integration test**.
 7. B7 polish, then M4+.
 
