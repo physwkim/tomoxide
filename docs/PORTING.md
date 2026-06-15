@@ -196,6 +196,13 @@ inference. Reconstruction algorithms exposed: `fourierrec`, `lprec`, `linerec`
 (GPU) plus tomopy's analytic+iterative set on CPU; modes `full`, `try`,
 `try_lamino`.
 
+The M3 CPU chain (`open_dxchange → normalize/minus_log → remove_stripe →
+find_center_vo → fbp → TIFF out`) is verified end-to-end by
+`crates/tomoxide/tests/pipeline_e2e.rs` (`m3_pipeline_hdf_to_tiff`) on one
+DXchange fixture: `find_center_vo = 63.500` (Δ=0 vs the Vo golden), FBP recovery
+vs the phantom Pearson `r = 0.8727`, TIFF round-trip bit-exact. The streaming
+orchestration above (`ReconFull/Steps/Try`) is M5, still stubbed.
+
 ---
 
 ## Notes on faithful porting
