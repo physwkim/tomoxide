@@ -572,9 +572,22 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `scl=0`, NaN pixels); errors only on an empty stack. 4 cases
   (positive/negative-dominated, symmetric, small-magnitude) pass at 0
   bit-mismatches. `scale_parity.rs`, golden from the **real tomopy**
-  `tools/gen_tomopy_scale_golden.py`. (The rest of `prep/alignment.py` —
-  `blur_edges` [sqrt → round-off floor], `shift_images`/`add_jitter` [skimage
-  warp], `align_seq`/`align_joint` — stays unported.)
+  `tools/gen_tomopy_scale_golden.py`.
+- ✅ **Edge blurring** — `alignment::blur_edges` (tomopy `prep/alignment.py:482`).
+  Done. Multiplies every projection image by a radial feather mask: within a
+  projection `rad = √((row−dy/2)² + (col−dz/2)²)`, the mask is `1` where
+  `rad < low·rad_max`, `0` where `rad > high·rad_max`, and a linear ramp
+  `(rmax−rad)/(rmax−rmin)` between (`rmin = low·rad_max`, `rmax = high·rad_max`).
+  Unlike the `sin`/`cos`/`exp` ports, `√` is **IEEE-correctly-rounded** so
+  `np.sqrt == f64::sqrt` bit-for-bit (no round-off floor); `arr**2 == x·x` for
+  f64 and the in-place `float32 *= float64` is the f64 product cast to f32 (both
+  verified in the golden env), so the result is **bit-exact (Δ=0)**. The mask is
+  built by the same sequential assignment as upstream, so a degenerate `low>high`
+  also matches. `blur_edges_parity.rs` covers the default `(0, 0.8)` and
+  `(0.2, 0.9)`, golden from the **real tomopy**
+  `tools/gen_tomopy_blur_edges_golden.py`. (The rest of `prep/alignment.py` —
+  `shift_images`/`add_jitter` [skimage warp], `align_seq`/`align_joint` — stays
+  unported.)
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
