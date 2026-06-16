@@ -19,7 +19,7 @@ pub mod phase;
 pub mod stripe;
 mod wavelet;
 
-pub use morph::{sino_360_to_180, Rotation};
+pub use morph::{downsample, sino_360_to_180, upsample, Rotation};
 pub use normalize::{
     minus_log, normalize, normalize_bg, normalize_dataset, normalize_nf, Averaging,
 };
