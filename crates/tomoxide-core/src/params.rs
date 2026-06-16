@@ -254,6 +254,19 @@ pub enum StripeMethod {
         /// Normalize each column by its intensity factor before correcting.
         norm: bool,
     },
+    /// Vo dead-stripe removal (tomopy `remove_dead_stripe`, Vo 2018
+    /// algorithm 6) — detects unresponsive/fluctuating columns and fills them by
+    /// per-row linear interpolation across the good columns.
+    VoDead {
+        /// Signal-to-noise ratio for stripe detection (tomopy default `3`;
+        /// greater is less sensitive).
+        snr: f32,
+        /// Median window size (tomopy default `51`).
+        size: usize,
+        /// Run the residual large-stripe pass after filling (tomopy default
+        /// `True`); `false` fills the dead columns only.
+        norm: bool,
+    },
 }
 
 /// Phase-retrieval method.

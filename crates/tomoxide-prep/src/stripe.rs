@@ -1,9 +1,9 @@
 //! Stripe-artifact removal (ports tomopy `prep/stripe.py` + tomocupy
 //! `processing/remove_stripe.py`). The Fourier-Wavelet (`Fw`), smoothing-filter
 //! (`Sf`), Titarenko (`Ti`), Vo all-stripe (`VoAll`), Vo sorting-based
-//! (`VoSort`), Vo filtering-based (`VoFilter`), and Vo large-stripe (`VoLarge`)
-//! methods are implemented. See `docs/PORTING.md` §D. Dispatch on
-//! [`StripeMethod`].
+//! (`VoSort`), Vo filtering-based (`VoFilter`), Vo large-stripe (`VoLarge`), and
+//! Vo dead-stripe (`VoDead`) methods are implemented. See `docs/PORTING.md` §D.
+//! Dispatch on [`StripeMethod`].
 
 use ndarray::Array2;
 use tomoxide_core::data::{Layout, Tomo};
@@ -46,6 +46,7 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
             drop_ratio,
             norm,
         } => remove_large_stripe(data, snr, size, drop_ratio, norm),
+        StripeMethod::VoDead { snr, size, norm } => remove_dead_stripe(data, snr, size, norm),
     }
 }
 
@@ -747,8 +748,9 @@ fn bracket(goodx: &[usize], xmiss: usize) -> (usize, f64) {
 
 /// `_rs_dead` (Vo algorithm 6): detect unresponsive/fluctuating columns, fill
 /// them by per-row linear interpolation across good columns (the `kx=ky=1`
-/// `RectBivariateSpline`), then pass through `_rs_large` for residual stripes.
-fn rs_dead(sino: &Array2<f32>, snr: f32, size: usize) -> Array2<f32> {
+/// `RectBivariateSpline`), then — only when `norm` is set — pass through
+/// `_rs_large` for residual stripes (tomopy gates the residual pass on `norm`).
+fn rs_dead(sino: &Array2<f32>, snr: f32, size: usize, norm: bool) -> Array2<f32> {
     let (nrow, ncol) = sino.dim();
     let sinosmooth = uniform_filter1d_axis0(sino, 10);
     let mut listdiff = vec![0.0f32; ncol];
@@ -790,7 +792,13 @@ fn rs_dead(sino: &Array2<f32>, snr: f32, size: usize) -> Array2<f32> {
         }
     }
 
-    rs_large(&work, snr, size, 0.1, true)
+    // Residual large-stripe pass — tomopy runs it only when `norm is True`; the
+    // inner `_rs_large` always uses its own defaults (drop_ratio=0.1, norm=True).
+    if norm {
+        rs_large(&work, snr, size, 0.1, true)
+    } else {
+        work
+    }
 }
 
 /// `_rs_sort` (Vo algorithm 3, `dim = 1`): sort each column, median-smooth the
@@ -846,7 +854,8 @@ fn remove_all_stripe(data: &mut Tomo<f32>, snr: f32, la_size: usize, sm_size: us
                 sino[[p, c]] = proj.array[[p, m, c]];
             }
         }
-        let sino = rs_dead(&sino, snr, la_size);
+        // VoAll always runs the residual large-stripe pass (tomopy default norm=True).
+        let sino = rs_dead(&sino, snr, la_size, true);
         let sino = rs_sort(&sino, sm_size);
         for p in 0..nproj {
             for c in 0..ncol {
@@ -895,6 +904,46 @@ fn remove_large_stripe(
             }
         }
         let sino = rs_large(&sino, snr, size, drop_ratio, norm);
+        for p in 0..nproj {
+            for c in 0..ncol {
+                proj.array[[p, m, c]] = sino[[p, c]];
+            }
+        }
+    }
+
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+/// Vo dead-stripe removal (tomopy `remove_dead_stripe`, Vo 2018 algorithm 6).
+///
+/// For each sinogram slice apply `_rs_dead`: smooth each detector column over
+/// projections (`uniform_filter1d` width 10), score each column by its summed
+/// deviation from that smooth, detect the unresponsive/fluctuating columns
+/// (`_detect_stripe` + 1-px dilation, the two border columns never flagged), and
+/// fill the flagged columns by per-row linear interpolation across the good
+/// columns (the `kx=ky=1` `RectBivariateSpline`). When `norm` is set a residual
+/// `_rs_large` pass then removes wide stripes. The bilinear fill (and the
+/// `norm`-gated residual factor division) are arithmetic, so this is held to the
+/// f32 round-off floor. Shares the `rs_dead`/`rs_large` helpers with `VoAll`.
+fn remove_dead_stripe(data: &mut Tomo<f32>, snr: f32, size: usize, norm: bool) -> Result<()> {
+    let target = data.layout;
+    // tomopy operates on `tomo[:, m, :]` = `[proj, col]` slices of the
+    // `[proj, row, col]` projection-layout stack.
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, nrows, ncol) = proj.array.dim();
+    if nproj < 2 || nrows == 0 || ncol < 4 || size == 0 {
+        return Ok(());
+    }
+
+    for m in 0..nrows {
+        let mut sino = Array2::<f32>::zeros((nproj, ncol));
+        for p in 0..nproj {
+            for c in 0..ncol {
+                sino[[p, c]] = proj.array[[p, m, c]];
+            }
+        }
+        let sino = rs_dead(&sino, snr, size, norm);
         for p in 0..nproj {
             for c in 0..ncol {
                 proj.array[[p, m, c]] = sino[[p, c]];
