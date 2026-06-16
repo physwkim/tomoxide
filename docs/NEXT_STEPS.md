@@ -343,6 +343,17 @@ below by dependency and value — the first three close the end-to-end pipeline.
   golden from `tools/gen_tomopy_rankfilter_golden.py`).
 - **Upstream:** tomopy `libtomo/misc/median_filt3d.c`;
   `misc/corr.py:355,413` (`median_filter3d`, `remove_outlier3d`).
+- ✅ **`median_filter_nonfinite` — done.** Port of tomopy `misc/corr.py:281`
+  (pure NumPy): replace each non-finite value (NaN/±inf) with the median of the
+  finite values in its `size×size` neighbourhood along the last two axes. Per
+  projection the medians read a snapshot taken before any write (tomopy's
+  `projection_copy`), so adjacent bad pixels don't see each other's fixes; the
+  window is clamped to the slice with bounds `i ± size/2` (even `size` →
+  odd `2·(size/2)+1` width, as upstream); `np.median` on float32 returns float32
+  (odd → middle order statistic, even → f32 mean of the two middles), and an
+  all-non-finite kernel errors. Medians are order-free, so it matches tomopy
+  1.15.3 **bit-for-bit (Δ=0)** for size 3/5 (`median_nonfinite_parity.rs`, golden
+  from `tools/gen_tomopy_median_nonfinite_golden.py`). `prep::filters::median_filter_nonfinite`.
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
