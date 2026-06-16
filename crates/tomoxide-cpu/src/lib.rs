@@ -164,7 +164,8 @@ impl Elementwise for CpuBackend {
 }
 
 // ----------------------------------------------------------------------------
-// FBP filter — kernel construction is real; application needs the FFT (TODO).
+// FBP filter — apodized ramp construction + rfft/irfft application with the
+// folded rotation-centre phase and edge-replicate padding (fbp_filter_center).
 // ----------------------------------------------------------------------------
 
 impl FbpFilter for CpuBackend {
