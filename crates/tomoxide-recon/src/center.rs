@@ -1,6 +1,7 @@
 //! Rotation-center finding (ports tomopy `recon/rotation.py` + tomocupy
 //! `find_center.py`). `find_center` (entropy), `find_center_vo` (Nghia Vo's
-//! method), and `find_center_pc` (phase correlation) are implemented;
+//! method), `find_center_pc` (phase correlation), and `write_center`
+//! (reconstruct a slice across a range of centers) are implemented;
 //! `find_center_sift` remains a stub. See `docs/PORTING.md` §C.
 
 use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
@@ -193,6 +194,103 @@ pub fn find_center_sift(_proj0: &[f32], _proj180: &[f32]) -> Result<f32> {
     ))
 }
 
+/// Reconstruct one slice across a range of rotation centers (tomopy
+/// `rotation.py:438` `write_center`).
+///
+/// Helps pick the rotation axis by eye: the `ind`-th sinogram is reconstructed
+/// with gridrec at every center in `cen_range = (start, stop, step)` (numpy
+/// `arange` semantics — values `start, start+step, …` while `< stop`; default
+/// `(ncol/2 − 5, ncol/2 + 5, 0.5)`), optionally circular-masked, and returned as a
+/// `[len(centers), n, n]` stack (`n = ncol`) alongside the center values. tomopy
+/// writes each slice to `{center:.2f}.tiff`; persist the returned stack the same
+/// way (e.g. via `tomoxide-io`) if those files are wanted — this is the
+/// I/O-free core so `tomoxide-recon` stays backend/`tomoxide-core`-only.
+///
+/// Parity scope: only the **center enumeration** is held to tomopy (Δ = 0 — it is
+/// pure `np.arange`). The reconstruction *content* goes through tomoxide's
+/// gridrec, a gridrec-*family* method (Kaiser–Bessel kernel, ramp weight; see
+/// `gridrec.rs`), so the slice pixels are self-consistent gridrec
+/// reconstructions, **not** bit-identical to tomopy's PSWF + `parzen` `gridrec`.
+///
+/// `ind` selects the slice (default `n_rows/2`, tomopy `dy//2`); `mask` applies a
+/// `ratio`-scaled circular mask (tomopy `mask`/`ratio`, default `ratio = 1`).
+pub fn write_center(
+    tomo: &Tomo<f32>,
+    theta: &[f32],
+    backend: &dyn Backend,
+    cen_range: Option<(f32, f32, f32)>,
+    ind: Option<usize>,
+    mask: bool,
+    ratio: f32,
+) -> Result<(Vec<f32>, Array3<f32>)> {
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    let sino = tomo.to_layout(Layout::Sinogram); // [row, angle, col]
+    let (nrows, nang, ncol) = sino.array.dim();
+    if theta.len() != nang {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{nang} angles"),
+            found: format!("{} theta", theta.len()),
+        });
+    }
+    if nrows == 0 || nang == 0 || ncol == 0 {
+        return Ok((Vec::new(), Array3::zeros((0, ncol, ncol))));
+    }
+    let ind = ind.unwrap_or(nrows / 2).min(nrows - 1);
+
+    // Center range (numpy `arange`). Default: `arange(ncol/2 − 5, ncol/2 + 5, 0.5)`
+    // (tomopy `rotation.py:548`).
+    let (start, stop, step) = match cen_range {
+        Some((a, b, s)) => (a as f64, b as f64, s as f64),
+        None => {
+            let half = ncol as f64 / 2.0;
+            (half - 5.0, half + 5.0, 0.5)
+        }
+    };
+    let centers = arange(start, stop, step);
+
+    // Reconstruct the same slice at each center (tomopy replicates `tomo[:, ind, :]`
+    // into a stack and reconstructs with per-slice centers).
+    let slc = Tomo::new(
+        sino.array
+            .index_axis(Axis(0), ind)
+            .to_owned()
+            .insert_axis(Axis(0)),
+        Layout::Sinogram,
+    );
+    let n = ncol; // tomopy num_gridx = dx
+    let mut stack = Array3::<f32>::zeros((centers.len(), n, n));
+    for (m, &c) in centers.iter().enumerate() {
+        let mut rec = recon_at(&slc, theta, c as f32, n, fft)?; // [1, n, n]
+        if mask {
+            let mut img = rec.index_axis_mut(Axis(0), 0);
+            circ_mask_inplace_ratio(&mut img, ratio as f64);
+        }
+        stack
+            .index_axis_mut(Axis(0), m)
+            .assign(&rec.index_axis(Axis(0), 0));
+    }
+    let centers: Vec<f32> = centers.iter().map(|&c| c as f32).collect();
+    Ok((centers, stack))
+}
+
+/// numpy `arange(start, stop, step)` for a positive `step`: length
+/// `⌈(stop − start)/step⌉`, value `start + i·step`.
+fn arange(start: f64, stop: f64, step: f64) -> Vec<f64> {
+    if step <= 0.0 {
+        return Vec::new();
+    }
+    let len = ((stop - start) / step).ceil();
+    let len = if len.is_finite() && len > 0.0 {
+        len as usize
+    } else {
+        0
+    };
+    (0..len).map(|i| start + i as f64 * step).collect()
+}
+
 // ----------------------------------------------------------------------------
 // Entropy center-finding internals (private). Mirrors tomopy
 // rotation.py:82-202 (`find_center`, `_adjust_hist_limits`, `_find_center_cost`)
@@ -221,15 +319,16 @@ fn recon_at(
     crate::gridrec::gridrec(sino, &geom, n, fft)
 }
 
-/// Apply tomopy's `circ_mask(rec, axis=0)` (default `ratio=1`, `val=0`) to one
-/// reconstruction slice: keep where `x²+y² < (n/2)²`, zero outside. Coordinates
-/// match `np.ogrid[0.5-n/2 : 0.5+n/2]`, i.e. cell `(i, j)` sits at
-/// `(i + 0.5 − n/2, j + 0.5 − n/2)`.
-fn circ_mask_inplace(img: &mut ArrayViewMut2<f32>) {
+/// Apply tomopy's `circ_mask(rec, axis=0, ratio, val=0)` to one reconstruction
+/// slice: keep where `x²+y² < (ratio·min(ny,nx)/2)²`, zero outside (tomopy
+/// `_get_mask`: `x²+y² < ratio²·r²`, `r = min/2`). Coordinates match
+/// `np.ogrid[0.5−n/2 : 0.5+n/2]`, i.e. cell `(i, j)` sits at
+/// `(i + 0.5 − ny/2, j + 0.5 − nx/2)`.
+fn circ_mask_inplace_ratio(img: &mut ArrayViewMut2<f32>, ratio: f64) {
     let (ny, nx) = img.dim();
     let half_y = ny as f64 / 2.0;
     let half_x = nx as f64 / 2.0;
-    let r2 = (ny.min(nx) as f64 / 2.0).powi(2);
+    let r2 = (ratio * (ny.min(nx) as f64 / 2.0)).powi(2);
     for i in 0..ny {
         let y = i as f64 + 0.5 - half_y;
         for j in 0..nx {
@@ -239,6 +338,11 @@ fn circ_mask_inplace(img: &mut ArrayViewMut2<f32>) {
             }
         }
     }
+}
+
+/// `circ_mask` with tomopy's default `ratio = 1`.
+fn circ_mask_inplace(img: &mut ArrayViewMut2<f32>) {
+    circ_mask_inplace_ratio(img, 1.0);
 }
 
 /// tomopy `_adjust_hist_min`: stretch the lower histogram bound away from zero.
