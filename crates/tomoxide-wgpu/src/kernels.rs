@@ -17,8 +17,8 @@ use tomoxide_core::geometry::{Beam, Geometry};
 use tomoxide_core::params::FilterName;
 
 use crate::shaders::{
-    BACKPROJECT_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_TRANSPOSE_WGSL, FFT_WGSL,
-    MEDFILT3D_WGSL, PROJECT_WGSL,
+    BACKPROJECT_WGSL, BLUESTEIN_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_TRANSPOSE_WGSL,
+    FFT_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
 };
 use crate::WgpuBackend;
 
@@ -384,6 +384,16 @@ struct FftParams {
     sign: f32,
 }
 
+/// Uniform block for the Bluestein convolution-multiply kernel. Padded to 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BzParams {
+    m: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 /// Uniform block for the FFT transpose kernel. Padded to 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -469,12 +479,98 @@ impl WgpuBackend {
             c.im = chunk[1] * norm;
         }
     }
+
+    /// Bluestein (chirp-z) batched 1-D DFT for an **arbitrary** length `n`, used
+    /// by [`Fft::fft_1d`] when `n` is not a power of two (the radix-2 kernel only
+    /// handles power-of-two lengths). `buf` holds `lanes` contiguous transforms
+    /// of length `n`; the result overwrites it in place. `inverse` selects the
+    /// IDFT and applies the matching `1/n` normalization (like the radix-2 path).
+    ///
+    /// A length-`n` DFT `X[k] = Σ x[j]·exp(s·2πi·jk/n)` (s = −1 forward, +1
+    /// inverse) is rewritten via `jk = (j² + k² − (k−j)²)/2` as
+    /// `X[k] = p[k]·Σ (x[j]·p[j])·h[k−j]` with chirps `p[j] = exp(s·πi·j²/n)` and
+    /// `h[m] = conj(p[|m|])` — a linear convolution evaluated by a power-of-two
+    /// circular convolution of length `m = next_power_of_two(2n−1)` (FFT both,
+    /// multiply spectra, inverse FFT). The chirps, the input premultiply, and the
+    /// output postmultiply/crop are done host-side so the `j² mod 2n` argument
+    /// reduction matches the CPU reference's precision; the three FFTs and the
+    /// spectral multiply run on the GPU in one serialized submission chain.
+    fn fft_bluestein(&self, buf: &mut [Complex32], n: usize, lanes: usize, inverse: bool) {
+        let m = (2 * n - 1).next_power_of_two();
+        let s = if inverse { 1.0f32 } else { -1.0f32 };
+        let pi = std::f32::consts::PI;
+
+        // Chirp p[j] = exp(s·πi·j²/n); reduce j² mod 2n first so the angle stays
+        // small and precise even for large j (πj²/n grows quadratically).
+        let two_n = 2 * n as u64;
+        let p: Vec<Complex32> = (0..n)
+            .map(|j| {
+                let r = ((j as u64 * j as u64) % two_n) as f32;
+                let ang = s * pi * r / n as f32;
+                Complex32::new(ang.cos(), ang.sin())
+            })
+            .collect();
+
+        // Per-lane premultiplied, zero-padded input a[l·m + j] = x[l·n + j]·p[j].
+        let mut a_host = vec![Complex32::new(0.0, 0.0); lanes * m];
+        for l in 0..lanes {
+            for j in 0..n {
+                a_host[l * m + j] = buf[l * n + j] * p[j];
+            }
+        }
+
+        // Symmetric kernel h on the length-m ring: h[0], h[±j] = conj(p[j]).
+        let mut h_host = vec![Complex32::new(0.0, 0.0); m];
+        h_host[0] = p[0].conj();
+        for j in 1..n {
+            let hj = p[j].conj();
+            h_host[j] = hj;
+            h_host[m - j] = hj;
+        }
+
+        // FFT both, multiply spectra (h broadcast across lanes), inverse FFT.
+        let a_buf = self.upload_complex("bz_a", &a_host);
+        let h_buf = self.upload_complex("bz_h", &h_host);
+        self.fft_passes(&h_buf, m, 1, false);
+        self.fft_passes(&a_buf, m, lanes, false);
+        let p_u = self.uniform(
+            "bz_p",
+            &BzParams {
+                m: m as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        );
+        self.dispatch1d(
+            BLUESTEIN_WGSL,
+            "cmul",
+            &[&a_buf, &h_buf, &p_u],
+            (lanes * m) as u32,
+        );
+        self.fft_passes(&a_buf, m, lanes, true);
+
+        // Download the (unnormalized inverse → ×m) convolution, then postmultiply
+        // by p[k], crop to n, and apply 1/m (convolution) plus 1/n (IDFT).
+        let out = self.download_f32(&a_buf, lanes * m * 2);
+        let conv_norm = 1.0 / m as f32;
+        let inv_norm = if inverse { 1.0 / n as f32 } else { 1.0 };
+        let scale = conv_norm * inv_norm;
+        for l in 0..lanes {
+            for k in 0..n {
+                let off = l * m + k;
+                let c = Complex32::new(out[2 * off], out[2 * off + 1]) * p[k];
+                buf[l * n + k] = Complex32::new(c.re * scale, c.im * scale);
+            }
+        }
+    }
 }
 
 impl Fft for WgpuBackend {
-    /// Batched 1-D radix-2 FFT. Requires a power-of-two `len` (the GPU kernel
-    /// only does radix-2); other lengths error out so the caller can fall back
-    /// to the CPU. `inverse` divides by `len`, matching the CPU backend.
+    /// Batched 1-D FFT. Power-of-two `len` runs the direct radix-2 kernel; any
+    /// other `len` runs the Bluestein chirp-z transform (also radix-2 under the
+    /// hood), so the GPU handles arbitrary lengths like the CPU backend rather
+    /// than erroring out. `inverse` divides by `len`, matching the CPU backend.
     fn fft_1d(&self, buf: &mut [Complex32], len: usize, batch: usize, inverse: bool) -> Result<()> {
         if len == 0 || batch == 0 {
             return Ok(());
@@ -485,15 +581,14 @@ impl Fft for WgpuBackend {
                 found: buf.len().to_string(),
             });
         }
-        if !len.is_power_of_two() {
-            return Err(Error::InvalidParam(format!(
-                "wgpu FFT requires a power-of-two length (got {len}); use the CPU backend"
-            )));
+        if len.is_power_of_two() {
+            let data = self.upload_complex("fft_1d", buf);
+            self.fft_passes(&data, len, batch, inverse);
+            let norm = if inverse { 1.0 / len as f32 } else { 1.0 };
+            self.download_complex(&data, buf, norm);
+        } else {
+            self.fft_bluestein(buf, len, batch, inverse);
         }
-        let data = self.upload_complex("fft_1d", buf);
-        self.fft_passes(&data, len, batch, inverse);
-        let norm = if inverse { 1.0 / len as f32 } else { 1.0 };
-        self.download_complex(&data, buf, norm);
         Ok(())
     }
 

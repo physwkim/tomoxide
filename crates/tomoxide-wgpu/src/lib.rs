@@ -564,13 +564,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     #[test]
-    fn fft_1d_rejects_non_power_of_two() {
+    fn fft_1d_bluestein_matches_cpu_for_non_power_of_two() {
+        // Non-power-of-two lengths run the Bluestein chirp-z path on the GPU
+        // (3 radix-2 FFTs of length m = next_pow2(2n−1) + chirp multiplies), so
+        // they must match rustfft (which also uses Bluestein internally) and
+        // round-trip cleanly. Forward error is taken relative to the spectrum's
+        // peak magnitude. Observed on Metal: rel ≈ 1e-7, roundtrip ≈ 1e-6; the
+        // 1e-5·peak / 1e-4 bars leave ~50× headroom yet are far tighter than a
+        // chirp/index bug (wrong sign, broken kernel symmetry) would produce.
         let be = WgpuBackend::new().expect("wgpu device init");
-        let mut buf = vec![Complex32::new(0.0, 0.0); 6];
-        assert!(matches!(
-            be.fft().unwrap().fft_1d(&mut buf, 6, 1, false),
-            Err(tomoxide_core::error::Error::InvalidParam(_))
-        ));
+        let cpu = tomoxide_cpu::CpuBackend;
+        for &(len, batch) in &[(3usize, 2usize), (5, 1), (6, 3), (12, 2), (100, 1)] {
+            let base: Vec<Complex32> = (0..len * batch)
+                .map(|k| Complex32::new((k as f32 * 0.3).sin(), (k as f32 * 0.17).cos()))
+                .collect();
+            let mut g = base.clone();
+            let mut c = base.clone();
+            be.fft().unwrap().fft_1d(&mut g, len, batch, false).unwrap();
+            cpu.fft()
+                .unwrap()
+                .fft_1d(&mut c, len, batch, false)
+                .unwrap();
+            let peak = c.iter().map(|z| z.norm()).fold(0.0f32, f32::max).max(1.0);
+            let err = g
+                .iter()
+                .zip(&c)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f32, f32::max);
+            // Round-trip: ifft(fft(x)) == x.
+            be.fft().unwrap().fft_1d(&mut g, len, batch, true).unwrap();
+            let rt = g
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "bluestein len={len}: peak={peak:.3}, fwd rel={:.3e}, roundtrip max|Δ|={rt:.3e}",
+                err / peak
+            );
+            assert!(
+                err <= 1e-5 * peak,
+                "bluestein forward len={len}: max|Δ|={err:.3e} > {:.3e}",
+                1e-5 * peak
+            );
+            assert!(rt <= 1e-4, "bluestein roundtrip len={len}: max|Δ|={rt:.3e}");
+        }
     }
 
     // --- FBP filter apply: parity vs the CPU backend ------------------------
