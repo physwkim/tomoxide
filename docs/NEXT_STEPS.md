@@ -429,6 +429,21 @@ below by dependency and value — the first three close the end-to-end pipeline.
   primitive that makes the integer-weighted `sobel_filter` bit-exact.
   `gaussian_filter_parity.rs`, golden from the **real tomopy**
   `tools/gen_tomopy_gaussian_filter_golden.py`. `prep::filters::gaussian_filter`.
+- ✅ **`sobel_filter` — done.** Port of tomopy `misc/corr.py:474`: scipy.ndimage's
+  Sobel transform on every 2-D slice along `axis` — a `[−1,0,1]`
+  central-difference correlation along the slice's last axis (the anti-symmetric
+  branch of `correlate1d_2d`) then a `[1,2,1]` smoothing correlation along the
+  other (the symmetric branch), both `mode='reflect'`. Reuses the f64
+  `correlate1d_2d` primitive built for `gaussian_filter`; the weights are exact
+  small integers and f32 inputs are exact in the f64 accumulator, so the result
+  is **bit-exact (Δ=0)** (0/2970 across all three axes). The published tomopy
+  1.15.3 wrapper cannot run — a bare `filters.sobel` (NameError; `corr.py` never
+  binds `filters`) *and* the numpy-2.x `arr[slc]` list-index `IndexError` — so the
+  golden inlines tomopy's verbatim body with exactly those two one-token compat
+  fixes (`filters.sobel → scipy.ndimage.sobel`, `arr[slc] → arr[tuple(slc)]`),
+  same dtype cast and per-slice scipy call. `sobel_filter_parity.rs`, golden from
+  the **real tomopy** `tools/gen_tomopy_sobel_filter_golden.py`.
+  `prep::filters::sobel_filter`.
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
