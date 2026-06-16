@@ -1,6 +1,7 @@
 //! Phase retrieval (ports tomopy `prep/phase.py` + tomocupy
-//! `processing/retrieve_phase.py`). Paganin single-step retrieval is
-//! implemented; `Gpaganin`/`farago` remain stubs. See `docs/PORTING.md` §D.
+//! `processing/retrieve_phase.py`). Paganin and generalized Paganin
+//! (`Gpaganin`) single-step retrieval are implemented; `farago` remains a stub.
+//! See `docs/PORTING.md` §D.
 
 use tomoxide_core::backend::{Backend, Fft};
 use tomoxide_core::data::{Layout, Tomo};
@@ -38,16 +39,42 @@ pub fn retrieve_phase(
             energy,
             alpha,
         } => {
-            let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
-                backend: backend.name(),
-                capability: "Fft",
-            })?;
-            paganin(data, pixel_size, dist, energy, alpha, fft)
+            let fft = require_fft(backend)?;
+            // Standard Paganin: `1/(λ·dist·(ix²+iy²)/(4π) + α)` over the squared
+            // reciprocal grid (tomopy/tomocupy `_paganin_filter_factor`).
+            let (dist_f, alpha_f) = (dist as f64, alpha as f64);
+            run_phase(data, pixel_size, dist, energy, fft, |ix, iy, wl| {
+                let w2 = ix * ix + iy * iy;
+                1.0 / (wl * dist_f * w2 / (4.0 * PHASE_PI) + alpha_f)
+            })
         }
-        PhaseMethod::GPaganin => Err(Error::todo(
-            "phase::retrieve_phase (Gpaganin)",
-            "tomocupy retrieve_phase (Gpaganin)",
-        )),
+        PhaseMethod::GPaganin {
+            pixel_size,
+            dist,
+            energy,
+            db,
+            w,
+        } => {
+            let fft = require_fft(backend)?;
+            // Generalized Paganin (Paganin et al. 2020): `cos`-based reciprocal
+            // grid `kf = cos(ix·2π·ps) + cos(iy·2π·ps)` and filter
+            // `1/(1 − (2·aph/W²)·(kf − 2))` with `aph = db·dist·λ/(4π)`
+            // (tomocupy `_reciprocal_gridG` + `_paganin_filter_factorG`).
+            //
+            // The grid/filter are evaluated in f32 to mirror cupy's single-
+            // precision arithmetic (`cp.cos` of a float32 grid, weak-scalar
+            // promotion). The filter is ill-conditioned — `scale ≈ 1.2e3`
+            // amplifies any rounding in `kf` — so matching the reference's actual
+            // f32 precision (rather than computing in f64) is what holds parity.
+            let (dist_f, db_f, w_f) = (dist as f64, db as f64, w as f64);
+            let two_pi_ps = (2.0 * PHASE_PI * pixel_size as f64) as f32;
+            let aph = db_f * (dist_f * wavelength(energy as f64)) / (4.0 * PHASE_PI);
+            let scale = (2.0 * aph / (w_f * w_f)) as f32;
+            run_phase(data, pixel_size, dist, energy, fft, move |ix, iy, _wl| {
+                let kf = (ix as f32 * two_pi_ps).cos() + (iy as f32 * two_pi_ps).cos();
+                (1.0f32 / (1.0 - scale * (kf - 2.0))) as f64
+            })
+        }
         PhaseMethod::Farago => Err(Error::todo(
             "phase::retrieve_phase (farago)",
             "tomocupy retrieve_phase.farago_filter:110",
@@ -82,14 +109,28 @@ fn reciprocal_coord(pixel_size: f64, num_grid: usize) -> Vec<f64> {
     rc
 }
 
+/// Resolve the backend FFT capability or report it missing.
+fn require_fft(backend: &dyn Backend) -> Result<&dyn Fft> {
+    backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })
+}
+
+/// Shared single-step phase-retrieval driver (tomopy/tomocupy `_retrieve_phase`):
+/// pad each radiograph to a power-of-two host for the Fresnel kernel, multiply by
+/// the `fftshift`ed max-normalized `combiner` filter in Fourier space, and crop
+/// back. `combiner(ix, iy, wl)` is the raw (un-normalized) filter value at
+/// reciprocal coordinates `(ix, iy)` for wavelength `wl` — the only part that
+/// differs between Paganin and generalized Paganin.
 #[allow(clippy::needless_range_loop)]
-fn paganin(
+fn run_phase(
     data: &mut Tomo<f32>,
     pixel_size: f32,
     dist: f32,
     energy: f32,
-    alpha: f32,
     fft: &dyn Fft,
+    combiner: impl Fn(f64, f64, f64) -> f64,
 ) -> Result<()> {
     let target = data.layout;
     let proj = data.to_layout(Layout::Projection); // [angle, dy, dz]
@@ -99,8 +140,7 @@ fn paganin(
     }
     let src = &proj.array;
 
-    let (ps, dist_f, energy_f, alpha_f) =
-        (pixel_size as f64, dist as f64, energy as f64, alpha as f64);
+    let (ps, dist_f, energy_f) = (pixel_size as f64, dist as f64, energy as f64);
     let wl = wavelength(energy_f);
     let pad_r = calc_pad_width(dy, ps, wl, dist_f);
     let pad_c = calc_pad_width(dz, ps, wl, dist_f);
@@ -117,16 +157,14 @@ fn paganin(
     }
     let val = (val_acc / (nproj * dy) as f64) as f32;
 
-    // Centered Paganin filter `1/(λ·dist·w2/(4π) + α)` and its max (at min w2).
+    // Centered phase filter and its max (the normalization denominator).
     let indx = reciprocal_coord(ps, nx);
     let indy = reciprocal_coord(ps, ny);
     let mut filt = vec![0.0f32; nx * ny];
     let mut maxf = f32::NEG_INFINITY;
     for i in 0..nx {
-        let ix2 = indx[i] * indx[i];
         for j in 0..ny {
-            let w2 = ix2 + indy[j] * indy[j];
-            let f = (1.0 / (wl * dist_f * w2 / (4.0 * PHASE_PI) + alpha_f)) as f32;
+            let f = combiner(indx[i], indy[j], wl) as f32;
             filt[i * ny + j] = f;
             if f > maxf {
                 maxf = f;

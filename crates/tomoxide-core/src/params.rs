@@ -235,8 +235,21 @@ pub enum PhaseMethod {
         /// Regularization parameter.
         alpha: f32,
     },
-    /// Generalized Paganin (tomocupy `Gpaganin`).
-    GPaganin,
+    /// Generalized Paganin (tomocupy `Gpaganin`, Paganin et al. 2020). Uses a
+    /// `cos`-based reciprocal grid and a `delta/beta` (`db`) + characteristic
+    /// length (`w`) filter instead of Paganin's `alpha` regularization.
+    GPaganin {
+        /// Detector pixel size (cm).
+        pixel_size: f32,
+        /// Sample-to-detector propagation distance (cm).
+        dist: f32,
+        /// X-ray energy (keV).
+        energy: f32,
+        /// Material `delta/beta` ratio.
+        db: f32,
+        /// Characteristic transverse length scale `W` (cm).
+        w: f32,
+    },
     /// Farago generalized retrieval (tomocupy `farago`).
     Farago,
 }
