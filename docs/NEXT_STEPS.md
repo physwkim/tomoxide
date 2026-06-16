@@ -208,6 +208,24 @@ below by dependency and value — the first three close the end-to-end pipeline.
   floor** (max rel ≤ 1e-5). `StripeMethod::VoLarge { snr, size, drop_ratio, norm }`;
   `stripe_volarge_parity.rs`, golden from the **real tomopy**
   `tools/gen_tomopy_stripe_volarge_golden.py` (snr=3, size=51, drop_ratio=0.1).
+- ✅ **VoDead (dead-stripe) — done.** Port of tomopy `prep/stripe.py:762`
+  `remove_dead_stripe` (Vo 2018 algorithm 6): per sinogram slice `_rs_dead`
+  smooths each detector column over projections (`uniform_filter1d` width 10),
+  scores each column by its summed deviation from that smooth, detects the
+  unresponsive/fluctuating columns (`_detect_stripe` + 1-px dilation, the two
+  border columns never flagged), and fills the flagged columns by per-row linear
+  interpolation across the good columns (the `kx=ky=1` `RectBivariateSpline`).
+  When `norm` is set a residual `_rs_large` pass then removes wide stripes.
+  **Structural change:** tomopy gates that residual pass on `norm`, but the
+  `rs_dead` helper previously hardcoded it (it only served `VoAll`, always
+  `norm=True`); a `norm` bool is now threaded through `rs_dead` and `VoAll`'s call
+  site passes `true` explicitly, so `VoAll` stays bit-identical. The bilinear fill
+  is arithmetic, so both cases hold to the **f32 round-off floor** (max rel ≤ 1e-5).
+  `snr=2` fires the dead-column detection; the two cases differ structurally on
+  the injected large stripes — `norm=true` removes them, `norm=false` leaves them
+  bit-identical to the input (Δ=0 on those columns, asserted).
+  `StripeMethod::VoDead { snr, size, norm }`; `stripe_vodead_parity.rs`, golden
+  from the **real tomopy** `tools/gen_tomopy_stripe_vodead_golden.py`.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
