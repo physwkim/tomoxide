@@ -13,6 +13,7 @@
 pub mod center;
 mod fourierrec;
 mod gridrec;
+mod lprec;
 pub mod ring;
 
 use ndarray::{Array3, Axis};
@@ -87,10 +88,18 @@ fn analytic(
         )?));
     }
 
-    // fbp / linerec / lprec: filtered back-projection. linerec is genuinely a
-    // line back-projection (tomocupy `cfunc_linerec` reduces to parallel-beam BP
-    // with linear interpolation); the distinct log-polar `lprec` port is pending
-    // (see docs/PORTING.md), so it currently shares this FBP path.
+    // lprec is the log-polar (Andersson–Carlsson–Nikitin) method: it maps the
+    // filtered sinogram into log-polar coordinates where back-projection is a 2-D
+    // FFT convolution, then resamples to the Cartesian grid (needs only the Fft
+    // capability). Faithful port of tomocupy `lprec`.
+    if algorithm == Algorithm::Lprec {
+        let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
+        return Ok(Volume::new(lprec::lprec(&filtered, geom, n, fft)?));
+    }
+
+    // fbp / linerec: filtered back-projection. linerec is genuinely a line
+    // back-projection (tomocupy `cfunc_linerec` reduces to parallel-beam BP with
+    // linear interpolation), so it shares this FBP path.
     let bp = backend
         .backprojector()
         .ok_or_else(|| missing("FilteredBackproject", backend))?;
