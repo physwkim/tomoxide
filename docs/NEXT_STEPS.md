@@ -335,12 +335,15 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B5. Rank filters — `CpuBackend: RankFilter`  (completes the prep family)
 
-- ✅ **`median3d` + `remove_outlier` — done.** Direct port of tomopy
+- ✅ **`median3d` + `remove_outlier3d` — done.** Direct port of tomopy
   `median_filt3d.c::medfilt3D_float` (clamp-to-center boundary, `(2·radius+1)³`
   window, sorted median at `total/2`; one uniform rule covers the pure-median
   and dezinger-threshold paths). Matches tomopy 1.15.3 **bit-for-bit** on 4
   parity cases — median size 3/5 and dezinger dif 0.5/5.0 (`rankfilter_parity.rs`,
-  golden from `tools/gen_tomopy_rankfilter_golden.py`).
+  golden from `tools/gen_tomopy_rankfilter_golden.py`). The facade fn and
+  `RankFilter` trait method were renamed `remove_outlier` → `remove_outlier3d`
+  (aligning to this docs name and the sibling `median3d`), freeing
+  `remove_outlier` for the 2-D corr.py:559 port below.
 - **Upstream:** tomopy `libtomo/misc/median_filt3d.c`;
   `misc/corr.py:355,413` (`median_filter3d`, `remove_outlier3d`).
 - ✅ **`median_filter_nonfinite` — done.** Port of tomopy `misc/corr.py:281`
@@ -375,9 +378,21 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `tools/gen_tomopy_median_filter_golden.py`). `prep::filters::median_filter`.
   Distinct from `median_filter3d` (3-D cube, backend-routed) and
   `median_filter_nonfinite` (NaN/±inf scrub). It is also the 2-D median primitive
-  that tomopy's `remove_outlier` (corr.py:559) reuses with a dezinger threshold;
-  that 2-D `remove_outlier` stays **blocked on a naming decision** — the
-  `remove_outlier` name is already taken by the 3-D cube `remove_outlier3d`.
+  (`median2d_reflect`) that the 2-D `remove_outlier` reuses with a dezinger
+  threshold (below).
+- ✅ **`remove_outlier` (2-D) — done.** Port of tomopy `misc/corr.py:559`: the
+  axis-chunked 2-D dezinger. For each index along `axis` the orthogonal 2-D
+  image's `size×size` median is taken (scipy.ndimage default `mode='reflect'`,
+  the shared `median2d_reflect` primitive), then a pixel is replaced by that
+  median only where `arr − median ≥ diff`. Single order statistic + plain f32
+  `where` → **bit-exact (Δ=0)**. Naming was unblocked by renaming the 3-D cube
+  dezinger `remove_outlier` → `remove_outlier3d` (a separate refactor commit);
+  `remove_outlier` now matches tomopy's public name. Golden from real tomopy
+  1.15.3 (uses `arr[tuple(slc)]`, runs on numpy 2.x). 6 cases (odd/even `size`,
+  all three axes, `dif=0`) pass at 0 bit-mismatches (`remove_outlier_parity.rs`,
+  golden from `tools/gen_tomopy_remove_outlier_golden.py`).
+  `prep::filters::remove_outlier`. Distinct from `remove_outlier3d` (3-D cube)
+  and `remove_outlier1d` (1-D mirror).
 - ✅ **`remove_outlier1d` — done.** Port of tomopy `misc/corr.py:615`: 1-D
   `size`-tap median along `axis` (scipy.ndimage `mode='mirror'`, whole-sample
   reflection — its index map verified against scipy `ni_support.c`
@@ -393,8 +408,8 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `size`, all three axes, `dif=0`) pass at 0 bit-mismatches
   (`remove_outlier1d_parity.rs`, golden from
   `tools/gen_tomopy_remove_outlier1d_golden.py`). `prep::filters::remove_outlier1d`.
-  Distinct from the existing `filters::remove_outlier` (which is the 3-D cube
-  dezinger `remove_outlier3d`, backend-routed).
+  Distinct from the 2-D `remove_outlier` (corr.py:559) and the 3-D cube
+  `remove_outlier3d` (backend-routed).
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
