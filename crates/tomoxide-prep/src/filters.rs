@@ -1,10 +1,10 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
 //! `circ_mask`/`remove_nan`/`remove_neg`/`adjust_range`/`median_filter_nonfinite`/
-//! `median_filter`/`remove_outlier1d`/`remove_outlier` are real; the 3-D rank
-//! filters (`median_filter3d`, `remove_outlier3d`) route through the backend
-//! (stubbed). See `docs/PORTING.md` §E.
+//! `median_filter`/`remove_outlier1d`/`remove_outlier`/`gaussian_filter` are
+//! real; the 3-D rank filters (`median_filter3d`, `remove_outlier3d`) route
+//! through the backend (stubbed). See `docs/PORTING.md` §E.
 
-use ndarray::Axis;
+use ndarray::{Array2, Axis};
 use tomoxide_core::backend::Backend;
 use tomoxide_core::data::{Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
@@ -310,6 +310,259 @@ pub fn remove_outlier1d(data: &mut Tomo<f32>, diff: f32, size: usize, axis: usiz
     Ok(())
 }
 
+/// Gaussian-filter every 2-D slice along `axis` (tomopy `misc/corr.py:118`
+/// `gaussian_filter`). For each index along `axis` the orthogonal 2-D image is
+/// convolved with a separable Gaussian (1-D pass along each slice axis, the
+/// intermediate stored in f32 between passes, exactly as scipy.ndimage). `sigma`
+/// is the standard deviation (applied to both slice axes), `order` the
+/// derivative order (0 = plain Gaussian; ≥1 = that derivative of a Gaussian),
+/// and `axis` (0/1/2) indexes the underlying 3-D array, matching tomopy's `axis`.
+///
+/// Faithful to scipy.ndimage: the kernel radius is `⌊4σ + 0.5⌋` (`truncate=4`),
+/// the kernel is `exp(−x²/2σ²)` normalised by numpy's f64 pairwise sum then
+/// reversed for correlation, and the convolution accumulates in f64 with
+/// scipy's exact symmetric / anti-symmetric summation branch and `mode='reflect'`
+/// (half-sample) boundaries. Because the kernel uses `exp` (a transcendental,
+/// where numpy's vectorised f64 `exp` and libm differ by ≤1 ULP), the result is
+/// held to the **f32 round-off floor** (≤1 ULP), like the Fourier stripe ports.
+/// `σ ≤ 1e-15` is a no-op copy (scipy skips such axes). Input is assumed finite.
+pub fn gaussian_filter(data: &mut Tomo<f32>, sigma: f64, order: usize, axis: usize) -> Result<()> {
+    if axis > 2 {
+        return Err(Error::InvalidParam(
+            "gaussian_filter axis must be 0, 1, or 2".into(),
+        ));
+    }
+    if sigma < 0.0 || sigma.is_nan() {
+        return Err(Error::InvalidParam(
+            "gaussian_filter sigma must be >= 0".into(),
+        ));
+    }
+    // scipy skips axes with sigma <= 1e-15; both slice axes use the same sigma,
+    // so the whole filter is then the identity.
+    if sigma <= 1e-15 {
+        return Ok(());
+    }
+    // radius lw = int(truncate*sigma + 0.5), truncate = 4.0 (scipy default).
+    let lw = (4.0 * sigma + 0.5) as usize;
+    let weights = gaussian_kernel1d(sigma, order, lw);
+    let nslices = [data.array.dim().0, data.array.dim().1, data.array.dim().2][axis];
+    for s in 0..nslices {
+        let slice = data.array.index_axis(Axis(axis), s).to_owned();
+        let filtered = gaussian_filter2d(&slice, &weights);
+        data.array.index_axis_mut(Axis(axis), s).assign(&filtered);
+    }
+    Ok(())
+}
+
+/// Separable 2-D Gaussian filter on a single slice: a 1-D `correlate1d` pass
+/// along slice-axis 0 then slice-axis 1, the intermediate stored in f32 between
+/// passes (scipy.ndimage keeps intermediates in the output dtype). `weights` is
+/// the reversed f64 kernel shared by both axes.
+fn gaussian_filter2d(slice: &Array2<f32>, weights: &[f64]) -> Array2<f32> {
+    let mut cur = correlate1d_2d(slice, weights, 0);
+    cur = correlate1d_2d(&cur, weights, 1);
+    cur
+}
+
+/// Per-axis symmetry class of a correlation kernel, mirroring scipy's
+/// `NI_Correlate1D` test (`symmetric` = 1 / −1 / 0).
+enum Sym {
+    Even,
+    Odd,
+    None,
+}
+
+/// scipy's `NI_Correlate1D` symmetry test: only odd-length kernels can be
+/// symmetric; `|fw[i+size1] − fw[size1−i]| ≤ DBL_EPSILON` ⇒ even-symmetric,
+/// `|fw[size1+i] + fw[size1−i]| ≤ DBL_EPSILON` ⇒ anti-symmetric.
+fn filter_symmetry(weights: &[f64], size1: usize) -> Sym {
+    let fsize = weights.len();
+    if fsize % 2 == 0 {
+        return Sym::None;
+    }
+    let half = fsize / 2;
+    if (1..=half).all(|i| (weights[i + size1] - weights[size1 - i]).abs() <= f64::EPSILON) {
+        return Sym::Even;
+    }
+    if (1..=half).all(|i| (weights[size1 + i] + weights[size1 - i]).abs() <= f64::EPSILON) {
+        return Sym::Odd;
+    }
+    Sym::None
+}
+
+/// One scipy.ndimage `correlate1d` pass over `img` along slice-axis `sax`
+/// (0 = down columns / 1 = across rows), accumulating in f64 (scipy's line
+/// buffers are `double`) with `mode='reflect'` (half-sample) boundaries and
+/// `origin = 0`. The symmetric / anti-symmetric / general branch — and its exact
+/// summation order — matches `NI_Correlate1D`, so integer-weight kernels (sobel)
+/// are bit-exact and Gaussian kernels reach the f32 round-off floor. `weights`
+/// is the f64 kernel already reversed for correlation by the caller.
+fn correlate1d_2d(img: &Array2<f32>, weights: &[f64], sax: usize) -> Array2<f32> {
+    let (nr, nc) = img.dim();
+    let fsize = weights.len();
+    let size1 = fsize / 2;
+    let size2 = fsize - size1 - 1;
+    let sym = filter_symmetry(weights, size1);
+    let (nr_i, nc_i) = (nr, nc);
+    let len = if sax == 0 { nr_i } else { nc_i } as isize;
+    let lines = if sax == 0 { nc_i } else { nr_i };
+    let mut out = Array2::<f32>::zeros((nr, nc));
+    for line in 0..lines {
+        // Value at position `p` along `sax` (reflect-extended), other index = line.
+        let get = |p: isize| -> f64 {
+            let q = reflect_index(p, len);
+            (if sax == 0 {
+                img[[q, line]]
+            } else {
+                img[[line, q]]
+            }) as f64
+        };
+        for ll in 0..len {
+            let acc: f64 = match sym {
+                // oline[ll] = iline[0]*fw[0] + Σ_{jj=-size1..-1}(iline[jj]±iline[-jj])*fw[jj]
+                // fw was advanced by size1, so fw[jj] = weights[size1+jj]; the loop runs
+                // jj = -size1..-1 (outermost pair first), matching scipy's order.
+                Sym::Even => {
+                    let mut a = get(ll) * weights[size1];
+                    let mut jj = -(size1 as isize);
+                    while jj < 0 {
+                        a +=
+                            (get(ll + jj) + get(ll - jj)) * weights[(size1 as isize + jj) as usize];
+                        jj += 1;
+                    }
+                    a
+                }
+                Sym::Odd => {
+                    let mut a = get(ll) * weights[size1];
+                    let mut jj = -(size1 as isize);
+                    while jj < 0 {
+                        a +=
+                            (get(ll + jj) - get(ll - jj)) * weights[(size1 as isize + jj) as usize];
+                        jj += 1;
+                    }
+                    a
+                }
+                // oline[ll] = iline[size2]*fw[size2] + Σ_{jj=-size1..size2-1} iline[jj]*fw[jj]
+                Sym::None => {
+                    let mut a = get(ll + size2 as isize) * weights[size1 + size2];
+                    let mut jj = -(size1 as isize);
+                    while jj < size2 as isize {
+                        a += get(ll + jj) * weights[(size1 as isize + jj) as usize];
+                        jj += 1;
+                    }
+                    a
+                }
+            };
+            let o = acc as f32;
+            if sax == 0 {
+                out[[ll as usize, line]] = o;
+            } else {
+                out[[line, ll as usize]] = o;
+            }
+        }
+    }
+    out
+}
+
+/// scipy.ndimage `gaussian_filter1d`'s kernel: `_gaussian_kernel1d(sigma, order,
+/// lw)` reversed for correlation. For `order 0` it is the normalised Gaussian
+/// `exp(−x²/2σ²)/Σ`; for `order ≥ 1` it is multiplied by the polynomial from
+/// scipy's derivative recurrence (`q' + q·p'`, `p'=−1/σ²`). The Gaussian is
+/// normalised with numpy's f64 pairwise sum so the weights match numpy bit-for-bit
+/// up to the `exp` round-off floor. Returns a `2·lw+1`-length f64 kernel.
+fn gaussian_kernel1d(sigma: f64, order: usize, lw: usize) -> Vec<f64> {
+    let sigma2 = sigma * sigma;
+    let n = 2 * lw + 1;
+    let f = -0.5 / sigma2;
+    // phi_x = exp(-0.5/sigma2 * x**2), x = arange(-lw, lw+1) (x**2 exact in int).
+    let mut phi: Vec<f64> = (0..n)
+        .map(|i| {
+            let xi = i as i64 - lw as i64;
+            let xx = (xi * xi) as f64;
+            (f * xx).exp()
+        })
+        .collect();
+    let s = pairwise_sum_f64(&phi);
+    for v in &mut phi {
+        *v /= s;
+    }
+    let mut kernel = if order == 0 {
+        phi
+    } else {
+        // q(x): start q = [1, 0, ..., 0]; apply Q_deriv = D + P `order` times.
+        // D[i][i+1] = i+1 (q' operator); P[i+1][i] = -1/sigma2 (q·p' operator).
+        let mut q = vec![0.0f64; order + 1];
+        q[0] = 1.0;
+        for _ in 0..order {
+            let mut nq = vec![0.0f64; order + 1];
+            for i in 0..=order {
+                // (D@q)[i] = (i+1)*q[i+1]
+                if i < order {
+                    nq[i] += ((i + 1) as f64) * q[i + 1];
+                }
+                // (P@q)[i] = (-1/sigma2)*q[i-1]
+                if i >= 1 {
+                    nq[i] += (-1.0 / sigma2) * q[i - 1];
+                }
+            }
+            q = nq;
+        }
+        // q_poly(x_i) = Σ_j x_i^j * q[j], then multiply by phi_x elementwise.
+        (0..n)
+            .map(|i| {
+                let xi = (i as i64 - lw as i64) as f64;
+                let mut acc = 0.0f64;
+                let mut xpow = 1.0f64;
+                for &qj in &q {
+                    acc += xpow * qj;
+                    xpow *= xi;
+                }
+                acc * phi[i]
+            })
+            .collect()
+    };
+    kernel.reverse();
+    kernel
+}
+
+/// numpy's f64 pairwise summation (the f64 analogue of `normalize`'s
+/// `pairwise_sum_f32`): sequential for `n < 8`, an 8-accumulator unrolled base
+/// case for `n ≤ 128`, otherwise split at `n/2` rounded down to a multiple of 8
+/// and recurse. Reproduces `np.sum`/`ndarray.mean` over f64 exactly, so a
+/// Gaussian kernel's normalisation matches numpy bit-for-bit.
+fn pairwise_sum_f64(a: &[f64]) -> f64 {
+    let n = a.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n < 8 {
+        let mut res = 0.0f64;
+        for &v in a {
+            res += v;
+        }
+        return res;
+    }
+    if n <= 128 {
+        let mut r = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]];
+        let mut i = 8;
+        while i + 8 <= n {
+            for k in 0..8 {
+                r[k] += a[i + k];
+            }
+            i += 8;
+        }
+        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        while i < n {
+            res += a[i];
+            i += 1;
+        }
+        return res;
+    }
+    let mut n2 = n / 2;
+    n2 -= n2 % 8;
+    pairwise_sum_f64(&a[..n2]) + pairwise_sum_f64(&a[n2..])
+}
+
 /// Per-slice 2-D median over the two axes orthogonal to `axis`, with a
 /// `size×size` footprint and scipy.ndimage's default `mode='reflect'`
 /// (half-sample reflection). Selects a single order statistic (rank
@@ -489,6 +742,52 @@ mod tests {
         );
         remove_outlier(&mut t, 1000.0, 3, 0).unwrap();
         assert_eq!(t.array[[0, 1, 1]], 100.0);
+    }
+
+    #[test]
+    fn gaussian_filter_rejects_bad_params() {
+        let mut t = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Projection);
+        assert!(matches!(
+            gaussian_filter(&mut t, 1.0, 0, 3),
+            Err(Error::InvalidParam(_))
+        ));
+        assert!(matches!(
+            gaussian_filter(&mut t, -1.0, 0, 0),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn gaussian_filter_zero_sigma_is_noop() {
+        // scipy skips axes with sigma <= 1e-15, so the filter is the identity.
+        let arr = Array3::from_shape_vec((1, 2, 3), vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let mut t = Tomo::new(arr.clone(), Layout::Projection);
+        gaussian_filter(&mut t, 0.0, 0, 0).unwrap();
+        assert_eq!(t.array, arr);
+    }
+
+    #[test]
+    fn gaussian_filter_smooths_spike() {
+        // One 7×7 slice (axis 0): a unit spike on a zero field. A Gaussian blur
+        // must lower the centre below 1, raise its 4-neighbours above 0, leave
+        // the centre as the global max, and (kernel sums to ~1) roughly conserve
+        // the total mass.
+        let mut slice = vec![0.0f32; 49];
+        slice[3 * 7 + 3] = 1.0;
+        let arr = Array3::from_shape_vec((1, 7, 7), slice).unwrap();
+        let before: f64 = arr.iter().map(|&v| v as f64).sum();
+        let mut t = Tomo::new(arr, Layout::Projection);
+        gaussian_filter(&mut t, 1.0, 0, 0).unwrap();
+        let c = t.array[[0, 3, 3]];
+        assert!(c > 0.0 && c < 1.0, "centre {c} not in (0,1)");
+        assert!(t.array[[0, 3, 2]] > 0.0, "neighbour not raised");
+        assert!(t.array[[0, 2, 3]] > 0.0, "neighbour not raised");
+        // Centre stays the maximum of the blurred field.
+        let max = t.array.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(c, max);
+        // Mass roughly conserved (truncation + reflect edges, so only approx).
+        let after: f64 = t.array.iter().map(|&v| v as f64).sum();
+        assert!((after - before).abs() < 0.05, "mass {before} -> {after}");
     }
 
     #[test]
