@@ -239,6 +239,21 @@ pub enum StripeMethod {
         /// Median-window dimensionality: `1` → `(size, 1)`, `2` → `(size, size)`.
         dim: u8,
     },
+    /// Vo large-stripe removal (tomopy `remove_large_stripe`, Vo 2018
+    /// algorithm 5) — detects wide stripe columns and replaces them with the
+    /// rank-smoothed column profile.
+    VoLarge {
+        /// Signal-to-noise ratio for stripe detection (tomopy default `3`;
+        /// greater is less sensitive).
+        snr: f32,
+        /// Median window size (tomopy default `51`).
+        size: usize,
+        /// Fraction of extreme pixels dropped before estimating the per-column
+        /// intensity factor (tomopy default `0.1`, clamped to `[0, 0.8]`).
+        drop_ratio: f32,
+        /// Normalize each column by its intensity factor before correcting.
+        norm: bool,
+    },
 }
 
 /// Phase-retrieval method.

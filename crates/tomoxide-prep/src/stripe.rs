@@ -1,8 +1,9 @@
 //! Stripe-artifact removal (ports tomopy `prep/stripe.py` + tomocupy
 //! `processing/remove_stripe.py`). The Fourier-Wavelet (`Fw`), smoothing-filter
 //! (`Sf`), Titarenko (`Ti`), Vo all-stripe (`VoAll`), Vo sorting-based
-//! (`VoSort`), and Vo filtering-based (`VoFilter`) methods are implemented. See
-//! `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
+//! (`VoSort`), Vo filtering-based (`VoFilter`), and Vo large-stripe (`VoLarge`)
+//! methods are implemented. See `docs/PORTING.md` §D. Dispatch on
+//! [`StripeMethod`].
 
 use ndarray::Array2;
 use tomoxide_core::data::{Layout, Tomo};
@@ -39,6 +40,12 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
         StripeMethod::VoFilter { sigma, size, dim } => {
             remove_stripe_based_filtering(data, sigma, size, dim)
         }
+        StripeMethod::VoLarge {
+            snr,
+            size,
+            drop_ratio,
+            norm,
+        } => remove_large_stripe(data, snr, size, drop_ratio, norm),
     }
 }
 
@@ -841,6 +848,53 @@ fn remove_all_stripe(data: &mut Tomo<f32>, snr: f32, la_size: usize, sm_size: us
         }
         let sino = rs_dead(&sino, snr, la_size);
         let sino = rs_sort(&sino, sm_size);
+        for p in 0..nproj {
+            for c in 0..ncol {
+                proj.array[[p, m, c]] = sino[[p, c]];
+            }
+        }
+    }
+
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+/// Vo large-stripe removal (tomopy `remove_large_stripe`, Vo 2018 algorithm 5).
+///
+/// For each sinogram slice apply `_rs_large`: sort each detector column over
+/// projections, median-smooth the sorted profile, estimate a per-column
+/// intensity factor from the central rows (`drop_ratio` of the extremes
+/// dropped), detect the wide-stripe columns (`_detect_stripe` + 1-px binary
+/// dilation), and overwrite *only* those columns with the rank-smoothed profile
+/// mapped back through the (optionally intensity-normalised) sort order. The
+/// smoothed values are pure rank-filter selections of existing f32 samples and
+/// the per-column factor is computed in the upstream op order, so this matches
+/// tomopy to the f32 round-off floor on tie-free columns. Shares the `rs_large`
+/// helper with `VoAll`.
+fn remove_large_stripe(
+    data: &mut Tomo<f32>,
+    snr: f32,
+    size: usize,
+    drop_ratio: f32,
+    norm: bool,
+) -> Result<()> {
+    let target = data.layout;
+    // tomopy operates on `tomo[:, m, :]` = `[proj, col]` slices of the
+    // `[proj, row, col]` projection-layout stack.
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, nrows, ncol) = proj.array.dim();
+    if nproj < 2 || nrows == 0 || ncol < 4 || size == 0 {
+        return Ok(());
+    }
+
+    for m in 0..nrows {
+        let mut sino = Array2::<f32>::zeros((nproj, ncol));
+        for p in 0..nproj {
+            for c in 0..ncol {
+                sino[[p, c]] = proj.array[[p, m, c]];
+            }
+        }
+        let sino = rs_large(&sino, snr, size, drop_ratio, norm);
         for p in 0..nproj {
             for c in 0..ncol {
                 proj.array[[p, m, c]] = sino[[p, c]];
