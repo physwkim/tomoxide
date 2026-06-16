@@ -588,6 +588,27 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `tools/gen_tomopy_blur_edges_golden.py`. (The rest of `prep/alignment.py` —
   `shift_images`/`add_jitter` [skimage warp], `align_seq`/`align_joint` — stays
   unported.)
+- ✅ **Morphological inpainter** — `filters::inpainter_morph` (tomopy
+  `misc/corr.py:996`, C `libtomo/misc/inpainter.c` `Inpainter_morph_main`,
+  Kazantsev 2023). Done. Fills a boolean-masked region: zero the mask, grow
+  inward from the non-empty boundary (≤`countmask` passes) until filled, then
+  `iterations` smoothing passes; `axis=None` runs the symmetric 3-D kernel,
+  `axis=Some(a)` inpaints each 2-D slice along array axis `a`. Three modes via
+  `InpaintingType`: **Mean** (`eucl_weighting`, Gaussian-distance-weighted) and
+  **Median** are deterministic and **bit-exact (Δ=0)** — the mean path's `exp`/
+  `powf` match macOS libm bit-for-bit and its f32 multiply-accumulate is fused
+  via `mul_add` to match libtomo's FMA-contracted build (a split `*`,`+` drifts
+  ≤2 ULP, the one wrinkle this port had to chase); the median path reproduces the
+  C buffer-sort quirks exactly (2-D sorts `counter_local−1`, 3-D sorts the whole
+  `window_fullength` zero-padded buffer, both pick `_values[counter_local/2]`, so
+  a boundary cell can land on the padding and stay exactly `0.0` — one golden case
+  exercises this). **Random** (rand-pair + final mean smoothing) is faithfully
+  ported but has **no bit-parity reference**: C `rand()` under OpenMP is not
+  reproducible run-to-run (verified — tomopy's own output differs each run), so it
+  uses an internal deterministic LCG and is covered structurally by unit tests.
+  `inpainter_morph_parity.rs` covers mean/median × {`axis=None`, `axis=0`} ×
+  `iterations` 0/1/2, golden from the **real tomopy**
+  `tools/gen_tomopy_inpainter_morph_golden.py`.
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
