@@ -189,6 +189,33 @@ fn fourierrec_recon_matches_cpu_on_gpu() {
 }
 
 #[test]
+fn lprec_recon_matches_cpu_on_gpu() {
+    // lprec (log-polar method) needs only the Fft capability: the precompute
+    // 1-D FFTs (lengths ntheta=128, nrho=256, Nthetalarge=512) and the runtime
+    // 2-D convolution (256×128) are all power-of-two at n=128, so the radix-2 GPU
+    // path runs the whole reconstruction with no extra kernels — only the FFT
+    // backend (wgpu vs rustfft) differs from CPU. The cubic prefilter / gather /
+    // resample are host code shared by both backends.
+    let n = 128;
+    let (sg, sc, phantom) = recon_both(Algorithm::Lprec, n, 180);
+
+    let corr = pearson_disk(&sg, &phantom, n, 0.85);
+    eprintln!("GPU lprec Pearson vs phantom = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "GPU lprec correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    // The only backend difference is the FFT (several power-of-two 1-D transforms
+    // in precompute plus the 256×128 2-D convolution per span), so GPU↔CPU agree
+    // to f32-FFT tolerance. The 1e-4 bar matches the other analytic GPU tests and
+    // is far tighter than any wiring bug (wrong FFT size/direction/layout).
+    let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
+    eprintln!("GPU vs CPU lprec: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
+    assert!(nrmse < 1e-4, "GPU vs CPU lprec NRMSE too large: {nrmse:.3e}");
+}
+
+#[test]
 fn fourierrec_non_power_of_two_recon_matches_cpu_on_gpu() {
     // n=96 drives fourierrec through both arbitrary-length GPU FFT paths: the
     // radial 1-D transform is length 96 (Bluestein chirp-z) and the 2-D inverse
