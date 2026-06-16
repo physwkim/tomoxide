@@ -1,11 +1,11 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
 //! `circ_mask`/`remove_nan`/`remove_neg`/`adjust_range`/`median_filter_nonfinite`/
 //! `median_filter`/`remove_outlier1d`/`remove_outlier`/`gaussian_filter`/
-//! `sobel_filter` are real; the 3-D rank filters (`median_filter3d`,
-//! `remove_outlier3d`) route through the backend (stubbed). See
-//! `docs/PORTING.md` §E.
+//! `sobel_filter`/`inpainter_morph` are real; the 3-D rank filters
+//! (`median_filter3d`, `remove_outlier3d`) route through the backend (stubbed).
+//! See `docs/PORTING.md` §E.
 
-use ndarray::{Array2, Axis};
+use ndarray::{Array2, Array3, Axis};
 use tomoxide_core::backend::Backend;
 use tomoxide_core::data::{Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
@@ -682,6 +682,497 @@ fn mirror_index(i: isize, n: isize) -> usize {
     m as usize
 }
 
+/// Neighbour-selection strategy for [`inpainter_morph`], mirroring tomopy's
+/// `inpainting_type` (`"mean"` → 0, `"median"` → 1, `"random"` → 2 in the C
+/// `Inpainter_morph_main`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InpaintingType {
+    /// Gaussian-distance-weighted mean of the non-empty neighbours
+    /// (`eucl_weighting_inpainting`). Deterministic.
+    Mean,
+    /// Median order statistic of the non-empty neighbours
+    /// (`median_rand_inpainting`, `method_type == 1`). Deterministic.
+    Median,
+    /// Mean of two random non-empty neighbours, then a final mean-smoothing pass
+    /// (`method_type == 2`). **Non-deterministic** (see [`inpainter_morph`]).
+    Random,
+}
+
+/// Morphological inpainter / extrapolator over the masked region of a volume
+/// (tomopy `misc/corr.py:996` `inpainter_morph`, C `libtomo/misc/inpainter.c`
+/// `Inpainter_morph_main`, Kazantsev 2023). `mask == true` marks the missing
+/// voxels; they are zeroed and then grown inward from the non-empty boundary
+/// (up to `countmask` passes) until the whole region is filled, followed by
+/// `iterations` optional smoothing passes. `size` is the neighbour-window
+/// half-width (`W_halfsize`, must be ≥ 1); `axis = None` runs the symmetric 3-D
+/// kernel, `axis = Some(a)` inpaints each 2-D slice taken along array axis `a`
+/// independently (recommended in sinogram space), exactly like upstream. The
+/// result is written back into `data.array` in place (upstream returns a fresh
+/// `out`); `data` and `mask` must have the same shape.
+///
+/// Parity: [`InpaintingType::Mean`] and [`InpaintingType::Median`] are fully
+/// deterministic and reproduce tomopy **bit-for-bit (Δ=0)** — the mean path is a
+/// fixed-order f32 Gaussian-weighted sum (`exp`/`powf` match macOS libm
+/// bit-for-bit, and the multiply-accumulate is fused via `mul_add` to match
+/// libtomo's FMA-contracted build — a split `*`+`+` drifts ≤2 ULP), and the
+/// median path reproduces the C buffer-sort quirks exactly
+/// (the 2-D branch sorts only `counter_local − 1` entries; the 3-D branch sorts
+/// the whole `window_fullength` buffer including its zero padding, then both pick
+/// `_values[counter_local / 2]`). [`InpaintingType::Random`] is faithfully ported
+/// but has **no bit-parity reference**: upstream draws from C `rand()` inside an
+/// OpenMP-parallel loop, so tomopy's own output is not reproducible run-to-run;
+/// this port uses an internal deterministic PRNG, so its `Random` output is
+/// stable but does not match any particular tomopy run.
+pub fn inpainter_morph(
+    data: &mut Tomo<f32>,
+    mask: &Array3<bool>,
+    size: usize,
+    iterations: usize,
+    inpainting: InpaintingType,
+    axis: Option<usize>,
+) -> Result<()> {
+    if size < 1 {
+        return Err(Error::InvalidParam(
+            "inpainter_morph size must be >= 1".into(),
+        ));
+    }
+    if data.array.dim() != mask.dim() {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{:?}", data.array.dim()),
+            found: format!("{:?}", mask.dim()),
+        });
+    }
+    let (d0, d1, d2) = data.array.dim();
+    if d0 == 0 || d1 == 0 || d2 == 0 {
+        return Err(Error::InvalidParam(
+            "inpainter_morph: a dimension has length zero".into(),
+        ));
+    }
+    match axis {
+        None => {
+            // 3-D inpainting over the whole volume. C `index = dimX*dimY*k +
+            // j*dimX + i` with dimX fastest ⇒ dimx=d2, dimy=d1, dimz=d0.
+            let out = {
+                let std = data.array.as_standard_layout();
+                let inp = std.as_slice().expect("standard layout is contiguous");
+                let msk: Vec<bool> = mask.iter().copied().collect();
+                inpainter_core(inp, &msk, (d2, d1, d0), iterations, size, inpainting)
+            };
+            data.array =
+                Array3::from_shape_vec((d0, d1, d2), out).expect("output length matches shape");
+        }
+        Some(a) => {
+            if a > 2 {
+                return Err(Error::InvalidParam(
+                    "inpainter_morph axis must be 0, 1, or 2 (or None)".into(),
+                ));
+            }
+            // 2-D inpainting per slice taken along axis `a` (squeeze → 2-D), with
+            // dimx = slice-axis-1 (fast), dimy = slice-axis-0, dimz = 1.
+            let n = data.array.len_of(Axis(a));
+            for m in 0..n {
+                let slice = data.array.index_axis(Axis(a), m).to_owned();
+                let mslice = mask.index_axis(Axis(a), m);
+                let (s0, s1) = slice.dim();
+                let out = {
+                    let sstd = slice.as_standard_layout();
+                    let sflat = sstd.as_slice().expect("standard layout is contiguous");
+                    let mflat: Vec<bool> = mslice.iter().copied().collect();
+                    inpainter_core(sflat, &mflat, (s1, s0, 1), iterations, size, inpainting)
+                };
+                let out2d =
+                    Array2::from_shape_vec((s0, s1), out).expect("output length matches slice");
+                data.array.index_axis_mut(Axis(a), m).assign(&out2d);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Window geometry shared by the inpainter cell kernels. `(dimx, dimy, dimz)` are
+/// the C dimensions (dimx fastest); `hw` is `W_halfsize`, `kh` the window's k
+/// half-range (0 in 2-D so the 3-D loops collapse to one plane).
+#[derive(Clone, Copy)]
+struct Geom {
+    dimx: usize,
+    dimy: usize,
+    dimz: usize,
+    hw: isize,
+    kh: isize,
+    window_fullength: usize,
+    is3d: bool,
+}
+
+impl Geom {
+    #[inline]
+    fn idx(&self, i: usize, j: usize, k: usize) -> usize {
+        self.dimx * self.dimy * k + j * self.dimx + i
+    }
+    #[inline]
+    fn in_bounds(&self, i1: isize, j1: isize, k1: isize) -> bool {
+        (0..self.dimx as isize).contains(&i1)
+            && (0..self.dimy as isize).contains(&j1)
+            && (0..self.dimz as isize).contains(&k1)
+    }
+}
+
+/// Tiny deterministic LCG (constants from Knuth's MMIX) used only for
+/// [`InpaintingType::Random`], which has no bit-parity reference (C `rand()`
+/// under OpenMP). Keeps this port's `Random` output stable run-to-run without an
+/// external RNG dependency.
+struct Lcg(u64);
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Lcg(seed)
+    }
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) as u32
+    }
+}
+
+/// Faithful reproduction of `Inpainter_morph_main` for one C-contiguous buffer of
+/// shape `(dimz, dimy, dimx)` (dimx fastest). `dimz == 1` selects the 2-D
+/// algorithm. Returns the inpainted `Output` buffer in the same C order.
+fn inpainter_core(
+    input: &[f32],
+    mask: &[bool],
+    dims: (usize, usize, usize),
+    iterations: usize,
+    hw: usize,
+    method: InpaintingType,
+) -> Vec<f32> {
+    let (dimx, dimy, dimz) = dims;
+    let mut output = input.to_vec();
+    let mut updated = input.to_vec();
+    let mut m_upd = mask.to_vec();
+
+    // Zero the masked region (and count it); inpainting only reads non-zero.
+    let mut countmask = 0usize;
+    for ((o, u), &mk) in output.iter_mut().zip(updated.iter_mut()).zip(mask.iter()) {
+        if mk {
+            *o = 0.0;
+            *u = 0.0;
+            countmask += 1;
+        }
+    }
+
+    let is3d = dimz != 1;
+    let w_fullsize = 2 * hw + 1;
+    let window_fullength = if is3d {
+        w_fullsize * w_fullsize * w_fullsize
+    } else {
+        w_fullsize * w_fullsize
+    };
+    let g = Geom {
+        dimx,
+        dimy,
+        dimz,
+        hw: hw as isize,
+        kh: if is3d { hw as isize } else { 0 },
+        window_fullength,
+        is3d,
+    };
+
+    // Gaussian distance weights, in the same nested order as the eucl
+    // accumulation so `Gauss_weights[counterglob]` lines up cell-for-cell.
+    let mut gauss = vec![0.0f32; window_fullength];
+    {
+        let denom = (2 * window_fullength) as f32;
+        let mut c = 0usize;
+        for i_m in -g.hw..=g.hw {
+            for j_m in -g.hw..=g.hw {
+                for k_m in -g.kh..=g.kh {
+                    let num =
+                        (i_m as f32).powf(2.0) + (j_m as f32).powf(2.0) + (k_m as f32).powf(2.0);
+                    gauss[c] = (-num / denom).exp();
+                    c += 1;
+                }
+            }
+        }
+    }
+
+    // Nothing to inpaint ⇒ output is the (unchanged) input copy.
+    if countmask == 0 {
+        return output;
+    }
+    let iterations_mask_complete = countmask;
+    let mut lcg = Lcg::new(0x9E37_79B9_7F4A_7C15);
+
+    // PHASE 1 — grow the masked region until complete (or the bound is hit).
+    for _l in 0..iterations_mask_complete {
+        for i in 0..dimx {
+            for j in 0..dimy {
+                for k in 0..dimz {
+                    match method {
+                        InpaintingType::Mean => {
+                            eucl_cell(&g, (i, j, k), &output, &mut updated, &mut m_upd, &gauss);
+                        }
+                        InpaintingType::Median | InpaintingType::Random => {
+                            median_rand_cell(
+                                &g,
+                                (i, j, k),
+                                &output,
+                                &mut updated,
+                                &mut m_upd,
+                                method,
+                                &mut lcg,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        output.copy_from_slice(&updated);
+        if !m_upd.iter().any(|&b| b) {
+            break;
+        }
+    }
+
+    // PHASE 2 — random's final outlier-removal mean-smoothing pass.
+    if method == InpaintingType::Random {
+        smoothing_pass(&g, mask, &output, &mut updated);
+    }
+    output.copy_from_slice(&updated);
+
+    // PHASE 3 — optional user smoothing iterations over the original mask.
+    if iterations > 0 {
+        m_upd.copy_from_slice(mask);
+        for _l in 0..iterations {
+            for i in 0..dimx {
+                for j in 0..dimy {
+                    for k in 0..dimz {
+                        match method {
+                            InpaintingType::Mean => {
+                                eucl_cell(&g, (i, j, k), &output, &mut updated, &mut m_upd, &gauss);
+                            }
+                            InpaintingType::Median | InpaintingType::Random => {
+                                median_rand_cell(
+                                    &g,
+                                    (i, j, k),
+                                    &output,
+                                    &mut updated,
+                                    &mut m_upd,
+                                    method,
+                                    &mut lcg,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            output.copy_from_slice(&updated);
+        }
+        if method == InpaintingType::Random {
+            smoothing_pass(&g, mask, &output, &mut updated);
+            output.copy_from_slice(&updated);
+        }
+    }
+
+    output
+}
+
+/// `eucl_weighting_inpainting`: Gaussian-weighted mean of the non-empty
+/// neighbours in the `±hw` window, accumulated in fixed window order (f32).
+fn eucl_cell(
+    g: &Geom,
+    pos: (usize, usize, usize),
+    output: &[f32],
+    updated: &mut [f32],
+    m_upd: &mut [bool],
+    gauss: &[f32],
+) {
+    let (i, j, k) = pos;
+    let index = g.idx(i, j, k);
+    if !m_upd[index] {
+        return;
+    }
+    if !vicinity_nonzero(g, pos, output) {
+        return;
+    }
+    let mut sum_val = 0.0f32;
+    let mut sumweights = 0.0f32;
+    let mut counter_local = 0u32;
+    let mut cg = 0usize;
+    for i_m in -g.hw..=g.hw {
+        let i1 = i as isize + i_m;
+        for j_m in -g.hw..=g.hw {
+            let j1 = j as isize + j_m;
+            for k_m in -g.kh..=g.kh {
+                let k1 = k as isize + k_m;
+                if g.in_bounds(i1, j1, k1) {
+                    let v = output[g.idx(i1 as usize, j1 as usize, k1 as usize)];
+                    if v != 0.0 {
+                        // libtomo is built with FMA contraction (Apple Silicon
+                        // clang `-ffp-contract`): `sum_val += Output*Gauss` fuses
+                        // to a single-rounded `fmaf`. Reproduce with `mul_add` to
+                        // stay bit-exact; a separate `*`+`+` drifts ≤2 ULP.
+                        sum_val = v.mul_add(gauss[cg], sum_val);
+                        sumweights += gauss[cg];
+                        counter_local += 1;
+                    }
+                }
+                cg += 1;
+            }
+        }
+    }
+    if counter_local > 0 {
+        updated[index] = sum_val / sumweights;
+        m_upd[index] = false;
+    }
+}
+
+/// `median_rand_inpainting`: median (deterministic) or random-pair (no parity
+/// reference) selection from the non-empty neighbours in the `±hw` window.
+fn median_rand_cell(
+    g: &Geom,
+    pos: (usize, usize, usize),
+    output: &[f32],
+    updated: &mut [f32],
+    m_upd: &mut [bool],
+    method: InpaintingType,
+    lcg: &mut Lcg,
+) {
+    let (i, j, k) = pos;
+    let index = g.idx(i, j, k);
+    if !m_upd[index] {
+        return;
+    }
+    // Vicinity gate: the 3×3(×3) non-empty sum must be non-zero.
+    let kr: isize = if g.is3d { 1 } else { 0 };
+    let mut vicinity_sum = 0.0f32;
+    for i_m in -1..=1 {
+        let i1 = i as isize + i_m;
+        for j_m in -1..=1 {
+            let j1 = j as isize + j_m;
+            for k_m in -kr..=kr {
+                let k1 = k as isize + k_m;
+                if g.in_bounds(i1, j1, k1) {
+                    let v = output[g.idx(i1 as usize, j1 as usize, k1 as usize)];
+                    if v != 0.0 {
+                        vicinity_sum += v;
+                    }
+                }
+            }
+        }
+    }
+    if vicinity_sum == 0.0 {
+        return;
+    }
+    // Gather non-empty neighbours into a zero-padded `window_fullength` buffer.
+    let mut values = vec![0.0f32; g.window_fullength];
+    let mut counter_local = 0usize;
+    for i_m in -g.hw..=g.hw {
+        let i1 = i as isize + i_m;
+        for j_m in -g.hw..=g.hw {
+            let j1 = j as isize + j_m;
+            for k_m in -g.kh..=g.kh {
+                let k1 = k as isize + k_m;
+                if g.in_bounds(i1, j1, k1) {
+                    let v = output[g.idx(i1 as usize, j1 as usize, k1 as usize)];
+                    if v != 0.0 {
+                        values[counter_local] = v;
+                        counter_local += 1;
+                    }
+                }
+            }
+        }
+    }
+    match method {
+        InpaintingType::Median => {
+            // C quirk: 2-D sorts only `counter_local − 1` entries; 3-D sorts the
+            // whole zero-padded buffer. Both then pick `_values[counter_local/2]`.
+            let sort_len = if g.is3d {
+                g.window_fullength
+            } else {
+                counter_local.saturating_sub(1)
+            };
+            values[..sort_len].sort_by(|a, b| a.partial_cmp(b).expect("input is finite"));
+            updated[index] = values[counter_local / 2];
+        }
+        InpaintingType::Random => {
+            let r0 = lcg.next_u32() as usize % counter_local;
+            let r1 = lcg.next_u32() as usize % counter_local;
+            updated[index] = 0.5 * (values[r0] + values[r1]);
+        }
+        InpaintingType::Mean => unreachable!("mean uses eucl_cell"),
+    }
+    m_upd[index] = false;
+}
+
+/// `mean_smoothing` pass over every originally-masked voxel: replace it by the
+/// mean of its non-empty 3×3(×3) neighbours (random's outlier removal).
+fn smoothing_pass(g: &Geom, mask: &[bool], output: &[f32], updated: &mut [f32]) {
+    for i in 0..g.dimx {
+        for j in 0..g.dimy {
+            for k in 0..g.dimz {
+                mean_smoothing_cell(g, (i, j, k), mask, output, updated);
+            }
+        }
+    }
+}
+
+fn mean_smoothing_cell(
+    g: &Geom,
+    pos: (usize, usize, usize),
+    mask: &[bool],
+    output: &[f32],
+    updated: &mut [f32],
+) {
+    let (i, j, k) = pos;
+    let index = g.idx(i, j, k);
+    if !mask[index] {
+        return;
+    }
+    let kr: isize = if g.is3d { 1 } else { 0 };
+    let mut sum_val = 0.0f32;
+    let mut counter_local = 0u32;
+    for i_m in -1..=1 {
+        let i1 = i as isize + i_m;
+        for j_m in -1..=1 {
+            let j1 = j as isize + j_m;
+            for k_m in -kr..=kr {
+                let k1 = k as isize + k_m;
+                if g.in_bounds(i1, j1, k1) {
+                    let v = output[g.idx(i1 as usize, j1 as usize, k1 as usize)];
+                    if v != 0.0 {
+                        sum_val += v;
+                        counter_local += 1;
+                    }
+                }
+            }
+        }
+    }
+    if counter_local > 0 {
+        updated[index] = sum_val / counter_local as f32;
+    }
+}
+
+/// True if any voxel in the 3×3(×3) neighbourhood of `pos` has a non-zero
+/// `Output` value (the eucl `counter_vicinity > 0` gate).
+fn vicinity_nonzero(g: &Geom, pos: (usize, usize, usize), output: &[f32]) -> bool {
+    let (i, j, k) = pos;
+    let kr: isize = if g.is3d { 1 } else { 0 };
+    for i_m in -1..=1 {
+        let i1 = i as isize + i_m;
+        for j_m in -1..=1 {
+            let j1 = j as isize + j_m;
+            for k_m in -kr..=kr {
+                let k1 = k as isize + k_m;
+                if g.in_bounds(i1, j1, k1)
+                    && output[g.idx(i1 as usize, j1 as usize, k1 as usize)] != 0.0
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,5 +1379,89 @@ mod tests {
         // Mirror edges: i=0 window {a,a,b}={1,1,2} median 1; kept.
         assert_eq!(t.array[[0, 0, 0]], 1.0);
         assert_eq!(t.array[[0, 0, 4]], 1.0);
+    }
+
+    #[test]
+    fn inpainter_morph_rejects_zero_size() {
+        let mut t = Tomo::new(Array3::<f32>::ones((1, 3, 3)), Layout::Projection);
+        let mask = Array3::from_elem((1, 3, 3), false);
+        assert!(matches!(
+            inpainter_morph(&mut t, &mask, 0, 2, InpaintingType::Mean, None),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn inpainter_morph_rejects_shape_mismatch() {
+        let mut t = Tomo::new(Array3::<f32>::ones((1, 3, 3)), Layout::Projection);
+        let mask = Array3::from_elem((1, 3, 4), false);
+        assert!(matches!(
+            inpainter_morph(&mut t, &mask, 2, 2, InpaintingType::Mean, None),
+            Err(Error::ShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn inpainter_morph_rejects_bad_axis() {
+        let mut t = Tomo::new(Array3::<f32>::ones((2, 3, 3)), Layout::Projection);
+        let mask = Array3::from_elem((2, 3, 3), false);
+        assert!(matches!(
+            inpainter_morph(&mut t, &mask, 2, 2, InpaintingType::Mean, Some(3)),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn inpainter_morph_mean_and_median_fill_uniform() {
+        // A uniform field is reconstructed exactly: the masked centre's
+        // (weighted) mean / median of all-equal neighbours is the same value.
+        let mut mask = Array3::from_elem((1, 3, 3), false);
+        mask[[0, 1, 1]] = true;
+        for ty in [InpaintingType::Mean, InpaintingType::Median] {
+            let mut t = Tomo::new(Array3::<f32>::ones((1, 3, 3)), Layout::Projection);
+            inpainter_morph(&mut t, &mask, 1, 0, ty, None).unwrap();
+            assert_eq!(
+                t.array[[0, 1, 1]],
+                1.0,
+                "{ty:?} should fill centre with 1.0"
+            );
+            // Unmasked cells are untouched.
+            assert_eq!(t.array[[0, 0, 0]], 1.0);
+        }
+    }
+
+    #[test]
+    fn inpainter_morph_random_fills_masked_region() {
+        // `Random` has no bit-parity reference, but on a uniform field every
+        // random pair / smoothing average is still 1.0, so the masked block is
+        // deterministically filled — a structural check that it completes.
+        let mut mask = Array3::from_elem((1, 4, 4), false);
+        for r in 1..3 {
+            for c in 1..3 {
+                mask[[0, r, c]] = true;
+            }
+        }
+        let mut t = Tomo::new(Array3::<f32>::ones((1, 4, 4)), Layout::Projection);
+        inpainter_morph(&mut t, &mask, 2, 2, InpaintingType::Random, None).unwrap();
+        for r in 1..3 {
+            for c in 1..3 {
+                assert_eq!(t.array[[0, r, c]], 1.0, "masked ({r},{c}) not filled");
+            }
+        }
+    }
+
+    #[test]
+    fn inpainter_morph_axis_inpaints_each_slice() {
+        // axis=Some(0): each (3,3) slice is inpainted independently in 2-D.
+        // Slice 0 is uniform 1.0, slice 1 uniform 2.0 → centres fill to 1.0/2.0.
+        let mut arr = Array3::<f32>::ones((2, 3, 3));
+        arr.index_axis_mut(Axis(0), 1).fill(2.0);
+        let mut t = Tomo::new(arr, Layout::Projection);
+        let mut mask = Array3::from_elem((2, 3, 3), false);
+        mask[[0, 1, 1]] = true;
+        mask[[1, 1, 1]] = true;
+        inpainter_morph(&mut t, &mask, 1, 0, InpaintingType::Mean, Some(0)).unwrap();
+        assert_eq!(t.array[[0, 1, 1]], 1.0);
+        assert_eq!(t.array[[1, 1, 1]], 2.0);
     }
 }
