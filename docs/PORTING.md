@@ -18,7 +18,7 @@ Upstream roots (this machine):
 
 | tomoxide                     | Upstream                                                    | Backend  | Status |
 |------------------------------|------------------------------------------------------------|----------|--------|
-| `recon::fbp`                 | tomopy `libtomo/recon/fbp.c`; `extern/recon.py:238`         | CPU      | CPU done (golden: recovers phantom from tomopy sinogram r=0.87; tomopy's own `fbp` is a weak reference) |
+| `recon::fbp`                 | tomopy `libtomo/recon/fbp.c`; `extern/recon.py:238`         | CPU, wgpu | CPU done (golden: recovers phantom from tomopy sinogram r=0.87; tomopy's own `fbp` is a weak reference). wgpu back-projection step done — `FilteredBackproject` WGSL (backproject.wgsl): one thread/voxel, linear-interp sum over angles × π/nproj. Per-angle (cosθ,sinθ) + per-row center host-computed so the inclusion boundary is bit-identical to CPU; tolerance parity (rtol 1e-4). GPU FBP filter apply still pending (needs FFT) |
 | `recon::gridrec`             | tomopy `libtomo/gridrec/gridrec.c:195`; `extern/gridrec.py:64` | CPU   | CPU done (DFI/Kaiser-Bessel not PSWF; golden: vs tomopy gridrec r=0.98; Fourier recenter shift uses signed freq — correct at sub-pixel centers) |
 | `recon::fourierrec`          | tomocupy `reconstruction/fourierrec.py:46`; `cuda/cfunc_fourierrec.cu`, `include/cfunc_fourierrec.cuh:10` | CUDA, wgpu | stub |
 | `recon::lprec`               | tomocupy `reconstruction/lprec.py:292`; `cuda/cfunc_lprec.cu`, `include/cfunc_lprec.cuh:9` | CUDA, wgpu | stub |
