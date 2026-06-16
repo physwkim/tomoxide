@@ -116,6 +116,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `phase::retrieve_phase` (Gpaganin) | tomocupy `retrieve_phase.paganin_filter:59` (`method='Gpaganin'`, `_paganin_filter_factorG:215`) | CPU | ✓ — tomocupy parity (max rel Δ≈4.9e-7). Grid/filter in f32 to mirror cupy single precision (ill-conditioned, `scale≈1.2e3`); golden via scipy.fft single-precision transcription |
 | `phase::retrieve_phase` (farago) | tomocupy `retrieve_phase.farago_filter:110` (`_farago_filter_factor:212`) | CPU | ✓ — tomocupy parity (max rel Δ≈4.6e-7). Filter `1/(cos θ + db·sin θ)` over the squared reciprocal grid, built in f32 to mirror cupy (f32-sensitive: `db≈1e3` amplifies θ rounding ~1e3×); exact-f32 reciprocal coord (`reciprocal_coord_f32`) makes the filter bit-identical to numpy's; golden via scipy.fft single-precision transcription |
 | `hardening::beam_correct`         | tomocupy `processing/external/hardening.py:50`    | GPU     | stub    |
+| `alignment::scale`                | tomopy `prep/alignment.py:460`                    | CPU     | CPU ✓ — tomopy parity (bit-exact, Δ=0, incl. the returned `scl`). Divide a projection stack in place by `scl = max(\|max\|, \|min\|)` into `[−1, 1]`. Pure order statistics + elementwise f32 divide → exact. `prep::scale(data) -> scl`. Matches tomopy's no-zero-guard (all-zero → `scl=0`, NaN) |
 | `align::align_seq/align_joint`    | tomopy `prep/alignment.py:89,216`                 | CPU     | stub    |
 
 Paganin params (shared): `pixel_size` [cm], `dist` [cm], `energy` [keV],

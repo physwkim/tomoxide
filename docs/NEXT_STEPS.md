@@ -483,6 +483,19 @@ below by dependency and value — the first three close the end-to-end pipeline.
   Pure copy/fill → **bit-exact (Δ=0)** for constant/edge on axes 0/1/2 and default
   / explicit `npad`. `pad_parity.rs`, golden from the **real tomopy**
   `tools/gen_tomopy_pad_golden.py`.
+- ✅ **Projection scaling** — `alignment::scale` (tomopy `prep/alignment.py:460`).
+  Done. Seeds a new `prep::alignment` module mirroring tomopy's `prep/alignment.py`.
+  Divides a projection stack in place by `scl = max(|max|, |min|)` to land it in
+  `[−1, 1]` and returns `scl` (needed to invert the scaling). Pure order
+  statistics (`max`/`min`/`abs`) plus an elementwise f32 divide — no summation or
+  transcendental — so both the scaled array and the returned `scl` are
+  **bit-exact (Δ=0)**. Matches tomopy's lack of a zero guard (all-zero stack →
+  `scl=0`, NaN pixels); errors only on an empty stack. 4 cases
+  (positive/negative-dominated, symmetric, small-magnitude) pass at 0
+  bit-mismatches. `scale_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_scale_golden.py`. (The rest of `prep/alignment.py` —
+  `blur_edges` [sqrt → round-off floor], `shift_images`/`add_jitter` [skimage
+  warp], `align_seq`/`align_joint` — stays unported.)
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
