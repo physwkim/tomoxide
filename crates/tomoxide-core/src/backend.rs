@@ -107,8 +107,22 @@ pub trait FbpFilter {
     /// Build the frequency-domain filter kernel of length `n`.
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>>;
 
-    /// Apply `filter` to a sinogram in place, including the sub-pixel rotation
-    /// center shift (tomocupy `fbp_filter_center`).
+    /// Apply `filter` to a sinogram in place (pure shift-invariant ramp
+    /// convolution along the detector axis).
+    ///
+    /// **Center handling differs from tomocupy by design.** tomocupy's
+    /// `fbp_filter_center` folds the rotation-center correction into this filter
+    /// as a per-row Fourier phase `exp(-2πi·(-center + sht + n/2)·t)` (a
+    /// band-limited sub-pixel shift to `n/2`), so its back-projector assumes the
+    /// center is at `n/2`. tomoxide instead handles the center **downstream**,
+    /// where each method already touches the data: fbp/linerec sample the
+    /// back-projector at `t = …+ center` (linear-interp sub-pixel), and
+    /// fourierrec/lprec/gridrec apply a signed-frequency Fourier recenter in
+    /// their own grids. The two are numerically equivalent and the downstream
+    /// path is verified against the tomopy goldens (gridrec r=0.98, the
+    /// `gridrec_subpixel_center` non-integer-center regression test). `geom` is
+    /// therefore unused by this method — kept in the signature for backends that
+    /// might fold center in here, and so the trait stays uniform.
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()>;
 }
 

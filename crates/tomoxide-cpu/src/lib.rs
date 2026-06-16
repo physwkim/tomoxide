@@ -184,8 +184,10 @@ impl FbpFilter for CpuBackend {
     /// `filter.len()`, forward-transformed, multiplied by the (real) filter,
     /// inverse-transformed, and the leading `n_cols` real samples are written
     /// back. Ramp filtering is a shift-invariant 1-D convolution, so the
-    /// rotation center is handled entirely by the back-projector, not here —
-    /// `geom` is unused.
+    /// rotation center is handled **downstream**, not here (fbp/linerec sample
+    /// the back-projector at `…+ center`; fourierrec/lprec/gridrec recenter in
+    /// their own Fourier grids) — see the [`FbpFilter::apply`] trait doc for why
+    /// this differs from tomocupy's `fbp_filter_center` phase. `geom` is unused.
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], _geom: &Geometry) -> Result<()> {
         let pad = filter.len();
         if pad == 0 {

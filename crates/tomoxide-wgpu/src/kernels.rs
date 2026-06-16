@@ -679,8 +679,10 @@ impl FbpFilter for WgpuBackend {
     /// Forward FFT, frequency-domain multiply, and inverse FFT all run on the
     /// GPU in one serialized submission chain — no host round-trip between the
     /// transforms. Mirrors `CpuBackend::apply`; `geom` is unused because ramp
-    /// filtering is shift-invariant (the rotation center is the
-    /// back-projector's job). Requires a power-of-two `pad` (the GPU FFT is
+    /// filtering is shift-invariant and the rotation center is handled
+    /// downstream per method (see the `FbpFilter::apply` trait doc — this
+    /// differs from tomocupy's `fbp_filter_center` phase by design). Requires a
+    /// power-of-two `pad` (the GPU FFT is
     /// radix-2 only); other lengths error so the caller can fall back to CPU.
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], _geom: &Geometry) -> Result<()> {
         let pad = filter.len();
