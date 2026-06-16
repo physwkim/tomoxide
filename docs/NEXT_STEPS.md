@@ -300,6 +300,15 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `np.median(dark, …, dtype=np.float32)` raises on modern numpy (no reference),
   mirroring the `remove_stripe_ti` block-path treatment. `normalize_nf_parity.rs`,
   golden from the **real tomopy** `tools/gen_tomopy_normalize_nf_golden.py`.
+- ✅ **Downsample / upsample** — `morph::{downsample, upsample}` (tomopy
+  `misc/morph.py` → `libtomo/misc/morph.c::c_sample`). Done. Power-of-two binning
+  (`2^level`) along any axis: downsample = per-bin mean accumulated as
+  `Σ(data/binsize)` in f32 with the C's flat running counter (bit-exact even when
+  the axis isn't divisible); upsample = `×binsize` replication. **Bit-exact (Δ=0)**
+  across axes 0/1/2. `sample_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_sample_golden.py`. (`trim_sinogram` is unrunnable on modern
+  numpy — float `ceil/floor` slice bounds + float `diameter` array shape both
+  raise `TypeError` — so it has no reference; deferred as a TODO.)
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a

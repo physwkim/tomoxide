@@ -131,7 +131,7 @@ Paganin params (shared): `pixel_size` [cm], `dist` [cm], `energy` [keV],
 | `filters::circ_mask`        | tomopy `misc/corr.py:852`                             | partial|
 | `filters::remove_nan/neg`   | tomopy `misc/corr.py:506,533`                         | partial|
 | `filters::inpainter_morph`  | tomopy `misc/corr.py`; `libtomo/misc/inpainter.c`     | stub   |
-| `morph::downsample/upsample`| tomopy `misc/morph.py:191,212`                        | stub   |
+| `morph::downsample/upsample`| tomopy `misc/morph.py:191,212`; `libtomo/misc/morph.c` (`c_sample`) | CPU ✓ — tomopy parity (bit-exact, Δ=0) across axes 0/1/2. downsample = bin mean Σ(data/binsize) f32 (flat counter, divisibility-faithful); upsample = replicate ×binsize; `morph::{downsample, upsample}(arr, level, axis)` |
 | `morph::pad/trim_sinogram`  | tomopy `misc/morph.py:73,255`                         | stub   |
 | `morph::sino_360_to_180`    | tomopy `misc/morph.py` (`sino_360_to_180`)            | CPU ✓ — tomopy parity (bit-exact, Δ=0) for `Left`/`Right` & `overlap=0/4`. Reversed-half stitch + f64 linspace seam cross-fade cast to f32; `prep::morph::{sino_360_to_180, Rotation}` |
 
