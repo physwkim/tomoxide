@@ -133,7 +133,7 @@ Paganin params (shared): `pixel_size` [cm], `dist` [cm], `energy` [keV],
 | `filters::inpainter_morph`  | tomopy `misc/corr.py`; `libtomo/misc/inpainter.c`     | stub   |
 | `morph::downsample/upsample`| tomopy `misc/morph.py:191,212`                        | stub   |
 | `morph::pad/trim_sinogram`  | tomopy `misc/morph.py:73,255`                         | stub   |
-| `morph::sino_360_to_180`    | tomopy `misc/morph.py` (`sino_360_to_180`)            | stub   |
+| `morph::sino_360_to_180`    | tomopy `misc/morph.py` (`sino_360_to_180`)            | CPU ✓ — tomopy parity (bit-exact, Δ=0) for `Left`/`Right` & `overlap=0/4`. Reversed-half stitch + f64 linspace seam cross-fade cast to f32; `prep::morph::{sino_360_to_180, Rotation}` |
 
 C-extern signatures (tomopy `extern/misc.py`):
 

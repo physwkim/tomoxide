@@ -280,6 +280,16 @@ below by dependency and value — the first three close the end-to-end pipeline.
   **bit-for-bit (Δ=0)** for both `air=1` (default) and `air=4`.
   `normalize_bg_parity.rs`, golden from the **real tomopy**
   `tools/gen_tomopy_normalize_bg_golden.py`.
+- ✅ **360→180 folding** — `morph::sino_360_to_180` (tomopy `misc/morph.py`). Done.
+  New `prep::morph` module: the first `n=dx/2` projections (0–180°) are kept and
+  the next `n` (180–360°) are column-reversed and stitched on to widen the
+  detector, overlapping by `overlap` columns with a linear cross-fade;
+  `Rotation::{Left,Right}` selects which half lands on which side. Direct regions
+  are exact f32 copies and the seam blend is computed in f64 (numpy `float64`
+  linspace weights · `float32` data) then cast to f32, with a faithful numpy
+  `linspace`, so it matches tomopy 1.15.3 **bit-for-bit (Δ=0)** for both rotations
+  and `overlap=0/4`. `sino360_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_sino360_golden.py`.
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
