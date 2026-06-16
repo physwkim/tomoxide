@@ -486,6 +486,22 @@ below by dependency and value — the first three close the end-to-end pipeline.
   phase-retrieval ports. Golden from real tomopy
   (`tools/gen_tomopy_add_drift_golden.py`; 1493/9216 pixels differ ≤1 ULP, worst
   rel=1.19e-7) in `tests/add_drift_parity.rs`.
+- ✅ **3-D Shepp-Logan phantom** — `phantom::shepp3d` (`crates/tomoxide-sim/src/
+  phantom.rs`; tomopy `misc/phantom.py:284`). Done. A faithful f64 ellipsoid
+  rasterizer: 10 ellipsoids sampled on `np.mgrid[-1:1:size·j]`
+  (`= arange·step − 1`, `step = 2/(size−1)`), each rotated by an Euler matrix
+  (libm `sin`/`cos` of `to_radians` — `np.radians` and numpy's *scalar* trig both
+  verified bit-exact vs Rust), shifted by its centre and scaled by its semi-axes,
+  with the inclusion test `Σ((R·r − c)/s)² ≤ 1` in f64 and the amplitudes
+  accumulated in f32 exactly like numpy's in-place `obj[mask] += A` (the f64 add
+  cast back to f32 after each ellipsoid), then `clip(0, ∞)`. Matches tomopy
+  **bit-for-bit (Δ=0)** at sizes 16/17/32. The only step not reproduced is
+  numpy's BLAS dot order inside `tensordot` (≤1 ULP), which flips **no** voxel —
+  no grid sample lands within f64-ULP of the `≤ 1` boundary, the same
+  non-materialisation as the `circ_mask` boundary gap, so a plain sequential dot
+  suffices. `shepp3d_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_shepp3d_golden.py`. (The simplified f32 `shepp2d` rasterizer
+  is left untouched.)
 - ✅ **Background normalization** — `normalize::normalize_bg` (tomopy
   `prep/normalize.py:207` → `libtomo/prep/prep.c::normalize_bg`). Done. Per
   projection row the mean of the `air` left- and right-boundary pixels defines an

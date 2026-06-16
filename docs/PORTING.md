@@ -163,7 +163,7 @@ void medianfilter_main_float(float* in,float* out,int kernel_half_size,float abs
 | tomoxide                  | Upstream                                | Status  |
 |---------------------------|-----------------------------------------|---------|
 | `phantom::shepp2d`        | tomopy `misc/phantom.py:246`            | partial |
-| `phantom::shepp3d`        | tomopy `misc/phantom.py`                | stub    |
+| `phantom::shepp3d`        | tomopy `misc/phantom.py:284`            | done — tomopy parity (bit-exact, Δ=0). Faithful f64 ellipsoid rasterizer: 10 ellipsoids on `mgrid[-1:1:n·j]`, Euler-rotated (libm sin/cos of `to_radians`, bit-exact vs numpy scalar trig), inclusion `Σ((R·r−c)/s)²≤1` in f64, amplitudes accumulated in f32 like numpy `obj[mask]+=A`, then `clip(0,∞)`. The only unreproduced step (BLAS `tensordot` dot order, ≤1 ULP) flips no voxel. Sizes 16/17/32. `sim::shepp3d(size)` |
 | `phantom::{baboon,…}`     | tomopy `misc/phantom.py:89…`            | stub    |
 | `sim::angles`             | tomopy `sim/project.py:241`             | done    |
 | `sim::project`            | tomopy `sim/project.py:268`; `libtomo/recon/project.c` | partial (CPU parallel-beam) |
