@@ -15,6 +15,9 @@
 //!   angle axis (a ring, not per-element noise).
 //! * `add_zingers`  → the saturated fraction matches `f`, saturated cells equal
 //!   `sat`, and untouched cells keep their value.
+//! * `add_salt_pepper` → the corrupted fraction matches `prob`, corrupted cells
+//!   equal `val` (or, when `val=None`, the original data max), and untouched
+//!   cells keep their value.
 //!
 //! All tolerances are many standard errors wide of the sampling noise at the
 //! sample sizes used, so the bound is on a real distributional defect, not on
@@ -251,6 +254,68 @@ fn add_zingers_is_deterministic_per_seed() {
     tomoxide_sim::add_zingers(&mut a, 0.1, 9.0, 3).unwrap();
     tomoxide_sim::add_zingers(&mut b, 0.1, 9.0, 3).unwrap();
     tomoxide_sim::add_zingers(&mut c, 0.1, 9.0, 4).unwrap();
+    assert_eq!(a.array, b.array, "same seed must reproduce the same draw");
+    assert_ne!(a.array, c.array, "a different seed must change the draw");
+}
+
+#[test]
+fn add_salt_pepper_corrupts_fraction_prob() {
+    // Each element is independently set to `val` with probability `prob`.
+    let prob = 0.03f32;
+    let val = 7.0f32;
+    let mut t = tomo_filled(512, 0.0); // 262144 elements, all 0.0
+    tomoxide_sim::add_salt_pepper(&mut t, prob, Some(val), 0x71C5).unwrap();
+
+    let mut n_corrupt = 0usize;
+    for &v in t.array.iter() {
+        if v == val {
+            n_corrupt += 1;
+        } else {
+            assert_eq!(
+                v, 0.0,
+                "a non-corrupted element must keep its original value"
+            );
+        }
+    }
+    let frac = n_corrupt as f64 / t.array.len() as f64;
+    // SE of the fraction = sqrt(prob(1-prob)/N) ≈ sqrt(0.03·0.97/262144) ≈ 3.3e-4;
+    // the 0.002 tolerance is ~6 SE.
+    assert!(
+        (frac - prob as f64).abs() < 0.002,
+        "salt-and-pepper fraction = {frac} (want {prob})"
+    );
+}
+
+#[test]
+fn add_salt_pepper_default_val_is_data_max() {
+    // With `val=None`, corrupted cells take the *original* data max.
+    let n = 64;
+    let orig = Array3::from_shape_fn((1, n, n), |(_, r, c)| (r * n + c) as f32);
+    let data_max = (n * n - 1) as f32;
+    let mut t = Tomo::new(orig.clone(), Layout::Sinogram);
+    tomoxide_sim::add_salt_pepper(&mut t, 0.1, None, 0xABCD).unwrap();
+
+    let mut n_changed = 0usize;
+    for (&got, &o) in t.array.iter().zip(orig.iter()) {
+        if got != o {
+            assert_eq!(
+                got, data_max,
+                "a corrupted cell must take the original data max"
+            );
+            n_changed += 1;
+        }
+    }
+    assert!(n_changed > 0, "expected some corruption at prob=0.1");
+}
+
+#[test]
+fn add_salt_pepper_is_deterministic_per_seed() {
+    let mut a = tomo_filled(32, 1.0);
+    let mut b = tomo_filled(32, 1.0);
+    let mut c = tomo_filled(32, 1.0);
+    tomoxide_sim::add_salt_pepper(&mut a, 0.1, Some(5.0), 11).unwrap();
+    tomoxide_sim::add_salt_pepper(&mut b, 0.1, Some(5.0), 11).unwrap();
+    tomoxide_sim::add_salt_pepper(&mut c, 0.1, Some(5.0), 12).unwrap();
     assert_eq!(a.array, b.array, "same seed must reproduce the same draw");
     assert_ne!(a.array, c.array, "a different seed must change the draw");
 }

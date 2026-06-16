@@ -13,7 +13,7 @@ use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Angles, Geometry};
 
-pub use noise::{add_gaussian, add_poisson, add_rings, add_zingers};
+pub use noise::{add_gaussian, add_poisson, add_rings, add_salt_pepper, add_zingers};
 pub use phantom::shepp2d;
 
 /// `nang` uniformly spaced angles over `[ang1, ang2)` radians (tomopy

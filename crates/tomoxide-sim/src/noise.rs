@@ -1,5 +1,6 @@
 //! Additive noise models for forward-simulated data (tomopy
-//! `sim/project.py:110` `add_gaussian`, `:136` `add_poisson`).
+//! `sim/project.py`: `:110` `add_gaussian`, `:136` `add_poisson`, `:153`
+//! `add_rings`, `:183` `add_salt_pepper`, `:211` `add_zingers`).
 //!
 //! ## Parity scope: distribution, not bit-stream
 //!
@@ -242,6 +243,30 @@ pub fn add_zingers(data: &mut Tomo<f32>, f: f32, sat: f32, seed: u64) -> Result<
     for v in data.array.iter_mut() {
         if rng.next_open01() <= f {
             *v = sat;
+        }
+    }
+    Ok(())
+}
+
+/// Corrupt a random fraction `prob` of elements to `val`, modelling
+/// salt-and-pepper detector noise (tomopy `sim/project.py:183`
+/// `add_salt_pepper`).
+///
+/// Each element is independently corrupted with probability `prob` (tomopy
+/// draws `U(0, 1) < prob` — a strict `<`, unlike [`add_zingers`]'s `<=`). When
+/// `val` is `None` it defaults to the original `data.max()`, matching tomopy's
+/// `val=None` branch; the max is captured *before* any element is overwritten,
+/// so a corrupted pixel never feeds back into the default. `seed` makes the draw
+/// reproducible (tomopy uses the global numpy generator). See the module docs
+/// for the distribution-parity scope.
+pub fn add_salt_pepper(data: &mut Tomo<f32>, prob: f32, val: Option<f32>, seed: u64) -> Result<()> {
+    // tomopy's `val = tomo.max()` reads the original data, before corruption.
+    let val = val.unwrap_or_else(|| array_max(&data.array));
+    let prob = prob as f64;
+    let mut rng = SplitMix64::new(seed);
+    for v in data.array.iter_mut() {
+        if rng.next_open01() < prob {
+            *v = val;
         }
     }
     Ok(())
