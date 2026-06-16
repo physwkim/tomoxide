@@ -1,8 +1,8 @@
 //! # tomoxide-sim
 //!
 //! Phantoms and forward simulation (ports tomopy `sim/` + `misc/phantom.py`).
-//! `angles`, `phantom::shepp2d`, and the noise models are real; `project` is a
-//! thin backend wrapper (see `docs/PORTING.md` §F).
+//! `angles`, `phantom::{shepp2d, shepp3d}`, and the noise models are real;
+//! `project` is a thin backend wrapper (see `docs/PORTING.md` §F).
 #![forbid(unsafe_code)]
 
 mod noise;
@@ -14,7 +14,7 @@ use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Angles, Geometry};
 
 pub use noise::{add_drift, add_gaussian, add_poisson, add_rings, add_salt_pepper, add_zingers};
-pub use phantom::shepp2d;
+pub use phantom::{shepp2d, shepp3d};
 
 /// `nang` uniformly spaced angles over `[ang1, ang2)` radians (tomopy
 /// `sim/project.py:241`).
