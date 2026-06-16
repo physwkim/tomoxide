@@ -1,8 +1,8 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
 //! `circ_mask`/`remove_nan`/`remove_neg`/`adjust_range`/`median_filter_nonfinite`/
-//! `remove_outlier1d` are real; the 3-D rank filters (`median_filter3d`,
-//! `remove_outlier`) route through the backend (stubbed). See
-//! `docs/PORTING.md` §E.
+//! `median_filter`/`remove_outlier1d` are real; the 3-D rank filters
+//! (`median_filter3d`, `remove_outlier`) route through the backend (stubbed).
+//! See `docs/PORTING.md` §E.
 
 use ndarray::Axis;
 use tomoxide_core::backend::Backend;
@@ -172,6 +172,74 @@ pub fn remove_outlier(
         .remove_outlier(data, diff, size)
 }
 
+/// Median-filter every 2-D slice along `axis` with a `size×size` footprint
+/// (tomopy `misc/corr.py:167` `median_filter`). For each index along `axis` the
+/// orthogonal 2-D image is replaced by its `size×size` median taken with
+/// scipy.ndimage's default `mode='reflect'` (half-sample reflection, the edge
+/// sample repeated). `axis` indexes the underlying 3-D array (0/1/2), matching
+/// tomopy's `axis` on the raw ndarray.
+///
+/// scipy's median filter selects a single order statistic (rank
+/// `size·size/2`, never an average — even for an even footprint), so the result
+/// is bit-exact (Δ=0) vs tomopy on finite input. Unlike [`remove_outlier1d`]
+/// there is no threshold: every pixel is replaced by its local median. Input is
+/// assumed finite (compose with [`remove_nan`] first if needed).
+pub fn median_filter(data: &mut Tomo<f32>, size: usize, axis: usize) -> Result<()> {
+    if size == 0 {
+        return Err(Error::InvalidParam("median_filter size must be > 0".into()));
+    }
+    if axis > 2 {
+        return Err(Error::InvalidParam(
+            "median_filter axis must be 0, 1, or 2".into(),
+        ));
+    }
+    let dims = data.array.dim();
+    let shape = [dims.0, dims.1, dims.2];
+    if shape[axis] == 0 {
+        return Ok(());
+    }
+    // scipy.ndimage.median_filter footprint origin = size/2 per axis; median rank
+    // = filter_size // 2 = size·size // 2 (a single element, not a mean).
+    let orgn = (size / 2) as isize;
+    let rank = (size * size) / 2;
+    // The two axes orthogonal to `axis` form each 2-D slice (row = a1, col = a2).
+    let (a1, a2) = match axis {
+        0 => (1usize, 2usize),
+        1 => (0usize, 2usize),
+        _ => (0usize, 1usize),
+    };
+    let nr = shape[a1] as isize;
+    let nc = shape[a2] as isize;
+    let mut out = ndarray::Array3::<f32>::zeros(dims);
+    let mut window: Vec<f32> = Vec::with_capacity(size * size);
+    for s in 0..shape[axis] {
+        for r in 0..shape[a1] {
+            for c in 0..shape[a2] {
+                window.clear();
+                for dr in 0..size {
+                    let sr = reflect_index(r as isize + dr as isize - orgn, nr);
+                    for dc in 0..size {
+                        let sc = reflect_index(c as isize + dc as isize - orgn, nc);
+                        let mut idx = [0usize; 3];
+                        idx[axis] = s;
+                        idx[a1] = sr;
+                        idx[a2] = sc;
+                        window.push(data.array[[idx[0], idx[1], idx[2]]]);
+                    }
+                }
+                window.sort_by(|a, b| a.partial_cmp(b).expect("input is finite"));
+                let mut oidx = [0usize; 3];
+                oidx[axis] = s;
+                oidx[a1] = r;
+                oidx[a2] = c;
+                out[[oidx[0], oidx[1], oidx[2]]] = window[rank];
+            }
+        }
+    }
+    data.array = out;
+    Ok(())
+}
+
 /// Remove bright outliers with a 1-D median filter along `axis` (tomopy
 /// `misc/corr.py:615` `remove_outlier1d`). For each element the local
 /// `size`-tap median along `axis` is taken with scipy.ndimage `mode='mirror'`
@@ -248,6 +316,24 @@ pub fn remove_outlier1d(data: &mut Tomo<f32>, diff: f32, size: usize, axis: usiz
     Ok(())
 }
 
+/// scipy.ndimage `mode='reflect'` index map: half-sample symmetric reflection
+/// (period `2n`, the edge sample *is* repeated), matching `NI_EXTEND_REFLECT`
+/// in scipy `ni_support.c`.
+fn reflect_index(i: isize, n: isize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let period = 2 * n;
+    let mut j = i % period;
+    if j < 0 {
+        j += period;
+    }
+    if j >= n {
+        j = period - 1 - j;
+    }
+    j as usize
+}
+
 /// scipy.ndimage `mode='mirror'` index map: whole-sample symmetric reflection
 /// (period `2(n−1)`, the edge sample is *not* repeated), matching
 /// `NI_EXTEND_MIRROR` in scipy `ni_support.c`.
@@ -288,6 +374,37 @@ mod tests {
         remove_nan(&mut t, 0.0).unwrap();
         remove_neg(&mut t, 0.0).unwrap();
         assert_eq!(t.array.as_slice().unwrap(), &[0.0, 0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn median_filter_rejects_bad_params() {
+        let mut t = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Projection);
+        assert!(matches!(
+            median_filter(&mut t, 0, 0),
+            Err(Error::InvalidParam(_))
+        ));
+        assert!(matches!(
+            median_filter(&mut t, 3, 3),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn median_filter_replaces_spike_with_2d_median() {
+        // One 3×3 slice (axis 0) with a single bright spike at the centre.
+        // size=3 → 9-tap median; the centre window is the whole slice, whose
+        // median (rank 4 of {0,1,2,3,4,5,6,7,100} sorted) is 4.
+        #[rustfmt::skip]
+        let slice = vec![
+            0.0f32, 1.0, 2.0,
+            3.0,  100.0, 4.0,
+            5.0,    6.0, 7.0,
+        ];
+        let arr = Array3::from_shape_vec((1, 3, 3), slice).unwrap();
+        let mut t = Tomo::new(arr, Layout::Projection);
+        median_filter(&mut t, 3, 0).unwrap();
+        // Centre: sorted {0,1,2,3,4,5,6,7,100}, rank 9/2=4 → 4.0 (spike removed).
+        assert_eq!(t.array[[0, 1, 1]], 4.0);
     }
 
     #[test]
