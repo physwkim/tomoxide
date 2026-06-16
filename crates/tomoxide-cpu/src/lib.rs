@@ -171,47 +171,11 @@ impl FbpFilter for CpuBackend {
     /// Build the full frequency-domain apodized ramp filter for a projection of
     /// width `n`.
     ///
-    /// The returned kernel has length `pad = (2·n).next_power_of_two()` — the
-    /// projection is zero-padded to `pad` before transforming so the ramp
-    /// convolution does not wrap around — and is laid out in `rustfft` (fftfreq)
-    /// order, symmetric about the Nyquist bin. The ramp magnitude `r` runs `0`
-    /// at DC to `1` at Nyquist; `name` apodizes it. The window set matches
-    /// tomopy/tomocupy; exact `_wint` quadrature weighting is reconciled when
-    /// tomopy golden data is available.
+    /// Delegates to [`tomoxide_core::backend::make_fbp_filter`] — the kernel is
+    /// device-independent host arithmetic shared with every other backend, so
+    /// CPU and GPU build the identical filter from one definition.
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
-        if n == 0 {
-            return Err(Error::InvalidParam("filter length must be > 0".into()));
-        }
-        let pad = (2 * n).next_power_of_two();
-        let pi = std::f32::consts::PI;
-        let mut f = vec![0.0f32; pad];
-        for (k, slot) in f.iter_mut().enumerate() {
-            // |fftfreq| bin index, then r = normalized frequency in [0, 1].
-            let fk = if k <= pad / 2 { k } else { pad - k };
-            let r = 2.0 * fk as f32 / pad as f32;
-            let ramp = r;
-            *slot = match name {
-                FilterName::None => 1.0, // identity: no apodization, no ramp
-                FilterName::Ramp => ramp,
-                FilterName::Shepp => {
-                    let x = pi * r / 2.0;
-                    if x == 0.0 {
-                        ramp
-                    } else {
-                        ramp * (x.sin() / x)
-                    }
-                }
-                FilterName::Cosine => ramp * (pi * r / 2.0).cos(),
-                FilterName::Cosine2 => {
-                    let c = (pi * r / 2.0).cos();
-                    ramp * c * c
-                }
-                FilterName::Hamming => ramp * (0.54 + 0.46 * (pi * r).cos()),
-                FilterName::Hann => ramp * 0.5 * (1.0 + (pi * r).cos()),
-                FilterName::Parzen => ramp * (1.0 - r).powi(3),
-            };
-        }
-        Ok(f)
+        tomoxide_core::backend::make_fbp_filter(name, n)
     }
 
     /// Apply `filter` to every projection of `sino` in place.
