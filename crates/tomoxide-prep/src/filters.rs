@@ -1,7 +1,8 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
-//! `circ_mask`/`remove_nan`/`remove_neg` are real; rank filters route through
-//! the backend (stubbed). See `docs/PORTING.md` §E.
+//! `circ_mask`/`remove_nan`/`remove_neg`/`median_filter_nonfinite` are real;
+//! rank filters route through the backend (stubbed). See `docs/PORTING.md` §E.
 
+use ndarray::Axis;
 use tomoxide_core::backend::Backend;
 use tomoxide_core::data::{Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
@@ -44,6 +45,73 @@ pub fn remove_nan(data: &mut Tomo<f32>, val: f32) -> Result<()> {
 pub fn remove_neg(data: &mut Tomo<f32>, val: f32) -> Result<()> {
     data.array.mapv_inplace(|v| if v < 0.0 { val } else { v });
     Ok(())
+}
+
+/// Replace every non-finite value (NaN/±inf) with the median of the finite
+/// values in its `size×size` neighbourhood along the last two axes (tomopy
+/// `misc/corr.py:281` `median_filter_nonfinite`).
+///
+/// Each 2-D slice (axis 0 = projection) is corrected against a snapshot taken
+/// before any write, so two adjacent bad pixels do not see each other's fixes
+/// (tomopy's `projection_copy`). The window is clamped to the slice (the bounds
+/// use `i ± size/2`, so an even `size` gives an odd `2·(size/2)+1` width, as
+/// upstream). `np.median` on float32 returns float32 (the even-count midpoint is
+/// the f32 mean of the two middle order statistics), reproduced here. Errors if
+/// any kernel contains no finite value (tomopy raises `ValueError`).
+pub fn median_filter_nonfinite(data: &mut Tomo<f32>, size: usize) -> Result<()> {
+    if size == 0 {
+        return Err(Error::InvalidParam(
+            "median_filter_nonfinite size must be > 0".into(),
+        ));
+    }
+    let (n0, n1, n2) = data.array.dim();
+    let h = size / 2;
+    let mut window: Vec<f32> = Vec::new();
+    for i0 in 0..n0 {
+        // Snapshot: medians read pre-correction values (tomopy projection_copy).
+        let snap = data.array.index_axis(Axis(0), i0).to_owned();
+        for i1 in 0..n1 {
+            for i2 in 0..n2 {
+                if snap[[i1, i2]].is_finite() {
+                    continue;
+                }
+                let x_lo = i1.saturating_sub(h);
+                let x_hi = (i1 + h + 1).min(n1);
+                let y_lo = i2.saturating_sub(h);
+                let y_hi = (i2 + h + 1).min(n2);
+                window.clear();
+                for x in x_lo..x_hi {
+                    for y in y_lo..y_hi {
+                        let v = snap[[x, y]];
+                        if v.is_finite() {
+                            window.push(v);
+                        }
+                    }
+                }
+                if window.is_empty() {
+                    return Err(Error::InvalidParam(
+                        "median_filter_nonfinite: kernel contains only non-finite \
+                         values; increase size"
+                            .into(),
+                    ));
+                }
+                data.array[[i0, i1, i2]] = median_f32(&mut window);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `np.median` of finite `vals` (no NaN): the middle order statistic for an odd
+/// count, the f32 mean of the two middle order statistics for an even count.
+fn median_f32(vals: &mut [f32]) -> f32 {
+    vals.sort_by(|a, b| a.partial_cmp(b).expect("vals are finite"));
+    let n = vals.len();
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+    }
 }
 
 /// 3-D median filter, dispatched to the backend's [`RankFilter`] (stub).
