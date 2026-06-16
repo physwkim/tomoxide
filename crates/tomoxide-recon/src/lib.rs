@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod center;
+mod fourierrec;
 mod gridrec;
 pub mod ring;
 
@@ -61,21 +62,38 @@ fn analytic(
     let n = grid_size(sino, params);
     let nz = sino.n_rows();
 
-    // gridrec is a Fourier-grid method (needs only the Fft capability); the
-    // others are an FBP filter pass + back-projection.
+    // gridrec is a Fourier-grid method that applies its own ramp internally
+    // (needs only the Fft capability). Every other analytic method is a shared
+    // FBP-filter pass followed by either a Fourier-grid gridding (fourierrec) or
+    // a back-projection (fbp/linerec/lprec) — tomocupy's
+    // `fbp_filter_center(data)` → `cl_rec.backprojection`.
     if algorithm == Algorithm::Gridrec {
         let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
         return Ok(Volume::new(gridrec::gridrec(sino, geom, n, fft)?));
     }
-    let bp = backend
-        .backprojector()
-        .ok_or_else(|| missing("FilteredBackproject", backend))?;
     let filt = backend
         .fbp_filter()
         .ok_or_else(|| missing("FbpFilter", backend))?;
     let kernel = filt.make_filter(params.filter_name, sino.n_cols())?;
     let mut filtered = sino.clone();
     filt.apply(&mut filtered, &kernel, geom)?;
+
+    // fourierrec grids the filtered projections onto the Fourier plane with
+    // tomocupy's Gaussian USFFT kernel (needs only the Fft capability).
+    if algorithm == Algorithm::Fourierrec {
+        let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
+        return Ok(Volume::new(fourierrec::fourierrec(
+            &filtered, geom, n, fft,
+        )?));
+    }
+
+    // fbp / linerec / lprec: filtered back-projection. linerec is genuinely a
+    // line back-projection (tomocupy `cfunc_linerec` reduces to parallel-beam BP
+    // with linear interpolation); the distinct log-polar `lprec` port is pending
+    // (see docs/PORTING.md), so it currently shares this FBP path.
+    let bp = backend
+        .backprojector()
+        .ok_or_else(|| missing("FilteredBackproject", backend))?;
     let mut vol = Volume::new(Array3::zeros((nz, n, n)));
     bp.backproject(&filtered, geom, &mut vol)?;
     Ok(vol)
@@ -913,7 +931,11 @@ mod tests {
     }
 
     #[test]
-    fn analytic_without_backprojector_reports_missing_capability() {
+    fn analytic_without_capabilities_reports_missing_capability() {
+        // FBP is filter-then-back-project, and the dispatcher acquires the FBP
+        // filter first (so fourierrec, which needs no back-projector, can branch
+        // before it). A capability-less backend therefore surfaces the filter as
+        // the first missing capability.
         let (s, g) = tiny_sino();
         let err = recon(
             &s,
@@ -926,7 +948,7 @@ mod tests {
         assert!(matches!(
             err,
             Error::MissingCapability {
-                capability: "FilteredBackproject",
+                capability: "FbpFilter",
                 ..
             }
         ));
