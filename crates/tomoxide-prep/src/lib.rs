@@ -13,11 +13,13 @@
 mod fft;
 pub mod filters;
 pub mod hardening;
+pub mod morph;
 pub mod normalize;
 pub mod phase;
 pub mod stripe;
 mod wavelet;
 
+pub use morph::{sino_360_to_180, Rotation};
 pub use normalize::{minus_log, normalize, normalize_dataset};
 pub use phase::retrieve_phase;
 pub use stripe::remove_stripe;
