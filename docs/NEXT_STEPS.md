@@ -290,6 +290,16 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `linspace`, so it matches tomopy 1.15.3 **bit-for-bit (Δ=0)** for both rotations
   and `overlap=0/4`. `sino360_parity.rs`, golden from the **real tomopy**
   `tools/gen_tomopy_sino360_golden.py`.
+- ✅ **Nearest-flat-fields normalization** — `normalize::normalize_nf` (tomopy
+  `prep/normalize.py:245`, `averaging='mean'`). Done. Each flat group's per-pixel
+  median normalizes the projections nearest its `flat_loc`; `dark` is the dark-frame
+  mean; `(proj−dark)/max(flat−dark,1e-6)` with an optional `cutoff`, group bounds
+  at the half-to-even midpoint of consecutive `flat_loc`. f32 in upstream order →
+  **bit-exact (Δ=0)** for even/odd group sizes incl. the denom-clamp and cutoff
+  paths. `averaging='median'` returns a TODO error because tomopy's
+  `np.median(dark, …, dtype=np.float32)` raises on modern numpy (no reference),
+  mirroring the `remove_stripe_ti` block-path treatment. `normalize_nf_parity.rs`,
+  golden from the **real tomopy** `tools/gen_tomopy_normalize_nf_golden.py`.
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a

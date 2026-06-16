@@ -98,7 +98,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 |-----------------------------------|---------------------------------------------------|---------|---------|
 | `normalize::normalize`            | tomopy `prep/normalize.py:98`                     | CPU     | partial |
 | `normalize::normalize_bg`         | tomopy `prep/normalize.py:207`; `libtomo/prep/prep.c` (`normalize_bg`) | CPU | CPU ✓ — tomopy parity (bit-exact, Δ=0) for `air=1` & `air=4`. Per-row air baseline (left/right boundary means) lerp'd across the column axis, divide; f32 in upstream order, `f32::mul_add` for the clang-contracted `air_left + air_slope·j` |
-| `normalize::normalize_nf`         | tomopy `prep/normalize.py:245`                    | CPU     | stub    |
+| `normalize::normalize_nf`         | tomopy `prep/normalize.py:245`                    | CPU     | CPU ✓ — tomopy parity (bit-exact, Δ=0), `averaging='mean'`. Per-group flat median, dark mean, `(proj−dark)/max(flat−dark,1e-6)` + cutoff; half-to-even group boundaries. `averaging='median'` returns TODO (upstream `np.median(dtype=)` errors on modern numpy) |
 | `normalize::minus_log`            | tomopy `prep/normalize.py:72`; tomocupy `proc_functions.minus_log` | all | partial |
 | `normalize::darkflat`             | tomocupy `proc_functions.darkflat_correction:55`  | all     | partial |
 | `stripe::remove_stripe_fw`        | tomopy `prep/stripe.py:88`; tomocupy `remove_stripe.remove_stripe_fw` | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈1.2e-6). db5 dwt2/idwt2 hand-ported (no new dep) in `wavelet.rs`, pywt-validated; float32-forward/f64-damp+inverse dtype flow. Damping uses a self-contained `O(n log n)` FFT (radix-2 + Bluestein, arbitrary length, no FFT dep) in `fft.rs` |
