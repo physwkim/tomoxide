@@ -166,6 +166,7 @@ pub trait Elementwise {
 pub trait RankFilter {
     /// 3-D median filter with cubic window `size`.
     fn median3d(&self, vol: &mut Volume<f32>, size: usize) -> Result<()>;
-    /// Replace outliers exceeding `diff` from the local median (dezinger).
-    fn remove_outlier(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()>;
+    /// Replace outliers exceeding `diff` from the local 3-D-cube median
+    /// (dezinger; tomopy `remove_outlier3d`).
+    fn remove_outlier3d(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()>;
 }

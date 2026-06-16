@@ -664,7 +664,7 @@ impl RankFilter for CpuBackend {
     /// Same kernel as [`median3d`] but with the dezinger threshold `diff`: a
     /// voxel is replaced by the local median only when it deviates from it by
     /// at least `diff`; all others pass through unchanged.
-    fn remove_outlier(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()> {
+    fn remove_outlier3d(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()> {
         let radius = (size.max(3) - 1) / 2;
         data.array = medfilt3d_core(&data.array, radius, diff);
         Ok(())

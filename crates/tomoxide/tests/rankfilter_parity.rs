@@ -8,7 +8,7 @@
 
 use ndarray::Array3;
 use ndarray_npy::read_npy;
-use tomoxide::prep::filters::{median_filter3d, remove_outlier};
+use tomoxide::prep::filters::{median_filter3d, remove_outlier3d};
 use tomoxide::{CpuBackend, Layout, Tomo, Volume};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -58,19 +58,19 @@ fn remove_outlier3d_matches_tomopy() {
 
     // Small threshold: every injected spike exceeds it → all replaced.
     let mut tomo = Tomo::new(input.clone(), Layout::Projection);
-    remove_outlier(&mut tomo, 0.5, 3, &cpu).unwrap();
+    remove_outlier3d(&mut tomo, 0.5, 3, &cpu).unwrap();
     assert_bit_equal(
         &tomo.array,
         &load("tomopy_dezinger_small.npy"),
-        "remove_outlier dif=0.5",
+        "remove_outlier3d dif=0.5",
     );
 
     // Larger threshold: spikes (±10) still exceed 5.0, smooth structure stays.
     let mut tomo = Tomo::new(input.clone(), Layout::Projection);
-    remove_outlier(&mut tomo, 5.0, 3, &cpu).unwrap();
+    remove_outlier3d(&mut tomo, 5.0, 3, &cpu).unwrap();
     assert_bit_equal(
         &tomo.array,
         &load("tomopy_dezinger_large.npy"),
-        "remove_outlier dif=5.0",
+        "remove_outlier3d dif=5.0",
     );
 }

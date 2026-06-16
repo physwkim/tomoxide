@@ -1,8 +1,8 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
 //! `circ_mask`/`remove_nan`/`remove_neg`/`adjust_range`/`median_filter_nonfinite`/
-//! `median_filter`/`remove_outlier1d` are real; the 3-D rank filters
-//! (`median_filter3d`, `remove_outlier`) route through the backend (stubbed).
-//! See `docs/PORTING.md` §E.
+//! `median_filter`/`remove_outlier1d`/`remove_outlier` are real; the 3-D rank
+//! filters (`median_filter3d`, `remove_outlier3d`) route through the backend
+//! (stubbed). See `docs/PORTING.md` §E.
 
 use ndarray::Axis;
 use tomoxide_core::backend::Backend;
@@ -156,8 +156,10 @@ pub fn median_filter3d(vol: &mut Volume<f32>, size: usize, backend: &dyn Backend
         .median3d(vol, size)
 }
 
-/// Outlier (zinger) removal, dispatched to the backend's [`RankFilter`] (stub).
-pub fn remove_outlier(
+/// 3-D-cube outlier (zinger) removal, dispatched to the backend's
+/// [`RankFilter`] (tomopy `misc/corr.py:413` `remove_outlier3d`). Distinct from
+/// [`remove_outlier`], which is the axis-chunked 2-D dezinger (corr.py:559).
+pub fn remove_outlier3d(
     data: &mut Tomo<f32>,
     diff: f32,
     size: usize,
@@ -169,7 +171,7 @@ pub fn remove_outlier(
             backend: backend.name(),
             capability: "RankFilter",
         })?
-        .remove_outlier(data, diff, size)
+        .remove_outlier3d(data, diff, size)
 }
 
 /// Median-filter every 2-D slice along `axis` with a `size×size` footprint
