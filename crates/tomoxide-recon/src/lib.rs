@@ -8,11 +8,16 @@
 //! Analytic methods (`fbp`, `gridrec`, `fourierrec`, `lprec`, `linerec`) are a
 //! filter + back-projection pass; iterative methods compose forward projection
 //! and back-projection in a loop (see `docs/ARCHITECTURE.md` §3).
+//!
+//! Laminography ([`lamino`]) is intrinsically 3-D — every tilted projection
+//! contributes to every voxel — so it has its own entry point
+//! ([`lamino::lamino`]) rather than the per-slice [`recon`] dispatch.
 #![forbid(unsafe_code)]
 
 pub mod center;
 mod fourierrec;
 mod gridrec;
+pub mod lamino;
 mod lprec;
 pub mod ring;
 
