@@ -25,7 +25,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> vol    : array<f32>; // [nz, ny, nx]
 @group(0) @binding(4) var<uniform>             params : Params;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(WG)
 fn backproject(@builtin(global_invocation_id) gid : vec3<u32>) {
     let flat = gid.x;
     let plane = params.ny * params.nx;

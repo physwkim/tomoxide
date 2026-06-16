@@ -27,7 +27,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> sino   : array<f32>; // [nz, nproj, ncols]
 @group(0) @binding(4) var<uniform>             params : Params;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(WG)
 fn project(@builtin(global_invocation_id) gid : vec3<u32>) {
     let lane = gid.x; // flat over (nz * nproj)
     let nz = arrayLength(&center);

@@ -6,7 +6,7 @@
 // so callers compare with a tolerance, not bit-for-bit.
 @group(0) @binding(0) var<storage, read_write> ml_data : array<f32>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(WG)
 fn minus_log(@builtin(global_invocation_id) gid : vec3<u32>) {
     let i = gid.x;
     if (i >= arrayLength(&ml_data)) { return; }
@@ -32,7 +32,7 @@ struct DfParams {
 @group(0) @binding(2) var<storage, read>       df_denom : array<f32>;
 @group(0) @binding(3) var<uniform>             df_params : DfParams;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(WG)
 fn darkflat(@builtin(global_invocation_id) gid : vec3<u32>) {
     let i = gid.x;
     if (i >= df_params.n_elems) { return; }

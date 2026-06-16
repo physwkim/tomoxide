@@ -47,10 +47,17 @@ impl WgpuBackend {
     }
 
     /// Compile `wgsl`, then dispatch its `entry` compute function over
-    /// `n_threads` invocations (workgroup size [`WORKGROUP`]), binding `buffers`
-    /// at `@group(0)` in slice order. Uses the pipeline's auto-deduced bind-group
-    /// layout, so each buffer's address space (`storage`/`uniform`, read vs
-    /// read_write) is taken from the shader declaration.
+    /// `n_threads` invocations, binding `buffers` at `@group(0)` in slice order.
+    /// Uses the pipeline's auto-deduced bind-group layout, so each buffer's
+    /// address space (`storage`/`uniform`, read vs read_write) is taken from the
+    /// shader declaration.
+    ///
+    /// The dispatch launches `ceil(n_threads / WORKGROUP)` workgroups, so the
+    /// kernel's `@workgroup_size` MUST equal [`WORKGROUP`] or threads at the tail
+    /// go unlaunched. To make that impossible to get wrong, a `const WG` is
+    /// injected into the shader source from [`WORKGROUP`]; every 1-D kernel
+    /// declares `@workgroup_size(WG)` rather than a literal, so the size has a
+    /// single source of truth here.
     pub(crate) fn dispatch1d(
         &self,
         wgsl: &str,
@@ -58,11 +65,12 @@ impl WgpuBackend {
         buffers: &[&wgpu::Buffer],
         n_threads: u32,
     ) {
+        let src = format!("const WG : u32 = {WORKGROUP}u;\n{wgsl}");
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(entry),
-                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
             });
         let pipeline = self
             .device
