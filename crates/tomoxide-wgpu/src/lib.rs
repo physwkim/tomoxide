@@ -100,6 +100,12 @@ impl Backend for WgpuBackend {
     fn elementwise(&self) -> Option<&dyn tomoxide_core::backend::Elementwise> {
         Some(self)
     }
+
+    /// Parallel-beam filtered back-projection runs on the GPU.
+    #[cfg(feature = "gpu-wgpu")]
+    fn backprojector(&self) -> Option<&dyn tomoxide_core::backend::FilteredBackproject> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
@@ -215,7 +221,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // bar is a small relative+absolute tolerance, not bit-for-bit.
     use ndarray::Array3;
     use tomoxide_core::backend::Backend;
-    use tomoxide_core::data::{Frames, Layout, Tomo};
+    use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
+    use tomoxide_core::geometry::{Angles, Center, Geometry};
 
     /// Assert two flat f32 sequences agree within a relative+absolute tolerance.
     fn assert_close(gpu: &[f32], cpu: &[f32], rtol: f32, atol: f32) {
@@ -325,6 +332,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 c.array.as_standard_layout().as_slice().unwrap(),
                 1e-5,
                 1e-6,
+            );
+        }
+    }
+
+    // --- FilteredBackproject capability: parity vs the CPU backend ----------
+    #[test]
+    fn backproject_matches_cpu() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        // [row, angle, col] sinogram with structure: 2 rows, 6 angles, 8 cols.
+        let (nz, nang, ncols) = (2usize, 6usize, 8usize);
+        let sarr = Array3::from_shape_fn((nz, nang, ncols), |(z, a, col)| {
+            ((z * 3 + a) as f32 * 0.3 + col as f32 * 0.17).sin() + 0.05 * col as f32
+        });
+        let s = Tomo::new(sarr, Layout::Sinogram);
+        let mut geom = Geometry::parallel(
+            Angles::uniform(nang, 0.0, std::f32::consts::PI),
+            ncols,
+            nz,
+            1.0,
+        );
+
+        // Reconstruct an interior 4×4 ROI inside the 8-wide detector (the
+        // physically sensible field-of-view): every ray maps to t ∈ ~[0.7, 6.8],
+        // safely away from the detector edges 0 and ncols−1. That keeps GPU/CPU
+        // divergence to pure multiply-accumulate rounding. A full-detector-width
+        // grid lets corner rays graze the hard inclusion cutoff (t≈0 or
+        // t≈ncols−1), where a sub-ULP t difference flips a whole edge sample —
+        // a legitimate discontinuity, not a rounding error.
+        let recon = 4usize;
+        // Exercise both center buffer paths: scalar (default 4.0) and per-row.
+        for center in [geom.center.clone(), Center::PerRow(vec![3.5, 4.0])] {
+            geom.center = center;
+            let mut g = Volume::new(Array3::<f32>::zeros((nz, recon, recon)));
+            let mut c = Volume::new(Array3::<f32>::zeros((nz, recon, recon)));
+            be.backprojector()
+                .unwrap()
+                .backproject(&s, &geom, &mut g)
+                .unwrap();
+            cpu.backprojector()
+                .unwrap()
+                .backproject(&s, &geom, &mut c)
+                .unwrap();
+
+            assert_eq!(g.array.dim(), c.array.dim());
+            assert_close(
+                g.array.as_slice().unwrap(),
+                c.array.as_slice().unwrap(),
+                1e-4,
+                1e-5,
             );
         }
     }
