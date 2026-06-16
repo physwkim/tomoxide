@@ -225,6 +225,20 @@ pub enum StripeMethod {
         /// Median-window dimensionality: `1` → `(size, 1)`, `2` → `(size, size)`.
         dim: u8,
     },
+    /// Vo filtering-based stripe removal (tomopy `remove_stripe_based_filtering`,
+    /// Vo 2018 algorithm 2) — separates a low-pass component via a Gaussian
+    /// Fourier filter along the projection axis, sorting-corrects it, and adds
+    /// back the high-pass residual.
+    VoFilter {
+        /// Gaussian-window sigma separating the low-/high-pass components
+        /// (tomopy default `3`; recommended `3`–`10`).
+        sigma: f32,
+        /// Median window size for the inner sort (`None` = tomopy default
+        /// `max(5, 0.01·ncol)`, or `21` for `ncol > 2000`).
+        size: Option<usize>,
+        /// Median-window dimensionality: `1` → `(size, 1)`, `2` → `(size, size)`.
+        dim: u8,
+    },
 }
 
 /// Phase-retrieval method.

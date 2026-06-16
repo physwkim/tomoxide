@@ -1,8 +1,8 @@
 //! Stripe-artifact removal (ports tomopy `prep/stripe.py` + tomocupy
 //! `processing/remove_stripe.py`). The Fourier-Wavelet (`Fw`), smoothing-filter
-//! (`Sf`), Titarenko (`Ti`), Vo all-stripe (`VoAll`), and Vo sorting-based
-//! (`VoSort`) methods are implemented. See `docs/PORTING.md` §D. Dispatch on
-//! [`StripeMethod`].
+//! (`Sf`), Titarenko (`Ti`), Vo all-stripe (`VoAll`), Vo sorting-based
+//! (`VoSort`), and Vo filtering-based (`VoFilter`) methods are implemented. See
+//! `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
 
 use ndarray::Array2;
 use tomoxide_core::data::{Layout, Tomo};
@@ -36,6 +36,9 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
             sm_size,
         } => remove_all_stripe(data, snr, la_size, sm_size),
         StripeMethod::VoSort { size, dim } => remove_stripe_based_sorting(data, size, dim),
+        StripeMethod::VoFilter { sigma, size, dim } => {
+            remove_stripe_based_filtering(data, sigma, size, dim)
+        }
     }
 }
 
@@ -897,6 +900,152 @@ fn remove_stripe_based_sorting(data: &mut Tomo<f32>, size: Option<usize>, dim: u
         for p in 0..nproj {
             for c in 0..ncol {
                 proj.array[[p, m, c]] = corrected[[p, c]];
+            }
+        }
+    }
+
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Vo filtering-based stripe removal (tomopy `prep/stripe.py`
+// ::remove_stripe_based_filtering, Vo 2018 algorithm 2). Per sinogram slice:
+// separate a low-pass (smooth) component with a Gaussian Fourier filter along
+// the projection axis (`_rs_filter`), apply the sorting-based correction
+// (`_rs_sort`) to that smooth component, then add back the high-pass residual.
+// The Fourier filter runs in f64 (numpy promotes `float32 · float64-window` to
+// float64) before casting the smooth component to f32, so — like the
+// Fourier-Wavelet path — it matches tomopy to the f32 round-off floor, not
+// bit-exactly. Projector-independent.
+// ----------------------------------------------------------------------------
+
+/// `np.pad(..., mode='reflect')` index map: whole-sample symmetric reflection
+/// (the array edge is *not* repeated, unlike scipy.ndimage `reflect`), period
+/// `2(n-1)`. Used to reflect-pad the projection axis before the Fourier filter.
+fn reflect_whole_sample(i: isize, n: isize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let period = 2 * (n - 1);
+    let mut m = i % period;
+    if m < 0 {
+        m += period;
+    }
+    if m >= n {
+        m = period - m;
+    }
+    m as usize
+}
+
+/// `scipy.signal.windows.gaussian(len, std=sigma)` (symmetric): `exp(-n²/(2σ²))`
+/// with `n = arange(len) − (len−1)/2`. Computed in f64 like scipy.
+fn gaussian_window(len: usize, sigma: f64) -> Vec<f64> {
+    let center = (len as f64 - 1.0) / 2.0;
+    let sig2 = 2.0 * sigma * sigma;
+    (0..len)
+        .map(|k| {
+            let n = k as f64 - center;
+            (-(n * n) / sig2).exp()
+        })
+        .collect()
+}
+
+/// `(-1)^k` (tomopy `_create_listsign`), the spatial-domain modulation that
+/// turns the low-pass Fourier multiply into a band centred at the spectrum mid.
+#[inline]
+fn listsign(k: usize) -> f64 {
+    if k % 2 == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// `_rs_filter` smooth component: for each detector column, reflect-pad the
+/// projection profile, modulate by `listsign`, low-pass it with the Gaussian
+/// `window` in Fourier space, demodulate, and crop back. Returns the smooth
+/// sinogram `[nproj, ncol]` cast to f32 (tomopy stores it in a float32 array).
+///
+/// `window` has length `nproj + 2·pad`. The Fourier core
+/// `real(ifft(fft(col·listsign) · window))` is the `crate::fft` f64 column
+/// filter; the surrounding `· listsign` (real) commutes through `real(·)`, so
+/// the post-filter demodulation is a plain elementwise sign flip.
+fn rs_filter_smooth(sino: &Array2<f32>, window: &[f64], pad: usize) -> Array2<f32> {
+    let (nproj, ncol) = sino.dim();
+    let len = nproj + 2 * pad;
+    debug_assert_eq!(window.len(), len);
+    let n = nproj as isize;
+    let mut smooth = Array2::<f32>::zeros((nproj, ncol));
+    let mut signed = vec![0.0f64; len];
+    for c in 0..ncol {
+        // Reflect-padded, listsign-modulated column (f64).
+        for (k, sv) in signed.iter_mut().enumerate() {
+            let src = reflect_whole_sample(k as isize - pad as isize, n);
+            *sv = sino[[src, c]] as f64 * listsign(k);
+        }
+        let filtered = fft::filter_real_column(&signed, window);
+        // Demodulate and crop the padding: output index p ↔ filtered[pad + p].
+        for p in 0..nproj {
+            smooth[[p, c]] = (filtered[pad + p] * listsign(pad + p)) as f32;
+        }
+    }
+    smooth
+}
+
+/// Vo filtering-based stripe removal (tomopy `remove_stripe_based_filtering`,
+/// Vo 2018 algorithm 2).
+///
+/// `pad = min(150, ⌊0.1·nproj⌋)`; the Gaussian window length is `nproj + 2·pad`.
+/// `size = None` → tomopy default `max(5, ⌊0.01·ncol⌋)` (`21` for `ncol > 2000`);
+/// `dim` selects the inner `_rs_sort` median footprint exactly as `VoSort`.
+fn remove_stripe_based_filtering(
+    data: &mut Tomo<f32>,
+    sigma: f32,
+    size: Option<usize>,
+    dim: u8,
+) -> Result<()> {
+    let target = data.layout;
+    // tomopy operates on `tomo[:, m, :]` = `[proj, col]` slices of the
+    // `[proj, row, col]` projection-layout stack.
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, nrows, ncol) = proj.array.dim();
+    if nproj < 2 || nrows == 0 || ncol == 0 {
+        return Ok(());
+    }
+    // tomopy `_remove_stripe_based_filtering` (stripe.py:506-517).
+    let pad = 150.min((0.1 * nproj as f64) as usize);
+    let window = gaussian_window(nproj + 2 * pad, sigma as f64);
+    let size = size.unwrap_or_else(|| {
+        if ncol > 2000 {
+            21
+        } else {
+            5.max((0.01 * ncol as f64) as usize)
+        }
+    });
+    if size == 0 {
+        return Ok(());
+    }
+
+    for m in 0..nrows {
+        let mut sino = Array2::<f32>::zeros((nproj, ncol));
+        for p in 0..nproj {
+            for c in 0..ncol {
+                sino[[p, c]] = proj.array[[p, m, c]];
+            }
+        }
+        // Smooth (low-pass) component, then its sorting-based correction.
+        let smooth = rs_filter_smooth(&sino, &window, pad);
+        let smooth_cor = if dim == 1 {
+            rs_sort(&smooth, size)
+        } else {
+            rs_sort_with(&smooth, |s| median_filter_2d(s, size))
+        };
+        // out = smooth_cor + (sino − smooth)  (the high-pass residual added back).
+        for p in 0..nproj {
+            for c in 0..ncol {
+                let sharp = sino[[p, c]] - smooth[[p, c]];
+                proj.array[[p, m, c]] = smooth_cor[[p, c]] + sharp;
             }
         }
     }
