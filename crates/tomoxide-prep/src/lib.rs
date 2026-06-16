@@ -26,4 +26,4 @@ pub use normalize::{
 };
 pub use phase::retrieve_phase;
 pub use stripe::remove_stripe;
-pub use stripe3d::stripes_detect3d;
+pub use stripe3d::{stripes_detect3d, stripes_mask3d};
