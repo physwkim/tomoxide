@@ -392,6 +392,18 @@ below by dependency and value — the first three close the end-to-end pipeline.
   skewness, the add_rings constant-across-angles structural invariant, and the
   add_zingers / add_salt_pepper corrupted-fraction + default-val checks in
   `tests/noise_stats.rs`. The tomopy sim-noise family is complete.
+- ✅ **Sim illumination drift** — `add_drift` (`crates/tomoxide-sim/src/noise.rs`;
+  tomopy `sim/project.py:80`). Done. Deterministic (no RNG): scales each
+  projection angle `i` by `drift[i] = amp·sin(2π·i/period) + mean +
+  linspace(0,1)[i]`, constant across the detector. Held to the **f32 round-off
+  floor (≤1 ULP per pixel), not Δ=0** — numpy 2.x evaluates `np.sin` on the f64
+  angle array with its own vectorized routine that differs from Rust libm
+  `f64::sin` by ≤1 ULP for some angles, and that f64 difference survives the f32
+  cast in a small fraction of pixels (the f64·f32 product is commutative, so
+  `sin` is the sole divergence). Same precision class as the single-precision
+  phase-retrieval ports. Golden from real tomopy
+  (`tools/gen_tomopy_add_drift_golden.py`; 1493/9216 pixels differ ≤1 ULP, worst
+  rel=1.19e-7) in `tests/add_drift_parity.rs`.
 - ✅ **Background normalization** — `normalize::normalize_bg` (tomopy
   `prep/normalize.py:207` → `libtomo/prep/prep.c::normalize_bg`). Done. Per
   projection row the mean of the `air` left- and right-boundary pixels defines an

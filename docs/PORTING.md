@@ -161,6 +161,7 @@ void medianfilter_main_float(float* in,float* out,int kernel_half_size,float abs
 | `phantom::{baboon,…}`     | tomopy `misc/phantom.py:89…`            | stub    |
 | `sim::angles`             | tomopy `sim/project.py:241`             | done    |
 | `sim::project`            | tomopy `sim/project.py:268`; `libtomo/recon/project.c` | partial (CPU parallel-beam) |
+| `sim::add_drift`          | tomopy `sim/project.py:80`              | done (deterministic; f32 round-off floor ≤1 ULP — numpy's vectorized f64 `np.sin` vs libm `f64::sin` survives the f32 cast; drift `i` = amp·sin(2π·i/period)+mean+linspace(0,1)[i], const across detector) |
 | `sim::add_{gaussian,poisson}` | tomopy `sim/project.py:110,136` | done (distribution parity: matched moments — numpy's MT19937 stream is not reproducible; Poisson ports Knuth-mult / Hörmann PTRS) |
 | `sim::add_{rings,salt_pepper,zingers}` | tomopy `sim/project.py:153,183,211` | done (distribution parity: seeded SplitMix64; add_rings = fixed per-pixel sensitivity N(1,std) broadcast over angle, add_zingers = saturate fraction f to sat, add_salt_pepper = corrupt fraction prob to val (`<`), val=None → data max). Sim-noise family complete |
 
