@@ -410,6 +410,25 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `tools/gen_tomopy_remove_outlier1d_golden.py`). `prep::filters::remove_outlier1d`.
   Distinct from the 2-D `remove_outlier` (corr.py:559) and the 3-D cube
   `remove_outlier3d` (backend-routed).
+- ✅ **`gaussian_filter` — done.** Port of tomopy `misc/corr.py:118`: separable
+  Gaussian blur of every 2-D slice along `axis`. A faithful port of scipy.ndimage
+  `gaussian_filter1d` + the C `NI_Correlate1D` (verified line-by-line against
+  `scipy/ndimage/src/ni_filters.c`): the kernel is `exp(−x²/2σ²)` over
+  `x = −lw..lw` with `lw = ⌊4σ+0.5⌋` (`truncate=4`), normalised by **numpy's f64
+  pairwise sum** (new `pairwise_sum_f64`, the f64 analogue of `normalize`'s
+  `pairwise_sum_f32`) then reversed for correlation; the convolution loads the
+  line into an f64 buffer and accumulates in f64 with scipy's *exact* symmetric /
+  anti-symmetric / general summation branch (selected by the same `DBL_EPSILON`
+  test), `mode='reflect'` (half-sample) boundaries, and the **f32 intermediate**
+  cast between the two separable passes; derivative `order ≥ 1` uses scipy's
+  `q' + q·p'` kernel recurrence. The only possible divergence is the kernel `exp`
+  (numpy's vectorised f64 `exp` vs libm, ≤1 ULP), so the precision class is the
+  **f32 round-off floor** — but on the golden it realises **Δ=0** (0/12852 pixels
+  differ) across sigma=3 order=0 on each axis, a small-radius sigma, and
+  derivative orders 1 & 2. The `correlate1d_2d` branch reproduction is the shared
+  primitive that makes the integer-weighted `sobel_filter` bit-exact.
+  `gaussian_filter_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_gaussian_filter_golden.py`. `prep::filters::gaussian_filter`.
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
