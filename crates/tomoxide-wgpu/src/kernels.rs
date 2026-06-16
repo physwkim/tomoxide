@@ -7,14 +7,18 @@
 
 use bytemuck::{Pod, Zeroable};
 use ndarray::{Array3, Axis};
-use tomoxide_core::backend::{Elementwise, Fft, FilteredBackproject, ForwardProject, RankFilter};
+use tomoxide_core::backend::{
+    make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject, RankFilter,
+};
 use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
 use tomoxide_core::dtype::Complex32;
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Beam, Geometry};
+use tomoxide_core::params::FilterName;
 
 use crate::shaders::{
-    BACKPROJECT_WGSL, ELEMENTWISE_WGSL, FFT_TRANSPOSE_WGSL, FFT_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
+    BACKPROJECT_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_TRANSPOSE_WGSL, FFT_WGSL,
+    MEDFILT3D_WGSL, PROJECT_WGSL,
 };
 use crate::WgpuBackend;
 
@@ -359,6 +363,16 @@ impl RankFilter for WgpuBackend {
     }
 }
 
+/// Uniform block for the FBP filter-multiply kernel. Padded to 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FfltParams {
+    pad: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 /// Uniform block for the radix-2 FFT kernel (16 bytes — already a multiple of 16,
 /// so no padding is needed).
 #[repr(C)]
@@ -522,6 +536,84 @@ impl Fft for WgpuBackend {
             1.0
         };
         self.download_complex(&data, buf, norm);
+        Ok(())
+    }
+}
+
+impl FbpFilter for WgpuBackend {
+    /// Build the FBP apodized ramp filter on the host. The kernel is
+    /// device-independent, so this delegates to the shared
+    /// [`make_fbp_filter`] — CPU and GPU build the identical filter.
+    fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
+        make_fbp_filter(name, n)
+    }
+
+    /// Apply `filter` to every projection of `sino` on the GPU. Each detector
+    /// lane (axis 2 in both layouts) is zero-padded to `pad = filter.len()`,
+    /// forward-transformed, multiplied by the real filter, inverse-transformed,
+    /// scaled by `1/pad`, and its leading `n_cols` real samples written back.
+    /// Forward FFT, frequency-domain multiply, and inverse FFT all run on the
+    /// GPU in one serialized submission chain — no host round-trip between the
+    /// transforms. Mirrors `CpuBackend::apply`; `geom` is unused because ramp
+    /// filtering is shift-invariant (the rotation center is the
+    /// back-projector's job). Requires a power-of-two `pad` (the GPU FFT is
+    /// radix-2 only); other lengths error so the caller can fall back to CPU.
+    fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], _geom: &Geometry) -> Result<()> {
+        let pad = filter.len();
+        if pad == 0 {
+            return Err(Error::InvalidParam("empty filter".into()));
+        }
+        let ncols = sino.n_cols();
+        if pad < ncols {
+            return Err(Error::ShapeMismatch {
+                expected: format!(">= {ncols} (n_cols)"),
+                found: pad.to_string(),
+            });
+        }
+        if !pad.is_power_of_two() {
+            return Err(Error::InvalidParam(format!(
+                "wgpu FBP filter requires a power-of-two length (got {pad}); use the CPU backend"
+            )));
+        }
+        // Gather every detector lane into a zero-padded batch of complex
+        // transforms; lane `L` occupies `[L·pad, L·pad+ncols)`, the rest stays
+        // zero. `lanes`/`lanes_mut` iterate in the same order, so `L` maps
+        // consistently between gather and scatter regardless of memory layout.
+        let batch = sino.array.len() / ncols;
+        let mut host = vec![Complex32::new(0.0, 0.0); batch * pad];
+        for (l, lane) in sino.array.lanes(Axis(2)).into_iter().enumerate() {
+            let base = l * pad;
+            for (i, &v) in lane.iter().enumerate() {
+                host[base + i] = Complex32::new(v, 0.0);
+            }
+        }
+        let data = self.upload_complex("fbp_filter", &host);
+        self.fft_passes(&data, pad, batch, false);
+        let w = self.storage_ro("fbp_w", filter);
+        let p = self.uniform(
+            "fbp_p",
+            &FfltParams {
+                pad: pad as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        );
+        self.dispatch1d(
+            FBP_FILTER_WGSL,
+            "apply_filter",
+            &[&data, &w, &p],
+            (batch * pad) as u32,
+        );
+        self.fft_passes(&data, pad, batch, true);
+        // fft_passes leaves the inverse unnormalized; fold the 1/pad in here.
+        self.download_complex(&data, &mut host, 1.0 / pad as f32);
+        for (l, mut lane) in sino.array.lanes_mut(Axis(2)).into_iter().enumerate() {
+            let base = l * pad;
+            for (i, slot) in lane.iter_mut().enumerate() {
+                *slot = host[base + i].re;
+            }
+        }
         Ok(())
     }
 }

@@ -124,6 +124,13 @@ impl Backend for WgpuBackend {
     fn fft(&self) -> Option<&dyn tomoxide_core::backend::Fft> {
         Some(self)
     }
+
+    /// FBP apodization-filter application (pad → FFT → ×filter → IFFT → crop)
+    /// runs on the GPU, closing the full GPU filtered-back-projection path.
+    #[cfg(feature = "gpu-wgpu")]
+    fn fbp_filter(&self) -> Option<&dyn tomoxide_core::backend::FbpFilter> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
@@ -562,6 +569,67 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let mut buf = vec![Complex32::new(0.0, 0.0); 6];
         assert!(matches!(
             be.fft().unwrap().fft_1d(&mut buf, 6, 1, false),
+            Err(tomoxide_core::error::Error::InvalidParam(_))
+        ));
+    }
+
+    // --- FBP filter apply: parity vs the CPU backend ------------------------
+    // The whole pad → FFT → ×filter → IFFT → crop pipeline runs on the GPU; the
+    // bar is a tolerance (f32 twiddles + accumulation order), not bit-exact.
+
+    #[test]
+    fn fbp_filter_apply_matches_cpu() {
+        use tomoxide_core::params::FilterName;
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        // 6 detector lanes (3 angles × 2 rows) of width 16; the ramp filter
+        // zero-pads each lane to 32 before transforming.
+        let base = ramp_tomo(3, 2, 16, Layout::Sinogram);
+        let geom = Geometry::parallel(Angles::uniform(3, 0.0, std::f32::consts::PI), 16, 2, 1.0);
+
+        // CPU and GPU build the identical filter (shared make_fbp_filter).
+        let filter = cpu
+            .fbp_filter()
+            .unwrap()
+            .make_filter(FilterName::Ramp, 16)
+            .unwrap();
+        let gfilter = be
+            .fbp_filter()
+            .unwrap()
+            .make_filter(FilterName::Ramp, 16)
+            .unwrap();
+        assert_eq!(filter, gfilter, "make_filter differs between backends");
+
+        let mut g = base.clone();
+        let mut c = base.clone();
+        be.fbp_filter()
+            .unwrap()
+            .apply(&mut g, &filter, &geom)
+            .unwrap();
+        cpu.fbp_filter()
+            .unwrap()
+            .apply(&mut c, &filter, &geom)
+            .unwrap();
+
+        assert_close(
+            g.array.as_slice().unwrap(),
+            c.array.as_slice().unwrap(),
+            2e-3,
+            2e-3,
+        );
+    }
+
+    #[test]
+    fn fbp_filter_apply_rejects_non_power_of_two() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        // pad = 24 is ≥ ncols (8) but not a power of two: the radix-2 GPU FFT
+        // cannot transform it, so apply must error rather than corrupt data.
+        let mut sino = ramp_tomo(1, 1, 8, Layout::Sinogram);
+        let filter = vec![1.0f32; 24];
+        let geom = Geometry::parallel(Angles::uniform(1, 0.0, std::f32::consts::PI), 8, 1, 1.0);
+        assert!(matches!(
+            be.fbp_filter().unwrap().apply(&mut sino, &filter, &geom),
             Err(tomoxide_core::error::Error::InvalidParam(_))
         ));
     }
