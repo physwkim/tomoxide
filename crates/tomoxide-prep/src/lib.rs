@@ -17,6 +17,7 @@ pub mod morph;
 pub mod normalize;
 pub mod phase;
 pub mod stripe;
+pub mod stripe3d;
 mod wavelet;
 
 pub use morph::{downsample, pad, sino_360_to_180, upsample, PadMode, Rotation};
@@ -25,3 +26,4 @@ pub use normalize::{
 };
 pub use phase::retrieve_phase;
 pub use stripe::remove_stripe;
+pub use stripe3d::stripes_detect3d;
