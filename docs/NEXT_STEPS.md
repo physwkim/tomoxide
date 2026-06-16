@@ -261,7 +261,25 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `StripeMethod` variant). `stripe_detect3d_parity.rs`, golden from the **real
   tomopy** `tools/gen_tomopy_stripe_detect3d_golden.py` (size=10/radius=3 defaults
   and size=5/radius=2), plus `[0,1]`-range and stripe-highlight structural checks.
-  Next: `stripes_mask3d` (`prep/stripe.py:1058`) consumes these weights.
+- ✅ **stripes_mask3d (Kazantsev 2023) — done.** Port of tomopy
+  `prep/stripe.py:1058` `stripes_mask3d` / libtomo
+  `stripes_detect3d.c::stripesmask3d_main_float`: turns a `stripes_detect3d`
+  weights volume into a binary `bool` stripe mask. Threshold the weights (`<=`
+  candidate), then prune by stripe consistency in depth (drop deep features —
+  stripes are shallow) and along-angle (drop short runs), drop stripes shorter
+  than half the min length, and iteratively merge nearby stripes (one pass per
+  unit of min width). Each pass reads the previous pass's *full* result and
+  writes a fresh buffer, mirroring the C kernel's read/write `mask`/`Output`
+  split, so neighbour reads never see a half-updated mask. Pure integer/bool
+  logic with a single `f32` threshold compare and `(int)(0.01·sensitivity·len)`
+  thresholds (computed in f32 to match the C `float`), so it is **bit-exact
+  (Δ=0)** — the bool mask matches tomopy element-for-element. Public API
+  `prep::stripes_mask3d(&Array3<f32> weights, threshold, min_stripe_length,
+  min_stripe_depth, min_stripe_width, sensitivity_perc) -> Array3<bool>`.
+  `stripe_mask3d_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_stripe_mask3d_golden.py` (defaults `0.6/20/10/5/85` and a
+  looser `0.5/10/4/3/60`); the weights fixture is the real-tomopy
+  `stripes_detect3d` output. This completes the 3-D stripe-family port.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
