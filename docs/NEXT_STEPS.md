@@ -90,8 +90,19 @@ below by dependency and value — the first three close the end-to-end pipeline.
   refinement. Projector-independent and (with tol=0.5) quantized to a quarter-
   pixel center, so it matches tomopy 1.15.3 **exactly (Δ = 0)** on 4 cases
   including two subpixel (`center_pc_parity.rs`, golden from
-  `tools/gen_tomopy_center_pc_golden.py`). The `rotc_guess` pre-alignment
-  (`ndimage.shift`) is not yet ported — `Some(_)` returns `NotImplemented`.
+  `tools/gen_tomopy_center_pc_golden.py`). The `rotc_guess` pre-alignment is
+  **done**: both projections are pre-shifted by `[0, -imgshift]`
+  (`imgshift = rotc_guess - (ncol-1)/2`) through a line-faithful
+  `scipy.ndimage.shift` (order-3 cubic spline, `mode='constant'`, `cval=0`,
+  ported from scipy 1.17.1 — mirror-init prefilter + 16-tap separable resample,
+  out-of-bounds centres → `cval`, mirror-reflected edge taps), and `imgshift`
+  is added back. The isolated shift reproduces scipy **bit-for-bit (0 f32
+  mismatches)** across fractional/integer/out-of-bounds cases
+  (`tomoxide-recon` `ndimage_shift_matches_scipy`), and the end-to-end centers
+  match tomopy on 4 `imgshift != 0` cases (`center_pc_parity.rs`, golden from
+  `tools/gen_tomopy_center_pc_rotc_golden.py`). At `imgshift == 0` (default
+  `None`) the spline shift is the f32 identity, so it is skipped (None path
+  bit-for-bit unchanged).
 - ✅ **`find_center` — done.** Entropy + Nelder-Mead (`rotation.py:82`):
   reconstructs a slice with gridrec at candidate centers and minimises the masked
   reconstruction's 64-bin histogram entropy with a faithful scalar Nelder-Mead
