@@ -1524,6 +1524,7 @@ version = "0.0.0"
 dependencies = [
  "log",
  "ndarray",
+ "ndarray-npy",
  "tomoxide-core",
 ]
 

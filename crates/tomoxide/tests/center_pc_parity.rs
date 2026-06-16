@@ -10,6 +10,11 @@
 //! exactly. Goldens from tomopy 1.15.3 `find_center_pc`
 //! (`tools/gen_tomopy_center_pc_golden.py`); cases 2 and 4 land off the integer
 //! grid (centers 77.25 / 78.25), exercising the subpixel refinement.
+//!
+//! The `rotc_guess` pre-alignment path pre-shifts both projections by
+//! `[0, -imgshift]` through a faithful cubic-spline `scipy.ndimage.shift`
+//! (`gen_tomopy_center_pc_rotc_golden.py`; the shift itself is held to Δ ≈ 0 in
+//! `tomoxide-recon`'s `ndimage_shift_matches_scipy` unit test).
 
 use ndarray::{Array1, Array3, Axis};
 use ndarray_npy::read_npy;
@@ -50,15 +55,30 @@ fn find_center_pc_matches_tomopy() {
 }
 
 #[test]
-fn find_center_pc_rejects_rotc_guess() {
-    // The `rotc_guess` pre-alignment (ndimage.shift) is not yet ported; the
-    // function must reject it rather than silently ignore it.
-    let proj0 = load3("center_pc_proj0.npy");
-    let p0 = proj0.index_axis(Axis(0), 0).to_owned();
+fn find_center_pc_rotc_guess_matches_tomopy() {
+    // The `rotc_guess` pre-alignment spline-shifts both projections by
+    // `[0, -imgshift]` (imgshift = rotc_guess - (ncol-1)/2) before phase
+    // correlation, then adds imgshift back. Goldens use fractional and integer
+    // imgshift of both signs (+3.5, -3.0, +2.2, -4.7).
+    let proj0 = load3("center_pc_rotc_proj0.npy");
+    let proj180 = load3("center_pc_rotc_proj180.npy");
+    let tols = load1("center_pc_rotc_tols.npy");
+    let guesses = load1("center_pc_rotc_guess.npy");
+    let centers = load1("center_pc_rotc_centers.npy");
     let cpu = CpuBackend::new();
-    let err = recon::center::find_center_pc(&p0, &p0, &cpu, 0.5, Some(80.0));
-    assert!(
-        err.is_err(),
-        "rotc_guess=Some must be rejected, got {err:?}"
-    );
+
+    let ncase = proj0.dim().0;
+    for i in 0..ncase {
+        let p0 = proj0.index_axis(Axis(0), i).to_owned();
+        let p180 = proj180.index_axis(Axis(0), i).to_owned();
+        let tol = tols[i] as f32;
+        let guess = guesses[i] as f32;
+        let want = centers[i] as f32;
+        let got = recon::center::find_center_pc(&p0, &p180, &cpu, tol, Some(guess)).unwrap();
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "case {i} (rotc_guess={guess}): find_center_pc = {got}, tomopy = {want} (|Δ| = {})",
+            (got - want).abs()
+        );
+    }
 }

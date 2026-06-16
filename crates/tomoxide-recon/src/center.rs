@@ -152,8 +152,13 @@ pub fn find_center_vo(
 /// shift is quantized to half a pixel, so the center lands on a quarter-pixel
 /// grid exactly as tomopy's does.
 ///
-/// `rotc_guess` (tomopy's pre-alignment shift) is not yet ported — the default
-/// `None` path is the workhorse; `Some(_)` returns `NotImplemented`.
+/// `rotc_guess` (tomopy's pre-alignment shift) pre-shifts both projections by
+/// `[0, −imgshift]` with `imgshift = rotc_guess − (ncol−1)/2` through a faithful
+/// `scipy.ndimage.shift` (order-3 cubic spline, `mode='constant'`, `cval=0`; see
+/// `ndimage_shift_spline3_constant`) and adds `imgshift` back to the recovered
+/// center, exactly as tomopy `rotation.py:419-435`. With the default `None`,
+/// `imgshift == 0`, where scipy's spline shift is the identity to f32 precision,
+/// so the round-trip is skipped (bit-for-bit unchanged from before).
 pub fn find_center_pc(
     proj0: &Array2<f32>,
     proj180: &Array2<f32>,
@@ -161,12 +166,6 @@ pub fn find_center_pc(
     tol: f32,
     rotc_guess: Option<f32>,
 ) -> Result<f32> {
-    if rotc_guess.is_some() {
-        return Err(Error::todo(
-            "center::find_center_pc (rotc_guess pre-alignment)",
-            "tomopy recon/rotation.py:419 (ndimage.shift) — not yet ported",
-        ));
-    }
     let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
         backend: backend.name(),
         capability: "Fft",
@@ -178,12 +177,26 @@ pub fn find_center_pc(
             found: format!("{}x{}", proj180.dim().0, proj180.dim().1),
         });
     }
-    // reference = proj0, moving = fliplr(proj180); imgshift == 0 (rotc_guess None).
-    let mov = fliplr(proj180);
+    // Pre-alignment shift about the detector midline (tomopy rotation.py:419).
+    let imgshift = match rotc_guess {
+        Some(g) => g as f64 - (ncol as f64 - 1.0) / 2.0,
+        None => 0.0,
+    };
     let upsample = 1.0f64 / tol as f64;
-    let (_shift_row, shift_col) = phase_cross_correlation(proj0, &mov, upsample, fft)?;
+    // reference = proj0, moving = fliplr(proj180). When imgshift != 0 both
+    // projections are spline-shifted by [0, -imgshift] first (rotation.py:422-423);
+    // at imgshift == 0 the spline shift is f32-identity, so use the inputs as-is.
+    let shift_col = if imgshift != 0.0 {
+        let p0 = ndimage_shift_spline3_constant(proj0, 0.0, -imgshift);
+        let p180 = ndimage_shift_spline3_constant(proj180, 0.0, -imgshift);
+        let mov = fliplr(&p180);
+        phase_cross_correlation(&p0, &mov, upsample, fft)?.1
+    } else {
+        let mov = fliplr(proj180);
+        phase_cross_correlation(proj0, &mov, upsample, fft)?.1
+    };
     let center = (ncol as f64 + shift_col - 1.0) / 2.0;
-    Ok(center as f32)
+    Ok((center + imgshift) as f32)
 }
 
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
@@ -628,6 +641,193 @@ fn phase_cross_correlation(
 }
 
 // ----------------------------------------------------------------------------
+// scipy.ndimage.shift (order=3 cubic spline, mode='constant', cval=0) — the
+// exact port used by `find_center_pc`'s `rotc_guess` pre-alignment. tomopy
+// shifts both projections by `[0, -imgshift]` (rotation.py:422-423) before phase
+// correlation, so the spline output feeds straight into the FFT registration and
+// must match scipy to the f64 floor — unlike the deliberately-approximate
+// `cubic_shift_cols` above (truncated-horizon prefilter, taps dropped at the
+// boundary), whose zero-filled boundary columns the Vo metric overwrites.
+//
+// Mirrors scipy 1.17.1: `_interpolation.py::shift` (prefilter both axes to
+// float64 with `spline_filter`, negate the shift, call `zoom_shift`),
+// `ni_splines.c::apply_filter`/`_init_causal_mirror`/`_init_anticausal_mirror`/
+// `get_spline_interpolation_weights`, and `ni_interpolation.c::NI_ZoomShift`
+// (mode='constant' ⇒ an out-of-bounds output centre collapses to `cval`, while
+// in-bounds taps are whole-sample mirror-reflected) + `map_coordinate`.
+// ----------------------------------------------------------------------------
+
+/// `scipy.ndimage.shift(img, [shift_row, shift_col], order=3, mode='constant',
+/// cval=0)` for a 2-D float32 image. The public scipy API negates the shift
+/// internally, so output pixel `(i, j)` samples input coordinate
+/// `(i − shift_row, j − shift_col)`; out-of-bounds centres yield 0.
+fn ndimage_shift_spline3_constant(
+    img: &Array2<f32>,
+    shift_row: f64,
+    shift_col: f64,
+) -> Array2<f32> {
+    let (nr, nc) = img.dim();
+    let mut out = Array2::<f32>::zeros((nr, nc));
+    if nr == 0 || nc == 0 {
+        return out;
+    }
+    let coeff = spline_prefilter_2d(img); // float64 B-spline coefficients
+                                          // scipy negates the user shift (`shift = [-ii for ii in shift]`).
+    let (s_row, s_col) = (-shift_row, -shift_col);
+    let (nri, nci) = (nr as isize, nc as isize);
+    let (row_hi, col_hi) = (nr as f64 - 1.0, nc as f64 - 1.0);
+    for i in 0..nr {
+        let cc_row = i as f64 + s_row;
+        // map_coordinate(.., CONSTANT): out-of-bounds centre ⇒ cval (0).
+        if cc_row < 0.0 || cc_row > row_hi {
+            continue; // whole row is cval
+        }
+        let w_row = spline_weights3(cc_row);
+        let start_row = (cc_row.floor() as isize) - 1; // order odd ⇒ floor(cc) − order/2
+        let row_taps = [
+            mirror_index(start_row, nri),
+            mirror_index(start_row + 1, nri),
+            mirror_index(start_row + 2, nri),
+            mirror_index(start_row + 3, nri),
+        ];
+        for j in 0..nc {
+            let cc_col = j as f64 + s_col;
+            if cc_col < 0.0 || cc_col > col_hi {
+                continue; // out-of-bounds centre ⇒ cval (0)
+            }
+            let w_col = spline_weights3(cc_col);
+            let start_col = (cc_col.floor() as isize) - 1;
+            let col_taps = [
+                mirror_index(start_col, nci),
+                mirror_index(start_col + 1, nci),
+                mirror_index(start_col + 2, nci),
+                mirror_index(start_col + 3, nci),
+            ];
+            // 16-tap separable sum, axis-0 (rows) outer and axis-1 (cols) inner
+            // with the `coeff * w_row * w_col` multiply order, matching
+            // NI_ZoomShift's fcoordinates enumeration and accumulation.
+            let mut t = 0.0f64;
+            for a in 0..4 {
+                let cr = coeff.row(row_taps[a]);
+                let wr = w_row[a];
+                for b in 0..4 {
+                    t += cr[col_taps[b]] * wr * w_col[b];
+                }
+            }
+            out[[i, j]] = t as f32;
+        }
+    }
+    out
+}
+
+/// Prefilter `img` (float32) to cubic B-spline coefficients (float64) over both
+/// axes with mirror-boundary initialisation — scipy `spline_filter` runs
+/// `spline_filter1d` along axis 0 then axis 1, and for `mode='constant'` the
+/// order-3 `apply_filter` uses the mirror init (`ni_splines.c:295-300`).
+fn spline_prefilter_2d(img: &Array2<f32>) -> Array2<f64> {
+    let (nr, nc) = img.dim();
+    let z = 3.0f64.sqrt() - 2.0; // the single order-3 pole √3 − 2
+    let mut c = Array2::<f64>::from_shape_fn((nr, nc), |(i, j)| img[[i, j]] as f64);
+    // axis 0: filter each column (a line along axis 0). `len == 1` ⇒ no filter.
+    if nr > 1 {
+        let mut line = vec![0.0f64; nr];
+        for j in 0..nc {
+            for (i, v) in line.iter_mut().enumerate() {
+                *v = c[[i, j]];
+            }
+            apply_spline_filter_mirror(&mut line, z);
+            for (i, &v) in line.iter().enumerate() {
+                c[[i, j]] = v;
+            }
+        }
+    }
+    // axis 1: filter each row (a line along axis 1).
+    if nc > 1 {
+        let mut line = vec![0.0f64; nc];
+        for i in 0..nr {
+            for (j, v) in line.iter_mut().enumerate() {
+                *v = c[[i, j]];
+            }
+            apply_spline_filter_mirror(&mut line, z);
+            for (j, &v) in line.iter().enumerate() {
+                c[[i, j]] = v;
+            }
+        }
+    }
+    c
+}
+
+/// scipy `ni_splines.c::apply_filter` for a single order-3 pole with mirror
+/// initialisation: gain `(1−z)(1−1/z)` applied first, then one causal/anticausal
+/// pass — `_init_causal_mirror`, forward recursion, `_init_anticausal_mirror`,
+/// backward recursion. Caller guarantees `len ≥ 2`.
+fn apply_spline_filter_mirror(c: &mut [f64], z: f64) {
+    let n = c.len();
+    // _apply_filter_gain.
+    let gain = (1.0 - z) * (1.0 - 1.0 / z);
+    for v in c.iter_mut() {
+        *v *= gain;
+    }
+    // _init_causal_mirror: c[0] = (c[0] + Σ_{i} z^i·(c[i] + z^{n-1}·c[n-1-i])) / (1 − z^{2(n-1)}).
+    // `powf` (libm `pow`) matches scipy's `pow(z, n-1)` to the last bit; `powi`
+    // (exponentiation by squaring) can differ in the final ULP.
+    let z_n_1 = z.powf((n - 1) as f64);
+    let mut acc = c[0] + z_n_1 * c[n - 1];
+    let mut z_i = z;
+    for i in 1..n - 1 {
+        acc += z_i * (c[i] + z_n_1 * c[n - 1 - i]);
+        z_i *= z;
+    }
+    c[0] = acc / (1.0 - z_n_1 * z_n_1);
+    // Forward (causal) recursion.
+    for i in 1..n {
+        c[i] += z * c[i - 1];
+    }
+    // _init_anticausal_mirror.
+    c[n - 1] = (z * c[n - 2] + c[n - 1]) * z / (z * z - 1.0);
+    // Backward (anticausal) recursion.
+    for i in (0..n - 1).rev() {
+        c[i] = z * (c[i + 1] - c[i]);
+    }
+}
+
+/// scipy `ni_splines.c::get_spline_interpolation_weights` for order 3: the cubic
+/// B-spline weights at fractional offset `frac(cc)`, for the four taps
+/// `floor(cc)−1 … floor(cc)+2`. The last weight is `1 − Σ` (in scipy's order).
+fn spline_weights3(cc: f64) -> [f64; 4] {
+    let x = cc - cc.floor(); // order is odd ⇒ x -= floor(x)
+    let y = x;
+    let z = 1.0 - x;
+    let mut w = [0.0f64; 4];
+    w[1] = (y * y * (y - 2.0) * 3.0 + 4.0) / 6.0;
+    w[2] = (z * z * (z - 2.0) * 3.0 + 4.0) / 6.0;
+    w[0] = z * z * z / 6.0;
+    w[3] = 1.0 - w[0] - w[1] - w[2];
+    w
+}
+
+/// scipy `map_coordinate(idx, len, NI_EXTEND_MIRROR)` for an integer tap index:
+/// whole-sample reflection (period `2·len−2`, edges not repeated).
+fn mirror_index(idx: isize, len: isize) -> usize {
+    if len == 1 {
+        return 0;
+    }
+    let mut v = idx;
+    if v < 0 {
+        let sz2 = 2 * len - 2;
+        v = sz2 * ((-v) / sz2) + v;
+        v = if v <= 1 - len { v + sz2 } else { -v };
+    } else if v > len - 1 {
+        let sz2 = 2 * len - 2;
+        v -= sz2 * (v / sz2);
+        if v >= len {
+            v = sz2 - v;
+        }
+    }
+    v as usize
+}
+
+// ----------------------------------------------------------------------------
 // Vo's method internals (private). Mirrors tomopy rotation.py:236-388.
 // ----------------------------------------------------------------------------
 
@@ -1041,5 +1241,48 @@ fn beta3(t: f64) -> f64 {
         a * a * a / 6.0
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ndimage_shift_spline3_constant;
+    use ndarray::{Array2, Array3};
+    use ndarray_npy::read_npy;
+
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+    /// The cubic-spline `ndimage.shift` port reproduces scipy 1.17.1 bit-for-bit
+    /// (order=3, mode='constant', cval=0) across fractional/integer shifts of
+    /// both signs, including out-of-bounds (cval) and mirror-tap edge cases.
+    #[test]
+    fn ndimage_shift_matches_scipy() {
+        let input: Array2<f32> = read_npy(format!("{FIXTURES}/ndimage_shift_input.npy")).unwrap();
+        let outputs: Array3<f32> =
+            read_npy(format!("{FIXTURES}/ndimage_shift_outputs.npy")).unwrap();
+        let params: Array2<f64> = read_npy(format!("{FIXTURES}/ndimage_shift_params.npy")).unwrap();
+        let ncases = params.dim().0;
+        assert_eq!(outputs.dim().0, ncases);
+
+        for k in 0..ncases {
+            let (sr, sc) = (params[[k, 0]], params[[k, 1]]);
+            let got = ndimage_shift_spline3_constant(&input, sr, sc);
+            let want = outputs.index_axis(ndarray::Axis(0), k);
+            let mut max_abs = 0.0f32;
+            let mut n_mismatch = 0usize;
+            for (g, w) in got.iter().zip(want.iter()) {
+                let d = (g - w).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+                if g.to_bits() != w.to_bits() {
+                    n_mismatch += 1;
+                }
+            }
+            assert_eq!(
+                n_mismatch, 0,
+                "case {k} shift=({sr},{sc}): {n_mismatch} f32 bit-mismatches vs scipy, max|Δ|={max_abs:e}"
+            );
+        }
     }
 }

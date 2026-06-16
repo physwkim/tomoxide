@@ -12,3 +12,6 @@ description = "Backend-agnostic reconstruction algorithms and center finding for
 tomoxide-core.workspace = true
 ndarray.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+ndarray-npy.workspace = true
