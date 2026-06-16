@@ -362,6 +362,23 @@ below by dependency and value — the first three close the end-to-end pipeline.
   summation → matches tomopy 1.15.3 **bit-for-bit (Δ=0)** across both-None /
   high-only / low-only / both / looser-than-data cases (`adjust_range_parity.rs`,
   golden from `tools/gen_tomopy_adjust_range_golden.py`). `prep::filters::adjust_range`.
+- ✅ **`remove_outlier1d` — done.** Port of tomopy `misc/corr.py:615`: 1-D
+  `size`-tap median along `axis` (scipy.ndimage `mode='mirror'`, whole-sample
+  reflection — its index map verified against scipy `ni_support.c`
+  `NI_EXTEND_MIRROR`), then replace a pixel by that median only where
+  `arr − median ≥ diff` (strict `<` keeps it). scipy's median filter picks a
+  single order statistic (rank `size/2`, never an average even for even `size`)
+  and the `where` test is a plain f32 subtraction, so the result is **bit-exact
+  (Δ=0)** on finite input. The published tomopy 1.15.3 wrapper raises
+  `IndexError` on numpy 2.x (corr.py:660 indexes `arr[slc]` with a *list*; the
+  sibling `remove_outlier` already uses `arr[tuple(slc)]`), so the golden inlines
+  tomopy's verbatim body with that single one-character compat fix — same
+  chunking / dtype casts / scipy call / `ne.evaluate` `where`. 6 cases (odd/even
+  `size`, all three axes, `dif=0`) pass at 0 bit-mismatches
+  (`remove_outlier1d_parity.rs`, golden from
+  `tools/gen_tomopy_remove_outlier1d_golden.py`). `prep::filters::remove_outlier1d`.
+  Distinct from the existing `filters::remove_outlier` (which is the 3-D cube
+  dezinger `remove_outlier3d`, backend-routed).
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
