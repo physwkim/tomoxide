@@ -106,6 +106,12 @@ impl Backend for WgpuBackend {
     fn backprojector(&self) -> Option<&dyn tomoxide_core::backend::FilteredBackproject> {
         Some(self)
     }
+
+    /// Parallel-beam forward projection (Radon transform) runs on the GPU.
+    #[cfg(feature = "gpu-wgpu")]
+    fn projector(&self) -> Option<&dyn tomoxide_core::backend::ForwardProject> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
@@ -377,6 +383,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .backproject(&s, &geom, &mut c)
                 .unwrap();
 
+            assert_eq!(g.array.dim(), c.array.dim());
+            assert_close(
+                g.array.as_slice().unwrap(),
+                c.array.as_slice().unwrap(),
+                1e-4,
+                1e-5,
+            );
+        }
+    }
+
+    // --- ForwardProject capability: parity vs the CPU backend --------------
+    #[test]
+    fn forward_project_matches_cpu() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        // Interior 4×4×2 volume projected onto an 8-wide / 6-angle detector. The
+        // small grid keeps every pixel's t inside (0, ncols−1), away from the
+        // hard splat-inclusion cutoff (same edge-grazing hazard as backproject).
+        let (nz, ny, nx) = (2usize, 4usize, 4usize);
+        let (nang, ncols) = (6usize, 8usize);
+        let varr = Array3::from_shape_fn((nz, ny, nx), |(z, y, x)| {
+            0.3 + z as f32 * 0.5 + y as f32 * 0.11 + x as f32 * 0.07
+        });
+        let v = Volume::new(varr);
+        let mut geom = Geometry::parallel(
+            Angles::uniform(nang, 0.0, std::f32::consts::PI),
+            ncols,
+            nz,
+            1.0,
+        );
+
+        // Exercise both center buffer paths: scalar (default 4.0) and per-row.
+        for center in [geom.center.clone(), Center::PerRow(vec![3.5, 4.0])] {
+            geom.center = center;
+            let mut g = Tomo::new(Array3::<f32>::zeros((nz, nang, ncols)), Layout::Sinogram);
+            let mut c = Tomo::new(Array3::<f32>::zeros((nz, nang, ncols)), Layout::Sinogram);
+            be.projector().unwrap().project(&v, &geom, &mut g).unwrap();
+            cpu.projector().unwrap().project(&v, &geom, &mut c).unwrap();
+
+            assert_eq!(g.layout, Layout::Sinogram);
             assert_eq!(g.array.dim(), c.array.dim());
             assert_close(
                 g.array.as_slice().unwrap(),

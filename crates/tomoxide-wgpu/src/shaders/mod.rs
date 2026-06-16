@@ -9,3 +9,5 @@ pub const ELEMENTWISE_WGSL: &str = include_str!("elementwise.wgsl");
 pub const FBP_FILTER_WGSL: &str = include_str!("fbp_filter.wgsl");
 /// Parallel-beam back-projection (sinogram → slice).
 pub const BACKPROJECT_WGSL: &str = include_str!("backproject.wgsl");
+/// Parallel-beam forward projection (slice → sinogram), the Radon transform.
+pub const PROJECT_WGSL: &str = include_str!("project.wgsl");

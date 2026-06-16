@@ -7,12 +7,12 @@
 
 use bytemuck::{Pod, Zeroable};
 use ndarray::{Array3, Axis};
-use tomoxide_core::backend::{Elementwise, FilteredBackproject};
+use tomoxide_core::backend::{Elementwise, FilteredBackproject, ForwardProject};
 use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Beam, Geometry};
 
-use crate::shaders::{BACKPROJECT_WGSL, ELEMENTWISE_WGSL};
+use crate::shaders::{BACKPROJECT_WGSL, ELEMENTWISE_WGSL, PROJECT_WGSL};
 use crate::WgpuBackend;
 
 /// Uniform block for the `darkflat` kernel. Padded to 16 bytes to satisfy the
@@ -153,15 +153,7 @@ impl FilteredBackproject for WgpuBackend {
             });
         }
 
-        // (cosθ, sinθ) interleaved, matching the CPU reference's `sin_cos`.
-        let mut cossin = Vec::with_capacity(nang * 2);
-        for &a in angles {
-            let (sn, c) = a.sin_cos();
-            cossin.push(c);
-            cossin.push(sn);
-        }
-        // Per-row center, expanded so Scalar and PerRow share one buffer path.
-        let center: Vec<f32> = (0..nz).map(|r| geom.center.at(r)).collect();
+        let (cossin, center) = cossin_center(geom, nz);
         let scale = std::f32::consts::PI / nang as f32;
 
         let sino_std = s.array.as_standard_layout();
@@ -191,4 +183,93 @@ impl FilteredBackproject for WgpuBackend {
         out.array = Array3::from_shape_vec((nz, ny, nx), result).expect("len matches dims");
         Ok(())
     }
+}
+
+/// Per-angle `(cosθ, sinθ)` interleaved plus the per-row `center`, both computed
+/// host-side with the same `sin_cos` as the CPU reference so the GPU sampling
+/// (and its inclusion-boundary decision) is bit-identical to the CPU path. The
+/// center is expanded to one value per row so the `Scalar` and `PerRow` cases
+/// share a single buffer path. Shared by the back- and forward-projectors.
+fn cossin_center(geom: &Geometry, nz: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cossin = Vec::with_capacity(geom.angles.0.len() * 2);
+    for &a in &geom.angles.0 {
+        let (sn, c) = a.sin_cos();
+        cossin.push(c);
+        cossin.push(sn);
+    }
+    let center = (0..nz).map(|r| geom.center.at(r)).collect();
+    (cossin, center)
+}
+
+impl ForwardProject for WgpuBackend {
+    /// Parallel-beam pixel-driven forward projection (the Radon transform).
+    ///
+    /// Mirrors [`CpuBackend::project`](../../tomoxide_cpu) — the exact linear-
+    /// interp adjoint of [`Self::backproject`]. Forward projection is a scatter
+    /// (each pixel splats onto two detector columns), so to stay race-free the
+    /// GPU maps one thread per `(row, angle)`: each owns a disjoint detector-
+    /// column span and visits pixels in the CPU's `(iy, ix)` order, so the
+    /// per-column accumulation order matches and only the multiply-accumulate
+    /// rounding diverges (tolerance parity, not Δ=0). `out` is overwritten with
+    /// a fresh `[row, angle, col]` sinogram.
+    fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
+        if geom.beam != Beam::Parallel {
+            return Err(Error::InvalidParam(
+                "wgpu forward projection currently supports parallel beam only".into(),
+            ));
+        }
+        let (nz, ny, nx) = vol.dims();
+        let nang = geom.angles.0.len();
+        let ncols = geom.detector.width;
+        if nang == 0 || ncols == 0 {
+            return Err(Error::InvalidParam(
+                "geometry has no angles or zero detector width".into(),
+            ));
+        }
+
+        let (cossin, center) = cossin_center(geom, nz);
+        let vol_std = vol.array.as_standard_layout();
+        let vol_buf = self.storage_ro("fp_vol", vol_std.as_slice().expect("standard layout"));
+        let cossin_buf = self.storage_ro("fp_cossin", &cossin);
+        let center_buf = self.storage_ro("fp_center", &center);
+        let total = nz * nang * ncols;
+        let sino_buf = self.storage_rw("fp_sino", &vec![0.0f32; total]);
+        let params = FpParams {
+            nproj: nang as u32,
+            ncols: ncols as u32,
+            ny: ny as u32,
+            nx: nx as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let param_buf = self.uniform("fp_params", &params);
+        // One thread per (row, angle); each owns a disjoint sinogram column span.
+        self.dispatch1d(
+            PROJECT_WGSL,
+            "project",
+            &[&vol_buf, &cossin_buf, &center_buf, &sino_buf, &param_buf],
+            (nz * nang) as u32,
+        );
+        let result = self.download_f32(&sino_buf, total);
+        let array = Array3::from_shape_vec((nz, nang, ncols), result).expect("len matches dims");
+        *out = Tomo::new(array, Layout::Sinogram);
+        Ok(())
+    }
+}
+
+/// Uniform block for the `project` kernel. Padded to 32 bytes (a 16-byte
+/// multiple) to satisfy the WGSL uniform-buffer layout rules.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FpParams {
+    nproj: u32,
+    ncols: u32,
+    ny: u32,
+    nx: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
