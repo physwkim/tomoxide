@@ -1542,8 +1542,10 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "log",
+ "ndarray",
  "pollster",
  "tomoxide-core",
+ "tomoxide-cpu",
  "wgpu",
 ]
 

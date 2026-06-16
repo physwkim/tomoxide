@@ -16,7 +16,12 @@ gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
 tomoxide-core.workspace = true
+ndarray.workspace = true
 log.workspace = true
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
+
+[dev-dependencies]
+# CPU backend is the parity reference for the GPU kernel tests (gpu-wgpu only).
+tomoxide-cpu.workspace = true

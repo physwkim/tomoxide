@@ -13,6 +13,11 @@
 #[cfg(feature = "gpu-wgpu")]
 pub mod shaders;
 
+#[cfg(feature = "gpu-wgpu")]
+mod compute;
+#[cfg(feature = "gpu-wgpu")]
+mod kernels;
+
 use tomoxide_core::backend::{Backend, DeviceKind};
 use tomoxide_core::dtype::Dtype;
 use tomoxide_core::error::{Error, Result};
@@ -89,7 +94,13 @@ impl Backend for WgpuBackend {
         // f16 needs the `shader-f16` device feature; advertise f32 for now.
         dt == Dtype::F32
     }
-    // Capability accessors stay `None` until the WGSL kernels land in M6.
+
+    /// Elementwise preprocessing (dark/flat correction, `−ln`) runs on the GPU.
+    #[cfg(feature = "gpu-wgpu")]
+    fn elementwise(&self) -> Option<&dyn tomoxide_core::backend::Elementwise> {
+        Some(self)
+    }
+    // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
 #[cfg(test)]
@@ -197,5 +208,124 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         staging.unmap();
 
         assert_eq!(out, vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+    }
+
+    // --- Elementwise capability: parity vs the CPU backend ------------------
+    // GPU f32 transcendentals/divisions differ from libm by a few ULP, so the
+    // bar is a small relative+absolute tolerance, not bit-for-bit.
+    use ndarray::Array3;
+    use tomoxide_core::backend::Backend;
+    use tomoxide_core::data::{Frames, Layout, Tomo};
+
+    /// Assert two flat f32 sequences agree within a relative+absolute tolerance.
+    fn assert_close(gpu: &[f32], cpu: &[f32], rtol: f32, atol: f32) {
+        assert_eq!(gpu.len(), cpu.len(), "length mismatch");
+        for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let tol = atol + rtol * c.abs();
+            assert!(
+                (g - c).abs() <= tol,
+                "index {i}: gpu={g} cpu={c} |Δ|={} > tol={tol}",
+                (g - c).abs()
+            );
+        }
+    }
+
+    fn ramp_tomo(np: usize, nr: usize, nc: usize, layout: Layout) -> Tomo<f32> {
+        let n = np * nr * nc;
+        let data: Vec<f32> = (0..n).map(|k| 0.5 + k as f32 * 0.01).collect();
+        Tomo::new(Array3::from_shape_vec((np, nr, nc), data).unwrap(), layout)
+    }
+
+    #[test]
+    fn minus_log_matches_cpu() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        let base = ramp_tomo(3, 4, 5, Layout::Projection);
+        let mut g = base.clone();
+        let mut c = base.clone();
+        be.elementwise().unwrap().minus_log(&mut g).unwrap();
+        cpu.elementwise().unwrap().minus_log(&mut c).unwrap();
+
+        assert_close(
+            g.array.as_slice().unwrap(),
+            c.array.as_slice().unwrap(),
+            1e-5,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn minus_log_scrubs_nonfinite_like_cpu() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        // Values at/below the 1e-6 clamp drive -ln(...) large but finite; the
+        // clamp floor itself (1e-6) gives the max magnitude. Mix in zeros and
+        // negatives to exercise the clamp path on both backends identically.
+        let data = vec![0.0f32, -3.0, 1e-9, 1.0, 2.5, 1e-7];
+        let base = Tomo::new(
+            Array3::from_shape_vec((1, 2, 3), data).unwrap(),
+            Layout::Projection,
+        );
+        let mut g = base.clone();
+        let mut c = base.clone();
+        be.elementwise().unwrap().minus_log(&mut g).unwrap();
+        cpu.elementwise().unwrap().minus_log(&mut c).unwrap();
+
+        assert_close(
+            g.array.as_slice().unwrap(),
+            c.array.as_slice().unwrap(),
+            1e-5,
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn darkflat_matches_cpu_projection_and_sinogram() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        // 2 dark + 3 flat frames over a 4×5 plane; data is 3 projections.
+        let dark = Frames::new(
+            Array3::from_shape_vec(
+                (2, 4, 5),
+                (0..2 * 4 * 5).map(|k| 0.1 + k as f32 * 0.002).collect(),
+            )
+            .unwrap(),
+        );
+        let flat = Frames::new(
+            Array3::from_shape_vec(
+                (3, 4, 5),
+                (0..3 * 4 * 5).map(|k| 1.0 + k as f32 * 0.003).collect(),
+            )
+            .unwrap(),
+        );
+
+        // Build a projection-layout base (3 projections over the 4×5 detector
+        // plane) and derive the sinogram case by converting it, so the detector
+        // plane stays consistent with the dark/flat planes in both layouts.
+        let proj_base = ramp_tomo(3, 4, 5, Layout::Projection);
+        for layout in [Layout::Projection, Layout::Sinogram] {
+            let base = proj_base.to_layout(layout);
+            let mut g = base.clone();
+            let mut c = base.clone();
+            be.elementwise()
+                .unwrap()
+                .darkflat(&mut g, &flat, &dark)
+                .unwrap();
+            cpu.elementwise()
+                .unwrap()
+                .darkflat(&mut c, &flat, &dark)
+                .unwrap();
+
+            assert_eq!(g.layout, c.layout, "layout preserved");
+            assert_close(
+                g.array.as_standard_layout().as_slice().unwrap(),
+                c.array.as_standard_layout().as_slice().unwrap(),
+                1e-5,
+                1e-6,
+            );
+        }
     }
 }
