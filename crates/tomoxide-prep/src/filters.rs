@@ -146,7 +146,7 @@ fn median_f32(vals: &mut [f32]) -> f32 {
     }
 }
 
-/// 3-D median filter, dispatched to the backend's [`RankFilter`] (stub).
+/// 3-D median filter, dispatched to the backend's [`RankFilter`](tomoxide_core::backend::RankFilter) (stub).
 pub fn median_filter3d(vol: &mut Volume<f32>, size: usize, backend: &dyn Backend) -> Result<()> {
     backend
         .rank_filter()
@@ -158,7 +158,7 @@ pub fn median_filter3d(vol: &mut Volume<f32>, size: usize, backend: &dyn Backend
 }
 
 /// 3-D-cube outlier (zinger) removal, dispatched to the backend's
-/// [`RankFilter`] (tomopy `misc/corr.py:413` `remove_outlier3d`). Distinct from
+/// [`RankFilter`](tomoxide_core::backend::RankFilter) (tomopy `misc/corr.py:413` `remove_outlier3d`). Distinct from
 /// [`remove_outlier`], which is the axis-chunked 2-D dezinger (corr.py:559).
 pub fn remove_outlier3d(
     data: &mut Tomo<f32>,
@@ -364,7 +364,7 @@ pub fn gaussian_filter(data: &mut Tomo<f32>, sigma: f64, order: usize, axis: usi
 /// exactly like tomopy (which leaves scipy's `axis=-1` default, so the gradient
 /// is always along the slice's last axis).
 ///
-/// Reuses the f64 [`correlate1d_2d`] primitive shared with [`gaussian_filter`].
+/// Reuses the f64 `correlate1d_2d` primitive shared with [`gaussian_filter`].
 /// The weights are exact small integers (no transcendental), and f32 inputs are
 /// exact in the f64 accumulator, so the result is **bit-exact (Δ=0)** vs tomopy
 /// on finite input.

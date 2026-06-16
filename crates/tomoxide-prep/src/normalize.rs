@@ -1,7 +1,8 @@
 //! Flat/dark normalization and minus-log (ports tomopy `prep/normalize.py`).
 //!
 //! Flat/dark correction and minus-log are thin, backend-agnostic wrappers over
-//! the [`Elementwise`] capability so the same call runs on CPU/CUDA/wgpu.
+//! the [`Elementwise`](tomoxide_core::backend::Elementwise) capability so the
+//! same call runs on CPU/CUDA/wgpu.
 //! Background (air-region) normalization is a per-row reduction, so it is a
 //! direct CPU port matching the libtomo C bit-for-bit.
 
@@ -256,7 +257,7 @@ pub fn normalize_nf(
 /// tomopy's default `roi` is `[0, 0, 10, 10]`.
 ///
 /// The ROI mean reproduces numpy's f32 pairwise summation (see
-/// [`pairwise_sum_f32`]), so `bg` and the subsequent elementwise f32 divide are
+/// `pairwise_sum_f32`), so `bg` and the subsequent elementwise f32 divide are
 /// bit-exact (Δ=0) vs tomopy. Errors on an out-of-range or empty ROI (tomopy
 /// would instead clamp via numpy slicing and divide by a NaN/empty mean).
 pub fn normalize_roi(data: &mut Tomo<f32>, roi: [usize; 4]) -> Result<()> {

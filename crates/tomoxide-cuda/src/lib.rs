@@ -1,13 +1,13 @@
 //! # tomoxide-cuda
 //!
 //! The CUDA backend. It re-uses tomocupy's battle-tested `.cu` kernels through
-//! a thin C-ABI shim (see [`ffi`] and `cuda/shim.cpp`) rather than rewriting
+//! a thin C-ABI shim (see `ffi` and `cuda/shim.cpp`) rather than rewriting
 //! them. Compiled only when the **`cuda` feature** is enabled and an NVIDIA
 //! toolkit is present; otherwise [`CudaBackend::new`] reports the backend as
 //! unavailable so the rest of the workspace still builds and runs (on CPU).
 //!
 //! In this scaffold the backend advertises the device but exposes no
-//! capabilities yet — the FFI signatures are committed in [`ffi`] and the
+//! capabilities yet — the FFI signatures are committed in `ffi` and the
 //! streaming wiring lands in milestone M4 (see `docs/ROADMAP.md`).
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 

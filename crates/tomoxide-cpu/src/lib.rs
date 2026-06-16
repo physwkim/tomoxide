@@ -627,7 +627,7 @@ impl RankFilter for CpuBackend {
     }
 
     /// Outlier (zinger) removal (tomopy `misc/corr.py::remove_outlier3d`).
-    /// Same kernel as [`median3d`] but with the dezinger threshold `diff`: a
+    /// Same kernel as [`RankFilter::median3d`] but with the dezinger threshold `diff`: a
     /// voxel is replaced by the local median only when it deviates from it by
     /// at least `diff`; all others pass through unchanged.
     fn remove_outlier3d(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()> {

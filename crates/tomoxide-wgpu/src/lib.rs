@@ -1,9 +1,9 @@
 //! # tomoxide-wgpu
 //!
-//! A portable GPU backend built on [`wgpu`], so the GPU reconstruction path
+//! A portable GPU backend built on `wgpu`, so the GPU reconstruction path
 //! runs on hardware CUDA can't target — notably **Metal** on Apple Silicon, and
 //! Vulkan/DX12 elsewhere. Kernels are WGSL ports of the CUDA kernels (see
-//! [`shaders`]).
+//! `shaders`).
 //!
 //! Gated behind the **`gpu-wgpu`** feature because `wgpu` is a heavy
 //! dependency; the default workspace build skips it and

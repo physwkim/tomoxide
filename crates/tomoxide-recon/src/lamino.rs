@@ -20,7 +20,7 @@
 //!      real reconstructed volume.
 //!
 //! Each USFFT is a Gaussian-gridding operator (accuracy target `eps = 1e-3`,
-//! half-width `m`, shape `mu`) identical in spirit to [`crate::fourierrec`]'s
+//! half-width `m`, shape `mu`) identical in spirit to `fourierrec`'s
 //! gather, with a `fwd`/`adj` pair that are exact transposes — verified by the
 //! adjoint dot-product test `⟨A·f, g⟩ = ⟨f, A*·g⟩`.
 //!

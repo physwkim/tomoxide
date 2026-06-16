@@ -1,6 +1,6 @@
 //! # tomoxide-prep
 //!
-//! Preprocessing for tomoxide: flat/dark [`normalize`]ation and minus-log,
+//! Preprocessing for tomoxide: flat/dark [`normalize`](mod@normalize)ation and minus-log,
 //! [`stripe`] removal, [`phase`] retrieval, beam [`hardening`], and misc
 //! [`filters`] (circular mask, NaN/neg scrubbing, median/outlier). Depends on
 //! `tomoxide-core` only; device kernels are reached through backend traits.
