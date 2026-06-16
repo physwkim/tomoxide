@@ -269,6 +269,17 @@ below by dependency and value — the first three close the end-to-end pipeline.
   seeded SplitMix64 (no `rand` dep); Poisson ports numpy's Knuth-mult / Hörmann
   PTRS selection. Tested by moments incl. Poisson skewness in
   `tests/noise_stats.rs`.
+- ✅ **Background normalization** — `normalize::normalize_bg` (tomopy
+  `prep/normalize.py:207` → `libtomo/prep/prep.c::normalize_bg`). Done. Per
+  projection row the mean of the `air` left- and right-boundary pixels defines an
+  air baseline linearly interpolated across the detector-column axis; every pixel
+  is divided by its local baseline (non-positive means clamped to `1`). f32 in the
+  upstream accumulation order, with `f32::mul_add` for the baseline
+  `air_left + air_slope·j` (a single C statement clang contracts to a fused
+  multiply-add under the default `-ffp-contract=on`), so it matches tomopy 1.15.3
+  **bit-for-bit (Δ=0)** for both `air=1` (default) and `air=4`.
+  `normalize_bg_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_normalize_bg_golden.py`.
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a

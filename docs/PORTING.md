@@ -97,7 +97,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | tomoxide                          | Upstream                                          | Backend | Status  |
 |-----------------------------------|---------------------------------------------------|---------|---------|
 | `normalize::normalize`            | tomopy `prep/normalize.py:98`                     | CPU     | partial |
-| `normalize::normalize_bg`         | tomopy `prep/normalize.py:207`; `libtomo/prep/prep.c` (`normalize_bg`) | CPU | stub |
+| `normalize::normalize_bg`         | tomopy `prep/normalize.py:207`; `libtomo/prep/prep.c` (`normalize_bg`) | CPU | CPU ✓ — tomopy parity (bit-exact, Δ=0) for `air=1` & `air=4`. Per-row air baseline (left/right boundary means) lerp'd across the column axis, divide; f32 in upstream order, `f32::mul_add` for the clang-contracted `air_left + air_slope·j` |
 | `normalize::normalize_nf`         | tomopy `prep/normalize.py:245`                    | CPU     | stub    |
 | `normalize::minus_log`            | tomopy `prep/normalize.py:72`; tomocupy `proc_functions.minus_log` | all | partial |
 | `normalize::darkflat`             | tomocupy `proc_functions.darkflat_correction:55`  | all     | partial |
