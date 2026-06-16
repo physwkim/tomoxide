@@ -180,8 +180,23 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `gpaganin_parity.rs`, golden from `tools/gen_tomocupy_gpaganin_golden.py` (a
   faithful CPU/`scipy.fft` single-precision transcription of tomocupy's exact
   functions, since tomocupy needs a GPU).
-- **Remaining stub:** `crates/tomoxide-prep/src/phase.rs` — `Farago` (tomocupy
-  `retrieve_phase.farago_filter:110`).
+- ✅ **Farago — done.** Port of tomocupy `retrieve_phase.farago_filter`
+  (Farago 2024): the same padded-Fourier driver (`run_phase`) as Paganin but with
+  the filter `1/(cos θ + db·sin θ)`, `θ = π·λ·dist·(ix² + iy²)` over the **squared**
+  reciprocal grid (`_reciprocal_grid` + `_farago_filter_factor`). `run_phase` now
+  takes a filter-builder closure; the f64-grid Paganin family goes through a
+  `pointwise_filter` adapter (bit-identical to the prior inline path) while Farago
+  builds its grid directly in f32. The filter is f32-sensitive — `db ≈ 1e3`
+  multiplies `sin θ` so a 1-ULP error in `θ` is amplified ~1e3× — so the grid is
+  built from the **exact** f32 reciprocal coordinate (numpy/cupy round the
+  `0.5/((n−1)·ps)` scale to f32 *before* the multiply, NEP50 weak scalar;
+  `reciprocal_coord_f32`). An f64 grid cast down diverges ~1e-3 (verified); the
+  exact-f32 grid makes the filter **bit-identical** to numpy's, leaving only the
+  single-precision FFT residual → **f32 round-off floor** (max rel Δ≈4.6e-7).
+  `farago_parity.rs`, golden from `tools/gen_tomocupy_farago_golden.py` (faithful
+  CPU/`scipy.fft` single-precision transcription of tomocupy's exact functions).
+- **Phase family complete:** Paganin, GPaganin, and Farago are all ported; no
+  phase-retrieval stubs remain.
 
 ### B5. Rank filters — `CpuBackend: RankFilter`  (completes the prep family)
 

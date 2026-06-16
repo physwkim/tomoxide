@@ -111,7 +111,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `stripe::stripes_detect3d`        | tomopy `prep/stripe.py:984`; `libtomo/prep/stripes_detect3d.c` | CPU | stub |
 | `phase::retrieve_phase` (Paganin) | tomopy `prep/phase.py:80`; tomocupy `retrieve_phase.paganin_filter:59` | CPU | ✓ — tomopy parity (max rel Δ≈2.4e-7) |
 | `phase::retrieve_phase` (Gpaganin) | tomocupy `retrieve_phase.paganin_filter:59` (`method='Gpaganin'`, `_paganin_filter_factorG:215`) | CPU | ✓ — tomocupy parity (max rel Δ≈4.9e-7). Grid/filter in f32 to mirror cupy single precision (ill-conditioned, `scale≈1.2e3`); golden via scipy.fft single-precision transcription |
-| `phase::retrieve_phase` (farago) | tomocupy `retrieve_phase.farago_filter:110`  | CPU | stub |
+| `phase::retrieve_phase` (farago) | tomocupy `retrieve_phase.farago_filter:110` (`_farago_filter_factor:212`) | CPU | ✓ — tomocupy parity (max rel Δ≈4.6e-7). Filter `1/(cos θ + db·sin θ)` over the squared reciprocal grid, built in f32 to mirror cupy (f32-sensitive: `db≈1e3` amplifies θ rounding ~1e3×); exact-f32 reciprocal coord (`reciprocal_coord_f32`) makes the filter bit-identical to numpy's; golden via scipy.fft single-precision transcription |
 | `hardening::beam_correct`         | tomocupy `processing/external/hardening.py:50`    | GPU     | stub    |
 | `align::align_seq/align_joint`    | tomopy `prep/alignment.py:89,216`                 | CPU     | stub    |
 
