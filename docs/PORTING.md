@@ -101,7 +101,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `normalize::normalize_nf`         | tomopy `prep/normalize.py:245`                    | CPU     | stub    |
 | `normalize::minus_log`            | tomopy `prep/normalize.py:72`; tomocupy `proc_functions.minus_log` | all | partial |
 | `normalize::darkflat`             | tomocupy `proc_functions.darkflat_correction:55`  | all     | partial |
-| `stripe::remove_stripe_fw`        | tomopy `prep/stripe.py:88`; tomocupy `remove_stripe.remove_stripe_fw` | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈1.2e-6). db5 dwt2/idwt2 hand-ported (no new dep) in `wavelet.rs`, pywt-validated; float32-forward/f64-damp+inverse dtype flow. Damping uses a self-contained O(n²) direct DFT (no FFT dep) — perf TODO for large stacks |
+| `stripe::remove_stripe_fw`        | tomopy `prep/stripe.py:88`; tomocupy `remove_stripe.remove_stripe_fw` | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈1.2e-6). db5 dwt2/idwt2 hand-ported (no new dep) in `wavelet.rs`, pywt-validated; float32-forward/f64-damp+inverse dtype flow. Damping uses a self-contained `O(n log n)` FFT (radix-2 + Bluestein, arbitrary length, no FFT dep) in `fft.rs` |
 | `stripe::remove_stripe_ti`        | tomopy `prep/stripe.py:179` (Titarenko/Miqueles) | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈5.2e-7); default `nblock=0` only (`_ringb` block path unrunnable on modern numpy) |
 | `stripe::remove_stripe_sf`        | tomopy `prep/stripe.py:333`; `libtomo/prep/stripe.c` (`remove_stripe_sf`) | CPU | CPU ✓ — tomopy parity (bit-exact) |
 | `stripe::remove_stripe_based_sorting` | tomopy `prep/stripe.py:363` (Vo alg. 3)       | CPU     | stub    |

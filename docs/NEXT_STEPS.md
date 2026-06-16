@@ -153,8 +153,9 @@ below by dependency and value — the first three close the end-to-end pipeline.
   promotion), so it matches tomopy 1.15.3 to the **f32 round-off floor** (max rel
   Δ≈1.2e-6) — `stripe_fw_parity.rs`, golden from
   `tools/gen_tomopy_stripe_fw_golden.py`. The Münch damping uses a self-contained
-  O(n²) direct DFT (arbitrary length, no FFT dependency) — known perf cost for
-  large stacks, flagged in PORTING §D for a future FFT.
+  `O(n log n)` FFT (radix-2 + Bluestein for arbitrary length, no FFT dependency)
+  in `crates/tomoxide-prep/src/fft.rs`, validated against a naive DFT to the f64
+  floor.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
