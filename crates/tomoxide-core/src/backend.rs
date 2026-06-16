@@ -122,6 +122,11 @@ pub trait FbpFilter {
     /// this is the pure ramp, so the centre-aligned goldens are unchanged.
     /// `geom` supplies the per-row centre.
     ///
+    /// Each lane is centred in the `filter.len()`-wide buffer and
+    /// **edge-replicate**-padded on both borders before the transform (then the
+    /// centred window is cropped back out), matching tomocupy's `ne = 4·n`
+    /// padding so the long-tailed ramp does not ring against a hard zero step.
+    ///
     /// Out of scope here: gridrec runs its own integrated filter+recenter (it
     /// never calls this method), and the iterative back-projectors keep
     /// `geom.center` in the projector/adjoint pair (their data is not filtered).
@@ -136,20 +141,25 @@ pub trait FbpFilter {
 /// function — only [`FbpFilter::apply`] differs by backend. Keeping a single
 /// definition here means CPU and GPU cannot drift to different filter shapes.
 ///
-/// The returned kernel has length `pad = (2·n).next_power_of_two()` — the
-/// projection is zero-padded to `pad` before transforming so the ramp
-/// convolution does not wrap around — and is laid out in `rustfft` (fftfreq)
-/// order, symmetric about the Nyquist bin. The ramp magnitude `r` runs `0`
-/// at DC to `1` at Nyquist; `name` apodizes it. The window set matches
-/// tomopy/tomocupy; exact `_wint` quadrature weighting is reconciled when
-/// tomopy golden data is available.
+/// The returned kernel has length `pad = (4·n).next_power_of_two()` — the
+/// projection is edge-replicate-padded to `pad` and centred before
+/// transforming (see [`FbpFilter::apply`]) so the ramp convolution neither
+/// wraps around nor rings against a hard zero step — and is laid out in
+/// `rustfft` (fftfreq) order, symmetric about the Nyquist bin. The `4·n`
+/// width matches tomocupy's `ne` (`fbp_filter_center`: `ne = 4·n` for the
+/// float32 path; the `next_power_of_two` rounding here is exact for every
+/// power-of-two width — the whole golden set — and matches tomocupy's own
+/// float16 pow2-rounding for the rest, keeping the wgpu radix-2 FFT usable at
+/// any width). The ramp magnitude `r` runs `0` at DC to `1` at Nyquist;
+/// `name` apodizes it. The window set matches tomopy/tomocupy; exact `_wint`
+/// quadrature weighting is reconciled when tomopy golden data is available.
 pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
     if n == 0 {
         return Err(crate::error::Error::InvalidParam(
             "filter length must be > 0".into(),
         ));
     }
-    let pad = (2 * n).next_power_of_two();
+    let pad = (4 * n).next_power_of_two();
     let pi = std::f32::consts::PI;
     let mut f = vec![0.0f32; pad];
     for (k, slot) in f.iter_mut().enumerate() {

@@ -673,9 +673,10 @@ impl FbpFilter for WgpuBackend {
     }
 
     /// Apply `filter` to every projection of `sino` on the GPU. Each detector
-    /// lane (axis 2 in both layouts) is zero-padded to `pad = filter.len()`,
-    /// forward-transformed, multiplied by the real filter, inverse-transformed,
-    /// scaled by `1/pad`, and its leading `n_cols` real samples written back.
+    /// lane (axis 2 in both layouts) is centred in a `pad = filter.len()`-wide
+    /// buffer and edge-replicate-padded on both borders, forward-transformed,
+    /// multiplied by the real filter, inverse-transformed, scaled by `1/pad`,
+    /// and the centred `n_cols`-wide window cropped back out.
     /// Forward FFT, frequency-domain multiply, and inverse FFT all run on the
     /// GPU in one serialized submission chain — no host round-trip between the
     /// transforms. Mirrors `CpuBackend::apply`, including the per-row
@@ -702,16 +703,28 @@ impl FbpFilter for WgpuBackend {
                 "wgpu FBP filter requires a power-of-two length (got {pad}); use the CPU backend"
             )));
         }
-        // Gather every detector lane into a zero-padded batch of complex
-        // transforms; lane `L` occupies `[L·pad, L·pad+ncols)`, the rest stays
-        // zero. `lanes`/`lanes_mut` iterate in the same order, so `L` maps
-        // consistently between gather and scatter regardless of memory layout.
+        // Gather every detector lane into the batch of complex transforms,
+        // centred and edge-replicate-padded exactly like CpuBackend::apply
+        // (tomocupy `fbp_filter_center`): lane `L` occupies
+        // `[L·pad + pad_side, L·pad + pad_side + ncols)`, and the borders
+        // replicate the first/last column. `lanes`/`lanes_mut` iterate in the
+        // same order, so `L` maps consistently between gather and scatter
+        // regardless of memory layout.
         let batch = sino.array.len() / ncols;
+        let pad_side = pad / 2 - ncols / 2;
         let mut host = vec![Complex32::new(0.0, 0.0); batch * pad];
         for (l, lane) in sino.array.lanes(Axis(2)).into_iter().enumerate() {
             let base = l * pad;
+            let first = lane[0];
+            let last = lane[ncols - 1];
+            for slot in host[base..base + pad_side].iter_mut() {
+                *slot = Complex32::new(first, 0.0);
+            }
             for (i, &v) in lane.iter().enumerate() {
-                host[base + i] = Complex32::new(v, 0.0);
+                host[base + pad_side + i] = Complex32::new(v, 0.0);
+            }
+            for slot in host[base + pad_side + ncols..base + pad].iter_mut() {
+                *slot = Complex32::new(last, 0.0);
             }
         }
         // Per-lane centre shift δ = ncols/2 − center(row). `lanes` iterates the
@@ -752,7 +765,7 @@ impl FbpFilter for WgpuBackend {
         // fft_passes leaves the inverse unnormalized; fold the 1/pad in here.
         self.download_complex(&data, &mut host, 1.0 / pad as f32);
         for (l, mut lane) in sino.array.lanes_mut(Axis(2)).into_iter().enumerate() {
-            let base = l * pad;
+            let base = l * pad + pad_side;
             for (i, slot) in lane.iter_mut().enumerate() {
                 *slot = host[base + i].re;
             }

@@ -181,21 +181,21 @@ impl FbpFilter for CpuBackend {
     /// Apply `filter` to every projection of `sino` in place, folding in the
     /// rotation-center shift (tomocupy `fbp_filter_center`).
     ///
-    /// Each `(row, angle)` detector lane is zero-padded to `filter.len()`,
-    /// forward-transformed, multiplied by the ramp filter **and** a per-row
-    /// Fourier-shift phase `exp(-2πi·f_k·(ncols/2 − center)/pad)` (signed
-    /// frequency `f_k`, see the body comment), inverse-
-    /// transformed, and the leading `n_cols` real samples written back. The
-    /// phase is the band-limited sub-pixel shift that moves the rotation axis
-    /// from detector column `center` to the midpoint `ncols/2`, so after this
-    /// pass **every analytic back-projector reconstructs against a
-    /// centre = `ncols/2` geometry**: the rotation centre is owned in this one
-    /// place and the back-projectors / Fourier grids are centre-agnostic
-    /// (matching tomocupy `backproj_functions.py::fbp_filter_center`). At the
-    /// default centre `ncols/2` the shift is zero and the phase is unity, so the
-    /// centre-aligned goldens are unaffected. (Edge-replicate padding, the other
-    /// half of tomocupy's routine, is a separate refinement; this still
-    /// zero-pads.)
+    /// Each `(row, angle)` detector lane is centred in a `filter.len()`-wide
+    /// buffer and edge-replicate-padded on both borders, forward-transformed,
+    /// multiplied by the ramp filter **and** a per-row Fourier-shift phase
+    /// `exp(-2πi·f_k·(ncols/2 − center)/pad)` (signed frequency `f_k`, see the
+    /// body comment), inverse-transformed, and the centred `n_cols`-wide window
+    /// cropped back out. The phase is the band-limited sub-pixel shift that
+    /// moves the rotation axis from detector column `center` to the midpoint
+    /// `ncols/2`, so after this pass **every analytic back-projector
+    /// reconstructs against a centre = `ncols/2` geometry**: the rotation centre
+    /// is owned in this one place and the back-projectors / Fourier grids are
+    /// centre-agnostic (matching tomocupy
+    /// `backproj_functions.py::fbp_filter_center`, including its `ne = 4·n`
+    /// edge-replicated padding). At the default centre `ncols/2` the shift is
+    /// zero and the phase is unity, so the centre-aligned goldens are
+    /// unaffected.
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()> {
         let pad = filter.len();
         if pad == 0 {
@@ -250,6 +250,13 @@ impl FbpFilter for CpuBackend {
         let inv = planner.plan_fft_inverse(pad);
         let norm = 1.0 / pad as f32;
         let mut buf = vec![Complex32::new(0.0, 0.0); pad];
+        // Centre the width-`ncols` lane in the `pad`-wide buffer and edge-
+        // replicate the borders (tomocupy `fbp_filter_center`: `pad_side =
+        // ne//2 − n//2`, `tmp[:pad_side] = data[:1]`, `tmp[pad_side+n:] =
+        // data[-1:]`). Edge-replication, not zero-fill, keeps the long-tailed
+        // ramp from ringing against a hard step at the projection borders; the
+        // centred window is cropped back out at `[pad_side, pad_side+ncols)`.
+        let pad_side = pad / 2 - ncols / 2;
         // Axis 2 is the detector column in both layouts; `lanes_mut` iterates the
         // other two axes in C order, so `flat = i0·d1 + i1` recovers the slice row
         // (`i0` in Sinogram order, `i1` in Projection order) for the per-row phase.
@@ -263,11 +270,16 @@ impl FbpFilter for CpuBackend {
                 };
                 &wrows[row]
             };
-            for slot in buf.iter_mut() {
-                *slot = Complex32::new(0.0, 0.0);
+            let first = lane[0];
+            let last = lane[ncols - 1];
+            for slot in buf[..pad_side].iter_mut() {
+                *slot = Complex32::new(first, 0.0);
             }
             for (i, &v) in lane.iter().enumerate() {
-                buf[i] = Complex32::new(v, 0.0);
+                buf[pad_side + i] = Complex32::new(v, 0.0);
+            }
+            for slot in buf[pad_side + ncols..].iter_mut() {
+                *slot = Complex32::new(last, 0.0);
             }
             fwd.process(&mut buf);
             for (c, wk) in buf.iter_mut().zip(w.iter()) {
@@ -275,7 +287,7 @@ impl FbpFilter for CpuBackend {
             }
             inv.process(&mut buf);
             for (i, slot) in lane.iter_mut().enumerate() {
-                *slot = buf[i].re * norm;
+                *slot = buf[pad_side + i].re * norm;
             }
         }
         Ok(())
@@ -764,21 +776,21 @@ mod tests {
     #[test]
     fn ramp_filter_is_padded_and_symmetric() {
         let f = CpuBackend.make_filter(FilterName::Ramp, 8).unwrap();
-        assert_eq!(f.len(), 16); // (2·8) is already a power of two
+        assert_eq!(f.len(), 32); // (4·8) is already a power of two (tomocupy ne = 4·n)
         assert_eq!(f[0], 0.0); // DC zeroed by the ramp
-                               // Rises monotonically to the Nyquist bin (k = 8), then mirrors down.
-        assert!(f[8] > f[4] && f[4] > f[2] && f[2] > f[1]);
-        assert!((f[8] - 1.0).abs() < 1e-6); // pure ramp == 1 at Nyquist
-        for k in 1..8 {
-            assert!((f[k] - f[16 - k]).abs() < 1e-6, "asymmetry at {k}");
+                               // Rises monotonically to the Nyquist bin (k = 16), then mirrors down.
+        assert!(f[16] > f[8] && f[8] > f[4] && f[4] > f[2] && f[2] > f[1]);
+        assert!((f[16] - 1.0).abs() < 1e-6); // pure ramp == 1 at Nyquist
+        for k in 1..16 {
+            assert!((f[k] - f[32 - k]).abs() < 1e-6, "asymmetry at {k}");
         }
     }
 
     #[test]
     fn fbp_none_filter_is_identity() {
         // The `None` filter is all ones, so apply() must reproduce the input
-        // exactly (this validates the zero-pad / FFT / crop machinery itself;
-        // the ramp's correctness is proven by the FBP round-trip test).
+        // exactly (this validates the centre / edge-pad / FFT / crop machinery
+        // itself; the ramp's correctness is proven by the FBP round-trip test).
         let arr = ndarray::Array3::from_shape_fn((1, 1, 16), |(_, _, k)| (k as f32 * 0.4).sin());
         let orig = arr.clone();
         let mut s = Tomo::new(arr, Layout::Sinogram);
