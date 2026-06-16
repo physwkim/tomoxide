@@ -247,3 +247,120 @@ pub fn normalize_nf(
     *data = proj.to_layout(target);
     Ok(())
 }
+
+/// Normalize each projection by the mean of an ROI window (tomopy
+/// `prep/normalize.py:168` `normalize_roi`). For every projection the mean `bg`
+/// of `proj[r0:r2, r1:r3]` is computed (the `roi` is `[r0, r1, r2, r3]` =
+/// `[row_start, col_start, row_end, col_end]`); if `bg != 0` the whole
+/// projection is divided by it in place (tomopy skips the zero-`bg` divide).
+/// tomopy's default `roi` is `[0, 0, 10, 10]`.
+///
+/// The ROI mean reproduces numpy's f32 pairwise summation (see
+/// [`pairwise_sum_f32`]), so `bg` and the subsequent elementwise f32 divide are
+/// bit-exact (Δ=0) vs tomopy. Errors on an out-of-range or empty ROI (tomopy
+/// would instead clamp via numpy slicing and divide by a NaN/empty mean).
+pub fn normalize_roi(data: &mut Tomo<f32>, roi: [usize; 4]) -> Result<()> {
+    let [r0, r1, r2, r3] = roi;
+    let target = data.layout;
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, ny, nx) = proj.array.dim();
+    if r0 >= r2 || r1 >= r3 || r2 > ny || r3 > nx {
+        return Err(Error::InvalidParam(
+            "normalize_roi: roi must satisfy 0<=r0<r2<=n_rows and 0<=r1<r3<=n_cols".into(),
+        ));
+    }
+    let n = ((r2 - r0) * (r3 - r1)) as f32;
+    let mut buf: Vec<f32> = Vec::with_capacity((r2 - r0) * (r3 - r1));
+    for p in 0..nproj {
+        // Gather the ROI in C-order (row-major) to match numpy's flatten.
+        buf.clear();
+        for y in r0..r2 {
+            for x in r1..r3 {
+                buf.push(proj.array[[p, y, x]]);
+            }
+        }
+        let bg = pairwise_sum_f32(&buf) / n;
+        if bg != 0.0 {
+            for y in 0..ny {
+                for x in 0..nx {
+                    proj.array[[p, y, x]] /= bg;
+                }
+            }
+        }
+    }
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+/// numpy's f32 pairwise summation (`pairwise_sum` in numpy
+/// `core/src/umath/loops_utils.h.src`): sequential for `n < 8`; an
+/// 8-accumulator unrolled base case for `n ≤ 128`; otherwise a recursive split
+/// at `n/2` rounded down to a multiple of 8. Reproducing the exact accumulation
+/// tree is what makes an `f32` `.mean()`/`.sum()` divisor bit-identical to
+/// numpy (a plain sequential sum diverges by up to ~1 ULP and fails Δ=0).
+fn pairwise_sum_f32(a: &[f32]) -> f32 {
+    let n = a.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n < 8 {
+        let mut res = 0.0f32;
+        for &v in a {
+            res += v;
+        }
+        return res;
+    }
+    if n <= 128 {
+        let mut r = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]];
+        let mut i = 8;
+        while i + 8 <= n {
+            for k in 0..8 {
+                r[k] += a[i + k];
+            }
+            i += 8;
+        }
+        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        while i < n {
+            res += a[i];
+            i += 1;
+        }
+        return res;
+    }
+    let mut n2 = n / 2;
+    n2 -= n2 % 8;
+    pairwise_sum_f32(&a[..n2]) + pairwise_sum_f32(&a[n2..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array3;
+
+    #[test]
+    fn pairwise_sum_small_and_block() {
+        // n < 8: sequential.
+        assert_eq!(pairwise_sum_f32(&[1.0, 2.0, 3.0]), 6.0);
+        // Exact integers stay exact regardless of the accumulation tree.
+        let v: Vec<f32> = (0..100).map(|k| k as f32).collect();
+        assert_eq!(pairwise_sum_f32(&v), 4950.0);
+        // Recursion path (n > 128).
+        let v: Vec<f32> = (0..200).map(|_| 1.0).collect();
+        assert_eq!(pairwise_sum_f32(&v), 200.0);
+    }
+
+    #[test]
+    fn normalize_roi_divides_by_roi_mean_and_rejects_bad_roi() {
+        // 1 projection, ROI = whole 2×2 image; mean = (1+2+3+4)/4 = 2.5.
+        let arr = Array3::from_shape_vec((1, 2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let mut t = Tomo::new(arr, Layout::Projection);
+        normalize_roi(&mut t, [0, 0, 2, 2]).unwrap();
+        let got: Vec<f32> = t.array.iter().copied().collect();
+        assert_eq!(got, vec![1.0 / 2.5, 2.0 / 2.5, 3.0 / 2.5, 4.0 / 2.5]);
+
+        let mut t = Tomo::new(Array3::<f32>::zeros((1, 2, 2)), Layout::Projection);
+        assert!(matches!(
+            normalize_roi(&mut t, [0, 0, 3, 2]),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+}

@@ -26,7 +26,7 @@ mod wavelet;
 pub use alignment::scale;
 pub use morph::{downsample, pad, sino_360_to_180, upsample, PadMode, Rotation};
 pub use normalize::{
-    minus_log, normalize, normalize_bg, normalize_dataset, normalize_nf, Averaging,
+    minus_log, normalize, normalize_bg, normalize_dataset, normalize_nf, normalize_roi, Averaging,
 };
 pub use phase::retrieve_phase;
 pub use stripe::remove_stripe;
