@@ -29,7 +29,7 @@ pub fn angles(nang: usize, ang1: f32, ang2: f32) -> Vec<f32> {
 /// A thin convenience wrapper for round-trip testing — the projection math
 /// lives in the backend (tomoxide-cpu ports tomopy `libtomo/recon/project.c`).
 /// Returns the `[row, angle, col]` sinogram, or
-/// [`Error::MissingCapability`](tomoxide_core::error::Error::MissingCapability)
+/// [`Error::MissingCapability`]
 /// if `backend` cannot forward-project.
 pub fn project(vol: &Volume<f32>, geom: &Geometry, backend: &dyn Backend) -> Result<Tomo<f32>> {
     let proj = backend.projector().ok_or(Error::MissingCapability {
