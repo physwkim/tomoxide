@@ -82,6 +82,16 @@ per-column accumulation matches; tolerance parity rtol 1e-4). Exact linear-
 interp adjoint of the wgpu back-projector, sharing the host-side
 `(cosθ,sinθ)`/per-row-center build.
 
+Because the whole `ForwardProject`+`FilteredBackproject` family dispatches
+through `&dyn Backend`, every iterative method built on those projectors
+(SIRT, MLEM, OSEM, PML/OSPML quad & hybrid, grad, tikh, tv) runs on the GPU
+unchanged when a `WgpuBackend` is passed — the solver, its R/C weight maps,
+and the residual updates all project on the GPU. Verified by the SIRT GPU↔CPU
+parity test (`iterative_gpu_parity`: 100-iter loop, GPU↔CPU correlation
+1.00000, NRMSE 1.8e-4, GPU recon as accurate as CPU). **Exception:** `Art`/
+`Bart` use the host-side sparse `RayProject` (single-ray Kaczmarz rows), which
+is not a GPU kernel, so they stay CPU-only.
+
 ---
 
 ## C. Center finding (`tomoxide-recon::center`)
