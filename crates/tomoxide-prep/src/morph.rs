@@ -257,3 +257,72 @@ pub fn upsample(arr: &Array3<f32>, level: u32, axis: usize) -> Result<Array3<f32
     }
     Ok(Array3::from_shape_vec((odx, ody, odz), out).expect("upsample shape"))
 }
+
+/// Padding mode for [`pad`] (tomopy `mode=`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PadMode {
+    /// Pad with a constant value (tomopy `mode='constant'`, `constant_values=`).
+    Constant(f32),
+    /// Pad by replicating the edge slab (tomopy `mode='edge'`).
+    Edge,
+}
+
+/// `_get_npad`: default half-width `⌈(dim·√2 − dim)/2⌉` (tomopy `misc/morph.py`).
+fn get_npad(dim: usize) -> usize {
+    let d = dim as f64;
+    ((d * std::f64::consts::SQRT_2 - d) / 2.0).ceil() as usize
+}
+
+/// Pad a 3D array by `npad` on both sides of `axis` (tomopy
+/// `misc/morph.py::pad`). `npad = None` selects `⌈(dim·√2 − dim)/2⌉`.
+///
+/// The original data is copied into the centre `[npad, npad+dim)` of the axis;
+/// the flanks are filled with a constant ([`PadMode::Constant`]) or by
+/// replicating the first/last slab ([`PadMode::Edge`]). Pure copy/fill, so the
+/// result matches tomopy bit-for-bit (Δ = 0).
+pub fn pad(
+    arr: &Array3<f32>,
+    axis: usize,
+    npad: Option<usize>,
+    mode: PadMode,
+) -> Result<Array3<f32>> {
+    if axis > 2 {
+        return Err(Error::InvalidParam(format!(
+            "pad: axis ({axis}) must be 0, 1 or 2"
+        )));
+    }
+    let dims = [arr.dim().0, arr.dim().1, arr.dim().2];
+    let dim = dims[axis];
+    let npad = npad.unwrap_or_else(|| get_npad(dim));
+    if dim == 0 && npad > 0 && mode == PadMode::Edge {
+        return Err(Error::InvalidParam(
+            "pad: cannot edge-pad a zero-length axis".into(),
+        ));
+    }
+    let mut newdims = dims;
+    newdims[axis] = dim + 2 * npad;
+    let mut out = Array3::<f32>::zeros((newdims[0], newdims[1], newdims[2]));
+    for o0 in 0..newdims[0] {
+        for o1 in 0..newdims[1] {
+            for o2 in 0..newdims[2] {
+                let mut coord = [o0, o1, o2];
+                let t = coord[axis];
+                let v = if t >= npad && t < npad + dim {
+                    // Centre: copy the original slab.
+                    coord[axis] = t - npad;
+                    arr[[coord[0], coord[1], coord[2]]]
+                } else {
+                    match mode {
+                        PadMode::Constant(c) => c,
+                        PadMode::Edge => {
+                            coord[axis] = if t < npad { 0 } else { dim - 1 };
+                            arr[[coord[0], coord[1], coord[2]]]
+                        }
+                    }
+                };
+                out[[o0, o1, o2]] = v;
+            }
+        }
+    }
+    Ok(out)
+}
