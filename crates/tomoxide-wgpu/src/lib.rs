@@ -564,6 +564,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     #[test]
+    fn fft_2d_non_power_of_two_matches_cpu() {
+        // Non-power-of-two 2-D shapes take the separable fallback: a 1-D pass
+        // along cols (radix-2 or Bluestein), a host transpose, a 1-D pass along
+        // rows, and a transpose back. Each axis may itself be Bluestein, so this
+        // exercises pow2×non-pow2 (4×6), non-pow2×pow2 (6×4), and non-pow2×
+        // non-pow2 (3×5, 6×10). Must match rustfft's 2-D transform and round-trip.
+        // Observed on Metal: forward rel ≈ 1e-6, roundtrip ≈ 1e-5.
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+        for &(rows, cols, batch) in &[(4usize, 6usize, 2usize), (6, 4, 1), (3, 5, 2), (6, 10, 1)] {
+            let base: Vec<Complex32> = (0..rows * cols * batch)
+                .map(|k| Complex32::new((k as f32 * 0.21).sin(), (k as f32 * 0.09).cos()))
+                .collect();
+            let mut g = base.clone();
+            let mut c = base.clone();
+            be.fft()
+                .unwrap()
+                .fft_2d(&mut g, rows, cols, batch, false)
+                .unwrap();
+            cpu.fft()
+                .unwrap()
+                .fft_2d(&mut c, rows, cols, batch, false)
+                .unwrap();
+            let peak = c.iter().map(|z| z.norm()).fold(0.0f32, f32::max).max(1.0);
+            let err = g
+                .iter()
+                .zip(&c)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f32, f32::max);
+            be.fft()
+                .unwrap()
+                .fft_2d(&mut g, rows, cols, batch, true)
+                .unwrap();
+            let rt = g
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "fft_2d {rows}×{cols}×{batch}: peak={peak:.3}, fwd rel={:.3e}, roundtrip max|Δ|={rt:.3e}",
+                err / peak
+            );
+            assert!(
+                err <= 1e-5 * peak,
+                "fft_2d forward {rows}×{cols}: max|Δ|={err:.3e} > {:.3e}",
+                1e-5 * peak
+            );
+            assert!(
+                rt <= 1e-4,
+                "fft_2d roundtrip {rows}×{cols}: max|Δ|={rt:.3e}"
+            );
+        }
+    }
+
+    #[test]
     fn fft_1d_bluestein_matches_cpu_for_non_power_of_two() {
         // Non-power-of-two lengths run the Bluestein chirp-z path on the GPU
         // (3 radix-2 FFTs of length m = next_pow2(2n−1) + chirp multiplies), so

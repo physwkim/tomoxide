@@ -212,6 +212,24 @@ fn cossin_center(geom: &Geometry, nz: usize) -> (Vec<f32>, Vec<f32>) {
     (cossin, center)
 }
 
+/// Transpose every `d0 × d1` image in a contiguous `[batch][d0][d1]` complex
+/// buffer to `[batch][d1][d0]`, in place via a per-image scratch. Used by the
+/// non-power-of-two [`fft_2d`](WgpuBackend::fft_2d) fallback to make the column
+/// axis contiguous for a 1-D pass and to restore row-major order afterwards.
+fn transpose_images(buf: &mut [Complex32], d0: usize, d1: usize, batch: usize) {
+    let img = d0 * d1;
+    let mut tmp = vec![Complex32::default(); img];
+    for b in 0..batch {
+        let base = b * img;
+        for r in 0..d0 {
+            for c in 0..d1 {
+                tmp[c * d0 + r] = buf[base + r * d1 + c];
+            }
+        }
+        buf[base..base + img].copy_from_slice(&tmp);
+    }
+}
+
 impl ForwardProject for WgpuBackend {
     /// Parallel-beam pixel-driven forward projection (the Radon transform).
     ///
@@ -592,9 +610,12 @@ impl Fft for WgpuBackend {
         Ok(())
     }
 
-    /// Batched 2-D radix-2 FFT, as a row pass + transpose + row pass + transpose
-    /// (so both axes run as contiguous radix-2 transforms). Requires power-of-two
-    /// `rows` and `cols`. `inverse` divides by `rows·cols`.
+    /// Batched 2-D FFT. Power-of-two `rows` and `cols` run the fast on-device
+    /// path — a row pass + transpose + row pass + transpose, so both axes run as
+    /// contiguous radix-2 transforms. Any other dims fall back to a separable
+    /// pair of [`fft_1d`] passes (each radix-2 or Bluestein per length) with a
+    /// host transpose between them, so the GPU handles arbitrary 2-D shapes like
+    /// the CPU backend rather than erroring. `inverse` divides by `rows·cols`.
     fn fft_2d(
         &self,
         buf: &mut [Complex32],
@@ -613,9 +634,17 @@ impl Fft for WgpuBackend {
             });
         }
         if !rows.is_power_of_two() || !cols.is_power_of_two() {
-            return Err(Error::InvalidParam(format!(
-                "wgpu 2-D FFT requires power-of-two dims (got {rows}×{cols}); use the CPU backend"
-            )));
+            // Separable fallback: FFT along the contiguous `cols` axis, transpose
+            // each image so `rows` become contiguous, FFT along `rows`, transpose
+            // back. Each 1-D pass selects radix-2 or Bluestein per length, and the
+            // per-axis inverse divisors (1/cols then 1/rows) compose to the 2-D
+            // 1/(rows·cols) — so the result matches the on-device pow2 path and
+            // the CPU backend exactly.
+            self.fft_1d(buf, cols, rows * batch, inverse)?;
+            transpose_images(buf, rows, cols, batch);
+            self.fft_1d(buf, rows, cols * batch, inverse)?;
+            transpose_images(buf, cols, rows, batch);
+            return Ok(());
         }
         let data = self.upload_complex("fft_2d", buf);
         // Row pass: `batch·rows` contiguous transforms of length `cols`.
