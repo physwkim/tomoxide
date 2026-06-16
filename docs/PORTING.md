@@ -157,7 +157,7 @@ void medianfilter_main_float(float* in,float* out,int kernel_half_size,float abs
 | `sim::angles`             | tomopy `sim/project.py:241`             | done    |
 | `sim::project`            | tomopy `sim/project.py:268`; `libtomo/recon/project.c` | partial (CPU parallel-beam) |
 | `sim::add_{gaussian,poisson}` | tomopy `sim/project.py:110,136` | done (distribution parity: matched moments — numpy's MT19937 stream is not reproducible; Poisson ports Knuth-mult / Hörmann PTRS) |
-| `sim::add_{rings,zingers}` | tomopy `sim/project.py:153,211` | stub |
+| `sim::add_{rings,zingers}` | tomopy `sim/project.py:153,211` | done (distribution parity: seeded SplitMix64; add_rings = fixed per-pixel sensitivity N(1,std) broadcast over angle, add_zingers = saturate fraction f to sat) |
 
 ---
 

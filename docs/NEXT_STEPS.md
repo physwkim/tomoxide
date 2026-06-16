@@ -263,12 +263,17 @@ below by dependency and value — the first three close the end-to-end pipeline.
 - **Beam hardening** — `crates/tomoxide-prep/src/hardening.rs:11`
   `beam_correct`; tomocupy `processing/external/hardening.py:50`. Needs
   material/spectrum config; defer unless a dataset needs it.
-- ✅ **Sim noise** — `add_gaussian` / `add_poisson` (`crates/tomoxide-sim/src/noise.rs`;
-  tomopy `sim/project.py:110,136`). Done. Distribution parity (matched moments),
-  not Δ=0: numpy's MT19937 stream is not reproducible from Rust. Self-contained
-  seeded SplitMix64 (no `rand` dep); Poisson ports numpy's Knuth-mult / Hörmann
-  PTRS selection. Tested by moments incl. Poisson skewness in
-  `tests/noise_stats.rs`.
+- ✅ **Sim noise** — `add_gaussian` / `add_poisson` / `add_rings` / `add_zingers`
+  (`crates/tomoxide-sim/src/noise.rs`; tomopy `sim/project.py:110,136,153,211`).
+  Done. Distribution parity (matched moments), not Δ=0: numpy's MT19937 stream is
+  not reproducible from Rust. Self-contained seeded SplitMix64 (no `rand` dep);
+  Poisson ports numpy's Knuth-mult / Hörmann PTRS selection. `add_rings` draws a
+  fixed per-detector-pixel sensitivity `N(1, std)` broadcast across all angles (a
+  ring); `add_zingers` saturates each element to `sat` with probability `f`.
+  Tested by moments incl. Poisson skewness, the add_rings constant-across-angles
+  structural invariant, and the add_zingers saturated fraction in
+  `tests/noise_stats.rs`. (tomopy `add_salt_pepper` is the same shape with a
+  data-derived default `val`; not yet ported.)
 - ✅ **Background normalization** — `normalize::normalize_bg` (tomopy
   `prep/normalize.py:207` → `libtomo/prep/prep.c::normalize_bg`). Done. Per
   projection row the mean of the `air` left- and right-boundary pixels defines an
