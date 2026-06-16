@@ -226,6 +226,25 @@ below by dependency and value — the first three close the end-to-end pipeline.
   bit-identical to the input (Δ=0 on those columns, asserted).
   `StripeMethod::VoDead { snr, size, norm }`; `stripe_vodead_parity.rs`, golden
   from the **real tomopy** `tools/gen_tomopy_stripe_vodead_golden.py`.
+- ✅ **VoFit (fitting-based) — done.** Port of tomopy `prep/stripe.py:520`
+  `remove_stripe_based_fitting` (Vo 2018 algorithm 1, for low-pass stripes): per
+  `[proj, col]` slice `_rs_fit` divides the sinogram by its Savitzky–Golay
+  polynomial fit along the projection axis, then re-multiplies by a mean-matched
+  2-D Gaussian-smoothed copy of that fit (`_2d_filter`:
+  `real(ifft2(fft2(matpad·matsign)·win2d)·matsign)`, `(-1)^(x+y)` modulation,
+  edge-pad columns + mean-pad rows, crop). Two new self-contained primitives, **no
+  new dependency**: (1) the Savitzky–Golay weights — scipy's `savgol_coeffs` is a
+  min-norm `lstsq`, computed here from **scaled normal equations** (fit nodes
+  mapped to ≈[-1, 1] so the tiny `(order+1)`-square solve is well-conditioned),
+  reproducing scipy's SVD `lstsq` to the f64 floor (verified directly vs scipy);
+  `mode='mirror'` reuses the existing whole-sample reflect. (2) the 2-D Fourier
+  filter `fft::filter_real_2d` — the separable 2-D analogue of
+  `filter_real_column` (fft2 rows-then-cols / ifft2 cols-then-rows over the f64
+  complex FFT), unit-tested vs a naive 2-D DFT. The 2-D filter runs in f64, so it
+  is held to the **f32 round-off floor** (max rel ≈ 2e-7) like Fw/VoFilter.
+  `StripeMethod::VoFit { order, sigma }`; `stripe_vofit_parity.rs`, golden from
+  the **real tomopy** `tools/gen_tomopy_stripe_vofit_golden.py` (order=3
+  sigma=(5,20) and order=1 sigma=(3,10)).
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
