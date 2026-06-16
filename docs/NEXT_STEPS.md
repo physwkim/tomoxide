@@ -483,6 +483,20 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `np.median(dark, …, dtype=np.float32)` raises on modern numpy (no reference),
   mirroring the `remove_stripe_ti` block-path treatment. `normalize_nf_parity.rs`,
   golden from the **real tomopy** `tools/gen_tomopy_normalize_nf_golden.py`.
+- ✅ **ROI normalization** — `normalize::normalize_roi` (tomopy
+  `prep/normalize.py:168`). Done. Each projection is divided by the mean `bg` of
+  its ROI window `proj[r0:r2, r1:r3]` (skipped when `bg == 0`, matching tomopy's
+  `if bg != 0`). The catch is the divisor: numpy's `ndarray.mean` sums the ROI in
+  f32 with its **pairwise** accumulation tree (8-accumulator unrolled base case
+  for `n ≤ 128`, recursive split rounded down to a multiple of 8 otherwise), so a
+  plain sequential f32 sum diverges by ~1 ULP and poisons every divided pixel. A
+  new `pairwise_sum_f32` reproduces that tree exactly → `bg` and the elementwise
+  divide are **bit-exact (Δ=0)** for the default 10×10 ROI (base case), a
+  480-element ROI (recursion path), and an offset non-square ROI. Golden from the
+  **real tomopy** `tools/gen_tomopy_normalize_roi_golden.py`, which applies
+  tomopy's verbatim per-projection `_normalize_roi` kernel in-process (the macOS
+  `mproc.distribute_jobs` pool is flaky and the chunking is per-projection
+  independent, so this is numerically identical). `normalize_roi_parity.rs`.
 - ✅ **Downsample / upsample** — `morph::{downsample, upsample}` (tomopy
   `misc/morph.py` → `libtomo/misc/morph.c::c_sample`). Done. Power-of-two binning
   (`2^level`) along any axis: downsample = per-bin mean accumulated as
