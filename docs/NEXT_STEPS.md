@@ -179,6 +179,21 @@ below by dependency and value — the first three close the end-to-end pipeline.
   scaffold (sort/perm/unsort) was made smoother-pluggable and is shared with
   `VoAll` (unchanged, still passing). `stripe_vosort_parity.rs`, golden from the
   **real tomopy** `tools/gen_tomopy_stripe_vosort_golden.py`.
+- ✅ **VoFilter (filtering-based) — done.** Port of tomopy `prep/stripe.py:437`
+  `remove_stripe_based_filtering` (Vo 2018 algorithm 2): per sinogram slice
+  `_rs_filter` separates a low-pass (smooth) component with a Gaussian Fourier
+  filter along the projection axis (`real(ifft(fft(col·listsign)·window)·listsign)`,
+  reflect-padded), runs the `_rs_sort` correction on that component, then adds back
+  the high-pass residual. New pieces: `scipy.signal.windows.gaussian` (closed-form
+  `exp(-n²/2σ²)`), the `(-1)^n` listsign modulation, and `np.pad` mode=`reflect`
+  (whole-sample symmetric — distinct from scipy.ndimage `reflect`). The Fourier
+  core reuses the self-contained f64 column FFT in `fft.rs` and the inner sort
+  reuses the `rs_sort`/`median_filter_2d` scaffolds from `VoSort`. tomopy runs the
+  filter in float64 then casts to f32, so it is held to the **f32 round-off floor**
+  like the Fourier-Wavelet path (measured Δ=0 for these fixtures, `dim=1` sigma=3 &
+  `dim=2` sigma=5). `StripeMethod::VoFilter { sigma, size, dim }`;
+  `stripe_vofilter_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_stripe_vofilter_golden.py`.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over

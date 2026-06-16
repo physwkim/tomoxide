@@ -105,7 +105,7 @@ Forward model shared by all: tomopy `libtomo/recon/project.c`
 | `stripe::remove_stripe_ti`        | tomopy `prep/stripe.py:179` (Titarenko/Miqueles) | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈5.2e-7); default `nblock=0` only (`_ringb` block path unrunnable on modern numpy) |
 | `stripe::remove_stripe_sf`        | tomopy `prep/stripe.py:333`; `libtomo/prep/stripe.c` (`remove_stripe_sf`) | CPU | CPU ✓ — tomopy parity (bit-exact) |
 | `stripe::remove_stripe_based_sorting` | tomopy `prep/stripe.py:363` (Vo alg. 3)       | CPU     | CPU ✓ — tomopy parity (bit-exact, Δ=0) for `dim=1` & `dim=2`. `_rs_sort` is a pure rank-filter selection on f32; `StripeMethod::VoSort { size, dim }`, reuses the `rs_sort` scaffold (now smoother-pluggable) shared with `VoAll` |
-| `stripe::remove_stripe_based_filtering` | tomopy `prep/stripe.py:437` (Vo alg. 2)     | CPU     | stub    |
+| `stripe::remove_stripe_based_filtering` | tomopy `prep/stripe.py:437` (Vo alg. 2)     | CPU     | CPU ✓ — tomopy parity to the f32 floor (measured Δ=0) for `dim=1` & `dim=2`. `_rs_filter` Gaussian-Fourier low-pass + `_rs_sort` + high-pass residual; `StripeMethod::VoFilter { sigma, size, dim }`, reuses the f64 column FFT (`fft.rs`) and the `rs_sort`/`median_filter_2d` scaffolds from `VoSort` |
 | `stripe::remove_stripe_based_fitting` | tomopy `prep/stripe.py:520` (Vo alg. 1)       | CPU     | stub    |
 | `stripe::remove_all_stripe`       | tomopy `prep/stripe.py:843` (Vo alg. 3+5+6); tomocupy `remove_stripe.remove_all_stripe` | CPU | CPU ✓ — tomopy parity (≈f32 floor, max rel Δ≈5.8e-7) |
 | `stripe::stripes_detect3d`        | tomopy `prep/stripe.py:984`; `libtomo/prep/stripes_detect3d.c` | CPU | stub |
