@@ -1,7 +1,8 @@
 //! Stripe-artifact removal (ports tomopy `prep/stripe.py` + tomocupy
 //! `processing/remove_stripe.py`). The Fourier-Wavelet (`Fw`), smoothing-filter
-//! (`Sf`), Titarenko (`Ti`), and Vo all-stripe (`VoAll`) methods are
-//! implemented. See `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
+//! (`Sf`), Titarenko (`Ti`), Vo all-stripe (`VoAll`), and Vo sorting-based
+//! (`VoSort`) methods are implemented. See `docs/PORTING.md` §D. Dispatch on
+//! [`StripeMethod`].
 
 use ndarray::Array2;
 use tomoxide_core::data::{Layout, Tomo};
@@ -34,6 +35,7 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
             la_size,
             sm_size,
         } => remove_all_stripe(data, snr, la_size, sm_size),
+        StripeMethod::VoSort { size, dim } => remove_stripe_based_sorting(data, size, dim),
     }
 }
 
@@ -534,6 +536,33 @@ fn median_filter_axis1(arr: &Array2<f32>, size: usize) -> Array2<f32> {
     out
 }
 
+/// `median_filter` with a square footprint `(size, size)`, scipy `reflect`
+/// boundary, rank `size²/2` (the `dim=2` branch of tomopy `_rs_sort`).
+fn median_filter_2d(arr: &Array2<f32>, size: usize) -> Array2<f32> {
+    let (nrow, ncol) = arr.dim();
+    let half = (size / 2) as isize;
+    let (nr, nc) = (nrow as isize, ncol as isize);
+    let mid = (size * size) / 2;
+    let mut out = Array2::<f32>::zeros((nrow, ncol));
+    let mut win = vec![0.0f32; size * size];
+    for i in 0..nrow {
+        for j in 0..ncol {
+            let mut t = 0;
+            for di in 0..size {
+                let ri = reflect_index(i as isize - half + di as isize, nr);
+                for dj in 0..size {
+                    let cj = reflect_index(j as isize - half + dj as isize, nc);
+                    win[t] = arr[[ri, cj]];
+                    t += 1;
+                }
+            }
+            win.sort_by(|a, b| a.total_cmp(b));
+            out[[i, j]] = win[mid];
+        }
+    }
+    out
+}
+
 /// `binary_dilation` with one iteration of the default 3-element structuring
 /// element (border value 0).
 fn binary_dilation_1d(mask: &[f32]) -> Vec<f32> {
@@ -756,7 +785,7 @@ fn rs_dead(sino: &Array2<f32>, snr: f32, size: usize) -> Array2<f32> {
 
 /// `_rs_sort` (Vo algorithm 3, `dim = 1`): sort each column, median-smooth the
 /// sorted profiles across columns, then unsort.
-fn rs_sort(sino: &Array2<f32>, size: usize) -> Array2<f32> {
+fn rs_sort_with(sino: &Array2<f32>, smooth: impl Fn(&Array2<f32>) -> Array2<f32>) -> Array2<f32> {
     let (nrow, ncol) = sino.dim();
     // Build the sorted-value matrix laid out as [ncol, nrow] (the transpose the
     // tomopy code filters over) plus the per-column permutation.
@@ -770,9 +799,9 @@ fn rs_sort(sino: &Array2<f32>, size: usize) -> Array2<f32> {
             perm[c][rank] = row;
         }
     }
-    // median_filter footprint (size, 1) on the [ncol, nrow] array: median along
-    // axis 0 (across columns) at each sorted rank.
-    let smoothed = median_filter_axis0(&sortedv, size);
+    // Smooth the sorted [ncol, nrow] matrix (footprint differs by `dim`), then
+    // scatter back to the original projection order.
+    let smoothed = smooth(&sortedv);
 
     let mut out = Array2::<f32>::zeros((nrow, ncol));
     for c in 0..ncol {
@@ -781,6 +810,11 @@ fn rs_sort(sino: &Array2<f32>, size: usize) -> Array2<f32> {
         }
     }
     out
+}
+
+/// `_rs_sort` with `dim=1` (median footprint `(size, 1)`) — the `VoAll` path.
+fn rs_sort(sino: &Array2<f32>, size: usize) -> Array2<f32> {
+    rs_sort_with(sino, |s| median_filter_axis0(s, size))
 }
 
 /// Vo all-stripe removal (`remove_all_stripe`): `_rs_dead` then `_rs_sort` per
@@ -807,6 +841,62 @@ fn remove_all_stripe(data: &mut Tomo<f32>, snr: f32, la_size: usize, sm_size: us
         for p in 0..nproj {
             for c in 0..ncol {
                 proj.array[[p, m, c]] = sino[[p, c]];
+            }
+        }
+    }
+
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+/// Vo sorting-based stripe removal (tomopy `remove_stripe_based_sorting`,
+/// Vo 2018 algorithm 3) — good for partial stripes.
+///
+/// For each sinogram slice apply `_rs_sort`: sort each detector column's values
+/// over projections, median-smooth the sorted matrix, then unsort. The median is
+/// a pure rank-filter selection of an existing f32 value (no arithmetic), so this
+/// matches tomopy bit-for-bit (Δ = 0) on tie-free columns (exact ties sort in
+/// numpy-quicksort order, which is not portable).
+///
+/// `size = None` → tomopy default `max(5, ⌊0.01·ncol⌋)` (`21` for `ncol > 2000`);
+/// `dim` selects the median footprint (`1` → `(size, 1)`, any other value →
+/// `(size, size)`, matching tomopy's `if dim == 1 … else` branch).
+fn remove_stripe_based_sorting(data: &mut Tomo<f32>, size: Option<usize>, dim: u8) -> Result<()> {
+    let target = data.layout;
+    // tomopy operates on `tomo[:, m, :]` = `[proj, col]` slices of the
+    // `[proj, row, col]` projection-layout stack.
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, nrows, ncol) = proj.array.dim();
+    if nproj < 2 || nrows == 0 || ncol == 0 {
+        return Ok(());
+    }
+    // tomopy `_remove_stripe_based_sorting` default window (stripe.py:427-431).
+    let size = size.unwrap_or_else(|| {
+        if ncol > 2000 {
+            21
+        } else {
+            5.max((0.01 * ncol as f64) as usize)
+        }
+    });
+    if size == 0 {
+        return Ok(());
+    }
+
+    for m in 0..nrows {
+        let mut sino = Array2::<f32>::zeros((nproj, ncol));
+        for p in 0..nproj {
+            for c in 0..ncol {
+                sino[[p, c]] = proj.array[[p, m, c]];
+            }
+        }
+        let corrected = if dim == 1 {
+            rs_sort(&sino, size)
+        } else {
+            rs_sort_with(&sino, |s| median_filter_2d(s, size))
+        };
+        for p in 0..nproj {
+            for c in 0..ncol {
+                proj.array[[p, m, c]] = corrected[[p, c]];
             }
         }
     }

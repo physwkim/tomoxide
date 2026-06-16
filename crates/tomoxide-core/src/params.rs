@@ -216,6 +216,15 @@ pub enum StripeMethod {
         /// Small-stripe window size.
         sm_size: usize,
     },
+    /// Vo sorting-based stripe removal (tomopy `remove_stripe_based_sorting`,
+    /// Vo 2018 algorithm 3) — good for partial stripes.
+    VoSort {
+        /// Median window size (`None` = tomopy default `max(5, 0.01·ncol)`, or
+        /// `21` for `ncol > 2000`).
+        size: Option<usize>,
+        /// Median-window dimensionality: `1` → `(size, 1)`, `2` → `(size, size)`.
+        dim: u8,
+    },
 }
 
 /// Phase-retrieval method.
