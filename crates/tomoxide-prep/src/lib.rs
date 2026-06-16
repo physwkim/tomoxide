@@ -8,8 +8,8 @@
 //! Real in this scaffold: `normalize`/`minus_log` (via the CPU backend),
 //! `filters::{circ_mask, remove_nan, remove_neg, median_filter_nonfinite,
 //! adjust_range, median_filter, remove_outlier, remove_outlier1d,
-//! gaussian_filter, sobel_filter}`, `alignment::scale`. The rest are stubs that
-//! name their upstream `file:line` (see `docs/PORTING.md` §D/§E).
+//! gaussian_filter, sobel_filter}`, `alignment::{scale, blur_edges}`. The rest
+//! are stubs that name their upstream `file:line` (see `docs/PORTING.md` §D/§E).
 #![forbid(unsafe_code)]
 
 pub mod alignment;
@@ -23,7 +23,7 @@ pub mod stripe;
 pub mod stripe3d;
 mod wavelet;
 
-pub use alignment::scale;
+pub use alignment::{blur_edges, scale};
 pub use morph::{downsample, pad, sino_360_to_180, upsample, PadMode, Rotation};
 pub use normalize::{
     minus_log, normalize, normalize_bg, normalize_dataset, normalize_nf, normalize_roi, Averaging,
