@@ -68,8 +68,11 @@ fn lprec_reconstructs_shepp_logan_phantom() {
     assert_eq!(slice.dim(), (n, n));
     let corr = pearson_disk(&slice, &phantom, n, 0.85);
     eprintln!("lprec round-trip Pearson correlation = {corr:.4}");
+    // Observed r ≈ 0.9348 (deterministic: fixed phantom, angles, pow2 grid). The
+    // 0.93 bar is tighter than the original 0.90 while leaving headroom for f32
+    // FFT-rounding variance across rustfft versions/platforms.
     assert!(
-        corr > 0.9,
+        corr > 0.93,
         "lprec reconstruction correlates poorly with phantom: r = {corr:.4}"
     );
 }
@@ -81,10 +84,10 @@ fn lprec_agrees_with_gridrec() {
     // fourierrec↔gridrec pair (two gridding methods, r ≈ 1.0) they agree only to
     // ~0.97, not bit-for-bit: the log-polar resampling and the differing
     // apodization diverge at high spatial frequency (the disk periphery). The
-    // 0.95 bar confirms the inversion is correct and co-registered while leaving
+    // 0.96 bar confirms the inversion is correct and co-registered while leaving
     // room for that legitimate method difference; observed r ≈ 0.968 over the
     // 0.85 disk (≈0.99 central, ≈0.96 peripheral). A grid / kernel / orientation
-    // / interpolation bug drops this far below 0.95 (e.g. the pre-fix theta-order
+    // / interpolation bug drops this far below the 0.96 bar (e.g. the pre-fix theta-order
     // bug gave 0.01, the vertical-flip bug 0.58).
     let n = 128;
     let nang = 180;
@@ -96,5 +99,80 @@ fn lprec_agrees_with_gridrec() {
     eprintln!(
         "lprec↔gridrec r = {cross:.4} (lprec↔phantom {lp_corr:.4}, gridrec↔phantom {gr_corr:.4})"
     );
-    assert!(cross > 0.95, "lprec and gridrec disagree: r = {cross:.4}");
+    // Observed r ≈ 0.9676 (deterministic). Tightened from 0.95 to 0.96: still
+    // below the genuine method divergence at high frequency, but close enough to
+    // catch a regression the 0.95 bar would have let through.
+    assert!(cross > 0.96, "lprec and gridrec disagree: r = {cross:.4}");
+}
+
+#[test]
+fn lprec_reconstructs_at_n256() {
+    // Larger power-of-two grid (n=256 → nrho=512, ntheta=128). The other tests
+    // exercise n=128; this confirms the precompute (zeta kernel, log-polar grids)
+    // and the per-slice pipeline scale to a 4× larger grid without a sizing bug.
+    let n = 256;
+    let nang = 256;
+    let (slice, phantom) = recon_slice(Algorithm::Lprec, n, nang);
+    assert_eq!(slice.dim(), (n, n));
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("lprec n=256 round-trip Pearson = {corr:.4}");
+    assert!(
+        corr > 0.93,
+        "lprec n=256 reconstruction correlates poorly with phantom: r = {corr:.4}"
+    );
+}
+
+#[test]
+fn lprec_handles_non_power_of_two_size() {
+    // n = 192 is not a power of two. lprec rounds its *internal* FFT lengths to
+    // powers of two by construction (ntheta = 2^round(log2 nproj),
+    // nrho = 2·2^round(log2 n)), so this does NOT exercise a non-pow2/Bluestein
+    // FFT — the FFT path is byte-identical to the pow2 case. What a non-pow2 size
+    // does exercise is the detector/grid sampling at an odd width: the
+    // cubic-B-spline prefilter (`convert_to_coeffs`), the 4×4 wrap-addressed
+    // `cubic_interp2d`, the `lin[]` Cartesian coordinate ramp, and the unit-disk
+    // mask all run at width 192. An off-by-one or stride bug there (which the
+    // pow2 widths can mask) drops the correlation below the bar.
+    let n = 192;
+    let nang = 180;
+    let (lp, phantom) = recon_slice(Algorithm::Lprec, n, nang);
+    assert_eq!(lp.dim(), (n, n));
+    let (gr, _) = recon_slice(Algorithm::Gridrec, n, nang);
+    let rt = pearson_disk(&lp, &phantom, n, 0.85);
+    let cross = pearson_disk(&lp, &gr, n, 0.85);
+    eprintln!("lprec n=192 round-trip = {rt:.4}, lprec↔gridrec = {cross:.4}");
+    assert!(rt > 0.92, "lprec n=192 round-trip poor: r = {rt:.4}");
+    assert!(
+        cross > 0.95,
+        "lprec n=192 disagrees with gridrec: r = {cross:.4}"
+    );
+}
+
+#[test]
+fn lprec_rejects_non_square_geometry() {
+    // lprec's log-polar grid sizing assumes the reconstruction grid width equals
+    // the detector width (square geometry). A request with num_gridx ≠ detector
+    // width must be rejected up front, not silently mis-reconstructed onto a
+    // mismatched grid.
+    let n = 128;
+    let nang = 180;
+    let cpu = CpuBackend::new();
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let params = ReconParams {
+        num_gridx: Some(100), // ≠ detector width 128 → non-square
+        ..Default::default()
+    };
+    let result = recon::recon(&sino, &geom, Algorithm::Lprec, &params, &cpu);
+    assert!(
+        result.is_err(),
+        "lprec must reject a non-square (num_gridx ≠ detector) geometry"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("square") || msg.contains("detector width"),
+        "unexpected error for non-square geometry: {msg}"
+    );
 }
