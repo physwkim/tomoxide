@@ -245,6 +245,23 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `StripeMethod::VoFit { order, sigma }`; `stripe_vofit_parity.rs`, golden from
   the **real tomopy** `tools/gen_tomopy_stripe_vofit_golden.py` (order=3
   sigma=(5,20) and order=1 sigma=(3,10)).
+- ✅ **stripes_detect3d (Kazantsev 2023) — done.** Port of tomopy
+  `prep/stripe.py:984` `stripes_detect3d` / libtomo
+  `stripes_detect3d.c::stripesdetect3d_main_float`: a 3-D stripe *detector* (not a
+  remover) over the `[angle, detY, detX]` stack producing a `[0, 1]` weights
+  volume whose smaller values mark stripe edges. Four full-volume passes — a
+  6-stencil mean smoothing (kept only as the zero-gradient fallback of pass 3), a
+  detX forward-difference gradient (step 2), a per-voxel ratio between the mean
+  `|gradient|` in the angle×depth plate parallel to the stripe and the means
+  orthogonal to it (smaller of left/right), and a vertical (along-angle) median
+  filter with the C kernel's off-by-one median index. Pure f32, **no FFT and no
+  new dependency**, so it is **bit-exact (Δ=0)** against tomopy. New `stripe3d`
+  module; public API `prep::stripes_detect3d(&Tomo, size, radius) -> Array3<f32>`
+  (it returns weights and does not mutate the data, so it is deliberately *not* a
+  `StripeMethod` variant). `stripe_detect3d_parity.rs`, golden from the **real
+  tomopy** `tools/gen_tomopy_stripe_detect3d_golden.py` (size=10/radius=3 defaults
+  and size=5/radius=2), plus `[0,1]`-range and stripe-highlight structural checks.
+  Next: `stripes_mask3d` (`prep/stripe.py:1058`) consumes these weights.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
