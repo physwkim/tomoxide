@@ -47,6 +47,35 @@ pub fn remove_neg(data: &mut Tomo<f32>, val: f32) -> Result<()> {
     Ok(())
 }
 
+/// Clip the dynamic range of `data` to `[dmin, dmax]` (tomopy `misc/corr.py:90`
+/// `adjust_range`). A `None` bound defaults to the data's own min/max, and a
+/// bound is applied only when it is *strictly* tighter than the data range
+/// (strict `>`/`<`), so both-`None` and looser-than-data bounds are no-ops,
+/// exactly as upstream. The data is assumed finite (numpy's NaN propagation in
+/// `np.max`/`np.min` is not replicated; compose with [`remove_nan`] first).
+pub fn adjust_range(data: &mut Tomo<f32>, dmin: Option<f32>, dmax: Option<f32>) -> Result<()> {
+    let arr = &mut data.array;
+    if arr.is_empty() {
+        return Ok(());
+    }
+    // np.max / np.min on the unmodified array (tomopy lines 108-111).
+    let data_max = arr.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let data_min = arr.iter().copied().fold(f32::INFINITY, f32::min);
+    let dmax = dmax.unwrap_or(data_max);
+    let dmin = dmin.unwrap_or(data_min);
+    // Clip high only if dmax lies below the data max (tomopy lines 111-112).
+    if dmax < data_max {
+        arr.mapv_inplace(|v| if v > dmax { dmax } else { v });
+    }
+    // np.min is recomputed after the high clip (tomopy line 113); the high clip
+    // cannot lower the min, so this equals data_min unless dmax < data_min.
+    let cur_min = arr.iter().copied().fold(f32::INFINITY, f32::min);
+    if dmin > cur_min {
+        arr.mapv_inplace(|v| if v < dmin { dmin } else { v });
+    }
+    Ok(())
+}
+
 /// Replace every non-finite value (NaN/±inf) with the median of the finite
 /// values in its `size×size` neighbourhood along the last two axes (tomopy
 /// `misc/corr.py:281` `median_filter_nonfinite`).
