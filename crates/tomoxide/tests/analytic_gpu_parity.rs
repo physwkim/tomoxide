@@ -1,11 +1,16 @@
-//! End-to-end GPU↔CPU FBP parity (M6).
+//! End-to-end GPU↔CPU analytic-reconstruction parity (M6).
 //!
-//! The per-kernel tests prove each wgpu capability correct in isolation; this
-//! proves they *compose* — that `FbpFilter::apply` then `FilteredBackproject`,
-//! driven through `recon::recon(Algorithm::Fbp, &dyn Backend)`, produce a full
-//! reconstruction on the GPU that (1) actually reconstructs the phantom and
-//! (2) matches the CPU reconstruction within f32 tolerance. This is the real
-//! validation that the full GPU FBP path is closed.
+//! The per-kernel tests prove each wgpu capability correct in isolation; these
+//! prove they *compose* into full reconstructions driven through
+//! `recon::recon(.., &dyn Backend)`:
+//!   - **FBP** exercises `FbpFilter::apply` then `FilteredBackproject`.
+//!   - **gridrec** exercises only the `Fft` capability (the Kaiser-Bessel
+//!     gridding/deapodization is host code shared by both backends); it runs on
+//!     the GPU for free because every gridrec transform length is power-of-two
+//!     (`pad = (2·ncols).next_power_of_two()`, grid `m = pad`).
+//!
+//! Each asserts the GPU reconstruction (1) actually reconstructs the phantom
+//! and (2) matches the CPU reconstruction within f32 tolerance.
 //!
 //! Only built under `gpu-wgpu`; needs a real GPU adapter (skipped by the
 //! default workspace run). Run: `cargo test -p tomoxide --features gpu-wgpu`.
@@ -65,16 +70,19 @@ fn disk_nrmse(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) -> (
     ((se / nn).sqrt() / (sb / nn).sqrt(), maxabs)
 }
 
-#[test]
-fn fbp_recon_matches_cpu_on_gpu() {
-    let n = 128;
-    let nang = 180;
+/// Reconstruct a Shepp-Logan phantom with `algorithm` on both backends.
+///
+/// The phantom is forward-projected once on the CPU; both backends reconstruct
+/// the identical sinogram (`ncols = n`). Returns `(gpu_slice, cpu_slice,
+/// phantom)`. Output grid is `n×n` (`num_gridx = n`).
+fn recon_both(
+    algorithm: Algorithm,
+    n: usize,
+    nang: usize,
+) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
     let cpu = CpuBackend::new();
     let gpu = WgpuBackend::new().expect("wgpu device init");
 
-    // Single-slice Shepp-Logan phantom, forward-projected once on the CPU; both
-    // backends reconstruct the identical sinogram (ncols = 128 → filter pads to
-    // 256, a power of two the radix-2 GPU FFT handles).
     let phantom = sim::shepp2d(n).unwrap();
     let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
     let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
@@ -84,12 +92,21 @@ fn fbp_recon_matches_cpu_on_gpu() {
         num_gridx: Some(n),
         ..Default::default()
     };
-    let rc = recon::recon(&sino, &geom, Algorithm::Fbp, &params, &cpu).unwrap();
-    let rg = recon::recon(&sino, &geom, Algorithm::Fbp, &params, &gpu).unwrap();
+    let rc = recon::recon(&sino, &geom, algorithm, &params, &cpu).unwrap();
+    let rg = recon::recon(&sino, &geom, algorithm, &params, &gpu).unwrap();
     assert_eq!(rg.array.dim(), (1, n, n));
 
     let sc = rc.array.index_axis(Axis(0), 0).to_owned();
     let sg = rg.array.index_axis(Axis(0), 0).to_owned();
+    (sg, sc, phantom)
+}
+
+#[test]
+fn fbp_recon_matches_cpu_on_gpu() {
+    // ncols = 128 → the ramp filter pads to 256, a power of two the radix-2 GPU
+    // FFT handles. Exercises FbpFilter::apply ∘ FilteredBackproject on the GPU.
+    let n = 128;
+    let (sg, sc, phantom) = recon_both(Algorithm::Fbp, n, 180);
 
     // (1) The GPU reconstruction is itself a faithful reconstruction (not just a
     //     match to a possibly-wrong CPU output).
@@ -111,4 +128,33 @@ fn fbp_recon_matches_cpu_on_gpu() {
     let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
     eprintln!("GPU vs CPU FBP: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
     assert!(nrmse < 1e-4, "GPU vs CPU FBP NRMSE too large: {nrmse:.3e}");
+}
+
+#[test]
+fn gridrec_recon_matches_cpu_on_gpu() {
+    // gridrec needs only the Fft capability; every transform length is
+    // power-of-two (pad = (2·128).next = 256, grid m = 256), so it runs on the
+    // GPU with no extra kernels — only the FFT backend differs from CPU.
+    let n = 128;
+    let (sg, sc, phantom) = recon_both(Algorithm::Gridrec, n, 180);
+
+    let corr = pearson_disk(&sg, &phantom, n, 0.85);
+    eprintln!("GPU gridrec Pearson vs phantom = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "GPU gridrec correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    // Both backends run identical host gridding/deapodization, differing only in
+    // the FFT (wgpu radix-2 vs rustfft) on a 256-pt radial 1-D and a 256×256
+    // 2-D transform. Observed NRMSE ≈ 3.4e-7 on Metal (max|Δ| ≈ 3e-10 — the host
+    // gridding dominates, the FFT-backend difference is negligible); the 1e-4
+    // bar gives generous cross-adapter headroom yet is orders of magnitude
+    // tighter than any wiring bug (wrong FFT size/direction) would produce.
+    let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
+    eprintln!("GPU vs CPU gridrec: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
+    assert!(
+        nrmse < 1e-4,
+        "GPU vs CPU gridrec NRMSE too large: {nrmse:.3e}"
+    );
 }
