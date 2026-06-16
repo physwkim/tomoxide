@@ -168,6 +168,17 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `O(n log n)` FFT (radix-2 + Bluestein for arbitrary length, no FFT dependency)
   in `crates/tomoxide-prep/src/fft.rs`, validated against a naive DFT to the f64
   floor.
+- ✅ **VoSort (sorting-based) — done.** Port of tomopy `prep/stripe.py:363`
+  `remove_stripe_based_sorting` (Vo 2018 algorithm 3, for partial stripes): per
+  sinogram slice `_rs_sort` — argsort each detector column's values over
+  projections, median-smooth the sorted matrix, unsort. The median is a pure
+  rank-filter **selection** of an existing f32 value (no arithmetic), so it matches
+  tomopy 1.15.3 **bit-for-bit (Δ=0)** on tie-free columns for both `dim=1`
+  (footprint `(size,1)`) and `dim=2` (`(size,size)`); `size=None` → tomopy default
+  `max(5, ⌊0.01·ncol⌋)`. `StripeMethod::VoSort { size, dim }`; the `rs_sort`
+  scaffold (sort/perm/unsort) was made smoother-pluggable and is shared with
+  `VoAll` (unchanged, still passing). `stripe_vosort_parity.rs`, golden from the
+  **real tomopy** `tools/gen_tomopy_stripe_vosort_golden.py`.
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
