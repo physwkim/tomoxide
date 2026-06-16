@@ -194,6 +194,20 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `dim=2` sigma=5). `StripeMethod::VoFilter { sigma, size, dim }`;
   `stripe_vofilter_parity.rs`, golden from the **real tomopy**
   `tools/gen_tomopy_stripe_vofilter_golden.py`.
+- ✅ **VoLarge (large-stripe) — done.** Port of tomopy `prep/stripe.py:653`
+  `remove_large_stripe` (Vo 2018 algorithm 5): per sinogram slice `_rs_large`
+  sorts each detector column over projections, median-smooths the sorted profile
+  along the column axis (footprint `(1, size)`), estimates a per-column intensity
+  factor from the central rows (`drop_ratio` of the extremes dropped), detects the
+  wide-stripe columns (`_detect_stripe` + 1-px binary dilation), and overwrites
+  *only* those columns with the rank-smoothed profile mapped back through the
+  (optionally intensity-normalised) sort order. Reuses the `rs_large` helper
+  already shared with `VoAll` (unchanged). The rank-smoothed writes are pure f32
+  selections, so `norm=false` matches tomopy **bit-for-bit (Δ=0)**; `norm=true`
+  additionally divides the unmasked columns by their f32 factor → **f32 round-off
+  floor** (max rel ≤ 1e-5). `StripeMethod::VoLarge { snr, size, drop_ratio, norm }`;
+  `stripe_volarge_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_stripe_volarge_golden.py` (snr=3, size=51, drop_ratio=0.1).
 - **Done (each) =** inject a synthetic stripe into a sinogram; the chosen method
   reduces the column-variance of the stripe by a stated factor without blurring
   legitimate features; reconstruction shows fewer ring artifacts (roughness over
