@@ -1,7 +1,6 @@
 //! Phase retrieval (ports tomopy `prep/phase.py` + tomocupy
-//! `processing/retrieve_phase.py`). Paganin and generalized Paganin
-//! (`Gpaganin`) single-step retrieval are implemented; `farago` remains a stub.
-//! See `docs/PORTING.md` §D.
+//! `processing/retrieve_phase.py`). Paganin, generalized Paganin (`Gpaganin`),
+//! and Farago single-step retrieval are implemented. See `docs/PORTING.md` §D.
 
 use tomoxide_core::backend::{Backend, Fft};
 use tomoxide_core::data::{Layout, Tomo};
@@ -41,11 +40,16 @@ pub fn retrieve_phase(
         } => {
             let fft = require_fft(backend)?;
             // Standard Paganin: `1/(λ·dist·(ix²+iy²)/(4π) + α)` over the squared
-            // reciprocal grid (tomopy/tomocupy `_paganin_filter_factor`).
-            let (dist_f, alpha_f) = (dist as f64, alpha as f64);
-            run_phase(data, pixel_size, dist, energy, fft, |ix, iy, wl| {
-                let w2 = ix * ix + iy * iy;
-                1.0 / (wl * dist_f * w2 / (4.0 * PHASE_PI) + alpha_f)
+            // reciprocal grid (tomopy/tomocupy `_paganin_filter_factor`). The
+            // filter is well-conditioned, so the f64 grid matches tomopy within
+            // the f32 floor.
+            let (ps, dist_f, alpha_f) = (pixel_size as f64, dist as f64, alpha as f64);
+            let wl = wavelength(energy as f64);
+            run_phase(data, pixel_size, dist, energy, fft, move |nx, ny| {
+                pointwise_filter(nx, ny, ps, |ix, iy| {
+                    let w2 = ix * ix + iy * iy;
+                    (1.0 / (wl * dist_f * w2 / (4.0 * PHASE_PI) + alpha_f)) as f32
+                })
             })
         }
         PhaseMethod::GPaganin {
@@ -66,19 +70,41 @@ pub fn retrieve_phase(
             // promotion). The filter is ill-conditioned — `scale ≈ 1.2e3`
             // amplifies any rounding in `kf` — so matching the reference's actual
             // f32 precision (rather than computing in f64) is what holds parity.
-            let (dist_f, db_f, w_f) = (dist as f64, db as f64, w as f64);
-            let two_pi_ps = (2.0 * PHASE_PI * pixel_size as f64) as f32;
+            let (ps, dist_f, db_f, w_f) = (pixel_size as f64, dist as f64, db as f64, w as f64);
+            let two_pi_ps = (2.0 * PHASE_PI * ps) as f32;
             let aph = db_f * (dist_f * wavelength(energy as f64)) / (4.0 * PHASE_PI);
             let scale = (2.0 * aph / (w_f * w_f)) as f32;
-            run_phase(data, pixel_size, dist, energy, fft, move |ix, iy, _wl| {
-                let kf = (ix as f32 * two_pi_ps).cos() + (iy as f32 * two_pi_ps).cos();
-                (1.0f32 / (1.0 - scale * (kf - 2.0))) as f64
+            run_phase(data, pixel_size, dist, energy, fft, move |nx, ny| {
+                pointwise_filter(nx, ny, ps, |ix, iy| {
+                    let kf = (ix as f32 * two_pi_ps).cos() + (iy as f32 * two_pi_ps).cos();
+                    1.0f32 / (1.0 - scale * (kf - 2.0))
+                })
             })
         }
-        PhaseMethod::Farago => Err(Error::todo(
-            "phase::retrieve_phase (farago)",
-            "tomocupy retrieve_phase.farago_filter:110",
-        )),
+        PhaseMethod::Farago {
+            pixel_size,
+            dist,
+            energy,
+            db,
+        } => {
+            let fft = require_fft(backend)?;
+            // Farago (2024): same padded-Fourier machinery as Paganin but with
+            // the filter `1/(cos θ + db·sin θ)`, `θ = π·λ·dist·(ix² + iy²)` over
+            // the squared reciprocal grid (tomocupy `_reciprocal_grid` +
+            // `_farago_filter_factor`).
+            //
+            // Evaluated in f32 to mirror cupy: `db ≈ 1e3` multiplies `sin θ`, so a
+            // 1-ULP error in `θ` is amplified ~1e3×. The grid must be built from
+            // the *exact* f32 reciprocal coordinate — numpy/cupy round the
+            // `0.5/((n−1)·ps)` scale to f32 *before* the multiply (NEP50 weak
+            // scalar), which differs from an f64 grid cast down by up to 1 ULP and
+            // diverges ~1e-3 in the normalized filter. See [`reciprocal_coord_f32`].
+            let ps = pixel_size as f64;
+            let theta_scale = (PHASE_PI * wavelength(energy as f64) * dist as f64) as f32;
+            run_phase(data, pixel_size, dist, energy, fft, move |nx, ny| {
+                farago_filter_grid(nx, ny, ps, theta_scale, db)
+            })
+        }
     }
 }
 
@@ -109,6 +135,82 @@ fn reciprocal_coord(pixel_size: f64, num_grid: usize) -> Vec<f64> {
     rc
 }
 
+/// Centered reciprocal-space coordinates in f32, matching numpy/cupy exactly:
+/// `arange(-(n-1), n, 2, float32) · float32(0.5/((n-1)·pixel_size))`. The scale
+/// is rounded to f32 *before* the multiply (NEP50 weak-scalar promotion), which
+/// differs from `reciprocal_coord(...) as f32` (round once in f64) by up to 1
+/// ULP — negligible for Paganin but decisive for the f32-sensitive Farago filter.
+fn reciprocal_coord_f32(pixel_size: f64, num_grid: usize) -> Vec<f32> {
+    let n = (num_grid - 1) as f64;
+    let scale = (0.5 / (n * pixel_size)) as f32;
+    let mut rc = Vec::with_capacity(num_grid);
+    let mut v = -((num_grid - 1) as f32);
+    for _ in 0..num_grid {
+        rc.push(v * scale);
+        v += 2.0;
+    }
+    rc
+}
+
+/// Build a centered phase filter (row-major) and its max by evaluating `factor`
+/// at every f64 reciprocal grid point `(indx[i], indy[j])`. Used by the
+/// f64-grid Paganin family; Farago builds its grid directly in f32
+/// ([`farago_filter_grid`]).
+#[allow(clippy::needless_range_loop)]
+fn pointwise_filter(
+    nx: usize,
+    ny: usize,
+    pixel_size: f64,
+    factor: impl Fn(f64, f64) -> f32,
+) -> (Vec<f32>, f32) {
+    let indx = reciprocal_coord(pixel_size, nx);
+    let indy = reciprocal_coord(pixel_size, ny);
+    let mut filt = vec![0.0f32; nx * ny];
+    let mut maxf = f32::NEG_INFINITY;
+    for i in 0..nx {
+        for j in 0..ny {
+            let f = factor(indx[i], indy[j]);
+            filt[i * ny + j] = f;
+            if f > maxf {
+                maxf = f;
+            }
+        }
+    }
+    (filt, maxf)
+}
+
+/// Centered Farago filter (row-major) and its max, built directly in f32 to
+/// mirror cupy. `w2[i,j] = rcx²[i] + rcy²[j]` over the exact f32 reciprocal
+/// coordinates (tomocupy `_reciprocal_grid`: squared in f32, summed in f32); the
+/// filter is `1/(cos θ + db·sin θ)`, `θ = theta_scale·w2` with
+/// `theta_scale = π·λ·dist` (tomocupy `_farago_filter_factor`).
+#[allow(clippy::needless_range_loop)]
+fn farago_filter_grid(
+    nx: usize,
+    ny: usize,
+    pixel_size: f64,
+    theta_scale: f32,
+    db: f32,
+) -> (Vec<f32>, f32) {
+    let rcx = reciprocal_coord_f32(pixel_size, nx);
+    let rcy = reciprocal_coord_f32(pixel_size, ny);
+    let mut filt = vec![0.0f32; nx * ny];
+    let mut maxf = f32::NEG_INFINITY;
+    for i in 0..nx {
+        let sx = rcx[i] * rcx[i];
+        for j in 0..ny {
+            let w2 = sx + rcy[j] * rcy[j];
+            let theta = theta_scale * w2;
+            let f = 1.0f32 / (theta.cos() + db * theta.sin());
+            filt[i * ny + j] = f;
+            if f > maxf {
+                maxf = f;
+            }
+        }
+    }
+    (filt, maxf)
+}
+
 /// Resolve the backend FFT capability or report it missing.
 fn require_fft(backend: &dyn Backend) -> Result<&dyn Fft> {
     backend.fft().ok_or_else(|| Error::MissingCapability {
@@ -119,10 +221,10 @@ fn require_fft(backend: &dyn Backend) -> Result<&dyn Fft> {
 
 /// Shared single-step phase-retrieval driver (tomopy/tomocupy `_retrieve_phase`):
 /// pad each radiograph to a power-of-two host for the Fresnel kernel, multiply by
-/// the `fftshift`ed max-normalized `combiner` filter in Fourier space, and crop
-/// back. `combiner(ix, iy, wl)` is the raw (un-normalized) filter value at
-/// reciprocal coordinates `(ix, iy)` for wavelength `wl` — the only part that
-/// differs between Paganin and generalized Paganin.
+/// the `fftshift`ed max-normalized filter in Fourier space, and crop back.
+/// `build_filter(nx, ny)` returns the centered (un-shifted) filter row-major over
+/// the `nx × ny` reciprocal grid and its max (the normalization denominator) —
+/// the only part that differs between Paganin, generalized Paganin, and Farago.
 #[allow(clippy::needless_range_loop)]
 fn run_phase(
     data: &mut Tomo<f32>,
@@ -130,7 +232,7 @@ fn run_phase(
     dist: f32,
     energy: f32,
     fft: &dyn Fft,
-    combiner: impl Fn(f64, f64, f64) -> f64,
+    build_filter: impl Fn(usize, usize) -> (Vec<f32>, f32),
 ) -> Result<()> {
     let target = data.layout;
     let proj = data.to_layout(Layout::Projection); // [angle, dy, dz]
@@ -158,19 +260,7 @@ fn run_phase(
     let val = (val_acc / (nproj * dy) as f64) as f32;
 
     // Centered phase filter and its max (the normalization denominator).
-    let indx = reciprocal_coord(ps, nx);
-    let indy = reciprocal_coord(ps, ny);
-    let mut filt = vec![0.0f32; nx * ny];
-    let mut maxf = f32::NEG_INFINITY;
-    for i in 0..nx {
-        for j in 0..ny {
-            let f = combiner(indx[i], indy[j], wl) as f32;
-            filt[i * ny + j] = f;
-            if f > maxf {
-                maxf = f;
-            }
-        }
-    }
+    let (filt, maxf) = build_filter(nx, ny);
 
     let mut out = ndarray::Array3::<f32>::zeros((nproj, dy, dz));
     let mut buf = vec![Complex32::new(0.0, 0.0); nx * ny];

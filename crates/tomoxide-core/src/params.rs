@@ -250,6 +250,18 @@ pub enum PhaseMethod {
         /// Characteristic transverse length scale `W` (cm).
         w: f32,
     },
-    /// Farago generalized retrieval (tomocupy `farago`).
-    Farago,
+    /// Farago single-step retrieval (tomocupy `farago`, Farago 2024). Same
+    /// padded Fourier machinery as Paganin but with the filter
+    /// `1/(cos θ + db·sin θ)`, `θ = π·λ·dist·(ix² + iy²)` over the squared
+    /// reciprocal grid.
+    Farago {
+        /// Detector pixel size (cm).
+        pixel_size: f32,
+        /// Sample-to-detector propagation distance (cm).
+        dist: f32,
+        /// X-ray energy (keV).
+        energy: f32,
+        /// Material `delta/beta` ratio.
+        db: f32,
+    },
 }
