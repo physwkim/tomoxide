@@ -75,7 +75,12 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 
 Forward model shared by all: tomopy `libtomo/recon/project.c`
 (`void project(const float* obj,…,float* data,…,const float* center,const float* theta)`)
-→ `tomoxide-recon::project` / `ForwardProject` capability.
+→ `tomoxide-recon::project` / `ForwardProject` capability. CPU done; wgpu
+done — WGSL `project.wgsl` (one thread per `(row, angle)`, race-free scatter:
+each owns a disjoint detector-column span, visits pixels in CPU order so the
+per-column accumulation matches; tolerance parity rtol 1e-4). Exact linear-
+interp adjoint of the wgpu back-projector, sharing the host-side
+`(cosθ,sinθ)`/per-row-center build.
 
 ---
 
