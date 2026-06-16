@@ -30,6 +30,9 @@ fn shepp3d_matches_tomopy() {
                 mismatch += 1;
             }
         }
-        assert_eq!(mismatch, 0, "size {size}: {mismatch} f32 bit-mismatches vs tomopy");
+        assert_eq!(
+            mismatch, 0,
+            "size {size}: {mismatch} f32 bit-mismatches vs tomopy"
+        );
     }
 }
