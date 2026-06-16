@@ -4,12 +4,11 @@
 //! implemented. See `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
 
 use ndarray::Array2;
-use std::f64::consts::PI;
 use tomoxide_core::data::{Layout, Tomo};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::params::StripeMethod;
 
-use crate::wavelet;
+use crate::{fft, wavelet};
 
 /// Remove stripes from a sinogram stack using the selected method.
 pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
@@ -111,54 +110,14 @@ fn remove_stripe_sf(data: &mut Tomo<f32>, size: usize) -> Result<()> {
 // decomposition mirrors tomopy's float32 `pywt` path (each band rounded to f32),
 // while damping and reconstruction run in f64 exactly as tomopy's numpy/pywt
 // promotion does, so the result matches to the f32 round-off floor.
-// Projector-independent. The wavelet kernels live in `crate::wavelet`.
-//
-// NOTE: the Fourier damping uses a self-contained O(n²) direct DFT (no external
-// FFT dependency, arbitrary length). That is fine for parity-sized data but is a
-// known performance cost for large stacks — see `docs/PORTING.md` §D.
+// Projector-independent. The wavelet kernels live in `crate::wavelet`; the
+// arbitrary-length column FFT for the damping lives in `crate::fft`.
 // ----------------------------------------------------------------------------
 
 /// Round every element of an `f64` band to `f32` precision (emulating tomopy's
 /// float32 `pywt` forward pass), keeping the `f64` storage type.
 fn round_to_f32(a: &Array2<f64>) -> Array2<f64> {
     a.mapv(|v| v as f32 as f64)
-}
-
-/// Damp one real column of length `n` in Fourier space: `real(ifft(fft(col) ·
-/// D))`, where `D = ifftshift(damp)`. Equivalent to tomopy's
-/// `real(ifft(ifftshift(fftshift(fft(col)) · damp)))` because a permutation
-/// distributes over the elementwise product, so `fftshift`/`ifftshift` cancel
-/// around the multiply. Direct DFT (matches numpy `fft` to f64 round-off).
-fn damp_column(col: &[f64], d: &[f64]) -> Vec<f64> {
-    let n = col.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let nf = n as f64;
-    // G[k] = fft(col)[k] · D[k]   (col real, D real).
-    let mut gre = vec![0.0f64; n];
-    let mut gim = vec![0.0f64; n];
-    for k in 0..n {
-        let (mut re, mut im) = (0.0f64, 0.0f64);
-        for (m, &cv) in col.iter().enumerate() {
-            let ang = -2.0 * PI * (k as f64) * (m as f64) / nf;
-            re += cv * ang.cos();
-            im += cv * ang.sin();
-        }
-        gre[k] = re * d[k];
-        gim[k] = im * d[k];
-    }
-    // out[t] = real(ifft(G))[t] = (1/n) Σ_k Re(G[k]·e^{+2πi k t/n}).
-    (0..n)
-        .map(|t| {
-            let mut s = 0.0f64;
-            for k in 0..n {
-                let ang = 2.0 * PI * (k as f64) * (t as f64) / nf;
-                s += gre[k] * ang.cos() - gim[k] * ang.sin();
-            }
-            s / nf
-        })
-        .collect()
 }
 
 /// Münch damping factor `D = ifftshift(damp)` for a band with `my` rows, where
@@ -182,6 +141,11 @@ fn damp_vector(my: usize, sigma: f32) -> Vec<f64> {
 /// Damp the vertical-detail band `cv` (shape `[my, mx]`) along axis 0, in place
 /// on a fresh array. Matches tomopy `fcV = fftshift(fft(cV, axis=0)); fcV *=
 /// damp; cV = real(ifft(ifftshift(fcV), axis=0))`.
+///
+/// The `fftshift`/`ifftshift` pair cancels around the elementwise `damp`
+/// multiply (a permutation distributes over an elementwise product), so each
+/// column reduces to `real(ifft(fft(col) · D))` with `D = ifftshift(damp)` —
+/// computed by the `O(n log n)` arbitrary-length FFT in `crate::fft`.
 fn damp_vertical(cv: &Array2<f64>, sigma: f32) -> Array2<f64> {
     let (my, mx) = cv.dim();
     let d = damp_vector(my, sigma);
@@ -191,7 +155,7 @@ fn damp_vertical(cv: &Array2<f64>, sigma: f32) -> Array2<f64> {
         for (r, v) in col.iter_mut().enumerate() {
             *v = cv[[r, c]];
         }
-        let damped = damp_column(&col, &d);
+        let damped = fft::filter_real_column(&col, &d);
         for r in 0..my {
             out[[r, c]] = damped[r];
         }

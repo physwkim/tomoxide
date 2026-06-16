@@ -10,6 +10,7 @@
 //! their upstream `file:line` (see `docs/PORTING.md` §D/§E).
 #![forbid(unsafe_code)]
 
+mod fft;
 pub mod filters;
 pub mod hardening;
 pub mod normalize;
