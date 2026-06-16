@@ -1,6 +1,9 @@
-//! Additive noise models for forward-simulated data (tomopy
-//! `sim/project.py`: `:110` `add_gaussian`, `:136` `add_poisson`, `:153`
-//! `add_rings`, `:183` `add_salt_pepper`, `:211` `add_zingers`).
+//! Additive noise models and illumination effects for forward-simulated data
+//! (tomopy `sim/project.py`: `:80` `add_drift`, `:110` `add_gaussian`, `:136`
+//! `add_poisson`, `:153` `add_rings`, `:183` `add_salt_pepper`, `:211`
+//! `add_zingers`). `add_drift` is deterministic (no RNG), held to numeric parity
+//! at the f32 round-off floor (≤ 1 ULP — numpy's vectorized f64 `sin` vs libm);
+//! the rest are held to distribution parity (see below).
 //!
 //! ## Parity scope: distribution, not bit-stream
 //!
@@ -276,4 +279,56 @@ pub fn add_salt_pepper(data: &mut Tomo<f32>, prob: f32, val: Option<f32>, seed: 
 /// (unused there — the mutate loop is a no-op).
 fn array_max(a: &Array3<f32>) -> f32 {
     a.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// Apply a sinusoidal illumination drift along the rotation (angle) axis
+/// (tomopy `sim/project.py:80` `add_drift`).
+///
+/// Models beam instability as the object rotates: projection angle `i` is scaled
+/// by `drift[i] = amp·sin(2π·i/period) + mean + linspace(0,1)[i]`, held constant
+/// across the detector (the drift varies only along the angle axis, not the
+/// vertical/horizontal detector dimensions). Unlike the `add_*` noise models
+/// this is fully deterministic (no RNG), so it is held to numeric parity rather
+/// than distribution parity — but to the **f32 round-off floor, not Δ = 0**:
+/// numpy's vectorized f64 `sin` differs from libm `f64::sin` by ≤ 1 ULP for some
+/// angles, surviving the final f32 cast in a fraction of pixels (the `f64·f32`
+/// product is commutative, so the drift's `sin` is the only divergence). The
+/// drift and the product follow numpy (which promotes to f64); the result is
+/// stored back as f32. The drift is keyed on the angle axis in either [`Layout`]
+/// (tomopy varies it along `tomo.shape[0]`, the rotation dimension).
+pub fn add_drift(data: &mut Tomo<f32>, amp: f32, period: f32, mean: f32) -> Result<()> {
+    let n_ang = data.n_angles();
+    if n_ang == 0 {
+        return Ok(());
+    }
+    let (amp, period, mean) = (amp as f64, period as f64, mean as f64);
+    let lin = linspace01(n_ang);
+    let w = 2.0 * std::f64::consts::PI / period;
+    // drift[i] = amp·sin(w·i) + mean + linspace(0,1)[i], computed in f64 like numpy.
+    let drift: Vec<f64> = (0..n_ang)
+        .map(|i| amp * (w * i as f64).sin() + mean + lin[i])
+        .collect();
+    let layout = data.layout;
+    for ((a0, a1, _col), v) in data.array.indexed_iter_mut() {
+        let ang = match layout {
+            Layout::Projection => a0, // [angle, row, col]
+            Layout::Sinogram => a1,   // [row, angle, col]
+        };
+        *v = (*v as f64 * drift[ang]) as f32;
+    }
+    Ok(())
+}
+
+/// `numpy.linspace(0.0, 1.0, n)` in f64: `i/(n−1)` with the final sample pinned
+/// to exactly `1.0` (numpy sets the endpoint explicitly). `n == 1` → `[0.0]`.
+fn linspace01(n: usize) -> Vec<f64> {
+    if n == 1 {
+        return vec![0.0];
+    }
+    let step = 1.0 / (n - 1) as f64;
+    let mut v: Vec<f64> = (0..n).map(|i| i as f64 * step).collect();
+    if let Some(last) = v.last_mut() {
+        *last = 1.0;
+    }
+    v
 }
