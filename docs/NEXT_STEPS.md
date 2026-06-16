@@ -104,9 +104,21 @@ below by dependency and value — the first three close the end-to-end pipeline.
   rather than the signed frequency, collapsing reconstructions at sub-pixel
   centers (invisible at the integer default center; `gridrec_subpixel_center.rs`
   regresses it), bit-identical at integer centers.
-- **Remaining stubs:** `crates/tomoxide-recon/src/center.rs` —
-  `write_center` (`rotation.py:438`), `find_center_sift` (defer to M7, needs
-  SIFT/AI; tomocupy `find_center.py:99`).
+- ✅ **`write_center` — done.** Port of tomopy `rotation.py:438`: reconstruct the
+  `ind`-th slice (default `n_rows/2`) with gridrec across a range of rotation
+  centers (`cen_range`, numpy-`arange` semantics; default
+  `arange(ncol/2−5, ncol/2+5, 0.5)`), optionally `ratio`-circular-masked, returned
+  as a `[len(centers), n, n]` stack + the center values (the I/O-free core, so
+  `tomoxide-recon` stays `tomoxide-core`-only; persist as `{center:.2f}.tiff` via
+  `tomoxide-io` to mirror tomopy's files). Parity scope: the **center enumeration**
+  is held to tomopy exactly (Δ=0 vs a numpy golden, both default and explicit
+  range); the reconstruction *content* is gridrec-*family* (Kaiser–Bessel kernel +
+  ramp, not tomopy's PSWF + parzen), so the slice pixels are self-consistent
+  gridrec reconstructions, not bit-identical to tomopy — validated against an
+  independent `recon(Gridrec)` (Δ=0) plus the mask geometry. `write_center_parity.rs`,
+  golden from `tools/gen_tomopy_write_center_golden.py`.
+- **Remaining stub:** `crates/tomoxide-recon/src/center.rs` — `find_center_sift`
+  (defer to M7, needs SIFT/AI; tomocupy `find_center.py:99`).
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 
