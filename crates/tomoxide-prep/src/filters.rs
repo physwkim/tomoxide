@@ -1,8 +1,9 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
 //! `circ_mask`/`remove_nan`/`remove_neg`/`adjust_range`/`median_filter_nonfinite`/
-//! `median_filter`/`remove_outlier1d`/`remove_outlier`/`gaussian_filter` are
-//! real; the 3-D rank filters (`median_filter3d`, `remove_outlier3d`) route
-//! through the backend (stubbed). See `docs/PORTING.md` §E.
+//! `median_filter`/`remove_outlier1d`/`remove_outlier`/`gaussian_filter`/
+//! `sobel_filter` are real; the 3-D rank filters (`median_filter3d`,
+//! `remove_outlier3d`) route through the backend (stubbed). See
+//! `docs/PORTING.md` §E.
 
 use ndarray::{Array2, Axis};
 use tomoxide_core::backend::Backend;
@@ -350,6 +351,39 @@ pub fn gaussian_filter(data: &mut Tomo<f32>, sigma: f64, order: usize, axis: usi
         let slice = data.array.index_axis(Axis(axis), s).to_owned();
         let filtered = gaussian_filter2d(&slice, &weights);
         data.array.index_axis_mut(Axis(axis), s).assign(&filtered);
+    }
+    Ok(())
+}
+
+/// Sobel-filter every 2-D slice along `axis` (tomopy `misc/corr.py:474`
+/// `sobel_filter`). For each index along `axis` the orthogonal 2-D image is run
+/// through scipy.ndimage's Sobel transform: a `[−1, 0, 1]` central-difference
+/// correlation along the slice's last axis, then a `[1, 2, 1]` smoothing
+/// correlation along the other axis (both `mode='reflect'`). `axis` (0/1/2)
+/// indexes the underlying 3-D array, selecting which 2-D slices are taken,
+/// exactly like tomopy (which leaves scipy's `axis=-1` default, so the gradient
+/// is always along the slice's last axis).
+///
+/// Reuses the f64 [`correlate1d_2d`] primitive shared with [`gaussian_filter`].
+/// The weights are exact small integers (no transcendental), and f32 inputs are
+/// exact in the f64 accumulator, so the result is **bit-exact (Δ=0)** vs tomopy
+/// on finite input.
+pub fn sobel_filter(data: &mut Tomo<f32>, axis: usize) -> Result<()> {
+    if axis > 2 {
+        return Err(Error::InvalidParam(
+            "sobel_filter axis must be 0, 1, or 2".into(),
+        ));
+    }
+    // scipy.ndimage.sobel weights (passed to correlate1d unreversed).
+    const DERIV: [f64; 3] = [-1.0, 0.0, 1.0];
+    const SMOOTH: [f64; 3] = [1.0, 2.0, 1.0];
+    let nslices = [data.array.dim().0, data.array.dim().1, data.array.dim().2][axis];
+    for s in 0..nslices {
+        let slice = data.array.index_axis(Axis(axis), s).to_owned();
+        // axis=-1 → derivative along slice-axis 1; smoothing along slice-axis 0.
+        let deriv = correlate1d_2d(&slice, &DERIV, 1);
+        let out = correlate1d_2d(&deriv, &SMOOTH, 0);
+        data.array.index_axis_mut(Axis(axis), s).assign(&out);
     }
     Ok(())
 }
@@ -788,6 +822,38 @@ mod tests {
         // Mass roughly conserved (truncation + reflect edges, so only approx).
         let after: f64 = t.array.iter().map(|&v| v as f64).sum();
         assert!((after - before).abs() < 0.05, "mass {before} -> {after}");
+    }
+
+    #[test]
+    fn sobel_filter_rejects_bad_axis() {
+        let mut t = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Projection);
+        assert!(matches!(
+            sobel_filter(&mut t, 3),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn sobel_filter_responds_to_ramp_edge() {
+        // One 3×5 slice (axis 0), each row a column ramp [0,1,2,3,4].
+        // scipy.ndimage.sobel: central diff [-1,0,1] along the last axis (cols)
+        // with reflect edges → per row [1,2,2,2,1]; then [1,2,1] smoothing along
+        // rows (all rows identical → ×4) → [4,8,8,8,4].
+        #[rustfmt::skip]
+        let slice = vec![
+            0.0f32, 1.0, 2.0, 3.0, 4.0,
+            0.0,    1.0, 2.0, 3.0, 4.0,
+            0.0,    1.0, 2.0, 3.0, 4.0,
+        ];
+        let arr = Array3::from_shape_vec((1, 3, 5), slice).unwrap();
+        let mut t = Tomo::new(arr, Layout::Projection);
+        sobel_filter(&mut t, 0).unwrap();
+        let want = [4.0f32, 8.0, 8.0, 8.0, 4.0];
+        for r in 0..3 {
+            for (c, &w) in want.iter().enumerate() {
+                assert_eq!(t.array[[0, r, c]], w, "mismatch at ({r},{c})");
+            }
+        }
     }
 
     #[test]

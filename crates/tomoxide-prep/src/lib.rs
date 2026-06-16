@@ -8,8 +8,8 @@
 //! Real in this scaffold: `normalize`/`minus_log` (via the CPU backend),
 //! `filters::{circ_mask, remove_nan, remove_neg, median_filter_nonfinite,
 //! adjust_range, median_filter, remove_outlier, remove_outlier1d,
-//! gaussian_filter}`, `alignment::scale`. The rest are stubs that name their
-//! upstream `file:line` (see `docs/PORTING.md` §D/§E).
+//! gaussian_filter, sobel_filter}`, `alignment::scale`. The rest are stubs that
+//! name their upstream `file:line` (see `docs/PORTING.md` §D/§E).
 #![forbid(unsafe_code)]
 
 pub mod alignment;
