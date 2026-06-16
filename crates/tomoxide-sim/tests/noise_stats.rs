@@ -10,6 +10,11 @@
 //!   check is the load-bearing one for `λ ≥ 10`: it fails for a normal
 //!   approximation (skew → 0) and passes only for a genuine Poisson, so it
 //!   verifies the Hörmann PTRS path, not just the first two moments.
+//! * `add_rings`    → mean/std of the per-pixel sensitivity, plus the *load-
+//!   bearing structural* check that the sensitivity is constant across the
+//!   angle axis (a ring, not per-element noise).
+//! * `add_zingers`  → the saturated fraction matches `f`, saturated cells equal
+//!   `sat`, and untouched cells keep their value.
 //!
 //! All tolerances are many standard errors wide of the sampling noise at the
 //! sample sizes used, so the bound is on a real distributional defect, not on
@@ -159,4 +164,93 @@ fn add_poisson_is_deterministic_and_rejects_negative() {
         neg.array, before,
         "a rejected call must not mutate the data"
     );
+}
+
+#[test]
+fn add_rings_is_constant_across_angles_and_matches_std() {
+    // Ring artifacts come from a *fixed* per-pixel sensitivity: every angle
+    // sees the same (row, col) value. With a 1.0 input the output equals the
+    // sensitivity itself, drawn from N(1, std).
+    let (n_ang, n_row, n_col) = (8usize, 64usize, 64usize);
+    let std = 0.05f32;
+    let mut t = Tomo::new(
+        Array3::from_elem((n_ang, n_row, n_col), 1.0f32),
+        Layout::Projection,
+    );
+    tomoxide_sim::add_rings(&mut t, std, 0xBEEF).unwrap();
+
+    // Structural (load-bearing): the sensitivity does not vary with angle. This
+    // is what makes it a ring rather than the per-element noise of add_gaussian.
+    for a in 0..n_ang {
+        for r in 0..n_row {
+            for c in 0..n_col {
+                assert_eq!(
+                    t.array[[a, r, c]],
+                    t.array[[0, r, c]],
+                    "ring sensitivity must be constant across the angle axis"
+                );
+            }
+        }
+    }
+
+    // Distributional: 4096 distinct pixels → SE of the mean ≈ 0.05/64 ≈ 8e-4;
+    // the 0.01 tolerance is ~13 SE, so it bounds a real bias, not the seed.
+    let (m, m2, _) = central_moments(&t.array);
+    let s = m2.sqrt();
+    assert!(
+        (m - 1.0).abs() < 0.01,
+        "ring sensitivity mean = {m} (want 1.0)"
+    );
+    assert!(
+        (s - std as f64).abs() < 0.01,
+        "ring sensitivity std = {s} (want {std})"
+    );
+}
+
+#[test]
+fn add_rings_is_deterministic_per_seed() {
+    let base = Tomo::new(Array3::from_elem((4, 16, 16), 1.0f32), Layout::Projection);
+    let (mut a, mut b, mut c) = (base.clone(), base.clone(), base.clone());
+    tomoxide_sim::add_rings(&mut a, 0.05, 7).unwrap();
+    tomoxide_sim::add_rings(&mut b, 0.05, 7).unwrap();
+    tomoxide_sim::add_rings(&mut c, 0.05, 8).unwrap();
+    assert_eq!(a.array, b.array, "same seed must reproduce the same draw");
+    assert_ne!(a.array, c.array, "a different seed must change the draw");
+}
+
+#[test]
+fn add_zingers_saturates_fraction_f() {
+    // Each element is independently set to `sat` with probability f.
+    let f = 0.02f32;
+    let sat = 65536.0f32;
+    let mut t = tomo_filled(512, 0.0); // 262144 elements, all 0.0
+    tomoxide_sim::add_zingers(&mut t, f, sat, 0x5A17).unwrap();
+
+    let mut n_sat = 0usize;
+    for &v in t.array.iter() {
+        if v == sat {
+            n_sat += 1;
+        } else {
+            assert_eq!(v, 0.0, "a non-zinger element must keep its original value");
+        }
+    }
+    let frac = n_sat as f64 / t.array.len() as f64;
+    // SE of the fraction = sqrt(f(1-f)/N) ≈ sqrt(0.02·0.98/262144) ≈ 2.7e-4;
+    // the 0.002 tolerance is ~7 SE.
+    assert!(
+        (frac - f as f64).abs() < 0.002,
+        "zinger fraction = {frac} (want {f})"
+    );
+}
+
+#[test]
+fn add_zingers_is_deterministic_per_seed() {
+    let mut a = tomo_filled(32, 1.0);
+    let mut b = tomo_filled(32, 1.0);
+    let mut c = tomo_filled(32, 1.0);
+    tomoxide_sim::add_zingers(&mut a, 0.1, 9.0, 3).unwrap();
+    tomoxide_sim::add_zingers(&mut b, 0.1, 9.0, 3).unwrap();
+    tomoxide_sim::add_zingers(&mut c, 0.1, 9.0, 4).unwrap();
+    assert_eq!(a.array, b.array, "same seed must reproduce the same draw");
+    assert_ne!(a.array, c.array, "a different seed must change the draw");
 }

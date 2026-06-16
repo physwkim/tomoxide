@@ -20,8 +20,8 @@
 //! normal approximation would flatten) matches a true Poisson, not just its
 //! first two moments.
 
-use ndarray::Array3;
-use tomoxide_core::data::Tomo;
+use ndarray::{Array2, Array3};
+use tomoxide_core::data::{Layout, Tomo};
 use tomoxide_core::error::{Error, Result};
 
 /// SplitMix64 — a tiny, fast, seedable PRNG (Steele, Lea & Flood 2014).
@@ -191,6 +191,58 @@ pub fn add_poisson(data: &mut Tomo<f32>, seed: u64) -> Result<()> {
     let mut rng = SplitMix64::new(seed);
     for v in data.array.iter_mut() {
         *v = rng.poisson(*v as f64) as f32;
+    }
+    Ok(())
+}
+
+/// Multiply each detector pixel by a fixed per-pixel sensitivity drawn from
+/// `N(1, std)`, modelling the inconsistent pixel response that produces ring
+/// artifacts (tomopy `sim/project.py:153` `add_rings`).
+///
+/// The sensitivity is sampled once per detector `(row, col)` and held constant
+/// across every projection angle — so a pixel that consistently reads high or
+/// low traces a ring after reconstruction. This is the structural difference
+/// from [`add_gaussian`], whose noise is independent per element. It holds in
+/// either [`Layout`]: the sensitivity is keyed on the detector `(row, col)`,
+/// never the angle axis (tomopy broadcasts a `(1, ny, nx)` array over `theta`).
+/// `seed` makes the draw reproducible (tomopy uses the global numpy generator).
+/// See the module docs for the distribution-parity scope.
+pub fn add_rings(data: &mut Tomo<f32>, std: f32, seed: u64) -> Result<()> {
+    let (n_rows, n_cols) = (data.n_rows(), data.n_cols());
+    let std = std as f64;
+    let mut rng = SplitMix64::new(seed);
+    // One sensitivity per detector pixel, drawn in (row, col) C-order to mirror
+    // numpy's `size=(1, ny, nx)` traversal.
+    let mut sens = Array2::<f64>::zeros((n_rows, n_cols));
+    for s in sens.iter_mut() {
+        *s = 1.0 + std * rng.standard_normal();
+    }
+    // numpy promotes f32 * f64 → f64; we store the product back as f32.
+    let layout = data.layout;
+    for ((a0, a1, col), v) in data.array.indexed_iter_mut() {
+        let row = match layout {
+            Layout::Projection => a1, // [angle, row, col]
+            Layout::Sinogram => a0,   // [row, angle, col]
+        };
+        *v = (*v as f64 * sens[[row, col]]) as f32;
+    }
+    Ok(())
+}
+
+/// Saturate a random fraction `f` of elements to `sat`, modelling stray X-rays
+/// that flare individual pixels (tomopy `sim/project.py:211` `add_zingers`).
+///
+/// Each element is independently saturated with probability `f` (tomopy draws
+/// `U(0, 1) <= f`). `f <= 0` saturates nothing and `f >= 1` saturates
+/// everything, matching numpy's comparison. `seed` makes the draw reproducible.
+/// See the module docs for the distribution-parity scope.
+pub fn add_zingers(data: &mut Tomo<f32>, f: f32, sat: f32, seed: u64) -> Result<()> {
+    let f = f as f64;
+    let mut rng = SplitMix64::new(seed);
+    for v in data.array.iter_mut() {
+        if rng.next_open01() <= f {
+            *v = sat;
+        }
     }
     Ok(())
 }
