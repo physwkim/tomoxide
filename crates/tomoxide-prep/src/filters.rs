@@ -195,50 +195,42 @@ pub fn median_filter(data: &mut Tomo<f32>, size: usize, axis: usize) -> Result<(
             "median_filter axis must be 0, 1, or 2".into(),
         ));
     }
-    let dims = data.array.dim();
-    let shape = [dims.0, dims.1, dims.2];
-    if shape[axis] == 0 {
-        return Ok(());
+    data.array = median2d_reflect(&data.array, size, axis);
+    Ok(())
+}
+
+/// Remove bright outliers with a per-slice 2-D median along `axis` (tomopy
+/// `misc/corr.py:559` `remove_outlier`). For each index along `axis` the
+/// orthogonal 2-D image's `size×size` median is taken with scipy.ndimage's
+/// default `mode='reflect'`, then a pixel is replaced by that median only where
+/// it exceeds it by at least `diff` (`arr − median ≥ diff`, strict `<` keeps the
+/// pixel). `axis` indexes the underlying 3-D array (0/1/2), matching tomopy's
+/// `axis` on the raw ndarray.
+///
+/// Shares the 2-D median primitive with [`median_filter`]: the median is a
+/// single order statistic and the `where` test is a plain f32 subtraction, so
+/// the result is bit-exact (Δ=0) vs tomopy on finite input. This is the 2-D
+/// per-slice dezinger; [`remove_outlier3d`] is the 3-D-cube variant and
+/// [`remove_outlier1d`] the 1-D (`mode='mirror'`) variant.
+pub fn remove_outlier(data: &mut Tomo<f32>, diff: f32, size: usize, axis: usize) -> Result<()> {
+    if size == 0 {
+        return Err(Error::InvalidParam(
+            "remove_outlier size must be > 0".into(),
+        ));
     }
-    // scipy.ndimage.median_filter footprint origin = size/2 per axis; median rank
-    // = filter_size // 2 = size·size // 2 (a single element, not a mean).
-    let orgn = (size / 2) as isize;
-    let rank = (size * size) / 2;
-    // The two axes orthogonal to `axis` form each 2-D slice (row = a1, col = a2).
-    let (a1, a2) = match axis {
-        0 => (1usize, 2usize),
-        1 => (0usize, 2usize),
-        _ => (0usize, 1usize),
-    };
-    let nr = shape[a1] as isize;
-    let nc = shape[a2] as isize;
-    let mut out = ndarray::Array3::<f32>::zeros(dims);
-    let mut window: Vec<f32> = Vec::with_capacity(size * size);
-    for s in 0..shape[axis] {
-        for r in 0..shape[a1] {
-            for c in 0..shape[a2] {
-                window.clear();
-                for dr in 0..size {
-                    let sr = reflect_index(r as isize + dr as isize - orgn, nr);
-                    for dc in 0..size {
-                        let sc = reflect_index(c as isize + dc as isize - orgn, nc);
-                        let mut idx = [0usize; 3];
-                        idx[axis] = s;
-                        idx[a1] = sr;
-                        idx[a2] = sc;
-                        window.push(data.array[[idx[0], idx[1], idx[2]]]);
-                    }
-                }
-                window.sort_by(|a, b| a.partial_cmp(b).expect("input is finite"));
-                let mut oidx = [0usize; 3];
-                oidx[axis] = s;
-                oidx[a1] = r;
-                oidx[a2] = c;
-                out[[oidx[0], oidx[1], oidx[2]]] = window[rank];
+    if axis > 2 {
+        return Err(Error::InvalidParam(
+            "remove_outlier axis must be 0, 1, or 2".into(),
+        ));
+    }
+    let tmp = median2d_reflect(&data.array, size, axis);
+    ndarray::Zip::from(&mut data.array)
+        .and(&tmp)
+        .for_each(|a, &t| {
+            if *a - t >= diff {
+                *a = t;
             }
-        }
-    }
-    data.array = out;
+        });
     Ok(())
 }
 
@@ -316,6 +308,55 @@ pub fn remove_outlier1d(data: &mut Tomo<f32>, diff: f32, size: usize, axis: usiz
             }
         });
     Ok(())
+}
+
+/// Per-slice 2-D median over the two axes orthogonal to `axis`, with a
+/// `size×size` footprint and scipy.ndimage's default `mode='reflect'`
+/// (half-sample reflection). Selects a single order statistic (rank
+/// `size·size/2`, never an average), so it is bit-exact. The caller validates
+/// `size > 0` and `axis ≤ 2`. Shared by [`median_filter`] and [`remove_outlier`].
+fn median2d_reflect(arr: &ndarray::Array3<f32>, size: usize, axis: usize) -> ndarray::Array3<f32> {
+    let dims = arr.dim();
+    let shape = [dims.0, dims.1, dims.2];
+    // scipy.ndimage.median_filter footprint origin = size/2 per axis; median rank
+    // = filter_size // 2 = size·size // 2 (a single element, not a mean).
+    let orgn = (size / 2) as isize;
+    let rank = (size * size) / 2;
+    // The two axes orthogonal to `axis` form each 2-D slice (row = a1, col = a2).
+    let (a1, a2) = match axis {
+        0 => (1usize, 2usize),
+        1 => (0usize, 2usize),
+        _ => (0usize, 1usize),
+    };
+    let nr = shape[a1] as isize;
+    let nc = shape[a2] as isize;
+    let mut out = ndarray::Array3::<f32>::zeros(dims);
+    let mut window: Vec<f32> = Vec::with_capacity(size * size);
+    for s in 0..shape[axis] {
+        for r in 0..shape[a1] {
+            for c in 0..shape[a2] {
+                window.clear();
+                for dr in 0..size {
+                    let sr = reflect_index(r as isize + dr as isize - orgn, nr);
+                    for dc in 0..size {
+                        let sc = reflect_index(c as isize + dc as isize - orgn, nc);
+                        let mut idx = [0usize; 3];
+                        idx[axis] = s;
+                        idx[a1] = sr;
+                        idx[a2] = sc;
+                        window.push(arr[[idx[0], idx[1], idx[2]]]);
+                    }
+                }
+                window.sort_by(|a, b| a.partial_cmp(b).expect("input is finite"));
+                let mut oidx = [0usize; 3];
+                oidx[axis] = s;
+                oidx[a1] = r;
+                oidx[a2] = c;
+                out[[oidx[0], oidx[1], oidx[2]]] = window[rank];
+            }
+        }
+    }
+    out
 }
 
 /// scipy.ndimage `mode='reflect'` index map: half-sample symmetric reflection
@@ -407,6 +448,47 @@ mod tests {
         median_filter(&mut t, 3, 0).unwrap();
         // Centre: sorted {0,1,2,3,4,5,6,7,100}, rank 9/2=4 → 4.0 (spike removed).
         assert_eq!(t.array[[0, 1, 1]], 4.0);
+    }
+
+    #[test]
+    fn remove_outlier_rejects_bad_params() {
+        let mut t = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Projection);
+        assert!(matches!(
+            remove_outlier(&mut t, 0.5, 0, 0),
+            Err(Error::InvalidParam(_))
+        ));
+        assert!(matches!(
+            remove_outlier(&mut t, 0.5, 3, 3),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn remove_outlier_replaces_only_above_threshold() {
+        // 3×3 slice (axis 0) with a bright spike at the centre; 2-D median is 4.0.
+        #[rustfmt::skip]
+        let slice = vec![
+            0.0f32, 1.0, 2.0,
+            3.0,  100.0, 4.0,
+            5.0,    6.0, 7.0,
+        ];
+        // Small threshold: spike deviates 100−4=96 ≥ 1 → replaced; others kept
+        // (their |value − local median| stays below 1).
+        let mut t = Tomo::new(
+            Array3::from_shape_vec((1, 3, 3), slice.clone()).unwrap(),
+            Layout::Projection,
+        );
+        remove_outlier(&mut t, 1.0, 3, 0).unwrap();
+        assert_eq!(t.array[[0, 1, 1]], 4.0); // spike replaced by median
+        assert_eq!(t.array[[0, 0, 0]], 0.0); // non-outlier kept
+
+        // Huge threshold: nothing exceeds it → input unchanged.
+        let mut t = Tomo::new(
+            Array3::from_shape_vec((1, 3, 3), slice).unwrap(),
+            Layout::Projection,
+        );
+        remove_outlier(&mut t, 1000.0, 3, 0).unwrap();
+        assert_eq!(t.array[[0, 1, 1]], 100.0);
     }
 
     #[test]
