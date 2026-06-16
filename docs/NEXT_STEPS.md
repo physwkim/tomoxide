@@ -354,6 +354,14 @@ below by dependency and value — the first three close the end-to-end pipeline.
   all-non-finite kernel errors. Medians are order-free, so it matches tomopy
   1.15.3 **bit-for-bit (Δ=0)** for size 3/5 (`median_nonfinite_parity.rs`, golden
   from `tools/gen_tomopy_median_nonfinite_golden.py`). `prep::filters::median_filter_nonfinite`.
+- ✅ **`adjust_range` — done.** Port of tomopy `misc/corr.py:90` (pure NumPy):
+  clip a stack's values to `[dmin, dmax]`. `None` bounds default to the data
+  min/max, and a bound is applied only when *strictly* tighter than the data
+  range (strict `>`/`<`), so both-`None` and looser-than-data bounds are no-ops,
+  exactly as upstream (incl. the post-high-clip `np.min` recompute). No
+  summation → matches tomopy 1.15.3 **bit-for-bit (Δ=0)** across both-None /
+  high-only / low-only / both / looser-than-data cases (`adjust_range_parity.rs`,
+  golden from `tools/gen_tomopy_adjust_range_golden.py`). `prep::filters::adjust_range`.
 
 ### B6. Ring removal — `tomoxide-recon::ring`
 
