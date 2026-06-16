@@ -19,7 +19,7 @@ use tomoxide_core::backend::{
 use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
 use tomoxide_core::dtype::{Complex32, Dtype, Element};
 use tomoxide_core::error::{Error, Result};
-use tomoxide_core::geometry::{Beam, Geometry};
+use tomoxide_core::geometry::{Beam, Center, Geometry};
 use tomoxide_core::params::FilterName;
 
 /// A host-resident buffer. On the CPU backend "device memory" is just a `Vec`.
@@ -178,17 +178,25 @@ impl FbpFilter for CpuBackend {
         tomoxide_core::backend::make_fbp_filter(name, n)
     }
 
-    /// Apply `filter` to every projection of `sino` in place.
+    /// Apply `filter` to every projection of `sino` in place, folding in the
+    /// rotation-center shift (tomocupy `fbp_filter_center`).
     ///
-    /// Each `(row, angle)` line along the detector axis is zero-padded to
-    /// `filter.len()`, forward-transformed, multiplied by the (real) filter,
-    /// inverse-transformed, and the leading `n_cols` real samples are written
-    /// back. Ramp filtering is a shift-invariant 1-D convolution, so the
-    /// rotation center is handled **downstream**, not here (fbp/linerec sample
-    /// the back-projector at `…+ center`; fourierrec/lprec/gridrec recenter in
-    /// their own Fourier grids) — see the [`FbpFilter::apply`] trait doc for why
-    /// this differs from tomocupy's `fbp_filter_center` phase. `geom` is unused.
-    fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], _geom: &Geometry) -> Result<()> {
+    /// Each `(row, angle)` detector lane is zero-padded to `filter.len()`,
+    /// forward-transformed, multiplied by the ramp filter **and** a per-row
+    /// Fourier-shift phase `exp(-2πi·f_k·(ncols/2 − center)/pad)` (signed
+    /// frequency `f_k`, see the body comment), inverse-
+    /// transformed, and the leading `n_cols` real samples written back. The
+    /// phase is the band-limited sub-pixel shift that moves the rotation axis
+    /// from detector column `center` to the midpoint `ncols/2`, so after this
+    /// pass **every analytic back-projector reconstructs against a
+    /// centre = `ncols/2` geometry**: the rotation centre is owned in this one
+    /// place and the back-projectors / Fourier grids are centre-agnostic
+    /// (matching tomocupy `backproj_functions.py::fbp_filter_center`). At the
+    /// default centre `ncols/2` the shift is zero and the phase is unity, so the
+    /// centre-aligned goldens are unaffected. (Edge-replicate padding, the other
+    /// half of tomocupy's routine, is a separate refinement; this still
+    /// zero-pads.)
+    fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()> {
         let pad = filter.len();
         if pad == 0 {
             return Err(Error::InvalidParam("empty filter".into()));
@@ -200,14 +208,61 @@ impl FbpFilter for CpuBackend {
                 found: pad.to_string(),
             });
         }
+        // Combined per-row kernel: ramp × centre-shift phase. `δ = ncols/2 −
+        // center` is the shift (in detector pixels) that lands the axis on the
+        // midpoint; `cos(0)=1, sin(0)=0` makes δ=0 the identity ramp exactly.
+        //
+        // The phase MUST use the SIGNED frequency `f_k = k (k≤pad/2) else k−pad`,
+        // not the raw index: only the signed form is Hermitian-symmetric, so the
+        // inverse transform of (real ramp × phase) stays real. A raw index
+        // negates the negative-frequency half at a half-integer δ and collapses
+        // the slice — the same sub-pixel-centre trap documented in `gridrec`.
+        let half = ncols as f32 / 2.0;
+        let two_pi = std::f32::consts::TAU;
+        let make_w = |delta: f32| -> Vec<Complex32> {
+            (0..pad)
+                .map(|k| {
+                    let fk = if k <= pad / 2 {
+                        k as f32
+                    } else {
+                        k as f32 - pad as f32
+                    };
+                    let ang = -two_pi * fk * delta / pad as f32;
+                    Complex32::new(filter[k] * ang.cos(), filter[k] * ang.sin())
+                })
+                .collect()
+        };
+        // Most geometries share one centre (Scalar); build a single kernel then,
+        // and one per slice only for a PerRow centre.
+        let n_rows = sino.n_rows();
+        let wrows: Vec<Vec<Complex32>> = match &geom.center {
+            Center::Scalar(c) => vec![make_w(half - c)],
+            Center::PerRow(_) => (0..n_rows)
+                .map(|r| make_w(half - geom.center.at(r)))
+                .collect(),
+        };
+        let scalar = wrows.len() == 1;
+
+        let layout = sino.layout;
+        let d1 = sino.array.shape()[1];
         let mut planner = FftPlanner::<f32>::new();
         let fwd = planner.plan_fft_forward(pad);
         let inv = planner.plan_fft_inverse(pad);
         let norm = 1.0 / pad as f32;
         let mut buf = vec![Complex32::new(0.0, 0.0); pad];
-        // Axis 2 is the detector column in both layouts, so each lane is one
-        // projection regardless of row/angle ordering.
-        for mut lane in sino.array.lanes_mut(Axis(2)) {
+        // Axis 2 is the detector column in both layouts; `lanes_mut` iterates the
+        // other two axes in C order, so `flat = i0·d1 + i1` recovers the slice row
+        // (`i0` in Sinogram order, `i1` in Projection order) for the per-row phase.
+        for (flat, mut lane) in sino.array.lanes_mut(Axis(2)).into_iter().enumerate() {
+            let w = if scalar {
+                &wrows[0]
+            } else {
+                let row = match layout {
+                    Layout::Sinogram => flat / d1,
+                    Layout::Projection => flat % d1,
+                };
+                &wrows[row]
+            };
             for slot in buf.iter_mut() {
                 *slot = Complex32::new(0.0, 0.0);
             }
@@ -215,8 +270,8 @@ impl FbpFilter for CpuBackend {
                 buf[i] = Complex32::new(v, 0.0);
             }
             fwd.process(&mut buf);
-            for (c, &w) in buf.iter_mut().zip(filter.iter()) {
-                *c *= w;
+            for (c, wk) in buf.iter_mut().zip(w.iter()) {
+                *c *= *wk;
             }
             inv.process(&mut buf);
             for (i, slot) in lane.iter_mut().enumerate() {

@@ -678,13 +678,14 @@ impl FbpFilter for WgpuBackend {
     /// scaled by `1/pad`, and its leading `n_cols` real samples written back.
     /// Forward FFT, frequency-domain multiply, and inverse FFT all run on the
     /// GPU in one serialized submission chain — no host round-trip between the
-    /// transforms. Mirrors `CpuBackend::apply`; `geom` is unused because ramp
-    /// filtering is shift-invariant and the rotation center is handled
-    /// downstream per method (see the `FbpFilter::apply` trait doc — this
-    /// differs from tomocupy's `fbp_filter_center` phase by design). Requires a
-    /// power-of-two `pad` (the GPU FFT is
-    /// radix-2 only); other lengths error so the caller can fall back to CPU.
-    fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], _geom: &Geometry) -> Result<()> {
+    /// transforms. Mirrors `CpuBackend::apply`, including the per-row
+    /// rotation-centre phase (tomocupy `fbp_filter_center`): the per-lane shift
+    /// `ncols/2 − center` is uploaded and folded into the GPU filter-multiply,
+    /// so after this pass the back-projectors assume centre = `ncols/2`. At the
+    /// default centre the shift is zero and only the ramp applies. Requires a
+    /// power-of-two `pad` (the GPU FFT is radix-2 only); other lengths error so
+    /// the caller can fall back to CPU.
+    fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()> {
         let pad = filter.len();
         if pad == 0 {
             return Err(Error::InvalidParam("empty filter".into()));
@@ -713,9 +714,25 @@ impl FbpFilter for WgpuBackend {
                 host[base + i] = Complex32::new(v, 0.0);
             }
         }
+        // Per-lane centre shift δ = ncols/2 − center(row). `lanes` iterates the
+        // two non-detector axes in C order, so lane `l` maps to slice row `l/d1`
+        // (Sinogram) or `l%d1` (Projection) — the same mapping CpuBackend::apply
+        // uses. δ=0 at the default centre keeps the GPU goldens identical.
+        let half = ncols as f32 / 2.0;
+        let d1 = sino.array.shape()[1];
+        let deltas: Vec<f32> = (0..batch)
+            .map(|l| {
+                let row = match sino.layout {
+                    Layout::Sinogram => l / d1,
+                    Layout::Projection => l % d1,
+                };
+                half - geom.center.at(row)
+            })
+            .collect();
         let data = self.upload_complex("fbp_filter", &host);
         self.fft_passes(&data, pad, batch, false);
         let w = self.storage_ro("fbp_w", filter);
+        let deltas_buf = self.storage_ro("fbp_deltas", &deltas);
         let p = self.uniform(
             "fbp_p",
             &FfltParams {
@@ -728,7 +745,7 @@ impl FbpFilter for WgpuBackend {
         self.dispatch1d(
             FBP_FILTER_WGSL,
             "apply_filter",
-            &[&data, &w, &p],
+            &[&data, &w, &p, &deltas_buf],
             (batch * pad) as u32,
         );
         self.fft_passes(&data, pad, batch, true);

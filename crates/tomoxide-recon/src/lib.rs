@@ -25,7 +25,7 @@ use ndarray::{Array3, Axis};
 use tomoxide_core::backend::{Backend, FilteredBackproject, ForwardProject, RayProject, RayRow};
 use tomoxide_core::data::{Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
-use tomoxide_core::geometry::{Angles, Geometry};
+use tomoxide_core::geometry::{Angles, Center, Geometry};
 use tomoxide_core::params::{Algorithm, ReconParams};
 
 fn missing(capability: &'static str, backend: &dyn Backend) -> Error {
@@ -104,12 +104,20 @@ fn analytic(
 
     // fbp / linerec: filtered back-projection. linerec is genuinely a line
     // back-projection (tomocupy `cfunc_linerec` reduces to parallel-beam BP with
-    // linear interpolation), so it shares this FBP path.
+    // linear interpolation), so it shares this FBP path. `FbpFilter::apply` has
+    // already shifted the rotation axis onto the detector midpoint, so the
+    // back-projector runs against a centre = ncols/2 geometry — matching
+    // tomocupy, whose back-projection kernels assume n/2 after fbp_filter_center.
+    // (The iterative path keeps `geom.center`; only this analytic path recenters.)
     let bp = backend
         .backprojector()
         .ok_or_else(|| missing("FilteredBackproject", backend))?;
+    let centered = Geometry {
+        center: Center::Scalar(sino.n_cols() as f32 / 2.0),
+        ..geom.clone()
+    };
     let mut vol = Volume::new(Array3::zeros((nz, n, n)));
-    bp.backproject(&filtered, geom, &mut vol)?;
+    bp.backproject(&filtered, &centered, &mut vol)?;
     Ok(vol)
 }
 

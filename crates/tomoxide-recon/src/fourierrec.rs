@@ -81,7 +81,6 @@ pub fn fourierrec(
                                   // tomocupy `divphi` global sign `1 − n%4` (== +1 for n divisible by 4, the
                                   // supported case; replicated verbatim so the overall sign matches).
     let phi_sign = 1.0 - (nd % 4) as f32;
-    let two_pi = 2.0 * std::f32::consts::PI;
 
     // (cos θ, sin θ) per angle.
     let trig: Vec<(f32, f32)> = geom
@@ -122,20 +121,10 @@ pub fn fourierrec(
             }
         }
 
-        // Rotation-centre shift (Fourier-shift theorem on the centred spectrum):
-        // move the detector centre nd/2 onto the rotation axis `center`. No-op at
-        // the default centre nd/2; matches gridrec's signed-frequency phase.
-        let center = geom.center.at(row);
-        let shift = center - nd as f32 / 2.0;
-        if shift.abs() > 1e-6 {
-            for ia in 0..nang {
-                for k in 0..nd {
-                    let rho = k as f32 - nd as f32 / 2.0;
-                    let ph = two_pi * rho * shift / nd as f32;
-                    radial[ia * nd + k] *= Complex32::new(ph.cos(), ph.sin());
-                }
-            }
-        }
+        // The rotation-centre shift is folded into the shared FBP filter
+        // upstream (FbpFilter::apply moves the axis onto the detector midpoint
+        // nd/2), so the radial spectrum is already centred — no per-grid
+        // recenter here, and this method is centre-agnostic.
 
         // 2. Gather each radial Fourier sample onto the (2n+2m)² Cartesian grid
         //    with the separable Gaussian kernel (tomocupy `gather`).

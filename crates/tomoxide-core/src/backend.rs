@@ -107,22 +107,24 @@ pub trait FbpFilter {
     /// Build the frequency-domain filter kernel of length `n`.
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>>;
 
-    /// Apply `filter` to a sinogram in place (pure shift-invariant ramp
-    /// convolution along the detector axis).
+    /// Apply `filter` to a sinogram in place: the apodized ramp **and** the
+    /// rotation-centre correction, folded into one frequency-domain pass
+    /// (tomocupy `fbp_filter_center`).
     ///
-    /// **Center handling differs from tomocupy by design.** tomocupy's
-    /// `fbp_filter_center` folds the rotation-center correction into this filter
-    /// as a per-row Fourier phase `exp(-2πi·(-center + sht + n/2)·t)` (a
-    /// band-limited sub-pixel shift to `n/2`), so its back-projector assumes the
-    /// center is at `n/2`. tomoxide instead handles the center **downstream**,
-    /// where each method already touches the data: fbp/linerec sample the
-    /// back-projector at `t = …+ center` (linear-interp sub-pixel), and
-    /// fourierrec/lprec/gridrec apply a signed-frequency Fourier recenter in
-    /// their own grids. The two are numerically equivalent and the downstream
-    /// path is verified against the tomopy goldens (gridrec r=0.98, the
-    /// `gridrec_subpixel_center` non-integer-center regression test). `geom` is
-    /// therefore unused by this method — kept in the signature for backends that
-    /// might fold center in here, and so the trait stays uniform.
+    /// For each detector lane the kernel is the ramp times a per-row Fourier
+    /// phase `exp(-2πi·f_k·(n/2 − center)/pad)` with the *signed* frequency
+    /// `f_k` (so the inverse transform stays real) — a band-limited sub-pixel
+    /// shift that lands the rotation axis on the detector midpoint `n/2`. After
+    /// this pass **every analytic back-projector and Fourier grid reconstructs
+    /// against a centre = `n/2` geometry**, so the rotation centre is owned in
+    /// this one place: fbp/linerec back-project at `n/2`, and fourierrec/lprec
+    /// are centre-agnostic. At the default centre `n/2` the shift is zero and
+    /// this is the pure ramp, so the centre-aligned goldens are unchanged.
+    /// `geom` supplies the per-row centre.
+    ///
+    /// Out of scope here: gridrec runs its own integrated filter+recenter (it
+    /// never calls this method), and the iterative back-projectors keep
+    /// `geom.center` in the projector/adjoint pair (their data is not filtered).
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()>;
 }
 
