@@ -118,6 +118,12 @@ impl Backend for WgpuBackend {
     fn rank_filter(&self) -> Option<&dyn tomoxide_core::backend::RankFilter> {
         Some(self)
     }
+
+    /// Batched radix-2 FFT (power-of-two lengths) runs on the GPU.
+    #[cfg(feature = "gpu-wgpu")]
+    fn fft(&self) -> Option<&dyn tomoxide_core::backend::Fft> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
@@ -234,6 +240,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     use ndarray::Array3;
     use tomoxide_core::backend::Backend;
     use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
+    use tomoxide_core::dtype::Complex32;
     use tomoxide_core::geometry::{Angles, Center, Geometry};
 
     /// Assert two flat f32 sequences agree within a relative+absolute tolerance.
@@ -482,6 +489,79 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let mut vol = Volume::new(Array3::<f32>::zeros((9, 9, 9)));
         assert!(matches!(
             be.rank_filter().unwrap().median3d(&mut vol, 9),
+            Err(tomoxide_core::error::Error::InvalidParam(_))
+        ));
+    }
+
+    // --- Fft capability: tolerance parity vs CPU (rustfft) + roundtrip -----
+    fn assert_complex_close(g: &[Complex32], c: &[Complex32], tol: f32, what: &str) {
+        assert_eq!(g.len(), c.len());
+        for (i, (a, b)) in g.iter().zip(c.iter()).enumerate() {
+            assert!(
+                (a.re - b.re).abs() <= tol && (a.im - b.im).abs() <= tol,
+                "{what} index {i}: gpu={a:?} cpu={b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fft_1d_roundtrips_and_matches_cpu() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+        let (len, batch) = (8usize, 3usize);
+        let base: Vec<Complex32> = (0..len * batch)
+            .map(|k| Complex32::new((k as f32 * 0.3).sin(), (k as f32 * 0.17).cos()))
+            .collect();
+
+        // Forward parity vs rustfft.
+        let mut g = base.clone();
+        let mut c = base.clone();
+        be.fft().unwrap().fft_1d(&mut g, len, batch, false).unwrap();
+        cpu.fft()
+            .unwrap()
+            .fft_1d(&mut c, len, batch, false)
+            .unwrap();
+        assert_complex_close(&g, &c, 1e-3, "fft_1d forward");
+
+        // Roundtrip: ifft(fft(x)) == x.
+        be.fft().unwrap().fft_1d(&mut g, len, batch, true).unwrap();
+        assert_complex_close(&g, &base, 1e-3, "fft_1d roundtrip");
+    }
+
+    #[test]
+    fn fft_2d_roundtrips_and_matches_cpu() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+        let (rows, cols, batch) = (4usize, 8usize, 2usize);
+        let base: Vec<Complex32> = (0..rows * cols * batch)
+            .map(|k| Complex32::new((k as f32 * 0.21).sin(), (k as f32 * 0.09).cos()))
+            .collect();
+
+        let mut g = base.clone();
+        let mut c = base.clone();
+        be.fft()
+            .unwrap()
+            .fft_2d(&mut g, rows, cols, batch, false)
+            .unwrap();
+        cpu.fft()
+            .unwrap()
+            .fft_2d(&mut c, rows, cols, batch, false)
+            .unwrap();
+        assert_complex_close(&g, &c, 2e-3, "fft_2d forward");
+
+        be.fft()
+            .unwrap()
+            .fft_2d(&mut g, rows, cols, batch, true)
+            .unwrap();
+        assert_complex_close(&g, &base, 2e-3, "fft_2d roundtrip");
+    }
+
+    #[test]
+    fn fft_1d_rejects_non_power_of_two() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let mut buf = vec![Complex32::new(0.0, 0.0); 6];
+        assert!(matches!(
+            be.fft().unwrap().fft_1d(&mut buf, 6, 1, false),
             Err(tomoxide_core::error::Error::InvalidParam(_))
         ));
     }

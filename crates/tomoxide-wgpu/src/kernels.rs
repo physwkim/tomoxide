@@ -7,12 +7,15 @@
 
 use bytemuck::{Pod, Zeroable};
 use ndarray::{Array3, Axis};
-use tomoxide_core::backend::{Elementwise, FilteredBackproject, ForwardProject, RankFilter};
+use tomoxide_core::backend::{Elementwise, Fft, FilteredBackproject, ForwardProject, RankFilter};
 use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
+use tomoxide_core::dtype::Complex32;
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Beam, Geometry};
 
-use crate::shaders::{BACKPROJECT_WGSL, ELEMENTWISE_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL};
+use crate::shaders::{
+    BACKPROJECT_WGSL, ELEMENTWISE_WGSL, FFT_TRANSPOSE_WGSL, FFT_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
+};
 use crate::WgpuBackend;
 
 /// Max window the GPU median kernel can hold (must match `MAX_WIN` in
@@ -352,6 +355,173 @@ impl RankFilter for WgpuBackend {
     fn remove_outlier3d(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()> {
         let radius = (size.max(3) - 1) / 2;
         data.array = self.medfilt3d_gpu(&data.array, radius, diff)?;
+        Ok(())
+    }
+}
+
+/// Uniform block for the radix-2 FFT kernel (16 bytes — already a multiple of 16,
+/// so no padding is needed).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FftParams {
+    n: u32,
+    logn: u32,
+    m: u32,
+    sign: f32,
+}
+
+/// Uniform block for the FFT transpose kernel. Padded to 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TParams {
+    rows: u32,
+    cols: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+impl WgpuBackend {
+    /// Issue the in-place radix-2 passes (bit-reversal + `log2(n)` butterfly
+    /// stages) over `data`, treating it as `lanes` contiguous transforms of
+    /// length `n`. Does not normalize; the inverse `1/n` is applied by the
+    /// caller. Submissions serialize on the queue, so each stage observes the
+    /// previous one's writes; transient uniform buffers stay alive through the
+    /// pending submissions even after this returns.
+    fn fft_passes(&self, data: &wgpu::Buffer, n: usize, lanes: usize, inverse: bool) {
+        let logn = n.trailing_zeros();
+        let sign = if inverse { 1.0f32 } else { -1.0f32 };
+        let p0 = self.uniform(
+            "fft_p",
+            &FftParams {
+                n: n as u32,
+                logn,
+                m: 0,
+                sign,
+            },
+        );
+        self.dispatch1d(FFT_WGSL, "bitrev", &[data, &p0], (n * lanes) as u32);
+        let mut m = 2u32;
+        for _ in 0..logn {
+            let p = self.uniform(
+                "fft_p",
+                &FftParams {
+                    n: n as u32,
+                    logn,
+                    m,
+                    sign,
+                },
+            );
+            self.dispatch1d(FFT_WGSL, "butterfly", &[data, &p], (n * lanes / 2) as u32);
+            m <<= 1;
+        }
+    }
+
+    /// Transpose each `rows × cols` image of `src` into `cols × rows` in `dst`.
+    fn fft_transpose(
+        &self,
+        src: &wgpu::Buffer,
+        dst: &wgpu::Buffer,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+    ) {
+        let params = TParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let p = self.uniform("fft_t", &params);
+        self.dispatch1d(
+            FFT_TRANSPOSE_WGSL,
+            "transpose",
+            &[src, dst, &p],
+            (rows * cols * batch) as u32,
+        );
+    }
+
+    /// Upload an interleaved complex buffer to a `read_write` storage buffer
+    /// (each `Complex32` becomes a `vec2<f32>`).
+    fn upload_complex(&self, label: &str, buf: &[Complex32]) -> wgpu::Buffer {
+        let host: Vec<f32> = buf.iter().flat_map(|c| [c.re, c.im]).collect();
+        self.storage_rw(label, &host)
+    }
+
+    /// Read an interleaved complex buffer back into `buf`, scaling by `norm`.
+    fn download_complex(&self, data: &wgpu::Buffer, buf: &mut [Complex32], norm: f32) {
+        let out = self.download_f32(data, buf.len() * 2);
+        for (c, chunk) in buf.iter_mut().zip(out.chunks_exact(2)) {
+            c.re = chunk[0] * norm;
+            c.im = chunk[1] * norm;
+        }
+    }
+}
+
+impl Fft for WgpuBackend {
+    /// Batched 1-D radix-2 FFT. Requires a power-of-two `len` (the GPU kernel
+    /// only does radix-2); other lengths error out so the caller can fall back
+    /// to the CPU. `inverse` divides by `len`, matching the CPU backend.
+    fn fft_1d(&self, buf: &mut [Complex32], len: usize, batch: usize, inverse: bool) -> Result<()> {
+        if len == 0 || batch == 0 {
+            return Ok(());
+        }
+        if buf.len() != len * batch {
+            return Err(Error::ShapeMismatch {
+                expected: (len * batch).to_string(),
+                found: buf.len().to_string(),
+            });
+        }
+        if !len.is_power_of_two() {
+            return Err(Error::InvalidParam(format!(
+                "wgpu FFT requires a power-of-two length (got {len}); use the CPU backend"
+            )));
+        }
+        let data = self.upload_complex("fft_1d", buf);
+        self.fft_passes(&data, len, batch, inverse);
+        let norm = if inverse { 1.0 / len as f32 } else { 1.0 };
+        self.download_complex(&data, buf, norm);
+        Ok(())
+    }
+
+    /// Batched 2-D radix-2 FFT, as a row pass + transpose + row pass + transpose
+    /// (so both axes run as contiguous radix-2 transforms). Requires power-of-two
+    /// `rows` and `cols`. `inverse` divides by `rows·cols`.
+    fn fft_2d(
+        &self,
+        buf: &mut [Complex32],
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        inverse: bool,
+    ) -> Result<()> {
+        if rows == 0 || cols == 0 || batch == 0 {
+            return Ok(());
+        }
+        if buf.len() != rows * cols * batch {
+            return Err(Error::ShapeMismatch {
+                expected: (rows * cols * batch).to_string(),
+                found: buf.len().to_string(),
+            });
+        }
+        if !rows.is_power_of_two() || !cols.is_power_of_two() {
+            return Err(Error::InvalidParam(format!(
+                "wgpu 2-D FFT requires power-of-two dims (got {rows}×{cols}); use the CPU backend"
+            )));
+        }
+        let data = self.upload_complex("fft_2d", buf);
+        // Row pass: `batch·rows` contiguous transforms of length `cols`.
+        self.fft_passes(&data, cols, rows * batch, inverse);
+        // Transpose to make columns contiguous, transform length `rows`, back.
+        let scratch = self.storage_rw("fft_2d_t", &vec![0.0f32; rows * cols * batch * 2]);
+        self.fft_transpose(&data, &scratch, rows, cols, batch);
+        self.fft_passes(&scratch, rows, cols * batch, inverse);
+        self.fft_transpose(&scratch, &data, cols, rows, batch);
+        let norm = if inverse {
+            1.0 / (rows * cols) as f32
+        } else {
+            1.0
+        };
+        self.download_complex(&data, buf, norm);
         Ok(())
     }
 }
