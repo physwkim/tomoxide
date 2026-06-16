@@ -167,8 +167,20 @@ below by dependency and value — the first three close the end-to-end pipeline.
   power-of-2-padded radiographs (reuses `Fft`); matches tomopy 1.15.3 to the f32
   round-off floor (max relative Δ ≈ 2.4e-7), `phase_parity.rs` golden from
   `tools/gen_tomopy_phase_golden.py`.
-- **Remaining stubs:** `crates/tomoxide-prep/src/phase.rs` — `GPaganin`
-  (tomocupy generalized Paganin), `Farago` (tomocupy
+- ✅ **GPaganin (generalized Paganin) — done.** Port of tomocupy
+  `retrieve_phase.paganin_filter(method='Gpaganin')` (Paganin et al. 2020): same
+  single-step Fourier retrieval as Paganin but with a `cos`-based reciprocal grid
+  `kf = cos(ix·2π·ps) + cos(iy·2π·ps)` and filter `1/(1 − (2·aph/W²)·(kf − 2))`,
+  `aph = db·dist·λ/(4π)`, parameterized by `db`/`W` instead of `alpha`. The
+  shared pad/fftshift/normalize/ifft/crop driver is factored as `run_phase`;
+  Paganin and GPaganin are thin filter closures over it. The filter is
+  ill-conditioned (`scale ≈ 1.2e3`), so the grid/filter are evaluated in f32 to
+  mirror cupy's single precision — matching the reference to the **f32 round-off
+  floor** (max rel Δ≈4.9e-7) where an f64 evaluation diverged ~25×.
+  `gpaganin_parity.rs`, golden from `tools/gen_tomocupy_gpaganin_golden.py` (a
+  faithful CPU/`scipy.fft` single-precision transcription of tomocupy's exact
+  functions, since tomocupy needs a GPU).
+- **Remaining stub:** `crates/tomoxide-prep/src/phase.rs` — `Farago` (tomocupy
   `retrieve_phase.farago_filter:110`).
 
 ### B5. Rank filters — `CpuBackend: RankFilter`  (completes the prep family)
