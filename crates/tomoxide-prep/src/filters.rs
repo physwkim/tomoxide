@@ -1,6 +1,8 @@
 //! Misc filters & corrections (ports tomopy `misc/corr.py` + `libtomo/misc`).
-//! `circ_mask`/`remove_nan`/`remove_neg`/`median_filter_nonfinite` are real;
-//! rank filters route through the backend (stubbed). See `docs/PORTING.md` §E.
+//! `circ_mask`/`remove_nan`/`remove_neg`/`adjust_range`/`median_filter_nonfinite`/
+//! `remove_outlier1d` are real; the 3-D rank filters (`median_filter3d`,
+//! `remove_outlier`) route through the backend (stubbed). See
+//! `docs/PORTING.md` §E.
 
 use ndarray::Axis;
 use tomoxide_core::backend::Backend;
@@ -170,6 +172,100 @@ pub fn remove_outlier(
         .remove_outlier(data, diff, size)
 }
 
+/// Remove bright outliers with a 1-D median filter along `axis` (tomopy
+/// `misc/corr.py:615` `remove_outlier1d`). For each element the local
+/// `size`-tap median along `axis` is taken with scipy.ndimage `mode='mirror'`
+/// (whole-sample reflection); a pixel is then replaced by that median only when
+/// it exceeds it by at least `diff` (`arr − median ≥ diff`, strict `<` keeps the
+/// pixel), all others pass through unchanged. `axis` indexes the underlying 3-D
+/// array (0/1/2), matching tomopy's `axis` on the raw ndarray.
+///
+/// scipy's median filter selects a single order statistic (rank `size/2`, never
+/// an average — even for even `size`), and the `where` test is a plain f32
+/// subtraction, so the result is bit-exact (Δ=0) vs tomopy on finite input.
+/// Input is assumed finite (the dezinger operates on real projection data;
+/// compose with [`remove_nan`] first if needed).
+pub fn remove_outlier1d(data: &mut Tomo<f32>, diff: f32, size: usize, axis: usize) -> Result<()> {
+    if size == 0 {
+        return Err(Error::InvalidParam(
+            "remove_outlier1d size must be > 0".into(),
+        ));
+    }
+    if axis > 2 {
+        return Err(Error::InvalidParam(
+            "remove_outlier1d axis must be 0, 1, or 2".into(),
+        ));
+    }
+    let dims = data.array.dim();
+    let shape = [dims.0, dims.1, dims.2];
+    let len = shape[axis] as isize;
+    if len == 0 {
+        return Ok(());
+    }
+    // scipy.ndimage.median_filter footprint origin = size/2; median rank = size/2
+    // (filter_size // 2). For even `size` this picks one element, not a mean.
+    let orgn = (size / 2) as isize;
+    let rank = size / 2;
+    // The two axes orthogonal to `axis`, iterated as independent 1-D lines.
+    let (a1, a2) = match axis {
+        0 => (1usize, 2usize),
+        1 => (0usize, 2usize),
+        _ => (0usize, 1usize),
+    };
+    // Fill the median-filtered array `tmp` from the unmodified `data.array`,
+    // then apply the `where` replacement in place (the comparison reads the
+    // original values, which are still intact because `tmp` is separate).
+    let mut tmp = ndarray::Array3::<f32>::zeros(dims);
+    let mut window: Vec<f32> = Vec::with_capacity(size);
+    for p1 in 0..shape[a1] {
+        for p2 in 0..shape[a2] {
+            for i in 0..shape[axis] {
+                window.clear();
+                for k in 0..size {
+                    let src = mirror_index(i as isize + k as isize - orgn, len);
+                    let mut idx = [0usize; 3];
+                    idx[axis] = src;
+                    idx[a1] = p1;
+                    idx[a2] = p2;
+                    window.push(data.array[[idx[0], idx[1], idx[2]]]);
+                }
+                window.sort_by(|a, b| a.partial_cmp(b).expect("input is finite"));
+                let mut oidx = [0usize; 3];
+                oidx[axis] = i;
+                oidx[a1] = p1;
+                oidx[a2] = p2;
+                tmp[[oidx[0], oidx[1], oidx[2]]] = window[rank];
+            }
+        }
+    }
+    ndarray::Zip::from(&mut data.array)
+        .and(&tmp)
+        .for_each(|a, &t| {
+            if *a - t >= diff {
+                *a = t;
+            }
+        });
+    Ok(())
+}
+
+/// scipy.ndimage `mode='mirror'` index map: whole-sample symmetric reflection
+/// (period `2(n−1)`, the edge sample is *not* repeated), matching
+/// `NI_EXTEND_MIRROR` in scipy `ni_support.c`.
+fn mirror_index(i: isize, n: isize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let period = 2 * (n - 1);
+    let mut m = i % period;
+    if m < 0 {
+        m += period;
+    }
+    if m >= n {
+        m = period - m;
+    }
+    m as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +288,39 @@ mod tests {
         remove_nan(&mut t, 0.0).unwrap();
         remove_neg(&mut t, 0.0).unwrap();
         assert_eq!(t.array.as_slice().unwrap(), &[0.0, 0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn remove_outlier1d_rejects_bad_params() {
+        let mut t = Tomo::new(Array3::<f32>::zeros((1, 1, 4)), Layout::Projection);
+        assert!(matches!(
+            remove_outlier1d(&mut t, 0.5, 0, 2),
+            Err(Error::InvalidParam(_))
+        ));
+        assert!(matches!(
+            remove_outlier1d(&mut t, 0.5, 3, 3),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn remove_outlier1d_replaces_spike_with_mirror_median() {
+        // One line of length 5 along axis 2 with a single bright spike at i=2.
+        // size=3, mode='mirror' (whole-sample reflection). Medians of the
+        // centred 3-taps: i0 [b,a,b]; the spike (10) is the max in its windows
+        // so it never enters a median as the middle value while neighbours stay.
+        let line = vec![1.0f32, 2.0, 10.0, 2.0, 1.0];
+        let arr = Array3::from_shape_vec((1, 1, 5), line).unwrap();
+        let mut t = Tomo::new(arr, Layout::Projection);
+        remove_outlier1d(&mut t, 0.5, 3, 2).unwrap();
+        // i=2 window {2,10,2} median 2; 10-2=8 >= 0.5 -> replaced by 2.
+        // i=1 window {1,2,10} median 2; 2-2=0  < 0.5 -> kept.
+        // i=3 window {10,2,1} median 2; 2-2=0  < 0.5 -> kept.
+        assert_eq!(t.array[[0, 0, 2]], 2.0);
+        assert_eq!(t.array[[0, 0, 1]], 2.0);
+        assert_eq!(t.array[[0, 0, 3]], 2.0);
+        // Mirror edges: i=0 window {a,a,b}={1,1,2} median 1; kept.
+        assert_eq!(t.array[[0, 0, 0]], 1.0);
+        assert_eq!(t.array[[0, 0, 4]], 1.0);
     }
 }

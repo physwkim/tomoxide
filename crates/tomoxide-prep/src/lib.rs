@@ -7,8 +7,8 @@
 //!
 //! Real in this scaffold: `normalize`/`minus_log` (via the CPU backend),
 //! `filters::{circ_mask, remove_nan, remove_neg, median_filter_nonfinite,
-//! adjust_range}`. The rest are stubs that name their upstream `file:line` (see
-//! `docs/PORTING.md` §D/§E).
+//! adjust_range, remove_outlier1d}`. The rest are stubs that name their upstream
+//! `file:line` (see `docs/PORTING.md` §D/§E).
 #![forbid(unsafe_code)]
 
 mod fft;
