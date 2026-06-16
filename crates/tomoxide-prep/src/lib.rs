@@ -20,6 +20,8 @@ pub mod stripe;
 mod wavelet;
 
 pub use morph::{sino_360_to_180, Rotation};
-pub use normalize::{minus_log, normalize, normalize_dataset};
+pub use normalize::{
+    minus_log, normalize, normalize_bg, normalize_dataset, normalize_nf, Averaging,
+};
 pub use phase::retrieve_phase;
 pub use stripe::remove_stripe;
