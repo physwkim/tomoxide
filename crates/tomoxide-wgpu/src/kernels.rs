@@ -7,13 +7,17 @@
 
 use bytemuck::{Pod, Zeroable};
 use ndarray::{Array3, Axis};
-use tomoxide_core::backend::{Elementwise, FilteredBackproject, ForwardProject};
+use tomoxide_core::backend::{Elementwise, FilteredBackproject, ForwardProject, RankFilter};
 use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
 use tomoxide_core::error::{Error, Result};
 use tomoxide_core::geometry::{Beam, Geometry};
 
-use crate::shaders::{BACKPROJECT_WGSL, ELEMENTWISE_WGSL, PROJECT_WGSL};
+use crate::shaders::{BACKPROJECT_WGSL, ELEMENTWISE_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL};
 use crate::WgpuBackend;
+
+/// Max window the GPU median kernel can hold (must match `MAX_WIN` in
+/// `medfilt3d.wgsl`): diameter 7, i.e. `size ≤ 7`.
+const MEDFILT_MAX_WIN: usize = 343;
 
 /// Uniform block for the `darkflat` kernel. Padded to 16 bytes to satisfy the
 /// WGSL uniform-buffer layout rules.
@@ -272,4 +276,82 @@ struct FpParams {
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
+}
+
+/// Uniform block for the `medfilt3d` kernel. Padded to 32 bytes (a 16-byte
+/// multiple) to satisfy the WGSL uniform-buffer layout rules.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MfParams {
+    dz: u32,
+    dy: u32,
+    dx: u32,
+    radius: u32,
+    threshold: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+impl WgpuBackend {
+    /// 3-D median/dezinger core shared by [`RankFilter::median3d`] and
+    /// [`RankFilter::remove_outlier3d`] — one GPU thread per voxel, bit-exact
+    /// with `medfilt3d_core` on the CPU (pure gather + order statistic).
+    fn medfilt3d_gpu(
+        &self,
+        arr: &Array3<f32>,
+        radius: usize,
+        threshold: f32,
+    ) -> Result<Array3<f32>> {
+        let diameter = 2 * radius + 1;
+        let total = diameter * diameter * diameter;
+        if total > MEDFILT_MAX_WIN {
+            return Err(Error::InvalidParam(format!(
+                "wgpu median window {diameter}³={total} exceeds the GPU cap of \
+                 {MEDFILT_MAX_WIN} (size ≤ 7); use the CPU backend for larger windows"
+            )));
+        }
+        let (dz, dy, dx) = arr.dim();
+        let host: Vec<f32> = arr.iter().copied().collect();
+        let n = host.len();
+        let inp = self.storage_ro("mf_inp", &host);
+        let outp = self.storage_rw("mf_outp", &vec![0.0f32; n]);
+        let params = MfParams {
+            dz: dz as u32,
+            dy: dy as u32,
+            dx: dx as u32,
+            radius: radius as u32,
+            threshold,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let param_buf = self.uniform("mf_params", &params);
+        self.dispatch1d(
+            MEDFILT3D_WGSL,
+            "medfilt3d",
+            &[&inp, &outp, &param_buf],
+            n as u32,
+        );
+        let out = self.download_f32(&outp, n);
+        Ok(Array3::from_shape_vec((dz, dy, dx), out).expect("len matches dims"))
+    }
+}
+
+impl RankFilter for WgpuBackend {
+    /// 3-D median filter (tomopy `median_filter3d`). Bit-exact with the CPU.
+    fn median3d(&self, vol: &mut Volume<f32>, size: usize) -> Result<()> {
+        let radius = (size.max(3) - 1) / 2;
+        vol.array = self.medfilt3d_gpu(&vol.array, radius, 0.0)?;
+        Ok(())
+    }
+
+    /// Outlier (zinger) removal (tomopy `remove_outlier3d`): the same kernel as
+    /// [`Self::median3d`] but replacing a voxel by the local median only where
+    /// it deviates from it by at least `diff`. Bit-exact with the CPU.
+    fn remove_outlier3d(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()> {
+        let radius = (size.max(3) - 1) / 2;
+        data.array = self.medfilt3d_gpu(&data.array, radius, diff)?;
+        Ok(())
+    }
 }

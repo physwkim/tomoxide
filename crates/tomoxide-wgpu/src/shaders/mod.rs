@@ -11,3 +11,5 @@ pub const FBP_FILTER_WGSL: &str = include_str!("fbp_filter.wgsl");
 pub const BACKPROJECT_WGSL: &str = include_str!("backproject.wgsl");
 /// Parallel-beam forward projection (slice → sinogram), the Radon transform.
 pub const PROJECT_WGSL: &str = include_str!("project.wgsl");
+/// 3-D median / dezinger rank filter (clamp-to-center windowed order statistic).
+pub const MEDFILT3D_WGSL: &str = include_str!("medfilt3d.wgsl");

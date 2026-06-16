@@ -112,6 +112,12 @@ impl Backend for WgpuBackend {
     fn projector(&self) -> Option<&dyn tomoxide_core::backend::ForwardProject> {
         Some(self)
     }
+
+    /// 3-D median / dezinger rank filters run on the GPU (bit-exact with CPU).
+    #[cfg(feature = "gpu-wgpu")]
+    fn rank_filter(&self) -> Option<&dyn tomoxide_core::backend::RankFilter> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
@@ -432,5 +438,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 1e-5,
             );
         }
+    }
+
+    // --- RankFilter capability: BIT-EXACT parity vs the CPU backend --------
+    // Pure gather + order statistic + one subtraction → no rounding divergence.
+    #[test]
+    fn median3d_and_remove_outlier3d_match_cpu_bit_exact() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        let cpu = tomoxide_cpu::CpuBackend;
+
+        // Volume with a planted zinger spike so the dezinger threshold path hits.
+        let (dz, dy, dx) = (4usize, 5usize, 6usize);
+        let mut varr = Array3::from_shape_fn((dz, dy, dx), |(z, y, x)| {
+            ((z * 7 + y * 3 + x) as f32 * 0.13).sin() + 0.2 * x as f32
+        });
+        varr[[2, 2, 3]] = 99.0; // outlier
+
+        // median3d (threshold 0): plain local median everywhere.
+        let mut g = Volume::new(varr.clone());
+        let mut c = Volume::new(varr.clone());
+        be.rank_filter().unwrap().median3d(&mut g, 3).unwrap();
+        cpu.rank_filter().unwrap().median3d(&mut c, 3).unwrap();
+        assert_eq!(g.array, c.array, "median3d not bit-exact");
+
+        // remove_outlier3d (threshold 1.0): only the spike is replaced.
+        let mut g = Tomo::new(varr.clone(), Layout::Projection);
+        let mut c = Tomo::new(varr.clone(), Layout::Projection);
+        be.rank_filter()
+            .unwrap()
+            .remove_outlier3d(&mut g, 1.0, 3)
+            .unwrap();
+        cpu.rank_filter()
+            .unwrap()
+            .remove_outlier3d(&mut c, 1.0, 3)
+            .unwrap();
+        assert_eq!(g.array, c.array, "remove_outlier3d not bit-exact");
+    }
+
+    #[test]
+    fn median3d_rejects_window_over_cap() {
+        let be = WgpuBackend::new().expect("wgpu device init");
+        // size 9 → diameter 9 → 729 voxels > the 343 GPU window cap.
+        let mut vol = Volume::new(Array3::<f32>::zeros((9, 9, 9)));
+        assert!(matches!(
+            be.rank_filter().unwrap().median3d(&mut vol, 9),
+            Err(tomoxide_core::error::Error::InvalidParam(_))
+        ));
     }
 }
