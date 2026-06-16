@@ -22,7 +22,7 @@
 #![cfg(feature = "gpu-wgpu")]
 
 use ndarray::{Array2, Axis};
-use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
+use tomoxide::{recon, sim, Algorithm, Angles, Backend, CpuBackend, Geometry, ReconParams, Volume};
 use tomoxide_wgpu::WgpuBackend;
 
 /// Pearson correlation between two slices over a centered disk (amplitude-scale
@@ -212,7 +212,10 @@ fn lprec_recon_matches_cpu_on_gpu() {
     // is far tighter than any wiring bug (wrong FFT size/direction/layout).
     let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
     eprintln!("GPU vs CPU lprec: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
-    assert!(nrmse < 1e-4, "GPU vs CPU lprec NRMSE too large: {nrmse:.3e}");
+    assert!(
+        nrmse < 1e-4,
+        "GPU vs CPU lprec NRMSE too large: {nrmse:.3e}"
+    );
 }
 
 #[test]
@@ -242,5 +245,103 @@ fn fourierrec_non_power_of_two_recon_matches_cpu_on_gpu() {
     assert!(
         nrmse < 1e-4,
         "GPU vs CPU fourierrec(96) NRMSE too large: {nrmse:.3e}"
+    );
+}
+
+/// Pearson correlation between two flat volumes (amplitude-scale invariant).
+fn pearson_vec(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len() as f64;
+    let ma = a.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let mb = b.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
+    for (&x, &y) in a.iter().zip(b) {
+        let (dx, dy) = (x as f64 - ma, y as f64 - mb);
+        cov += dx * dy;
+        va += dx * dx;
+        vb += dy * dy;
+    }
+    cov / (va.sqrt() * vb.sqrt()).max(1e-12)
+}
+
+/// NRMSE (normalized by the CPU reference RMS) and max abs difference.
+fn nrmse_vec(test: &[f32], reference: &[f32]) -> (f32, f32) {
+    let mut se = 0.0f64;
+    let mut ref2 = 0.0f64;
+    let mut maxabs = 0.0f32;
+    for (&t, &r) in test.iter().zip(reference) {
+        let d = t - r;
+        se += (d * d) as f64;
+        ref2 += (r * r) as f64;
+        maxabs = maxabs.max(d.abs());
+    }
+    let nrmse = (se / ref2.max(1e-30)).sqrt() as f32;
+    (nrmse, maxabs)
+}
+
+/// Build the shared `[rh, n, n]` two-sphere phantom used by the lamino test.
+fn lamino_phantom(rh: usize, n: usize) -> Vec<f32> {
+    let mut vol = vec![0.0f32; rh * n * n];
+    let sphere = |vol: &mut [f32], cz: f32, cy: f32, cx: f32, r: f32, val: f32| {
+        for z in 0..rh {
+            for y in 0..n {
+                for x in 0..n {
+                    let d2 =
+                        (z as f32 - cz).powi(2) + (y as f32 - cy).powi(2) + (x as f32 - cx).powi(2);
+                    if d2 <= r * r {
+                        vol[(z * n + y) * n + x] = val;
+                    }
+                }
+            }
+        }
+    };
+    sphere(&mut vol, 3.0, 6.0, 6.0, 2.5, 1.0);
+    sphere(&mut vol, 5.0, 10.0, 9.0, 1.8, 0.6);
+    vol
+}
+
+/// Laminography (`recon::lamino`) runs the same 3-D reconstruction on the GPU.
+///
+/// Laminography uses only the `Fft` capability: the ramp filter and the three
+/// USFFT operators (`fft2d`, `usfft2d`, `usfft1d`) are centered 1-D/2-D FFTs
+/// plus host-side Gaussian gridding. With `n=16`, `rh=8`, `nz=16` every
+/// transform length (`detw=16`, `deth=16`, `2·rh=16`, `2·n=32`, `ne=2·detw=32`)
+/// is power-of-two, so the whole pipeline hits the wgpu radix-2 path and only the
+/// FFT backend (wgpu vs rustfft) differs from CPU.
+#[test]
+fn lamino_recon_matches_cpu_on_gpu() {
+    let cpu = CpuBackend::new();
+    let gpu = WgpuBackend::new().expect("wgpu device init");
+    let cfft = cpu.fft().expect("cpu fft capability");
+    let gfft = gpu.fft().expect("wgpu fft capability");
+
+    let (n, rh, nz) = (16usize, 8usize, 16usize);
+    let nproj = 64usize;
+    let lamino_angle = 20.0f32;
+    let theta: Vec<f32> = (0..nproj)
+        .map(|i| i as f32 / nproj as f32 * 2.0 * std::f32::consts::PI)
+        .collect();
+    let vol = lamino_phantom(rh, n);
+
+    // Forward-project once on the CPU, then reconstruct on both backends.
+    let proj = recon::lamino::lamino_project(&vol, &theta, lamino_angle, n, nz, cfft).unwrap();
+    let rc = recon::lamino::lamino(&proj, &theta, lamino_angle, n, rh, cfft).unwrap();
+    let rg = recon::lamino::lamino(&proj, &theta, lamino_angle, n, rh, gfft).unwrap();
+
+    // GPU reconstruction recovers the phantom.
+    let corr = pearson_vec(&rg, &vol);
+    eprintln!("GPU lamino Pearson vs phantom = {corr:.4}");
+    assert!(
+        corr > 0.7,
+        "GPU lamino correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    // Only the FFT backend differs, so GPU↔CPU agree to f32-FFT tolerance. The
+    // 1e-4 bar matches the other analytic GPU tests and is far tighter than any
+    // wiring bug (wrong FFT size/direction/layout).
+    let (nrmse, maxabs) = nrmse_vec(&rg, &rc);
+    eprintln!("GPU vs CPU lamino: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
+    assert!(
+        nrmse < 1e-4,
+        "GPU vs CPU lamino NRMSE too large: {nrmse:.3e}"
     );
 }
