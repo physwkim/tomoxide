@@ -8,6 +8,11 @@
 //!     gridding/deapodization is host code shared by both backends); it runs on
 //!     the GPU for free because every gridrec transform length is power-of-two
 //!     (`pad = (2·ncols).next_power_of_two()`, grid `m = pad`).
+//!   - **fourierrec** (tomocupy Gaussian-USFFT gridding) also composes through
+//!     `Fft` alone. At `n = 128` its transforms are power-of-two; at `n = 96`
+//!     the radial 1-D FFT is length 96 (Bluestein) and the 2-D FFT is 192×192
+//!     (separable Bluestein), so it additionally exercises the arbitrary-length
+//!     GPU FFT paths end to end.
 //!
 //! Each asserts the GPU reconstruction (1) actually reconstructs the phantom
 //! and (2) matches the CPU reconstruction within f32 tolerance.
@@ -156,5 +161,59 @@ fn gridrec_recon_matches_cpu_on_gpu() {
     assert!(
         nrmse < 1e-4,
         "GPU vs CPU gridrec NRMSE too large: {nrmse:.3e}"
+    );
+}
+
+#[test]
+fn fourierrec_recon_matches_cpu_on_gpu() {
+    // fourierrec needs only the Fft capability (FBP filter then Gaussian-USFFT
+    // gridding, all host code shared by both backends). At n=128 the radial 1-D
+    // FFT is length 128 and the 2-D inverse FFT is 256×256 — both power-of-two,
+    // so the radix-2 GPU path runs it for free, only the FFT backend differs.
+    let n = 128;
+    let (sg, sc, phantom) = recon_both(Algorithm::Fourierrec, n, 180);
+
+    let corr = pearson_disk(&sg, &phantom, n, 0.85);
+    eprintln!("GPU fourierrec Pearson vs phantom = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "GPU fourierrec correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
+    eprintln!("GPU vs CPU fourierrec: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
+    assert!(
+        nrmse < 1e-4,
+        "GPU vs CPU fourierrec NRMSE too large: {nrmse:.3e}"
+    );
+}
+
+#[test]
+fn fourierrec_non_power_of_two_recon_matches_cpu_on_gpu() {
+    // n=96 drives fourierrec through both arbitrary-length GPU FFT paths: the
+    // radial 1-D transform is length 96 (Bluestein chirp-z) and the 2-D inverse
+    // transform is 192×192 (separable Bluestein with a host transpose). This is
+    // the end-to-end proof that the non-power-of-two FFT generalization composes
+    // into a full reconstruction, not just isolated FFT round-trips.
+    let n = 96;
+    let (sg, sc, phantom) = recon_both(Algorithm::Fourierrec, n, 150);
+
+    let corr = pearson_disk(&sg, &phantom, n, 0.85);
+    eprintln!("GPU fourierrec(96) Pearson vs phantom = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "GPU fourierrec(96) correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    // Although the GPU runs Bluestein here (≈1e-6 rel error vs rustfft, vs the
+    // radix-2 path's ≈1e-7), the host gridding dominates the reconstruction, so
+    // the GPU↔CPU difference stays at the pow2 level — observed NRMSE ≈ 3.2e-7,
+    // essentially identical to the n=128 case. The 1e-4 bar therefore holds the
+    // same ~300× headroom while staying far tighter than any wiring bug.
+    let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
+    eprintln!("GPU vs CPU fourierrec(96): NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
+    assert!(
+        nrmse < 1e-4,
+        "GPU vs CPU fourierrec(96) NRMSE too large: {nrmse:.3e}"
     );
 }
