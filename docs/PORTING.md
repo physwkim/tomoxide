@@ -23,7 +23,7 @@ Upstream roots (this machine):
 | `recon::fourierrec`          | tomocupy `reconstruction/fourierrec.py:46`; `cuda/cfunc_fourierrec.cu`, `include/cfunc_fourierrec.cuh:10` | CUDA, wgpu | stub |
 | `recon::lprec`               | tomocupy `reconstruction/lprec.py:292`; `cuda/cfunc_lprec.cu`, `include/cfunc_lprec.cuh:9` | CUDA, wgpu | stub |
 | `recon::linerec`             | tomocupy `reconstruction/linerec.py:47`; `cuda/cfunc_linerec.cu`, `include/cfunc_linerec.cuh:9` | CUDA, wgpu | stub |
-| `recon::filter` (FBP filter) | tomocupy `reconstruction/fbp_filter.py:46`; `cuda/cfunc_filter.cu`; tomopy filter in `fbp.c` | all | partial (CPU done) |
+| `recon::filter` (FBP filter) | tomocupy `reconstruction/fbp_filter.py:46`; `cuda/cfunc_filter.cu`; tomopy filter in `fbp.c` | all | partial (CPU done). wgpu `Fft` primitive done (batched radix-2 1-D/2-D, power-of-two only, tolerance parity vs rustfft; fft.wgsl bit-reversal + per-stage butterflies, fft_2d via transpose) — unblocks the GPU FBP filter apply (still TODO: pad → fft_1d → ×filter → ifft → crop) |
 | `recon::lamino` (USFFT)      | tomocupy `reconstruction/lamfourierrec.py`; `cuda/cfunc_usfft1d.cu`, `cfunc_usfft2d.cu`, `cfunc_fft2d.cu` | CUDA | stub |
 
 ### C-extern signatures to match (tomopy `include/libtomo/recon.h`)
