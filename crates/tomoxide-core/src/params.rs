@@ -267,6 +267,19 @@ pub enum StripeMethod {
         /// `True`); `false` fills the dead columns only.
         norm: bool,
     },
+    /// Vo fitting-based stripe removal (tomopy `remove_stripe_based_fitting`,
+    /// Vo 2018 algorithm 1) — fits a polynomial along the projection axis and
+    /// divides out a Gaussian-smoothed low-pass of that fit, suppressing
+    /// low-pass stripes.
+    VoFit {
+        /// Savitzky–Golay polynomial fit order along the projection axis
+        /// (tomopy default `3`; recommended `1`–`5`).
+        order: usize,
+        /// Sigmas `(sigma_x, sigma_y)` of the 2-D Gaussian smoothing window in
+        /// the detector-column and projection directions (tomopy default
+        /// `(5, 20)`).
+        sigma: (f32, f32),
+    },
 }
 
 /// Phase-retrieval method.

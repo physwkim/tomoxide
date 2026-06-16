@@ -1,9 +1,9 @@
 //! Stripe-artifact removal (ports tomopy `prep/stripe.py` + tomocupy
 //! `processing/remove_stripe.py`). The Fourier-Wavelet (`Fw`), smoothing-filter
 //! (`Sf`), Titarenko (`Ti`), Vo all-stripe (`VoAll`), Vo sorting-based
-//! (`VoSort`), Vo filtering-based (`VoFilter`), Vo large-stripe (`VoLarge`), and
-//! Vo dead-stripe (`VoDead`) methods are implemented. See `docs/PORTING.md` §D.
-//! Dispatch on [`StripeMethod`].
+//! (`VoSort`), Vo filtering-based (`VoFilter`), Vo large-stripe (`VoLarge`), Vo
+//! dead-stripe (`VoDead`), and Vo fitting-based (`VoFit`) methods are
+//! implemented. See `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
 
 use ndarray::Array2;
 use tomoxide_core::data::{Layout, Tomo};
@@ -47,6 +47,7 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
             norm,
         } => remove_large_stripe(data, snr, size, drop_ratio, norm),
         StripeMethod::VoDead { snr, size, norm } => remove_dead_stripe(data, snr, size, norm),
+        StripeMethod::VoFit { order, sigma } => remove_stripe_based_fitting(data, order, sigma),
     }
 }
 
@@ -1149,6 +1150,302 @@ fn remove_stripe_based_filtering(
             for c in 0..ncol {
                 let sharp = sino[[p, c]] - smooth[[p, c]];
                 proj.array[[p, m, c]] = smooth_cor[[p, c]] + sharp;
+            }
+        }
+    }
+
+    *data = proj.to_layout(target);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Vo fitting-based stripe removal (algorithm 1) — tomopy
+// `remove_stripe_based_fitting`. Divides the sinogram by its Savitzky–Golay
+// polynomial fit along the projection axis, then re-multiplies by a 2-D
+// Gaussian-smoothed (mean-matched) copy of that fit. The 2-D Fourier filter
+// runs in f64 (the `fft.rs` 2-D primitive), so — like the Fourier-Wavelet and
+// VoFilter paths — it matches tomopy to the f32 round-off floor. The
+// Savitzky–Golay weights are computed from scaled normal equations (the fit
+// nodes mapped to ≈[-1, 1]), which reproduce scipy's SVD `lstsq` to the f64
+// floor without an external linear-algebra dependency.
+// ----------------------------------------------------------------------------
+
+/// In-place Gaussian elimination with partial pivoting: solve `a · x = b`,
+/// leaving the solution in `b`. `a` is `n×n`; used only for the tiny
+/// `(order+1)` Savitzky–Golay normal-equations system.
+fn solve_dense(a: &mut [Vec<f64>], b: &mut [f64]) {
+    let n = b.len();
+    for col in 0..n {
+        // Partial pivot: pick the largest-magnitude entry at/below the diagonal.
+        let piv = a
+            .iter()
+            .enumerate()
+            .skip(col)
+            .max_by(|(_, x), (_, y)| x[col].abs().total_cmp(&y[col].abs()))
+            .map(|(r, _)| r)
+            .unwrap_or(col);
+        if piv != col {
+            a.swap(col, piv);
+            b.swap(col, piv);
+        }
+        // Eliminate below the pivot. Clone the pivot row so the borrow of `a[r]`
+        // does not alias `a[col]`.
+        let pivot_row = a[col].clone();
+        let bcol = b[col];
+        let d = pivot_row[col];
+        for (r, ar) in a.iter_mut().enumerate().skip(col + 1) {
+            let f = ar[col] / d;
+            if f != 0.0 {
+                for (arc, &pc) in ar.iter_mut().zip(pivot_row.iter()).skip(col) {
+                    *arc -= f * pc;
+                }
+                b[r] -= f * bcol;
+            }
+        }
+    }
+    // Back-substitution.
+    for col in (0..n).rev() {
+        let s: f64 = a[col]
+            .iter()
+            .zip(b.iter())
+            .skip(col + 1)
+            .map(|(ac, bc)| ac * bc)
+            .sum();
+        b[col] = (b[col] - s) / a[col][col];
+    }
+}
+
+/// Savitzky–Golay smoothing weights (deriv 0) for an odd `window` and polynomial
+/// `order` (`order < window`) — the weights scipy's `savgol_coeffs` returns. The
+/// fit nodes are scaled to `≈[-1, 1]` (`u = (k − pos)/pos`) so the normal-
+/// equations solve is well-conditioned, reproducing scipy's SVD `lstsq` to the
+/// f64 floor.
+fn savgol_coeffs(window: usize, order: usize) -> Vec<f64> {
+    if window <= 1 {
+        return vec![1.0; window];
+    }
+    let pos = window / 2; // window is odd
+    let posf = pos as f64;
+    let m = order + 1;
+    // powers[j][k] = u_k^j, u_k = (k − pos)/pos.
+    let mut powers = vec![vec![0.0f64; window]; m];
+    for k in 0..window {
+        let u = (k as f64 - posf) / posf;
+        let mut p = 1.0;
+        for row in powers.iter_mut() {
+            row[k] = p;
+            p *= u;
+        }
+    }
+    // Normal matrix M[i][j] = Σ_k u_k^i u_k^j; solve M z = e0.
+    let mut mat = vec![vec![0.0f64; m]; m];
+    for (i, mrow) in mat.iter_mut().enumerate() {
+        for (j, cell) in mrow.iter_mut().enumerate() {
+            *cell = (0..window).map(|k| powers[i][k] * powers[j][k]).sum();
+        }
+    }
+    let mut z = vec![0.0f64; m];
+    z[0] = 1.0;
+    solve_dense(&mut mat, &mut z);
+    // c_k = Σ_j z_j u_k^j.
+    (0..window)
+        .map(|k| (0..m).map(|j| z[j] * powers[j][k]).sum())
+        .collect()
+}
+
+/// `scipy.signal.savgol_filter(sino, window, order, axis=0, mode='mirror')`: for
+/// each detector column convolve the projection profile with the Savitzky–Golay
+/// weights, reflecting at the boundary (whole-sample 'mirror', the same map as
+/// numpy `reflect`). tomopy runs this on the float32 sinogram, so each output is
+/// rounded to f32.
+fn savgol_filter_axis0(sino: &Array2<f32>, window: usize, order: usize) -> Array2<f32> {
+    let (nrow, ncol) = sino.dim();
+    let coeffs = savgol_coeffs(window, order);
+    let pos = (window / 2) as isize;
+    let n = nrow as isize;
+    let mut out = Array2::<f32>::zeros((nrow, ncol));
+    for c in 0..ncol {
+        for i in 0..nrow {
+            let mut s = 0.0f64;
+            for (k, &ck) in coeffs.iter().enumerate() {
+                let idx = reflect_whole_sample(i as isize + k as isize - pos, n);
+                s += ck * sino[[idx, c]] as f64;
+            }
+            out[[i, c]] = s as f32;
+        }
+    }
+    out
+}
+
+/// tomopy `_create_2d_window`: a 2-D Gaussian over the padded grid
+/// `(nrow+2·pad) × (ncol+2·pad)`, centred at `((H−1)/2, (W−1)/2)`,
+/// `win[y][x] = exp(−((x−cx)²/(2σx²) + (y−cy)²/(2σy²)))`.
+fn create_2d_window(nrow: usize, ncol: usize, sigma: (f64, f64), pad: usize) -> Array2<f64> {
+    let (sigmax, sigmay) = sigma;
+    let height = nrow + 2 * pad;
+    let width = ncol + 2 * pad;
+    let centerx = (width as f64 - 1.0) / 2.0;
+    let centery = (height as f64 - 1.0) / 2.0;
+    let numx = 2.0 * sigmax * sigmax;
+    let numy = 2.0 * sigmay * sigmay;
+    let mut w = Array2::<f64>::zeros((height, width));
+    for y in 0..height {
+        let dy = y as f64 - centery;
+        for x in 0..width {
+            let dx = x as f64 - centerx;
+            w[[y, x]] = (-(dx * dx / numx + dy * dy / numy)).exp();
+        }
+    }
+    w
+}
+
+/// tomopy `_create_matsign`: `(-1)^(x+y)` over the padded grid — the spatial
+/// modulation that recentres the low-pass Gaussian on the spectrum mid.
+fn create_matsign(nrow: usize, ncol: usize, pad: usize) -> Array2<f64> {
+    let height = nrow + 2 * pad;
+    let width = ncol + 2 * pad;
+    let mut s = Array2::<f64>::zeros((height, width));
+    for y in 0..height {
+        for x in 0..width {
+            s[[y, x]] = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+        }
+    }
+    s
+}
+
+/// tomopy `_2d_filter`: edge-pad the columns and mean-pad the rows by `pad`,
+/// band-pass with the 2-D Gaussian `win2d` via
+/// `real(ifft2(fft2(matpad·matsign)·win2d)·matsign)`, then crop the padding. The
+/// FFT path runs in f64 (numpy promotes the float32·float64-sign product),
+/// matching tomopy to the f32 floor.
+fn two_d_filter(
+    mat: &Array2<f32>,
+    win2d: &Array2<f64>,
+    matsign: &Array2<f64>,
+    pad: usize,
+) -> Array2<f64> {
+    let (nrow, ncol) = mat.dim();
+    let height = nrow + 2 * pad;
+    let width = ncol + 2 * pad;
+    let mut matpad = Array2::<f64>::zeros((height, width));
+    // Centre rows + column edges (replicate the first/last column = mode='edge').
+    for r in 0..nrow {
+        for x in 0..width {
+            let sc = if x < pad {
+                0
+            } else if x >= pad + ncol {
+                ncol - 1
+            } else {
+                x - pad
+            };
+            matpad[[r + pad, x]] = mat[[r, sc]] as f64;
+        }
+    }
+    // Mean-pad the rows: each pad row = the per-column mean of the edge-padded
+    // matrix (mode='mean', over the existing nrow rows), top and bottom alike.
+    for x in 0..width {
+        let mut sum = 0.0f64;
+        for r in 0..nrow {
+            sum += matpad[[r + pad, x]];
+        }
+        let colmean = sum / nrow as f64;
+        for r in 0..pad {
+            matpad[[r, x]] = colmean;
+        }
+        for r in (pad + nrow)..height {
+            matpad[[r, x]] = colmean;
+        }
+    }
+    // real(ifft2(fft2(matpad·matsign)·win2d)·matsign), cropped.
+    let mut modulated = Array2::<f64>::zeros((height, width));
+    for y in 0..height {
+        for x in 0..width {
+            modulated[[y, x]] = matpad[[y, x]] * matsign[[y, x]];
+        }
+    }
+    let filt = fft::filter_real_2d(&modulated, win2d);
+    let mut out = Array2::<f64>::zeros((nrow, ncol));
+    for r in 0..nrow {
+        for c in 0..ncol {
+            let (y, x) = (r + pad, c + pad);
+            out[[r, c]] = filt[[y, x]] * matsign[[y, x]];
+        }
+    }
+    out
+}
+
+/// tomopy `_rs_fit`: divide the sinogram by its Savitzky–Golay polynomial fit
+/// along the projection axis, then re-multiply by the mean-matched 2-D
+/// Gaussian-smoothed fit — suppressing the low-pass stripe component.
+fn rs_fit(
+    sino: &Array2<f32>,
+    order: usize,
+    win2d: &Array2<f64>,
+    matsign: &Array2<f64>,
+    pad: usize,
+) -> Array2<f32> {
+    let (nrow, ncol) = sino.dim();
+    // window = nrow made odd; order clamped below window.
+    let mut window = nrow;
+    if window % 2 == 0 {
+        window -= 1;
+    }
+    let order = if order >= window { window - 1 } else { order };
+
+    let sinofit = savgol_filter_axis0(sino, window, order);
+    let sinofitsmooth = two_d_filter(&sinofit, win2d, matsign, pad);
+    // num1 = mean(sinofit), num2 = mean(sinofitsmooth); rescale the smooth fit.
+    let denom = (nrow * ncol) as f64;
+    let num1 = sinofit.iter().map(|&v| v as f64).sum::<f64>() / denom;
+    let num2 = sinofitsmooth.iter().sum::<f64>() / denom;
+    let mut out = Array2::<f32>::zeros((nrow, ncol));
+    for r in 0..nrow {
+        for c in 0..ncol {
+            let fit = sinofit[[r, c]] as f64;
+            let smooth = num1 * sinofitsmooth[[r, c]] / num2;
+            out[[r, c]] = (sino[[r, c]] as f64 / fit * smooth) as f32;
+        }
+    }
+    out
+}
+
+/// Vo fitting-based stripe removal (tomopy `remove_stripe_based_fitting`,
+/// Vo 2018 algorithm 1) — suitable for low-pass stripes.
+///
+/// `pad = min(150, ⌊0.1·nproj⌋)`; the 2-D Gaussian window and `(-1)^(x+y)` sign
+/// matrix (which depend only on the stack dims, `sigma`, and `pad`) are built
+/// once and reused for every slice. Each `[proj, col]` slice goes through
+/// `_rs_fit`. Held to the f32 round-off floor (the 2-D Fourier smoothing runs in
+/// f64).
+fn remove_stripe_based_fitting(
+    data: &mut Tomo<f32>,
+    order: usize,
+    sigma: (f32, f32),
+) -> Result<()> {
+    let target = data.layout;
+    // tomopy operates on `tomo[:, m, :]` = `[proj, col]` slices of the
+    // `[proj, row, col]` projection-layout stack.
+    let mut proj = data.to_layout(Layout::Projection);
+    let (nproj, nrows, ncol) = proj.array.dim();
+    if nproj < 2 || nrows == 0 || ncol == 0 {
+        return Ok(());
+    }
+    let pad = 150.min((0.1 * nproj as f64) as usize);
+    let sigma = (sigma.0 as f64, sigma.1 as f64);
+    let win2d = create_2d_window(nproj, ncol, sigma, pad);
+    let matsign = create_matsign(nproj, ncol, pad);
+
+    for m in 0..nrows {
+        let mut sino = Array2::<f32>::zeros((nproj, ncol));
+        for p in 0..nproj {
+            for c in 0..ncol {
+                sino[[p, c]] = proj.array[[p, m, c]];
+            }
+        }
+        let fixed = rs_fit(&sino, order, &win2d, &matsign, pad);
+        for p in 0..nproj {
+            for c in 0..ncol {
+                proj.array[[p, m, c]] = fixed[[p, c]];
             }
         }
     }

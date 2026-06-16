@@ -5,11 +5,15 @@
 //! length (including primes) transforms in `O(n log n)`. This matches numpy
 //! `fft`/`ifft` to f64 round-off — far below the f32 floor the callers cast to.
 //!
-//! The only consumer is the Fourier-Wavelet stripe damping, which needs
-//! `real(ifft(fft(col) · d))` for arbitrary-length detail-band columns; that is
-//! exposed directly as [`filter_real_column`] so the complex type stays private.
+//! The consumers are the Fourier-Wavelet stripe damping, which needs
+//! `real(ifft(fft(col) · d))` for arbitrary-length detail-band columns (exposed
+//! as [`filter_real_column`]), and the fitting-based stripe filter, which needs
+//! the 2-D `real(ifft2(fft2(mat) · win))` (exposed as [`filter_real_2d`]). Both
+//! keep the complex type private.
 
 use std::f64::consts::PI;
+
+use ndarray::Array2;
 
 /// A complex number in f64 (kept private; callers use [`filter_real_column`]).
 #[derive(Clone, Copy)]
@@ -184,6 +188,52 @@ pub(crate) fn filter_real_column(col: &[f64], d: &[f64]) -> Vec<f64> {
     ifft(&filtered).iter().map(|c| c.re).collect()
 }
 
+/// `real(ifft2(fft2(input) · mult))` for a real 2-D `input` and a real
+/// per-frequency multiplier `mult` (same shape). The 2-D, separable analogue of
+/// [`filter_real_column`]: the forward transform runs along rows then columns,
+/// the multiplier is applied in the frequency domain, and the inverse runs along
+/// columns then rows. Used by the fitting-based stripe filter (`_2d_filter`).
+pub(crate) fn filter_real_2d(input: &Array2<f64>, mult: &Array2<f64>) -> Array2<f64> {
+    let (nrow, ncol) = input.dim();
+    if nrow == 0 || ncol == 0 {
+        return Array2::zeros((nrow, ncol));
+    }
+    // Complex working grid; row lanes (axis 1) and column lanes (axis 0) are
+    // transformed in place via ndarray's lane iterators.
+    let mut grid: Array2<Cx> = input.mapv(|v| Cx::new(v, 0.0));
+    // fft2: FFT along each row (axis 1), then each column (axis 0).
+    for mut lane in grid.rows_mut() {
+        let f = fft(&lane.iter().copied().collect::<Vec<_>>());
+        for (dst, src) in lane.iter_mut().zip(f) {
+            *dst = src;
+        }
+    }
+    for mut lane in grid.columns_mut() {
+        let f = fft(&lane.iter().copied().collect::<Vec<_>>());
+        for (dst, src) in lane.iter_mut().zip(f) {
+            *dst = src;
+        }
+    }
+    // Apply the real frequency multiplier.
+    grid.zip_mut_with(mult, |g, &m| *g = g.scale(m));
+    // ifft2: inverse FFT along each column, then each row; the per-axis 1/N
+    // factors compose to numpy's 1/(nrow·ncol).
+    for mut lane in grid.columns_mut() {
+        let f = ifft(&lane.iter().copied().collect::<Vec<_>>());
+        for (dst, src) in lane.iter_mut().zip(f) {
+            *dst = src;
+        }
+    }
+    let mut out = Array2::<f64>::zeros((nrow, ncol));
+    for (mut orow, glane) in out.rows_mut().into_iter().zip(grid.rows()) {
+        let f = ifft(&glane.iter().copied().collect::<Vec<_>>());
+        for (dst, src) in orow.iter_mut().zip(f) {
+            *dst = src.re;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +321,66 @@ mod tests {
                 .zip(&want)
                 .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
             assert!(err < 1e-11, "n={n}: filter err {err}");
+        }
+    }
+
+    #[test]
+    fn filter_real_2d_matches_naive() {
+        use ndarray::Array2;
+
+        // Naive inverse DFT (conj(dft(conj))/N), applied lane-wise.
+        let inv = |v: &[Cx]| -> Vec<Cx> {
+            let conj: Vec<Cx> = v.iter().map(|c| c.conj()).collect();
+            let f = dft_naive(&conj);
+            let s = 1.0 / v.len() as f64;
+            f.iter().map(|c| c.conj().scale(s)).collect()
+        };
+
+        // Reference: real(ifft2(fft2(mat)·mult)) via naive per-axis DFTs, using
+        // the same lane structure as filter_real_2d.
+        for &(nr, nc) in &[(4usize, 6usize), (5, 5), (8, 3), (7, 9)] {
+            let mut mat = Array2::<f64>::zeros((nr, nc));
+            let mut mult = Array2::<f64>::zeros((nr, nc));
+            for ((r, c), cell) in mat.indexed_iter_mut() {
+                *cell = ((r * 7 + c * 3) as f64 * 0.21).sin() + 0.05 * (r + c) as f64;
+                mult[[r, c]] =
+                    1.0 - (-((r as f64 - 1.5).powi(2) + (c as f64 - 2.0).powi(2)) / 5.0).exp();
+            }
+
+            let mut g: Array2<Cx> = mat.mapv(|v| Cx::new(v, 0.0));
+            for mut lane in g.rows_mut() {
+                let f = dft_naive(&lane.iter().copied().collect::<Vec<_>>());
+                for (dst, src) in lane.iter_mut().zip(f) {
+                    *dst = src;
+                }
+            }
+            for mut lane in g.columns_mut() {
+                let f = dft_naive(&lane.iter().copied().collect::<Vec<_>>());
+                for (dst, src) in lane.iter_mut().zip(f) {
+                    *dst = src;
+                }
+            }
+            g.zip_mut_with(&mult, |gv, &m| *gv = gv.scale(m));
+            for mut lane in g.columns_mut() {
+                let f = inv(&lane.iter().copied().collect::<Vec<_>>());
+                for (dst, src) in lane.iter_mut().zip(f) {
+                    *dst = src;
+                }
+            }
+            let mut want = Array2::<f64>::zeros((nr, nc));
+            for (mut wrow, glane) in want.rows_mut().into_iter().zip(g.rows()) {
+                let f = inv(&glane.iter().copied().collect::<Vec<_>>());
+                for (dst, src) in wrow.iter_mut().zip(f) {
+                    *dst = src.re;
+                }
+            }
+
+            let got = filter_real_2d(&mat, &mult);
+            let err = want
+                .iter()
+                .zip(got.iter())
+                .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+            assert!(err < 1e-11, "({nr},{nc}): 2d filter err {err}");
         }
     }
 }
