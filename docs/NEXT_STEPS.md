@@ -362,6 +362,22 @@ below by dependency and value — the first three close the end-to-end pipeline.
   summation → matches tomopy 1.15.3 **bit-for-bit (Δ=0)** across both-None /
   high-only / low-only / both / looser-than-data cases (`adjust_range_parity.rs`,
   golden from `tools/gen_tomopy_adjust_range_golden.py`). `prep::filters::adjust_range`.
+- ✅ **`median_filter` — done.** Port of tomopy `misc/corr.py:167`: median-filter
+  every 2-D slice along `axis` with a `size×size` footprint (scipy.ndimage
+  default `mode='reflect'`, half-sample reflection — its index map verified
+  against scipy `ni_support.c` `NI_EXTEND_REFLECT`). Every pixel is replaced by
+  its local median (no threshold). scipy's median filter picks a single order
+  statistic (rank `size·size/2`, never an average even for an even footprint), so
+  the result is **bit-exact (Δ=0)** on finite input. Golden from real tomopy
+  1.15.3 (this wrapper uses `arr[tuple(slc)]`, so unlike `remove_outlier1d` it
+  runs unmodified on numpy 2.x). 6 cases (odd/even `size`, all three axes) pass at
+  0 bit-mismatches (`median_filter_parity.rs`, golden from
+  `tools/gen_tomopy_median_filter_golden.py`). `prep::filters::median_filter`.
+  Distinct from `median_filter3d` (3-D cube, backend-routed) and
+  `median_filter_nonfinite` (NaN/±inf scrub). It is also the 2-D median primitive
+  that tomopy's `remove_outlier` (corr.py:559) reuses with a dezinger threshold;
+  that 2-D `remove_outlier` stays **blocked on a naming decision** — the
+  `remove_outlier` name is already taken by the 3-D cube `remove_outlier3d`.
 - ✅ **`remove_outlier1d` — done.** Port of tomopy `misc/corr.py:615`: 1-D
   `size`-tap median along `axis` (scipy.ndimage `mode='mirror'`, whole-sample
   reflection — its index map verified against scipy `ni_support.c`
