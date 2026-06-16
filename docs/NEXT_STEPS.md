@@ -309,6 +309,12 @@ below by dependency and value — the first three close the end-to-end pipeline.
   `tools/gen_tomopy_sample_golden.py`. (`trim_sinogram` is unrunnable on modern
   numpy — float `ceil/floor` slice bounds + float `diameter` array shape both
   raise `TypeError` — so it has no reference; deferred as a TODO.)
+- ✅ **Axis padding** — `morph::pad` (tomopy `misc/morph.py:73`). Done. Widens an
+  axis by `npad` on each side (`npad=None` → `⌈(dim·√2−dim)/2⌉`); flanks are a
+  constant (`PadMode::Constant`) or the replicated edge slab (`PadMode::Edge`).
+  Pure copy/fill → **bit-exact (Δ=0)** for constant/edge on axes 0/1/2 and default
+  / explicit `npad`. `pad_parity.rs`, golden from the **real tomopy**
+  `tools/gen_tomopy_pad_golden.py`.
 
 **M3 done =** `open_dxchange → normalize/minus_log → remove_stripe → find_center_vo
 → fbp → TIFF out` runs end-to-end on a checked-in small dataset, asserted by a
