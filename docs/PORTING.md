@@ -196,7 +196,7 @@ void medianfilter_main_float(float* in,float* out,int kernel_half_size,float abs
 | `dxchange::Reader`    | tomocupy `dataio/reader.py:59`        | done (`open_dxchange`; pure-Rust `rust-hdf5`, no libhdf5; bit-exact, gzip/uint16 fixture) |
 | `tiff::write`         | tomocupy `dataio/writer.py:281` (`--save-format tiff`) | done (`create_writer`; pure-Rust `tiff`, per-slice f32, bit-exact round-trip + tifffile-verified) |
 | `h5::write`           | tomocupy `dataio/writer.py` (`h5nolinks`, `--save-format h5`) | done (`create_writer`; pure-Rust `rust-hdf5`, `/exchange/data` f32 `[nz,ny,nx]` + axes/description/units attrs, bit-exact round-trip + h5py-verified) |
-| `zarr::write`         | tomocupy `--save-format zarr`         | stub   |
+| `zarr::write`         | tomocupy `--save-format zarr` (`dataio/writer.py` `initialize_zarr`) | done (`create_writer`; pure-Rust, **no new dependency**). Spec-compliant Zarr v2 `DirectoryStore`: `{path}.zarr/exchange/data` with hand-written `.zgroup`/`.zarray`/`.zattrs` and one raw little-endian-f32 chunk file per z-slice (`chunks=[1,ny,nx]`, like the h5 variant's `(1,n,n)`); readable by the Python `zarr` library. Verified by round-trip reassembly + structural metadata test. **Deviates** from tomocupy's Blosc-compressed multiscale NGFF pyramid (`Blosc(blosclz, clevel=5, shuffle=2)`, default chunk `8,64,64`, `downsampleZarr`): byte-faithful reproduction would need a zarr crate + a Blosc C-binding, which conflicts with the pure-Rust no-C-dep I/O stack (`rust-hdf5`). Uncompressed single-scale stores the identical sample values; Blosc + multiscale are a documented deferral |
 
 DXchange HDF5 layout (constants in `tomoxide-io::dxchange`):
 
