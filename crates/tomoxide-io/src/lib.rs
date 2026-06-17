@@ -1,9 +1,9 @@
 //! # tomoxide-io
 //!
 //! Dataset readers and writers. The primary format is **DXchange** HDF5 (the
-//! APS/synchrotron convention used by both tomopy and tomocupy); TIFF and zarr
-//! outputs mirror tomocupy's `--save-format`. All back-ends are stubs in this
-//! scaffold; see `docs/PORTING.md` §G.
+//! APS/synchrotron convention used by both tomopy and tomocupy); TIFF, HDF5,
+//! and zarr outputs mirror tomocupy's `--save-format`. The DXchange reader and
+//! all three writers ([`SaveFormat`]) are implemented; see `docs/PORTING.md` §G.
 #![forbid(unsafe_code)]
 
 use std::fs::File;
@@ -344,22 +344,22 @@ fn ensure_le(byte_order: ByteOrder) -> Result<()> {
 
 /// Create a writer for the given output format.
 ///
-/// [`SaveFormat::Tiff`] and [`SaveFormat::H5`] are implemented; `Zarr` remains a
-/// stub. `path` is the output **base**, and each writer appends its own suffix:
+/// [`SaveFormat::Tiff`], [`SaveFormat::H5`], and [`SaveFormat::Zarr`] are
+/// implemented. `path` is the output **base**, and each writer appends its own
+/// suffix:
 /// - TIFF — slice `i` → `{path}_{i:05}.tiff` (tomocupy `dataio/writer.py:281`,
 ///   `{fnameout}_{fid:05}.tiff`).
 /// - H5 — a single `{path}.h5` file holding one `/exchange/data` dataset
 ///   (tomocupy `dataio/writer.py` `h5nolinks`; `fnameout += '.h5'`).
+/// - Zarr — a `{path}.zarr` directory store with an `exchange/data` array
+///   (uncompressed, spec-compliant Zarr v2; one chunk file per z-slice).
 ///
 /// The parent directory of `path` is created if missing.
 pub fn create_writer(path: &str, format: SaveFormat) -> Result<Box<dyn VolumeWriter>> {
     match format {
         SaveFormat::Tiff => Ok(Box::new(TiffWriter::new(path)?)),
         SaveFormat::H5 => Ok(Box::new(H5Writer::new(path)?)),
-        SaveFormat::Zarr => Err(Error::todo(
-            "io::create_writer (zarr)",
-            "tomocupy dataio/writer.py:294",
-        )),
+        SaveFormat::Zarr => Ok(Box::new(ZarrWriter::new(path)?)),
     }
 }
 
@@ -539,6 +539,128 @@ impl VolumeWriter for H5Writer {
     }
 }
 
+/// Pure-Rust Zarr v2 reconstruction writer (spec-compliant `DirectoryStore`).
+///
+/// tomocupy's zarr output (`dataio/writer.py` `initialize_zarr` +
+/// `downsampleZarr`) is a **Blosc-compressed multiscale NGFF pyramid**
+/// (`Blosc(cname=blosclz, clevel=5, shuffle=2)`, default chunk `8,64,64`).
+/// Reproducing those exact bytes would need a zarr crate plus a Blosc
+/// C-binding; tomoxide keeps the I/O stack pure-Rust with no new C dependency
+/// (the same reason the reader/writer use `rust-hdf5`). So this writes an
+/// **uncompressed, single-scale** Zarr v2 array that is fully spec-compliant
+/// and readable by the Python `zarr` library:
+///
+/// ```text
+/// {path}.zarr/
+///   .zgroup                      {"zarr_format": 2}
+///   exchange/.zgroup             {"zarr_format": 2}
+///   exchange/data/.zarray        shape/chunks/dtype metadata
+///   exchange/data/.zattrs        axes/description/units (mirrors the H5 writer)
+///   exchange/data/{z}.0.0        one raw little-endian f32 chunk per z-slice
+/// ```
+///
+/// Chunks are `[1, ny, nx]` — one z-slice per chunk file, like the h5 variant's
+/// `chunks=(1, n, n)` — which makes the streaming `write_chunk([start, end))`
+/// a plain per-slice file write with no partial-chunk read-modify-write.
+/// Blosc compression and the NGFF multiscale pyramid are a documented deferral;
+/// the stored sample values are identical regardless.
+struct ZarrWriter {
+    /// Resolved `{path}.zarr` store root.
+    root: std::path::PathBuf,
+    /// Full array extents `(nz, ny, nx)`, fixed on the first `write_chunk`.
+    dims: Option<(usize, usize, usize)>,
+}
+
+impl ZarrWriter {
+    fn new(path: &str) -> Result<Self> {
+        // Append `.zarr` to the base, mirroring how TiffWriter/H5Writer treat
+        // `path` as a base and add their own suffix (tomocupy `fnameout += '.zarr'`).
+        let root = if path.ends_with(".zarr") {
+            std::path::PathBuf::from(path)
+        } else {
+            std::path::PathBuf::from(format!("{path}.zarr"))
+        };
+        if let Some(parent) = root.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::Io(format!("create dir {}: {e}", parent.display())))?;
+            }
+        }
+        Ok(Self { root, dims: None })
+    }
+
+    /// Create the store directories and write the `.zgroup`/`.zarray`/`.zattrs`
+    /// metadata for an `exchange/data` array of shape `(nz, ny, nx)`.
+    fn init_store(&self, nz: usize, ny: usize, nx: usize) -> Result<()> {
+        let data_dir = self.root.join("exchange").join("data");
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| Error::Io(format!("create dir {}: {e}", data_dir.display())))?;
+        let write = |rel: std::path::PathBuf, body: String| -> Result<()> {
+            std::fs::write(&rel, body)
+                .map_err(|e| Error::Io(format!("write {}: {e}", rel.display())))
+        };
+        // Root + group markers.
+        let zgroup = "{\n    \"zarr_format\": 2\n}".to_string();
+        write(self.root.join(".zgroup"), zgroup.clone())?;
+        write(self.root.join("exchange").join(".zgroup"), zgroup)?;
+        // Array metadata: little-endian f32 (`<f4`), uncompressed, C order,
+        // one z-slice per chunk. Keys sorted as the Python writer emits them.
+        let zarray = format!(
+            "{{\n    \"chunks\": [1, {ny}, {nx}],\n    \"compressor\": null,\n    \
+             \"dtype\": \"<f4\",\n    \"fill_value\": 0.0,\n    \"filters\": null,\n    \
+             \"order\": \"C\",\n    \"shape\": [{nz}, {ny}, {nx}],\n    \
+             \"zarr_format\": 2\n}}"
+        );
+        write(data_dir.join(".zarray"), zarray)?;
+        // Mirror the H5 writer's dataset attributes.
+        let zattrs = "{\n    \"axes\": \"z:y:x\",\n    \"description\": \"ReconData\",\n    \
+                      \"units\": \"counts\"\n}"
+            .to_string();
+        write(data_dir.join(".zattrs"), zattrs)?;
+        Ok(())
+    }
+}
+
+impl VolumeWriter for ZarrWriter {
+    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()> {
+        let (nz, ny, nx) = vol.dims();
+        if start > end || end > nz {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: slice range [{start}, {end}) out of bounds for {nz} slices"
+            )));
+        }
+        // The store is sized to the first volume's full extents; every later
+        // chunk must come from a volume of the same shape (the array shape in
+        // `.zarray` is fixed once written), mirroring H5Writer.
+        if self.dims.is_none() {
+            self.init_store(nz, ny, nx)?;
+            self.dims = Some((nz, ny, nx));
+        }
+        let dims = self.dims.unwrap();
+        if dims != (nz, ny, nx) {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: volume dims {:?} differ from the created store {:?}",
+                (nz, ny, nx),
+                dims
+            )));
+        }
+        let data_dir = self.root.join("exchange").join("data");
+        // One chunk file per z-slice: chunk grid coord (z, 0, 0) → "z.0.0".
+        for z in start..end {
+            let slice = vol.array.index_axis(Axis(0), z);
+            // C-order (y-major, x fastest) little-endian f32 — exactly `<f4`.
+            let mut bytes = Vec::with_capacity(ny * nx * 4);
+            for &v in slice.iter() {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            let chunk = data_dir.join(format!("{z}.0.0"));
+            std::fs::write(&chunk, &bytes)
+                .map_err(|e| Error::Io(format!("write {}: {e}", chunk.display())))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +678,68 @@ mod tests {
             open_dxchange("definitely-not-a-real-file.h5"),
             Err(Error::Io(_))
         ));
+    }
+
+    #[test]
+    fn zarr_writer_roundtrips_a_spec_compliant_store() {
+        // Unique temp store root (no tempfile dev-dep); clean before and after.
+        let base = std::env::temp_dir().join("tomoxide_zarr_writer_roundtrip");
+        let root = base.with_extension("zarr");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 3 slices of 2x2 with distinct, C-order-distinguishable values.
+        let arr = Array3::from_shape_fn((3, 2, 2), |(z, y, x)| (z * 100 + y * 10 + x) as f32);
+        let vol = Volume::new(arr.clone());
+
+        // Stream it in two calls to exercise the per-slice chunk writes.
+        let mut w = create_writer(base.to_str().unwrap(), SaveFormat::Zarr).unwrap();
+        w.write_chunk(&vol, 0, 2).unwrap();
+        w.write_chunk(&vol, 2, 3).unwrap();
+
+        // Structure: group markers + array metadata exist.
+        assert!(root.join(".zgroup").is_file());
+        assert!(root.join("exchange").join(".zgroup").is_file());
+        let data = root.join("exchange").join("data");
+        let zarray = std::fs::read_to_string(data.join(".zarray")).unwrap();
+        assert!(zarray.contains("\"shape\": [3, 2, 2]"), "{zarray}");
+        assert!(zarray.contains("\"chunks\": [1, 2, 2]"), "{zarray}");
+        assert!(zarray.contains("\"dtype\": \"<f4\""), "{zarray}");
+        assert!(zarray.contains("\"compressor\": null"), "{zarray}");
+        assert!(data.join(".zattrs").is_file());
+
+        // One chunk file per z-slice; reassemble and compare to the input.
+        for z in 0..3 {
+            let bytes = std::fs::read(data.join(format!("{z}.0.0"))).unwrap();
+            assert_eq!(bytes.len(), 2 * 2 * 4, "chunk {z} byte length");
+            let got: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let want: Vec<f32> = arr.index_axis(Axis(0), z).iter().copied().collect();
+            assert_eq!(got, want, "slice {z} round-trip");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zarr_writer_rejects_changed_dims() {
+        let base = std::env::temp_dir().join("tomoxide_zarr_writer_dims");
+        let root = base.with_extension("zarr");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut w = create_writer(base.to_str().unwrap(), SaveFormat::Zarr).unwrap();
+        let a = Volume::new(Array3::zeros((2, 4, 4)));
+        w.write_chunk(&a, 0, 2).unwrap();
+        // A second volume with different extents must be rejected (the store
+        // shape is fixed by the first write), mirroring H5Writer.
+        let b = Volume::new(Array3::zeros((2, 8, 8)));
+        assert!(matches!(
+            w.write_chunk(&b, 0, 2),
+            Err(Error::InvalidParam(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
