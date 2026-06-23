@@ -176,11 +176,12 @@ below by dependency and value — the first three close the end-to-end pipeline.
   rounding each `_ring` to f32. Reproduces the f64 CG + f32 cast in the upstream
   op order, so it matches tomopy 1.15.3 to the **f32 round-off floor**
   (max rel Δ≈5.2e-7) — `stripe_ti_parity.rs`, golden from
-  `tools/gen_tomopy_stripe_ti_golden.py`. Only the default `nblock=0`
-  (whole-sinogram) path is supported/verified: tomopy's block path `_ringb`
-  (nblock>0) is unrunnable on modern numpy (its NaN guard
-  `np.where(np.isnan(...) is True)` raises), so there is no reference output —
-  tomoxide returns `NotImplemented` for nblock>0 rather than guessing.
+  `tools/gen_tomopy_stripe_ti_golden.py`. **Both** the whole-sinogram
+  (`nblock=0`) and the block path (`nblock>0`, `_ringb`) are supported and
+  verified (nblock=4, 7; f32 floor). `_ringb`'s `np.where(np.isnan(...) is
+  True)` guard is an always-False no-op on modern numpy (a DeprecationWarning,
+  not an error), so the reference runs; the port reproduces its `np.ones` tail
+  fill for angles past the last full block.
 - ✅ **Fw (Fourier-Wavelet) — done.** Port of tomopy `prep/stripe.py:88`
   `_remove_stripe_fw` (Münch 2009): per slice pad the projection axis to
   `nproj + nproj/8`, run a `level`-deep db5 2-D wavelet decomposition, damp the
@@ -558,9 +559,11 @@ below by dependency and value — the first three close the end-to-end pipeline.
   mean; `(proj−dark)/max(flat−dark,1e-6)` with an optional `cutoff`, group bounds
   at the half-to-even midpoint of consecutive `flat_loc`. f32 in upstream order →
   **bit-exact (Δ=0)** for even/odd group sizes incl. the denom-clamp and cutoff
-  paths. `averaging='median'` returns a TODO error because tomopy's
-  `np.median(dark, …, dtype=np.float32)` raises on modern numpy (no reference),
-  mirroring the `remove_stripe_ti` block-path treatment. `normalize_nf_parity.rs`,
+  paths. `averaging='median'` is also implemented (per-pixel dark median): tomopy
+  passes a bogus `dtype=` to `np.median` (which it has never accepted, so it
+  raises on every numpy — a latent bug, not a numpy-version issue), so the golden
+  monkeypatches that kwarg away to recover the intended median; with a 3-frame
+  (odd) dark the median selects a sample → **Δ=0**. `normalize_nf_parity.rs`,
   golden from the **real tomopy** `tools/gen_tomopy_normalize_nf_golden.py`.
 - ✅ **ROI normalization** — `normalize::normalize_roi` (tomopy
   `prep/normalize.py:168`). Done. Each projection is divided by the mean `bg` of

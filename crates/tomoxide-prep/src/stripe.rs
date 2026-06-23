@@ -7,7 +7,7 @@
 
 use ndarray::Array2;
 use tomoxide_core::data::{Layout, Tomo};
-use tomoxide_core::error::{Error, Result};
+use tomoxide_core::error::Result;
 use tomoxide_core::params::StripeMethod;
 
 use crate::{fft, wavelet};
@@ -17,19 +17,7 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
     match method {
         StripeMethod::None => Ok(()),
         StripeMethod::Fw { sigma, level } => remove_stripe_fw(data, sigma, level),
-        StripeMethod::Ti { nblock, beta } => {
-            if nblock != 0 {
-                // tomopy's block path `_ringb` is unrunnable on modern numpy —
-                // its NaN guard `np.where(np.isnan(mysino) is True)` is an
-                // always-False identity comparison that errors on a 0-d array,
-                // so no reference output exists to establish parity against.
-                return Err(Error::todo(
-                    "stripe::remove_stripe_ti (nblock > 0 block path)",
-                    "tomopy prep/stripe.py:302 (_ringb) — reference errors on modern numpy",
-                ));
-            }
-            remove_stripe_ti(data, beta)
-        }
+        StripeMethod::Ti { nblock, beta } => remove_stripe_ti(data, beta, nblock),
         StripeMethod::Sf { size } => remove_stripe_sf(data, size),
         StripeMethod::VoAll {
             snr,
@@ -406,16 +394,80 @@ fn ti_ring(sino: &Array2<f32>, m: usize, n: usize) -> Array2<f32> {
     out
 }
 
+/// `_ringb(sino, m, n, step)`: block-wise variant of [`ti_ring`]. The transposed
+/// sinogram `mysino[col][angle]` is split into `floor(nproj/step)` blocks of
+/// `step` angles; each block gets its own regularization parameter and
+/// per-column offset `q`. Angles past the last full block keep tomopy's
+/// `np.ones` fill (`1.0`). Faithful to tomopy `_ringb`, including its no-op NaN
+/// guard (`np.where(np.isnan(x) is True)` never matches, so NaNs are *not*
+/// zeroed here, unlike `_ring`).
+fn ti_ringb(sino: &Array2<f32>, m: usize, n: usize, step: usize) -> Array2<f32> {
+    let (nproj, ncol) = sino.dim();
+    let r = ncol; // mysino rows (R)
+    let nn = nproj; // mysino cols (N = angles)
+    let mut mysino = vec![vec![0.0f64; nn]; r];
+    for (col, row) in mysino.iter_mut().enumerate() {
+        for (angle, cell) in row.iter_mut().enumerate() {
+            *cell = sino[[angle, col]] as f64;
+        }
+    }
+    let h = ti_kernel(m, n);
+    let nblock = if step == 0 { 0 } else { nn / step };
+    // new[col][angle], initialized to ones (tomopy `np.ones((R, N))`).
+    let mut newm = vec![vec![1.0f64; nn]; r];
+    for k in 0..nblock {
+        let j0 = k * step;
+        let j1 = j0 + step;
+        // alpha = 1/(2·(max−min)) of the block's column sums (sum over R rows).
+        let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for j in j0..j1 {
+            let mut s = 0.0f64;
+            for row in mysino.iter().take(r) {
+                s += row[j];
+            }
+            if s < min {
+                min = s;
+            }
+            if s > max {
+                max = s;
+            }
+        }
+        let alpha = 1.0 / (2.0 * (max - min));
+        // pp = block.mean(1): per-row mean over the `step` block angles.
+        let pp: Vec<f64> = mysino
+            .iter()
+            .map(|row| row[j0..j1].iter().sum::<f64>() / step as f64)
+            .collect();
+        let f: Vec<f64> = ti_matxvec(&h, &pp).iter().map(|v| -v).collect();
+        let q = ti_cgm(&h, alpha, &f);
+        for (col, row) in mysino.iter().enumerate() {
+            for j in j0..j1 {
+                newm[col][j] = row[j] + q[col];
+            }
+        }
+    }
+    let mut out = Array2::<f32>::zeros((nproj, ncol));
+    for col in 0..ncol {
+        for angle in 0..nproj {
+            out[[angle, col]] = newm[col][angle] as f32;
+        }
+    }
+    out
+}
+
 /// Titarenko stripe removal (`remove_stripe_ti`, default `nblock = 0`): combine
 /// the first- and second-difference corrected sinograms as
 /// `sqrt(d1·d2 + β·|min(d1·d2)|)`.
-fn remove_stripe_ti(data: &mut Tomo<f32>, beta: f32) -> Result<()> {
+fn remove_stripe_ti(data: &mut Tomo<f32>, beta: f32, nblock: usize) -> Result<()> {
     let target = data.layout;
     let mut proj = data.to_layout(Layout::Projection);
     let (nproj, nrows, ncol) = proj.array.dim();
     if nproj == 0 || nrows == 0 || ncol == 0 {
         return Ok(());
     }
+    // tomopy `_remove_stripe_ti`: nblock==0 → `_ring`, else `_ringb` with
+    // block size `int(nproj / nblock)` (the transposed N axis).
+    let step = if nblock == 0 { 0 } else { nproj / nblock };
     for m in 0..nrows {
         let mut sino = Array2::<f32>::zeros((nproj, ncol));
         for p in 0..nproj {
@@ -423,8 +475,11 @@ fn remove_stripe_ti(data: &mut Tomo<f32>, beta: f32) -> Result<()> {
                 sino[[p, c]] = proj.array[[p, m, c]];
             }
         }
-        let d1 = ti_ring(&sino, 1, 1);
-        let d2 = ti_ring(&sino, 2, 1);
+        let (d1, d2) = if nblock == 0 {
+            (ti_ring(&sino, 1, 1), ti_ring(&sino, 2, 1))
+        } else {
+            (ti_ringb(&sino, 1, 1, step), ti_ringb(&sino, 2, 1, step))
+        };
         // p = d1 * d2 (f32); d = sqrt(p + β·|min(p)|) (f32).
         let mut p = Array2::<f32>::zeros((nproj, ncol));
         let mut pmin = f32::INFINITY;

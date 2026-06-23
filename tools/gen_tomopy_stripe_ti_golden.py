@@ -9,18 +9,22 @@ corrected sinograms as `sqrt(d1*d2 + alpha*|min|)`, rounding each `_ring` to
 f32. tomoxide reimplements the same f64 CG + f32 cast, so this is held to the
 f32 round-off floor, not bit-exactness.
 
-Only the default `nblock=0` (whole-sinogram) path is generated: tomopy's block
-path `_ringb` (nblock>0) is unrunnable on modern numpy — its NaN guard
-`np.where(np.isnan(mysino) is True)` is an always-False identity comparison that
-raises on a 0-d array — so there is no reference output to compare against.
+Both the default `nblock=0` (whole-sinogram) path and the block path `_ringb`
+(nblock>0) are generated. `_ringb`'s NaN guard `np.where(np.isnan(mysino) is
+True)` is an always-False identity comparison; on modern numpy it only emits a
+DeprecationWarning (nonzero on a 0-d array) and is a harmless no-op, so the
+method runs and produces a valid reference. The block path initializes the
+corrected sinogram to `np.ones` and only fills `floor(nproj/step)` full blocks,
+so angles past the last block stay 1.0 — reproduced faithfully on the Rust side.
 
 Run with the tomopy-enabled env:
-    /Users/stevek/mamba/envs/tomopy-golden/bin/python \
-        tools/gen_tomopy_stripe_ti_golden.py
+    micromamba run -n tomo python tools/gen_tomopy_stripe_ti_golden.py
 """
 import multiprocessing as mp
 import os
+import warnings
 
+warnings.filterwarnings("ignore")  # _ringb's `is True` 0-d nonzero deprecation
 mp.set_start_method("fork", force=True)  # tomopy distribute_jobs spawns a Manager
 
 import numpy as np
@@ -53,6 +57,16 @@ out = stripe.remove_stripe_ti(
 ).astype("float32")
 np.save(os.path.join(OUT, "tomopy_stripe_ti_nblock0.npy"), out)
 print(f"nblock=0: max|Δ from input| = {float(np.max(np.abs(out - data))):.6g}")
+
+# Block path: nblock=4 (180/4=45, divides evenly) and nblock=7 (180/7→step=25,
+# 7*25=175, so the last 5 angles keep the np.ones fill — exercises the tail).
+for nb in (4, 7):
+    outb = stripe.remove_stripe_ti(
+        data.copy(), nblock=nb, alpha=1.5, ncore=1,
+    ).astype("float32")
+    np.save(os.path.join(OUT, f"tomopy_stripe_ti_nblock{nb}.npy"), outb)
+    print(f"nblock={nb}: step={180 // nb}, max|Δ from input| = "
+          f"{float(np.max(np.abs(outb - data))):.6g}")
 
 np.save(os.path.join(OUT, "stripe_ti_input.npy"), data)
 print("input", data.shape)

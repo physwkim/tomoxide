@@ -55,6 +55,32 @@ def main():
     out_b = tomopy.prep.normalize.normalize_nf(
         tomo.copy(), flats_b.copy(), dark.copy(), [1, 6], cutoff=1.5).astype("float32")
 
+    # averaging='median' case. tomopy calls `np.median(dark, axis=0,
+    # dtype=np.float32)`, but np.median has never accepted a `dtype` kwarg, so
+    # the call raises on every numpy — a latent tomopy bug, not a numpy-version
+    # issue. Monkeypatch np.median to drop the bogus kwarg, recovering the
+    # intended per-pixel dark median, and run the REAL normalize_nf. A 3-frame
+    # (odd) dark makes the median *select* a sample, so it differs from the mean
+    # and the result is an exact f32 (no even-average rounding).
+    dark3 = (0.1 + 0.05 * rng.random((3, NY, NX))).astype(np.float32)
+    dark3_med = np.median(dark3, axis=0).astype(np.float32)
+    flats_m = (1.0 + 0.3 * rng.random((4, NY, NX))).astype(np.float32)
+    flats_m[:, 0, 0] = dark3_med[0, 0]  # hit the flat-dark 1e-6 clamp
+
+    _orig_median = np.median
+
+    def _median_no_dtype(*args, **kwargs):
+        kwargs.pop("dtype", None)
+        return _orig_median(*args, **kwargs)
+
+    np.median = _median_no_dtype
+    try:
+        out_m = tomopy.prep.normalize.normalize_nf(
+            tomo.copy(), flats_m.copy(), dark3.copy(), [0, 7],
+            averaging="median").astype("float32")
+    finally:
+        np.median = _orig_median
+
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, "..", "crates", "tomoxide", "tests", "fixtures")
     np.save(os.path.join(out, "normalize_nf_tomo.npy"), tomo)
@@ -63,9 +89,13 @@ def main():
     np.save(os.path.join(out, "normalize_nf_flatsB.npy"), flats_b)
     np.save(os.path.join(out, "tomopy_normalize_nf_A.npy"), out_a)
     np.save(os.path.join(out, "tomopy_normalize_nf_B.npy"), out_b)
+    np.save(os.path.join(out, "normalize_nf_dark3.npy"), dark3)
+    np.save(os.path.join(out, "normalize_nf_flatsM.npy"), flats_m)
+    np.save(os.path.join(out, "tomopy_normalize_nf_median.npy"), out_m)
     print("tomopy", tomopy.__version__)
     print("A range", float(out_a.min()), float(out_a.max()))
     print("B range", float(out_b.min()), float(out_b.max()))
+    print("median range", float(out_m.min()), float(out_m.max()))
     print("wrote fixtures to", os.path.normpath(out))
 
 

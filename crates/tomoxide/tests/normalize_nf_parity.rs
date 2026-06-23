@@ -22,13 +22,23 @@ fn load(name: &str) -> Array3<f32> {
 }
 
 fn run_case(flats_file: &str, golden_file: &str, flat_loc: &[usize], cutoff: Option<f32>) {
+    run_case_full("normalize_nf_dark.npy", flats_file, golden_file, flat_loc, cutoff, Averaging::Mean);
+}
+
+fn run_case_full(
+    dark_file: &str,
+    flats_file: &str,
+    golden_file: &str,
+    flat_loc: &[usize],
+    cutoff: Option<f32>,
+    averaging: Averaging,
+) {
     let mut tomo = Tomo::new(load("normalize_nf_tomo.npy"), Layout::Projection);
     let flats = Frames::new(load(flats_file));
-    let dark = Frames::new(load("normalize_nf_dark.npy"));
+    let dark = Frames::new(load(dark_file));
     let golden = load(golden_file);
 
-    prep::normalize::normalize_nf(&mut tomo, &flats, &dark, flat_loc, cutoff, Averaging::Mean)
-        .unwrap();
+    prep::normalize::normalize_nf(&mut tomo, &flats, &dark, flat_loc, cutoff, averaging).unwrap();
 
     let got = tomo.to_layout(Layout::Projection);
     assert_eq!(got.array.dim(), golden.dim());
@@ -60,5 +70,20 @@ fn normalize_nf_odd_group_with_cutoff_matches_tomopy() {
         "tomopy_normalize_nf_B.npy",
         &[1, 6],
         Some(1.5),
+    );
+}
+
+#[test]
+fn normalize_nf_median_dark_matches_tomopy() {
+    // averaging='median' with a 3-frame (odd) dark, so the median *selects* a
+    // sample (≠ the mean) and the result is exact f32. Golden from the real
+    // normalize_nf with np.median's bogus `dtype=` kwarg monkeypatched away.
+    run_case_full(
+        "normalize_nf_dark3.npy",
+        "normalize_nf_flatsM.npy",
+        "tomopy_normalize_nf_median.npy",
+        &[0, 7],
+        None,
+        Averaging::Median,
     );
 }

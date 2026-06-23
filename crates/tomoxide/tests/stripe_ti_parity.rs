@@ -9,10 +9,11 @@
 //! `remove_stripe_ti` (`tools/gen_tomopy_stripe_ti_golden.py`, nblock=0,
 //! alpha=1.5).
 //!
-//! Only the default `nblock=0` path is covered: tomopy's block path `_ringb`
-//! (nblock>0) is unrunnable on modern numpy (its NaN guard
-//! `np.where(np.isnan(...) is True)` raises), so no reference output exists —
-//! tomoxide returns `NotImplemented` for nblock>0.
+//! Both the whole-sinogram (`nblock=0`) and block (`nblock>0`, `_ringb`) paths
+//! are covered. `_ringb`'s `np.where(np.isnan(...) is True)` guard is a no-op on
+//! modern numpy (a DeprecationWarning, not an error), so the block method runs
+//! and is a valid reference; the port reproduces its `np.ones` tail fill for
+//! angles past the last full block.
 
 use ndarray::Array3;
 use ndarray_npy::read_npy;
@@ -57,17 +58,25 @@ fn remove_stripe_ti_matches_tomopy() {
 }
 
 #[test]
-fn remove_stripe_ti_block_path_is_unsupported() {
-    // tomopy's `_ringb` cannot run on modern numpy, so the block path has no
-    // verifiable reference; tomoxide rejects it rather than guessing.
+fn remove_stripe_ti_block_matches_tomopy() {
+    // Block path (`_ringb`): nblock=4 divides 180 evenly; nblock=7 leaves a
+    // 5-angle tail at the `np.ones` fill. Both held to the f32 round-off floor.
     let input = load("stripe_ti_input.npy");
-    let mut tomo = Tomo::new(input, Layout::Projection);
-    let err = prep::stripe::remove_stripe(
-        &mut tomo,
-        StripeMethod::Ti {
-            nblock: 3,
-            beta: 1.5,
-        },
-    );
-    assert!(err.is_err(), "nblock>0 must be rejected, got {err:?}");
+    for nblock in [4usize, 7] {
+        let golden = load(&format!("tomopy_stripe_ti_nblock{nblock}.npy"));
+        let mut tomo = Tomo::new(input.clone(), Layout::Projection);
+        prep::stripe::remove_stripe(&mut tomo, StripeMethod::Ti { nblock, beta: 1.5 }).unwrap();
+        let got = tomo.array;
+        let scale = golden.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let max_abs = golden
+            .iter()
+            .zip(got.iter())
+            .fold(0.0f32, |m, (&g, &p)| m.max((g - p).abs()));
+        let max_rel = max_abs / scale;
+        eprintln!("Ti nblock={nblock}: max|Δ| = {max_abs}, max relative = {max_rel}");
+        assert!(
+            max_rel <= 1e-5,
+            "Ti nblock={nblock} parity: max|Δ| = {max_abs}, max relative = {max_rel}"
+        );
+    }
 }

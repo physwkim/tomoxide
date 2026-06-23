@@ -201,10 +201,28 @@ pub fn normalize_nf(
             d
         }
         Averaging::Median => {
-            return Err(Error::todo(
-                "normalize::normalize_nf (averaging='median')",
-                "tomopy prep/normalize.py:305 — np.median(dtype=) raises on modern numpy",
-            ));
+            // np.median(dark, axis=0).astype(float32). tomopy passes a bogus
+            // `dtype=` to np.median (which it has never accepted, so the call
+            // raises on every numpy) — the intent is the per-pixel median of the
+            // dark frames. numpy's median sorts and, for an even count, averages
+            // the two middle samples; computed here in f64 then cast to f32.
+            let mut d = Array2::<f32>::zeros((ny, nx));
+            let mut col = vec![0.0f64; ndark];
+            for y in 0..ny {
+                for x in 0..nx {
+                    for (k, c) in col.iter_mut().enumerate() {
+                        *c = dark.array[[k, y, x]] as f64;
+                    }
+                    col.sort_by(|a, b| a.total_cmp(b));
+                    let med = if ndark % 2 == 1 {
+                        col[ndark / 2]
+                    } else {
+                        (col[ndark / 2 - 1] + col[ndark / 2]) / 2.0
+                    };
+                    d[[y, x]] = med as f32;
+                }
+            }
+            d
         }
     };
 
