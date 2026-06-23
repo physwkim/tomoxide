@@ -71,7 +71,7 @@ const float* theta,float* recon,int ngridx,int ngridy, …)` in tomopy
 | `Tv`                   | `num_iter,reg_par`                  | `recon/tv.c`         | CPU done (Chambolle–Pock TV; reg_par[0]=strength, c=0.35; r=0.95, larger λ smooths) |
 | `Grad`                 | `num_iter,reg_par`                  | `recon/grad.c`       | CPU done (LS gradient descent; BB step reg_par[0]<0 → r=0.99; unit fixed step diverges for this projector, see note) |
 | `Tikh`                 | `num_iter,reg_data,reg_par`         | `recon/tikh.c`       | CPU done (grad + ridge term 2·reg_par[1]·(x−reg_data); no reg_par[1] ≡ grad; shares grad's core) |
-| `Vector{,2,3}`         | `num_iter,axis…`                    | `recon/vector.c`     | stub   |
+| `Vector{,2,3}`         | `num_iter,axis…`                    | `recon/vector.c`     | done (separate `recon::vector` API, not the scalar dispatch; bit-exact Δ=0 vs tomopy 1.15 — line-for-line C port incl. `calc_quadrant` int trick & mixed f32/f64; vector2/3 need a cube `dy==dx`, else tomopy corrupts memory) |
 
 Forward model shared by all: tomopy `libtomo/recon/project.c`
 (`void project(const float* obj,…,float* data,…,const float* center,const float* theta)`)

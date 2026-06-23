@@ -52,8 +52,8 @@ gridrec to r=0.98; FBP recovers the phantom from tomopy's sinogram to r=0.87.
 ## M2 — CPU iterative family (parity target: tomopy ART/SIRT/MLEM…) 🟢 scalar family done
 
 The full scalar iterative family is implemented and verified (sirt, mlem, osem,
-pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
-(`vector{,2,3}`, a separate multi-dataset API) remains, deferred below.
+pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
+(`vector{,2,3}`, a separate multi-dataset API) is also done — see below.
 
 
 - ✅ `Sirt` — R/C-weighted SIRT via the forward/back-projection capabilities;
@@ -87,7 +87,6 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   piecewise-constant phantom to r = 0.95 (λ=0.01, 200 iters); a larger λ smooths
   flat regions (roughness 0.34 → 0.22). Stable for this projector across the
   tested λ/iteration range despite the `grad` normalization caveat.
-- ⬜ `vector`.
 - ✅ `Art`/`Bart` — row-action (Kaczmarz) methods via a new single-ray projector
   capability (`RayProject`, CPU backend): the sparse rows of the same operator
   `R` the other methods use, built once and reused. ART updates after every ray
@@ -95,8 +94,13 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Only vector tomography
   (block-simultaneous, `update`/`sum_dist` accumulation applied per block),
   r = 0.98, and more subsets accelerate convergence (residual 689 vs 39792 at 8
   iters, 15 vs 1 block). CUDA/wgpu inherit the `None` accessor until ported.
-- ⬜ `vector`/`vector2`/`vector3` — vector tomography (multi-dataset in,
-  vector-field out); a separate API outside the scalar `recon()` dispatch.
+- ✅ `vector`/`vector2`/`vector3` — vector tomography (multi-dataset in,
+  vector-field out) in `recon::vector`, a separate API outside the scalar
+  `recon()` dispatch. Line-for-line port of tomopy `recon/vector.c` + the
+  `utils.c` ray-tracing helpers; bit-exact (Δ=0) vs tomopy 1.15. `vector` takes
+  any slice count; `vector2`/`vector3` reconstruct a full `dx³` vector field so
+  they require a cube (`dy==dx`) — tomopy corrupts memory otherwise, which the
+  port rejects explicitly.
 - ✅ Block/ordered-subset handling (`num_block`, `ind_block`) — `ordered_subsets`
   tiles the angle order into contiguous blocks (tomopy `osem.c`).
 - Verification: per-algorithm round-trip + non-negativity; OSEM↔MLEM and

@@ -20,6 +20,7 @@ mod gridrec;
 pub mod lamino;
 mod lprec;
 pub mod ring;
+pub mod vector;
 
 use ndarray::{Array3, Axis};
 use tomoxide_core::backend::{Backend, FilteredBackproject, ForwardProject, RayProject, RayRow};
@@ -176,12 +177,17 @@ fn iterative(
         Algorithm::Grad => grad(sino, geom, params, proj, bp),
         Algorithm::Tikh => tikh(sino, geom, params, proj, bp),
         Algorithm::Tv => tv(sino, geom, params, proj, bp),
-        // vector tomography (vector/vector2/vector3) needs a different API
-        // (multi-dataset in, vector-field out); not part of the scalar dispatch.
-        _ => Err(Error::todo(
-            "recon iterative (vector tomography)",
-            "tomopy libtomo/recon/vector.c",
+        // Vector tomography reconstructs a vector field from one to three tilt
+        // datasets, so it can't fit the scalar (one sinogram → one volume)
+        // signature here. It lives in [`vector`] with its own multi-dataset API.
+        Algorithm::Vector => Err(Error::InvalidParam(
+            "vector tomography is not a scalar reconstruction; call \
+             tomoxide_recon::vector::{vector,vector2,vector3} directly"
+                .into(),
         )),
+        // Analytic methods are dispatched by `recon()` → `analytic()`, and
+        // Art/Bart by the ray-projector path above, so they never reach here.
+        _ => unreachable!("non-iterative algorithm reached iterative dispatch"),
     }
 }
 

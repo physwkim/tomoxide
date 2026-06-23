@@ -30,22 +30,28 @@ M2 family was done. Before declaring any one done:
 
 ---
 
-## Option A — Finish M2: vector tomography (deferred)
+## Option A — Finish M2: vector tomography ✅ done
 
-The only remaining M2 method. Out of scope of the scalar `recon()` contract:
-it takes **multiple** tilt datasets in and returns a **vector field** out.
+The last M2 method, now implemented. Out of scope of the scalar `recon()`
+contract (multiple tilt datasets in, a vector field out), so it lives in its own
+module rather than the `Algorithm` dispatch.
 
-- **Stub:** `crates/tomoxide-recon/src/lib.rs:141` (the `_ =>` arm of the
-  iterative dispatch) — `vector` / `vector2` / `vector3`.
-- **Upstream:** tomopy `libtomo/recon/vector.c` (`vector`, `vector2`, `vector3`).
-- **Blocker / needs sign-off:** a separate API surface (multi-dataset in,
-  `Vec`-of-`Volume` or vector-field out) outside `recon()`. Decide the public
-  shape before coding — this is an architectural addition, not a drop-in arm.
-- **Done =** reconstruct a synthetic vector phantom from ≥2 tilt series; each
-  component round-trips to the known field within tolerance.
-
-Niche relative to Option B; recommended only if there is a concrete vector-data
-consumer.
+- **API:** `crates/tomoxide-recon/src/vector.rs` — `vector` / `vector2` /
+  `vector3`, taking `ArrayView3` inputs in tomopy projection order `(dt, dy, dx)`
+  and returning the field components as `(dy, dx, dx)` `Array3`s. The
+  `Algorithm::Vector` arm of the scalar dispatch returns an `InvalidParam`
+  pointing here.
+- **Upstream:** tomopy `libtomo/recon/vector.c` + the shared ray-tracing helpers
+  in `utils.c` (`preprocessing`, `calc_quadrant`, `calc_coords`, `trim_coords`,
+  `sort_intersections`, `calc_dist2`, `calc_simdata2/3`) — all ported line-for-line.
+- **Parity:** bit-exact (Δ=0) vs tomopy 1.15 via golden fixtures
+  (`tools/gen_tomopy_vector_golden.py`, `crates/tomoxide/tests/vector_parity.rs`).
+  Faithful to the mixed f32/f64 arithmetic and the `calc_quadrant` int rescaling.
+- **Cube requirement:** `vector2`/`vector3` reconstruct a full `dx³` field, so
+  their axis-1/axis-2 write indices only stay in bounds when `dy == dx`. tomopy
+  silently corrupts memory when `dy != dx`; the port rejects it explicitly.
+- **tomopy quirk preserved:** `vector2`/`vector3` use only `theta1`/`center1`
+  for every pass (the extra thetas/centers are accepted but unused upstream).
 
 ---
 
