@@ -86,8 +86,13 @@ fn analytic(
     filt.apply(&mut filtered, &kernel, geom)?;
 
     // fourierrec grids the filtered projections onto the Fourier plane with
-    // tomocupy's Gaussian USFFT kernel (needs only the Fft capability).
+    // tomocupy's Gaussian USFFT kernel. A backend with a monolithic Fourier
+    // method (CUDA cfunc_fourierrec) handles it directly; otherwise it composes
+    // from the generic Fft capability (CPU/wgpu).
     if algorithm == Algorithm::Fourierrec {
+        if let Some(fr) = backend.fourier_reconstruct() {
+            return fr.reconstruct(&filtered, geom, n);
+        }
         let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
         return Ok(Volume::new(fourierrec::fourierrec(
             &filtered, geom, n, fft,

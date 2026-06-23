@@ -86,6 +86,12 @@ impl Backend for CudaBackend {
     fn backprojector(&self) -> Option<&dyn tomoxide_core::backend::FilteredBackproject> {
         Some(self)
     }
+
+    /// Fourier-gridding reconstruction on the GPU (`cfunc_fourierrec`).
+    #[cfg(feature = "cuda")]
+    fn fourier_reconstruct(&self) -> Option<&dyn tomoxide_core::backend::FourierReconstruct> {
+        Some(self)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -93,7 +99,7 @@ mod cuda_impl {
     use super::{ffi, CudaBackend};
     use ndarray::Array3;
     use std::os::raw::c_void;
-    use tomoxide_core::backend::FilteredBackproject;
+    use tomoxide_core::backend::{FilteredBackproject, FourierReconstruct};
     use tomoxide_core::data::{Layout, Tomo, Volume};
     use tomoxide_core::error::{Error, Result};
     use tomoxide_core::geometry::{Beam, Geometry};
@@ -233,6 +239,108 @@ mod cuda_impl {
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
             Ok(())
+        }
+    }
+
+    impl FourierReconstruct for CudaBackend {
+        /// Fourier-gridding reconstruction via tomocupy's `cfunc_fourierrec`.
+        ///
+        /// The kernel processes `nz/2` **complex** slice-pairs: slice `s` and
+        /// `s + nz/2` of the filtered sinogram are packed into the real/imag of
+        /// one complex slice (tomocupy `FourierRec.backprojection`), and the
+        /// output volume is de-interleaved the same way. Requires an even slice
+        /// count and a square grid `n == ncols`. The FBP filter (incl. the
+        /// rotation-centre shift) is applied by the caller, so the kernel is
+        /// centre-agnostic. Output carries tomocupy's grid convention (verified
+        /// by scale/flip-invariant correlation vs the CPU `fourierrec`).
+        fn reconstruct(
+            &self,
+            filtered: &Tomo<f32>,
+            geom: &Geometry,
+            n: usize,
+        ) -> Result<Volume<f32>> {
+            let s = filtered.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let nz = s.n_rows();
+            let nproj = s.n_angles();
+            let ncols = s.n_cols();
+            if nz % 2 != 0 {
+                return Err(Error::InvalidParam(format!(
+                    "cuda fourierrec needs an even slice count (complex pairing); got nz={nz}"
+                )));
+            }
+            if n != ncols {
+                return Err(Error::InvalidParam(format!(
+                    "cuda fourierrec needs a square grid = detector width {ncols}; got {n}"
+                )));
+            }
+            let theta = &geom.angles.0;
+            if theta.len() != nproj {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("{nproj} angles"),
+                    found: theta.len().to_string(),
+                });
+            }
+            let src = s
+                .array
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+            // Pack slice pairs (s, s+nz/2) into interleaved complex: for each
+            // complex element [s, p, x], re = filtered[s], im = filtered[s+nz/2].
+            let half = nz / 2;
+            let mut g = vec![0.0f32; nz * nproj * ncols];
+            for sp in 0..half {
+                for p in 0..nproj {
+                    for x in 0..ncols {
+                        let idx = sp * nproj * ncols + p * ncols + x;
+                        g[2 * idx] = src[sp * nproj * ncols + p * ncols + x];
+                        g[2 * idx + 1] = src[(sp + half) * nproj * ncols + p * ncols + x];
+                    }
+                }
+            }
+
+            let g_dev = DevBuf::from_host_f32(&g)?;
+            let theta_dev = DevBuf::from_host_f32(theta)?;
+            // Output: complex [nz/2, n, n] = nz*n*n floats.
+            let f_dev = DevBuf::zeroed(nz * n * n * std::mem::size_of::<f32>())?;
+
+            let handle = unsafe {
+                ffi::tomoxide_fourierrec_new(nproj, half, n, theta_dev.ptr as *const f32)
+            };
+            if handle.is_null() {
+                return Err(Error::Backend("cfunc_fourierrec allocation failed".into()));
+            }
+            unsafe {
+                ffi::tomoxide_fourierrec_backproject(
+                    handle,
+                    f_dev.ptr,
+                    g_dev.ptr,
+                    std::ptr::null_mut(),
+                );
+            }
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            unsafe { ffi::tomoxide_fourierrec_free(handle) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda fourierrec sync failed ({rc})")));
+            }
+
+            let mut fbuf = vec![0.0f32; nz * n * n];
+            f_dev.to_host_f32(&mut fbuf)?;
+            // De-interleave: re → slice sp, im → slice sp+nz/2.
+            let mut vol = vec![0.0f32; nz * n * n];
+            for sp in 0..half {
+                for y in 0..n {
+                    for x in 0..n {
+                        let idx = sp * n * n + y * n + x;
+                        vol[sp * n * n + y * n + x] = fbuf[2 * idx];
+                        vol[(sp + half) * n * n + y * n + x] = fbuf[2 * idx + 1];
+                    }
+                }
+            }
+            Ok(Volume::new(
+                Array3::from_shape_vec((nz, n, n), vol)
+                    .map_err(|e| Error::InvalidParam(format!("cuda fourierrec shape: {e}")))?,
+            ))
         }
     }
 }

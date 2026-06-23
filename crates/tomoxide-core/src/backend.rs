@@ -65,6 +65,12 @@ pub trait Backend: Send + Sync {
     fn backprojector(&self) -> Option<&dyn FilteredBackproject> {
         None
     }
+    /// Monolithic Fourier-gridding reconstruction (e.g. CUDA `cfunc_fourierrec`)
+    /// for backends that don't expose the generic [`Fft`] capability the
+    /// CPU/wgpu `fourierrec` composes from.
+    fn fourier_reconstruct(&self) -> Option<&dyn FourierReconstruct> {
+        None
+    }
     /// Forward projection (Radon).
     fn projector(&self) -> Option<&dyn ForwardProject> {
         None
@@ -189,6 +195,16 @@ pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
         };
     }
     Ok(f)
+}
+
+/// Direct Fourier-gridding reconstruction (sinogram → volume) for a backend
+/// with a monolithic Fourier method that doesn't decompose into the [`Fft`]
+/// capability (CUDA `cfunc_fourierrec`). The caller applies the FBP filter
+/// first, so the input is the **filtered** sinogram.
+pub trait FourierReconstruct {
+    /// Reconstruct an `[nz, n, n]` volume from a filtered sinogram
+    /// `[nz, nproj, ncols]`.
+    fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>>;
 }
 
 /// Back-projection: sinogram → volume.

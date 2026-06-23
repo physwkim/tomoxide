@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "cfunc_linerec.cuh"
+#include "cfunc_fourierrec.cuh"
 
 namespace {
 inline size_t as_size(void* p) { return reinterpret_cast<size_t>(p); }
@@ -62,5 +63,14 @@ void tomoxide_linerec_backproject(void* h, void* f, const void* g, const float* 
                                                  as_size(stream));
 }
 void tomoxide_linerec_free(void* h) { delete static_cast<cfunc_linerec*>(h); }
+
+// ---- fourierrec (cfunc_fourierrec) ----
+void* tomoxide_fourierrec_new(size_t nproj, size_t nz, size_t n, const float* theta) {
+  return new cfunc_fourierrec(nproj, nz, n, as_size(theta));
+}
+void tomoxide_fourierrec_backproject(void* h, void* f, const void* g, void* stream) {
+  static_cast<cfunc_fourierrec*>(h)->backprojection(as_size(f), as_size(g), as_size(stream));
+}
+void tomoxide_fourierrec_free(void* h) { delete static_cast<cfunc_fourierrec*>(h); }
 
 }  // extern "C"

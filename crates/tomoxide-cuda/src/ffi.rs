@@ -48,4 +48,23 @@ unsafe extern "C" {
         stream: *mut c_void,
     );
     pub fn tomoxide_linerec_free(handle: *mut c_void);
+
+    // --- fourierrec (cfunc_fourierrec) ---
+    /// `cfunc_fourierrec(nproj, nz, n, theta_ptr)` — `nz` is the number of
+    /// complex slice-pairs (real input slices / 2); `theta` is a device pointer.
+    pub fn tomoxide_fourierrec_new(
+        nproj: usize,
+        nz: usize,
+        n: usize,
+        theta: *const f32,
+    ) -> *mut c_void;
+    /// `backprojection(f, g, stream)` — `g` = packed complex filtered sinogram,
+    /// `f` = packed complex output volume (both device pointers).
+    pub fn tomoxide_fourierrec_backproject(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        stream: *mut c_void,
+    );
+    pub fn tomoxide_fourierrec_free(handle: *mut c_void);
 }

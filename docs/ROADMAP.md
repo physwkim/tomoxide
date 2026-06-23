@@ -159,9 +159,15 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   the kernel's y-flip + `4/nproj` vs `π/nproj` scale), CUDA↔phantom 0.96
   (`crates/tomoxide/tests/cuda_fbp_parity.rs`). Needs ≥2 slices (the kernel
   interpolates vertically).
-- ⬜ `fourierrec`/`lprec` GPU back-projection (cufft, the complex slice-packing),
-  GPU `cfunc_filter`, and GPU `Elementwise`/stripe/phase to match tomocupy's
-  `proc_functions`.
+- ✅ `fourierrec` GPU reconstruction (`cfunc_fourierrec`, cuFFT) via a new
+  `FourierReconstruct` capability — `recon(Fourierrec, &CudaBackend)` packs
+  slice-pairs into complex, runs the kernel, de-interleaves, with the FBP filter
+  on the CPU (shared definition). CUDA↔CPU fourierrec Pearson = 0.9997, ↔phantom
+  0.971 (`cuda_fbp_parity.rs`). Needs an even slice count.
+- ⬜ `lprec` GPU back-projection, GPU `cfunc_filter`, and GPU
+  `Elementwise`/stripe/phase to match tomocupy's `proc_functions`. (The GPU
+  filter is low-value: the FBP filter is cheap and already shared from the CPU
+  definition, which both GPU back-projectors consume.)
 - Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
 ## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`) 🟢 chunked driver done
