@@ -13,6 +13,7 @@ default = []
 # Forward backend features to the backend crates.
 cuda = ["tomoxide-cuda/cuda"]
 gpu-wgpu = ["tomoxide-wgpu/gpu-wgpu"]
+beam-hardening = ["tomoxide-prep/beam-hardening"]
 
 [dependencies]
 tomoxide-core.workspace = true

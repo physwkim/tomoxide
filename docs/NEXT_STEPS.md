@@ -469,9 +469,20 @@ below by dependency and value — the first three close the end-to-end pipeline.
 
 ### B7. Lower-priority polish (M3 tail)
 
-- **Beam hardening** — `crates/tomoxide-prep/src/hardening.rs:11`
-  `beam_correct`; tomocupy `processing/external/hardening.py:50`. Needs
-  material/spectrum config; defer unless a dataset needs it.
+- ✅ **Beam hardening** — `crates/tomoxide-prep/src/hardening.rs`
+  (`BeamCorrector`); tomocupy `processing/external/hardening.py` +
+  the `beamhardening` package (aps-7bm). Builds the centerline (extinction →
+  pathlength) and angular (fan-angle → factor) LUTs by integrating the
+  scintillator-detected spectrum over sample thickness, then applies the two
+  `np.interp` passes tomocupy runs after minus-log. Gated behind the
+  **`beam-hardening`** feature (pulls xraylib; its build runs bindgen → needs
+  libclang). Cross sections come from xraylib instead of `beamhardening`'s
+  xraydb (no Rust port): identical for elements, ~4e-5 for compounds; the
+  algorithm is reproduced exactly, so parity vs an xraylib reference is at the
+  f64 floor (centerline ≈ 4e-12, output f32 ≈ 1e-7) — see
+  `tools/gen_beamhardening_golden.py`, `tests/beamhardening_parity.rs`.
+  Build note: `LIBCLANG_PATH` + `BINDGEN_EXTRA_CLANG_ARGS` (clang/gcc builtin
+  include) may be needed for bindgen on systems without a default clang.
 - ✅ **Sim noise** — `add_gaussian` / `add_poisson` / `add_rings` /
   `add_salt_pepper` / `add_zingers` (`crates/tomoxide-sim/src/noise.rs`; tomopy
   `sim/project.py:110,136,153,183,211`). Done. Distribution parity (matched
