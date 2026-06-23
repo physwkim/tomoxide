@@ -25,6 +25,7 @@ tomoxide-recon.workspace = true
 tomoxide-prep.workspace = true
 tomoxide-io.workspace = true
 tomoxide-sim.workspace = true
+ndarray.workspace = true
 log.workspace = true
 
 [dev-dependencies]

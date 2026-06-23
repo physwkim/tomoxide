@@ -3,11 +3,13 @@
 
 mod config;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
-use tomoxide::{BackendKind, Engine};
+use tomoxide::io::DatasetReader;
+use tomoxide::{Angles, BackendKind, Engine, Geometry, ReconParams};
+use tomoxide_core::geometry::Center;
 use tomoxide_core::params::Algorithm;
 
 use crate::config::Config;
@@ -107,12 +109,23 @@ fn main() -> anyhow::Result<()> {
                 center,
                 engine.name()
             );
-            // Wiring the DXchange reader → pipeline::reconstruct → writer is
-            // milestone M3; surface that honestly rather than pretending.
-            match tomoxide::io::open_dxchange(&file.to_string_lossy()) {
-                Ok(_) => unreachable!("reader is a stub"),
-                Err(e) => println!("not yet runnable: {e}"),
-            }
+            let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
+            let geom = geometry_from_reader(reader.as_mut(), center)?;
+            let params = recon_params(&geom);
+            let ds = reader.read_all()?;
+            let vol = tomoxide::reconstruct(
+                ds,
+                &geom,
+                algo,
+                &params,
+                &tomoxide::PrepOptions::default(),
+                &engine,
+            )?;
+            let out = recon_out_path(&file);
+            let mut writer = tomoxide::io::create_writer(&out, tomoxide::io::SaveFormat::Tiff)?;
+            let nz = vol.dims().0;
+            writer.write_chunk(&vol, 0, nz)?;
+            println!("wrote {nz} reconstructed slices to {out}");
         }
         Command::ReconSteps { file } => {
             let engine = Engine::new(backend_kind)?;
@@ -121,10 +134,50 @@ fn main() -> anyhow::Result<()> {
                 file.display(),
                 engine.name()
             );
-            if let Err(e) = tomoxide::ReconSteps.run() {
-                println!("not yet runnable: {e}");
-            }
+            let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
+            let geom = geometry_from_reader(reader.as_mut(), None)?;
+            let params = recon_params(&geom);
+            let out = recon_out_path(&file);
+            let mut writer = tomoxide::io::create_writer(&out, tomoxide::io::SaveFormat::Tiff)?;
+            tomoxide::ReconSteps::new(64).run(
+                reader.as_mut(),
+                writer.as_mut(),
+                &geom,
+                Algorithm::Fbp,
+                &params,
+                &tomoxide::PrepOptions::default(),
+                &engine,
+            )?;
+            println!("wrote streamed reconstruction to {out}");
         }
     }
     Ok(())
+}
+
+/// Build a parallel-beam geometry from the reader's sizes/angles, optionally
+/// overriding the rotation center (else the detector midline).
+fn geometry_from_reader(
+    reader: &mut dyn DatasetReader,
+    center: Option<f32>,
+) -> anyhow::Result<Geometry> {
+    let (_nproj, nz, nx, _nflat, _ndark) = reader.read_sizes()?;
+    let theta = reader.read_theta()?;
+    let mut geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
+    if let Some(c) = center {
+        geom.center = Center::Scalar(c);
+    }
+    Ok(geom)
+}
+
+/// Reconstruction params with the grid sized to the detector width.
+fn recon_params(geom: &Geometry) -> ReconParams {
+    ReconParams {
+        num_gridx: Some(geom.detector.width),
+        ..Default::default()
+    }
+}
+
+/// Output path for a reconstruction: `<input-without-extension>_rec`.
+fn recon_out_path(file: &Path) -> String {
+    format!("{}_rec", file.with_extension("").display())
 }

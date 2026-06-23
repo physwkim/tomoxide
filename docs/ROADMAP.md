@@ -164,12 +164,22 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   `proc_functions`.
 - Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
-## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`)
+## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`) 🟢 chunked driver done
 
-- `pipeline::ReconSteps`: sinogram/projection chunking, double buffering,
-  3-stage overlap (read → H2D → compute → D2H → write), read/write thread
-  pools, `try`/`try_lamino` center & laminography sweeps.
-- Out-of-core reconstruction of a dataset larger than device memory.
+- ✅ `pipeline::ReconSteps::run` ports tomocupy `recon_steps_all`: read whole
+  dataset → normalize → phase (row-coupling stages once), then reconstruct and
+  write **by sinogram (z) chunks** of `chunk_rows`, streaming each chunk to the
+  `VolumeWriter::write_chunk` interface instead of materializing the whole
+  volume. A `PerRow` center is sliced per chunk. Verified bit-identical (Δ=0) to
+  the full in-memory `reconstruct` and chunk-size invariant
+  (`crates/tomoxide/tests/recon_steps_parity.rs`) — the analytic methods are
+  per-slice independent.
+- ⬜ Overlapped multi-stream optimization (double buffering, 3-stage
+  read→H2D→compute→D2H→write overlap, read/write thread pools) and the
+  `try`/`try_lamino` center & laminography sweeps.
+- ⬜ True out-of-core *reads* (chunked `DatasetReader`) for datasets larger than
+  host memory — the current driver reads the whole dataset to memory (as
+  tomocupy `recon_steps_all` does) and bounds only the recon/write working set.
 
 ## M6 — Portable GPU (wgpu / Metal)
 
