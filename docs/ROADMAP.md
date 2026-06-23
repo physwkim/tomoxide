@@ -171,11 +171,19 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   backend). Direct GPU↔CPU filter rel Δ ≈ 2e-5 (cuFFT vs rustfft).
 - ✅ GPU **Elementwise** (dark/flat + minus-log): darkflat Δ=0, minus_log
   ≈1e-7 vs CPU (`cuda_elementwise_parity.rs`).
-- ⬜ `lprec` GPU back-projection (needs the precomputed log-polar grids uploaded
-  via `cfunc_lprec::setgrids` in the kernel's exact layout) and GPU
-  stripe/phase. Note: each GPU capability is host-in/out per the `Backend`
-  trait, so these are parity ports — a fused device-resident pipeline (no
-  per-stage host↔device copies) is a separate, larger design change.
+- ⬜ `lprec` GPU back-projection — **deferred (cost/value + layering).** The
+  kernel (`cfunc_lprec`) is straightforward to wire, but its `setgrids` wants
+  the 10 precomputed log-polar grids (fZ half-spectrum, `lp2p*`/`C2lp*`,
+  `lpids`/`wids`/`cids`) in the kernel's exact cuFFT-2D-R2C layout. Those grids
+  live in `recon::lprec`'s private precompute, so wiring them would either invert
+  the layering (`tomoxide-cuda` → `tomoxide-recon`, which the architecture
+  forbids — backends depend on `tomoxide-core` only) or duplicate ~200 lines of
+  precompute, all for a parity-only third analytic method (GPU `fourierrec`
+  already covers analytic recon on the device). Revisit if the lprec precompute
+  is promoted into `tomoxide-core`.
+- ⬜ GPU stripe/phase. Note: each GPU capability is host-in/out per the
+  `Backend` trait, so these are parity ports — a fused device-resident pipeline
+  (no per-stage host↔device copies) is a separate, larger design change.
 - Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
 ## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`) 🟢 chunked driver done
