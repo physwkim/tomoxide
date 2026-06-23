@@ -139,8 +139,15 @@ below by dependency and value — the first three close the end-to-end pipeline.
   gridrec reconstructions, not bit-identical to tomopy — validated against an
   independent `recon(Gridrec)` (Δ=0) plus the mask geometry. `write_center_parity.rs`,
   golden from `tools/gen_tomopy_write_center_golden.py`.
-- **Remaining stub:** `crates/tomoxide-recon/src/center.rs` — `find_center_sift`
-  (defer to M7, needs SIFT/AI; tomocupy `find_center.py:99`).
+- ✅ **`find_center_sift`** — `crates/tomoxide-recon/src/center.rs` (`sift`
+  module, **`sift-center`** feature). Ports tomocupy `find_center.py`
+  `_register_shift_sift` (OpenCV SIFT via the `opencv` crate → BFMatcher knn +
+  Lowe ratio test → mean keypoint shift) and the `n/2 − shift_x/2` center. The
+  uint8 normalization replicates numpy's `histogram`-based robust min/max
+  bit-exact; with the same OpenCV linked on both sides the shifts match cv2 to
+  ~5e-7. Build needs OpenCV (conda `libopencv`) + clang/libclang (the `opencv`
+  crate runs bindgen); set `PKG_CONFIG_PATH`, `LIBCLANG_PATH`, and
+  `LD_LIBRARY_PATH` to the OpenCV env, with a `clang` binary on `PATH`.
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 

@@ -140,7 +140,7 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   Fourier recentering shift used the raw FFT bin index instead of the signed
   frequency, collapsing reconstructions at sub-pixel centers (invisible at the
   integer default center); fixed (M1 gridrec, bit-identical at integer centers).
-  ⬜ `write_center`, `find_center_sift` (still stubs).
+  ✅ `write_center`; ✅ `find_center_sift` (OpenCV SIFT, `sift-center` feature).
 - `tomoxide-io`: DXchange HDF5 reader/writer + TIFF.
 
 **Done = a full CPU pipeline: HDF in → preprocess → center → FBP → TIFF out.**

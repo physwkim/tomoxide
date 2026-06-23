@@ -2,7 +2,8 @@
 //! `find_center.py`). `find_center` (entropy), `find_center_vo` (Nghia Vo's
 //! method), `find_center_pc` (phase correlation), and `write_center`
 //! (reconstruct a slice across a range of centers) are implemented;
-//! `find_center_sift` remains a stub. See `docs/PORTING.md` §C.
+//! `find_center_sift` is implemented behind the `sift-center` feature (it links
+//! OpenCV). See `docs/PORTING.md` §C.
 
 use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
 use tomoxide_core::backend::{Backend, Fft};
@@ -200,11 +201,209 @@ pub fn find_center_pc(
 }
 
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
-pub fn find_center_sift(_proj0: &[f32], _proj180: &[f32]) -> Result<f32> {
+///
+/// Available only with the **`sift-center`** feature (it links OpenCV via the
+/// `opencv` crate). See [`sift`] for the implementation.
+#[cfg(not(feature = "sift-center"))]
+pub fn find_center_sift(_proj0: &Array2<f32>, _proj180: &Array2<f32>, _threshold: f32) -> Result<f32> {
     Err(Error::todo(
-        "center::find_center_sift",
+        "center::find_center_sift (build with the `sift-center` feature)",
         "tomocupy find_center.py:99",
     ))
+}
+
+#[cfg(feature = "sift-center")]
+pub use sift::{find_center_sift, register_shift_sift};
+
+/// SIFT-feature rotation-center finding (tomocupy `find_center.py`
+/// `_register_shift_sift` + the `n//2 - shift_x/2` center formula). Requires the
+/// `sift-center` feature.
+#[cfg(feature = "sift-center")]
+pub mod sift {
+    use super::{fliplr, Error, Result};
+    use ndarray::Array2;
+    use opencv::core::{DMatch, KeyPoint, Mat, Vector, CV_8UC1, NORM_L2};
+    use opencv::features2d::{BFMatcher, SIFT};
+    use opencv::prelude::*;
+
+    /// numpy `np.histogram(data, 1000)` peak-thresholded robust min/max
+    /// (`_find_min_max`): 1000 uniform bins over `[min, max]`, keep bins whose
+    /// count exceeds 0.5 % of the peak, return the outermost surviving edges.
+    /// Replicates numpy's uniform-bin indexing (including the floating-point
+    /// decrement/increment corrections) so the 0–255 normalization is bit-exact.
+    fn find_min_max(data: &[f32]) -> (f32, f32) {
+        const NBINS: usize = 1000;
+        let (mut dmin, mut dmax) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in data {
+            if v < dmin {
+                dmin = v;
+            }
+            if v > dmax {
+                dmax = v;
+            }
+        }
+        let (first, last) = (dmin as f64, dmax as f64);
+        if last <= first {
+            return (dmin, dmax);
+        }
+        // bin_edges = linspace(first, last, NBINS+1) (last forced exact).
+        let edges: Vec<f64> = (0..=NBINS)
+            .map(|i| {
+                if i == NBINS {
+                    last
+                } else {
+                    first + (last - first) * (i as f64) / (NBINS as f64)
+                }
+            })
+            .collect();
+        let norm = NBINS as f64 / (last - first);
+        let mut h = vec![0u64; NBINS];
+        for &v in data {
+            let x = v as f64;
+            let mut idx = ((x - first) * norm) as i64;
+            if idx == NBINS as i64 {
+                idx -= 1;
+            }
+            let mut idx = idx.clamp(0, NBINS as i64 - 1) as usize;
+            // numpy corrections (both applied, sequentially — not else-if).
+            if x < edges[idx] && idx > 0 {
+                idx -= 1;
+            }
+            if idx != NBINS - 1 && x >= edges[idx + 1] {
+                idx += 1;
+            }
+            h[idx] += 1;
+        }
+        let hmax = *h.iter().max().unwrap_or(&0);
+        let thr = hmax as f64 * 0.005;
+        let st = h.iter().position(|&c| c as f64 > thr).unwrap_or(0);
+        let end = h.iter().rposition(|&c| c as f64 > thr).unwrap_or(NBINS - 1);
+        (edges[st] as f32, edges[end + 1] as f32)
+    }
+
+    /// `(img - mmin)/(mmax-mmin)*255`, clipped to 0–255, as a `CV_8UC1` Mat
+    /// (numpy f32 arithmetic then `astype(uint8)` truncation).
+    fn to_u8_mat(img: &Array2<f32>, mmin: f32, mmax: f32) -> Result<Mat> {
+        let (rows, cols) = img.dim();
+        let scale = mmax - mmin;
+        let mut buf = Vec::with_capacity(rows * cols);
+        for &v in img.iter() {
+            // numpy clips >255→255 then <0→0; clamp is equivalent for finite v.
+            let t = ((v - mmin) / scale * 255.0).clamp(0.0, 255.0);
+            buf.push(t as u8);
+        }
+        let mut m = Mat::new_rows_cols_with_default(
+            rows as i32,
+            cols as i32,
+            CV_8UC1,
+            opencv::core::Scalar::all(0.0),
+        )
+        .map_err(cv_err)?;
+        m.data_bytes_mut().map_err(cv_err)?.copy_from_slice(&buf);
+        Ok(m)
+    }
+
+    fn cv_err(e: opencv::Error) -> Error {
+        Error::Backend(format!("opencv: {e}"))
+    }
+
+    /// `(img normalized by its own robust min/max) → uint8` (tomocupy's
+    /// per-image 0–255 mapping). Exposed for parity testing of the
+    /// histogram-based normalization in isolation.
+    pub fn normalize_to_u8(img: &Array2<f32>) -> Vec<u8> {
+        let (mmin, mmax) = find_min_max(img.as_slice().expect("contiguous image"));
+        let scale = mmax - mmin;
+        img.iter()
+            .map(|&v| ((v - mmin) / scale * 255.0).clamp(0.0, 255.0) as u8)
+            .collect()
+    }
+
+    /// Per-pair SIFT shift estimate (tomocupy `_register_shift_sift`): SIFT
+    /// detect+describe on the normalized `datap2`/`datap1` images, BFMatcher
+    /// knn (k=2) with Lowe ratio test (`threshold`), and the mean keypoint
+    /// displacement, returned as `[dy, dx]` per pair. min/max for normalization
+    /// come from `datap1` (matching upstream). Also returns the number of good
+    /// matches in the last pair.
+    pub fn register_shift_sift(
+        datap1: &[Array2<f32>],
+        datap2: &[Array2<f32>],
+        threshold: f32,
+    ) -> Result<(Array2<f32>, usize)> {
+        if datap1.len() != datap2.len() || datap1.is_empty() {
+            return Err(Error::InvalidParam(
+                "register_shift_sift: need equal, non-empty datap1/datap2".into(),
+            ));
+        }
+        let mut sift = SIFT::create_def().map_err(cv_err)?;
+        let mut shifts = Array2::<f32>::zeros((datap1.len(), 2));
+        let mut ngood = 0usize;
+        for (id, (p1, p2)) in datap1.iter().zip(datap2).enumerate() {
+            let (mmin, mmax) = find_min_max(p1.as_slice().expect("contiguous datap1"));
+            let tmp1 = to_u8_mat(p2, mmin, mmax)?; // datap2 → query
+            let tmp2 = to_u8_mat(p1, mmin, mmax)?; // datap1 → train
+            let no_mask = Mat::default();
+            let (mut kp1, mut des1) = (Vector::<KeyPoint>::new(), Mat::default());
+            let (mut kp2, mut des2) = (Vector::<KeyPoint>::new(), Mat::default());
+            sift.detect_and_compute(&tmp1, &no_mask, &mut kp1, &mut des1, false)
+                .map_err(cv_err)?;
+            sift.detect_and_compute(&tmp2, &no_mask, &mut kp2, &mut des2, false)
+                .map_err(cv_err)?;
+
+            let bf = BFMatcher::new(NORM_L2, false).map_err(cv_err)?;
+            let mut knn = Vector::<Vector<DMatch>>::new();
+            bf.knn_train_match(&des1, &des2, &mut knn, 2, &no_mask, false)
+                .map_err(cv_err)?;
+
+            let (mut sum_x, mut sum_y, mut n) = (0.0f64, 0.0f64, 0usize);
+            for pair in knn.iter() {
+                if pair.len() < 2 {
+                    continue;
+                }
+                let m = pair.get(0).map_err(cv_err)?;
+                let nn = pair.get(1).map_err(cv_err)?;
+                if m.distance < threshold * nn.distance {
+                    let src = kp1.get(m.query_idx as usize).map_err(cv_err)?.pt();
+                    let dst = kp2.get(m.train_idx as usize).map_err(cv_err)?.pt();
+                    sum_x += (src.x - dst.x) as f64;
+                    sum_y += (src.y - dst.y) as f64;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return Err(Error::InvalidParam(format!(
+                    "register_shift_sift: no good SIFT matches for pair {id}"
+                )));
+            }
+            ngood = n;
+            // np.mean(shift)[::-1] = [mean_y, mean_x].
+            shifts[[id, 0]] = (sum_y / n as f64) as f32;
+            shifts[[id, 1]] = (sum_x / n as f64) as f32;
+        }
+        Ok((shifts, ngood))
+    }
+
+    /// Rotation center from a 0°/180° projection pair via SIFT feature matching
+    /// (tomocupy `find_center_sift`). The 180° projection is flipped left-right
+    /// (`data[..., ::-1]`), matched against the 0° projection, and the center is
+    /// `ncol/2 - mean_horizontal_shift/2`. `threshold` is the Lowe ratio (0.5
+    /// upstream).
+    pub fn find_center_sift(
+        proj0: &Array2<f32>,
+        proj180: &Array2<f32>,
+        threshold: f32,
+    ) -> Result<f32> {
+        if proj0.dim() != proj180.dim() {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{:?}", proj0.dim()),
+                found: format!("{:?}", proj180.dim()),
+            });
+        }
+        let ncol = proj0.dim().1;
+        let datap1 = [proj0.clone()];
+        let datap2 = [fliplr(proj180)];
+        let (shifts, _) = register_shift_sift(&datap1, &datap2, threshold)?;
+        Ok(ncol as f32 / 2.0 - shifts[[0, 1]] / 2.0)
+    }
 }
 
 /// Reconstruct one slice across a range of rotation centers (tomopy

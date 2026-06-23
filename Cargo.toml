@@ -49,6 +49,10 @@ tomoxide = { path = "crates/tomoxide", version = "0.0.0" }
 # libclang at compile time (see crates/tomoxide-prep docs). ---
 xraylib = { path = "../xraylib-rs/crates/xraylib" }
 
+# --- computer vision (SIFT center finding; optional, `sift-center` feature).
+# Links a system/conda OpenCV (≥4.x); its build runs bindgen → needs clang. ---
+opencv = { version = "0.98", default-features = false, features = ["features2d", "imgproc"] }
+
 # --- numerics ---
 ndarray = "0.16"
 ndarray-npy = "0.9"
