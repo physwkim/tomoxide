@@ -95,4 +95,45 @@ unsafe extern "C" {
     ) -> i32;
     /// In-place `−ln(max(x, 1e-6))` (non-finite → 0) over `n` elements.
     pub fn tomoxide_minuslog(data: *mut c_void, n: usize, stream: *mut c_void) -> i32;
+
+    // --- device-resident analytic pipeline helpers ---
+    /// Edge-replicate pad `[nz,nproj,ncols]` → `[nz,nproj,ne]` (centred at `pad_side`).
+    pub fn tomoxide_pad(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        ne: usize,
+        pad_side: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Crop centred window `[nz,nproj,ne]` → `[nz,nproj,ncols]`.
+    pub fn tomoxide_crop(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        ne: usize,
+        pad_side: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Pack slice pairs `(s, s+nz/2)` → complex `[nz/2,nproj,ncols]` (interleaved).
+    pub fn tomoxide_pack_pairs(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// De-interleave complex `[nz/2,n,n]` → `[nz,n,n]`.
+    pub fn tomoxide_unpack_pairs(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
 }

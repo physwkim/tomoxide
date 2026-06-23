@@ -176,3 +176,47 @@ fn cuda_fbp_filter_matches_cpu() {
     // cuFFT vs rustfft: f32 FFT round-off floor.
     assert!(max_abs / scale < 1e-4, "GPU filter ≠ CPU filter: rel {}", max_abs / scale);
 }
+
+#[test]
+fn cuda_fused_equals_per_stage() {
+    // The fused on-device analytic path (recon → analytic_reconstruct) must
+    // produce exactly the same volume as composing the per-capability stages
+    // (filter then back-project) — same kernels, same data, only the
+    // intermediate stays on the device. So Δ = 0.
+    use tomoxide::backend::{Backend, FbpFilter, FilteredBackproject};
+    use tomoxide::{FilterName, Layout, Tomo, Volume};
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let (n, nang, nz) = (96usize, 72usize, 4usize);
+    let params = ReconParams { num_gridx: Some(n), ..Default::default() };
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let sino = sim::project(&Volume::new(stack), &geom, &CpuBackend::new()).unwrap();
+
+    // Fused (device-resident) path.
+    let fused = recon::recon(&sino, &geom, Algorithm::Fbp, &params, &cuda).unwrap();
+
+    // Per-stage path through the same GPU capabilities.
+    let kernel = cuda.fbp_filter().unwrap().make_filter(FilterName::Ramp, n).unwrap();
+    let mut filtered = Tomo::new(sino.array.clone(), Layout::Sinogram);
+    cuda.fbp_filter().unwrap().apply(&mut filtered, &kernel, &geom).unwrap();
+    let mut vol = Volume::new(ndarray::Array3::zeros((nz, n, n)));
+    cuda.backprojector().unwrap().backproject(&filtered, &geom, &mut vol).unwrap();
+
+    let max_d = fused
+        .array
+        .iter()
+        .zip(vol.array.iter())
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+    eprintln!("fused vs per-stage max|Δ| = {max_d:e}");
+    assert_eq!(max_d, 0.0, "fused device path differs from per-stage: {max_d}");
+}

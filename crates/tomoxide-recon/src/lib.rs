@@ -78,6 +78,17 @@ fn analytic(
         let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
         return Ok(Volume::new(gridrec::gridrec(sino, geom, n, fft)?));
     }
+    // A backend with a fused on-device analytic path (CUDA) runs the whole
+    // filter → back-projection / Fourier chain resident on the device — one
+    // upload, one download — instead of host-roundtripping each capability.
+    if matches!(
+        algorithm,
+        Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+    ) {
+        if let Some(ar) = backend.analytic_reconstruct() {
+            return ar.reconstruct(sino, geom, algorithm, params);
+        }
+    }
     let filt = backend
         .fbp_filter()
         .ok_or_else(|| missing("FbpFilter", backend))?;

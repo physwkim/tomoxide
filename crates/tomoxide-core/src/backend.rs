@@ -71,6 +71,14 @@ pub trait Backend: Send + Sync {
     fn fourier_reconstruct(&self) -> Option<&dyn FourierReconstruct> {
         None
     }
+    /// Fused analytic reconstruction kept resident on the device: filter →
+    /// back-projection (or Fourier gridding) without intermediate host copies
+    /// (CUDA). When present, [`crate`]'s analytic dispatch routes the whole
+    /// `Fbp`/`Linerec`/`Fourierrec` chain here (one upload, one download)
+    /// instead of composing the host-roundtripping per-capability stages.
+    fn analytic_reconstruct(&self) -> Option<&dyn AnalyticReconstruct> {
+        None
+    }
     /// Forward projection (Radon).
     fn projector(&self) -> Option<&dyn ForwardProject> {
         None
@@ -195,6 +203,23 @@ pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
         };
     }
     Ok(f)
+}
+
+/// Fused, device-resident analytic reconstruction (raw sinogram → volume):
+/// the backend applies the FBP filter and the back-projection / Fourier
+/// gridding itself, keeping all intermediates on the device. Lets the analytic
+/// dispatcher avoid the per-capability host round-trips when a backend (CUDA)
+/// can fuse the chain. Must support at least `Fbp`/`Linerec` and `Fourierrec`.
+pub trait AnalyticReconstruct {
+    /// Reconstruct from the **unfiltered** sinogram; the backend computes the
+    /// FBP filter (`params.filter_name`) and applies it internally.
+    fn reconstruct(
+        &self,
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        algorithm: crate::params::Algorithm,
+        params: &crate::params::ReconParams,
+    ) -> Result<Volume<f32>>;
 }
 
 /// Direct Fourier-gridding reconstruction (sinogram → volume) for a backend

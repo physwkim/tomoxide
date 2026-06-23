@@ -181,9 +181,16 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   precompute, all for a parity-only third analytic method (GPU `fourierrec`
   already covers analytic recon on the device). Revisit if the lprec precompute
   is promoted into `tomoxide-core`.
-- ⬜ GPU stripe/phase. Note: each GPU capability is host-in/out per the
-  `Backend` trait, so these are parity ports — a fused device-resident pipeline
-  (no per-stage host↔device copies) is a separate, larger design change.
+- ✅ Fused **device-resident analytic pipeline** (`AnalyticReconstruct`
+  capability): `recon(Fbp/Linerec/Fourierrec, &CudaBackend)` now uploads the raw
+  sinogram once, runs pad → cuFFT filter → crop → back-projection (or pack →
+  fourierrec → unpack) entirely on the device, and downloads the volume once —
+  no per-stage host↔device copies. Device kernels for pad/crop/pack/unpack.
+  Δ=0 vs composing the per-capability stages (`cuda_fbp_parity.rs`).
+- ⬜ GPU stripe/phase. Note: the per-capability `Backend` accessors are still
+  host-in/out (used standalone); the fused `AnalyticReconstruct` is the
+  zero-copy path for the analytic chain. Folding stripe/phase into a fused
+  preprocessing+recon device path is a further extension.
 - Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
 ## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`) 🟢 chunked driver done

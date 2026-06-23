@@ -10,9 +10,12 @@
 //! GPU capabilities wired through the shim: the FBP **filter** (`cfunc_filter`,
 //! cuFFT), parallel-beam **back-projection** (`cfunc_linerec`), **Fourier**
 //! reconstruction (`cfunc_fourierrec`, via the `FourierReconstruct` capability),
-//! and **elementwise** dark/flat + minus-log. So `recon(Fbp, &CudaBackend)` and
-//! `recon(Fourierrec, &CudaBackend)` run filter + back-projection entirely on
-//! the device. Still on the CPU/wgpu side only: `lprec` and GPU stripe/phase.
+//! and **elementwise** dark/flat + minus-log. The `AnalyticReconstruct`
+//! capability fuses the analytic chain into a **device-resident** path:
+//! `recon(Fbp/Linerec/Fourierrec, &CudaBackend)` uploads the sinogram once,
+//! runs pad → filter → crop → back-projection (or pack → fourierrec → unpack)
+//! all on the device, and downloads the volume once — no per-stage host copies.
+//! Still on the CPU/wgpu side only: `lprec` and GPU stripe/phase.
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 #[cfg(feature = "cuda")]
@@ -82,6 +85,13 @@ impl Backend for CudaBackend {
     /// Fourier-gridding reconstruction on the GPU (`cfunc_fourierrec`).
     #[cfg(feature = "cuda")]
     fn fourier_reconstruct(&self) -> Option<&dyn tomoxide_core::backend::FourierReconstruct> {
+        Some(self)
+    }
+
+    /// Fused on-device analytic reconstruction (filter → back-projection /
+    /// fourierrec without per-stage host copies).
+    #[cfg(feature = "cuda")]
+    fn analytic_reconstruct(&self) -> Option<&dyn tomoxide_core::backend::AnalyticReconstruct> {
         Some(self)
     }
 
@@ -243,6 +253,183 @@ mod cuda_impl {
         }
     }
 
+    /// Complex FBP weight `w[z, k] = ramp[k]·exp(-2πi·k·δ_z/pad)/pad`, for
+    /// `k in 0..ne/2+1`, `δ_z = ncols/2 − center(z)` (half spectrum ⇒ `f_k = k ≥
+    /// 0`), interleaved re/im — folds the ramp, signed-frequency centre-shift
+    /// phase, and `1/ne` cuFFT-inverse normalization (matches the CPU filter).
+    fn build_filter_w(
+        filter: &[f32],
+        geom: &Geometry,
+        nz: usize,
+        ncols: usize,
+        pad: usize,
+    ) -> Vec<f32> {
+        let nfreq = pad / 2 + 1;
+        let half = ncols as f32 / 2.0;
+        let inv_pad = 1.0f32 / pad as f32;
+        let mut w = vec![0.0f32; nz * nfreq * 2];
+        for z in 0..nz {
+            let delta = half - geom.center.at(z);
+            for (k, &fk) in filter[..nfreq].iter().enumerate() {
+                let ang = -std::f32::consts::TAU * k as f32 * delta / pad as f32;
+                let idx = z * nfreq + k;
+                w[2 * idx] = fk * ang.cos() * inv_pad;
+                w[2 * idx + 1] = fk * ang.sin() * inv_pad;
+            }
+        }
+        w
+    }
+
+    fn ck(rc: i32, what: &str) -> Result<()> {
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda {what} failed ({rc})")));
+        }
+        Ok(())
+    }
+
+    impl tomoxide_core::backend::AnalyticReconstruct for CudaBackend {
+        /// Fused, device-resident analytic reconstruction: upload the raw
+        /// sinogram once, then pad → cuFFT filter → crop → back-projection
+        /// (`Fbp`/`Linerec` via `cfunc_linerec`) or pack → `cfunc_fourierrec` →
+        /// unpack (`Fourierrec`) — all on the device — and download the volume
+        /// once. No per-stage host round-trips. Square grid (`n == ncols`).
+        fn reconstruct(
+            &self,
+            sino: &Tomo<f32>,
+            geom: &Geometry,
+            algorithm: tomoxide_core::params::Algorithm,
+            params: &tomoxide_core::params::ReconParams,
+        ) -> Result<Volume<f32>> {
+            use tomoxide_core::backend::make_fbp_filter;
+            use tomoxide_core::params::Algorithm;
+
+            if geom.beam != Beam::Parallel {
+                return Err(Error::InvalidParam(
+                    "cuda analytic reconstruct supports parallel beam only".into(),
+                ));
+            }
+            let s = sino.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let (nz, nproj, ncols) = s.array.dim();
+            let n = params.num_gridx.unwrap_or(ncols);
+            if n != ncols {
+                return Err(Error::InvalidParam(format!(
+                    "cuda analytic reconstruct needs a square grid = detector width {ncols}; got {n}"
+                )));
+            }
+            let theta = &geom.angles.0;
+            if theta.len() != nproj {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("{nproj} angles"),
+                    found: theta.len().to_string(),
+                });
+            }
+            let raw = s
+                .array
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+            let filter = make_fbp_filter(params.filter_name, ncols)?;
+            let pad = filter.len();
+            let pad_side = pad / 2 - ncols / 2;
+            let w = build_filter_w(&filter, geom, nz, ncols, pad);
+            let fsz = std::mem::size_of::<f32>();
+            let null = std::ptr::null_mut::<c_void>();
+
+            // Upload the raw sinogram + filter weights + angles ONCE.
+            let sino_dev = DevBuf::from_host_f32(raw)?;
+            let w_dev = DevBuf::from_host_f32(&w)?;
+            let theta_dev = DevBuf::from_host_f32(theta)?;
+
+            // pad → filter → crop, all device-resident.
+            let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_pad(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+                },
+                "pad",
+            )?;
+            let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
+            if fh.is_null() {
+                return Err(Error::Backend("cfunc_filter allocation failed".into()));
+            }
+            unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
+            unsafe { ffi::tomoxide_filter_free(fh) };
+            let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null)
+                },
+                "crop",
+            )?;
+
+            let vol = match algorithm {
+                Algorithm::Fbp | Algorithm::Linerec => {
+                    let f = DevBuf::zeroed(nz * n * n * fsz)?;
+                    let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, nz) };
+                    if h.is_null() {
+                        return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+                    }
+                    unsafe {
+                        ffi::tomoxide_linerec_backproject(
+                            h,
+                            f.ptr,
+                            gf.ptr,
+                            theta_dev.ptr as *const f32,
+                            std::f32::consts::FRAC_PI_2,
+                            0,
+                            null,
+                        );
+                    }
+                    unsafe { ffi::tomoxide_linerec_free(h) };
+                    ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                    let mut host = vec![0.0f32; nz * n * n];
+                    f.to_host_f32(&mut host)?;
+                    host
+                }
+                Algorithm::Fourierrec => {
+                    if nz % 2 != 0 {
+                        return Err(Error::InvalidParam(format!(
+                            "cuda fourierrec needs an even slice count; got nz={nz}"
+                        )));
+                    }
+                    let gc = DevBuf::zeroed(nz * nproj * ncols * fsz)?; // complex [nz/2,nproj,ncols]
+                    ck(
+                        unsafe { ffi::tomoxide_pack_pairs(gf.ptr, gc.ptr, nz, nproj, ncols, null) },
+                        "pack",
+                    )?;
+                    let fc = DevBuf::zeroed(nz * n * n * fsz)?; // complex [nz/2,n,n]
+                    let h = unsafe {
+                        ffi::tomoxide_fourierrec_new(nproj, nz / 2, n, theta_dev.ptr as *const f32)
+                    };
+                    if h.is_null() {
+                        return Err(Error::Backend("cfunc_fourierrec allocation failed".into()));
+                    }
+                    unsafe { ffi::tomoxide_fourierrec_backproject(h, fc.ptr, gc.ptr, null) };
+                    unsafe { ffi::tomoxide_fourierrec_free(h) };
+                    let vol_dev = DevBuf::zeroed(nz * n * n * fsz)?;
+                    ck(
+                        unsafe { ffi::tomoxide_unpack_pairs(fc.ptr, vol_dev.ptr, nz, n, null) },
+                        "unpack",
+                    )?;
+                    ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                    let mut host = vec![0.0f32; nz * n * n];
+                    vol_dev.to_host_f32(&mut host)?;
+                    host
+                }
+                other => {
+                    return Err(Error::InvalidParam(format!(
+                        "cuda analytic reconstruct: unsupported algorithm {other:?}"
+                    )))
+                }
+            };
+
+            Ok(Volume::new(
+                Array3::from_shape_vec((nz, n, n), vol)
+                    .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
+            ))
+        }
+    }
+
     impl FbpFilter for CudaBackend {
         /// Shared FBP filter definition (same ramp the CPU/wgpu backends build),
         /// so the GPU filter applies an identical kernel.
@@ -270,26 +457,12 @@ mod cuda_impl {
                 });
             }
             let pad_side = pad / 2 - ncols / 2;
-            let nfreq = pad / 2 + 1;
             let src = s
                 .array
                 .as_slice()
                 .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
-            // Complex w[z, k] = ramp[k]·exp(-2πi·k·δ_z/pad)/pad, k in 0..ne/2+1,
-            // δ_z = ncols/2 − center(z). (Half spectrum ⇒ f_k = k ≥ 0.)
-            let half = ncols as f32 / 2.0;
-            let inv_pad = 1.0f32 / pad as f32;
-            let mut w = vec![0.0f32; nz * nfreq * 2];
-            for z in 0..nz {
-                let delta = half - geom.center.at(z);
-                for (k, &fk) in filter[..nfreq].iter().enumerate() {
-                    let ang = -std::f32::consts::TAU * k as f32 * delta / pad as f32;
-                    let idx = z * nfreq + k;
-                    w[2 * idx] = fk * ang.cos() * inv_pad;
-                    w[2 * idx + 1] = fk * ang.sin() * inv_pad;
-                }
-            }
+            let w = build_filter_w(filter, geom, nz, ncols, pad);
 
             // Padded real sinogram [nz, nproj, pad], edge-replicated borders.
             let mut g = vec![0.0f32; nz * nproj * pad];
