@@ -7,12 +7,12 @@
 //! unavailable so the rest of the workspace still builds and runs (on CPU).
 //!
 //! ## M4 scope
-//! The GPU path is the FBP **back-projection** (`cfunc_linerec`, parallel
-//! beam): the heavy O(N³) reduction runs on the device, while the FBP **filter**
-//! reuses the shared CPU definition ([`tomoxide_cpu::CpuBackend`]'s
-//! `FbpFilter`), so `recon(Fbp, &CudaBackend)` filters on the host and
-//! back-projects on the GPU. The other `cfunc_*` classes (fourierrec/lprec, and
-//! the cufft filter) are scaffolded in the shim history but not wired here.
+//! GPU capabilities wired through the shim: the FBP **filter** (`cfunc_filter`,
+//! cuFFT), parallel-beam **back-projection** (`cfunc_linerec`), **Fourier**
+//! reconstruction (`cfunc_fourierrec`, via the `FourierReconstruct` capability),
+//! and **elementwise** dark/flat + minus-log. So `recon(Fbp, &CudaBackend)` and
+//! `recon(Fourierrec, &CudaBackend)` run filter + back-projection entirely on
+//! the device. Still on the CPU/wgpu side only: `lprec` and GPU stripe/phase.
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 #[cfg(feature = "cuda")]
@@ -26,13 +26,7 @@ use tomoxide_core::error::Result;
 
 /// Handle to the CUDA backend.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct CudaBackend {
-    /// CPU backend used for the (host-side) FBP filter — the shared filter
-    /// definition, so the filtered sinogram the GPU back-projects is identical
-    /// to the pure-CPU path.
-    #[cfg(feature = "cuda")]
-    cpu: tomoxide_cpu::CpuBackend,
-}
+pub struct CudaBackend;
 
 impl CudaBackend {
     /// Initialise the CUDA backend.
@@ -55,9 +49,7 @@ impl CudaBackend {
                     "no CUDA device found".into(),
                 ));
             }
-            Ok(CudaBackend {
-                cpu: tomoxide_cpu::CpuBackend,
-            })
+            Ok(CudaBackend)
         }
     }
 }
@@ -74,11 +66,11 @@ impl Backend for CudaBackend {
         matches!(dt, Dtype::F32 | Dtype::F16)
     }
 
-    /// FBP filter: the shared CPU definition (host-side), so the filtered
-    /// sinogram is bit-identical to the pure-CPU path before GPU back-projection.
+    /// FBP filter on the GPU (`cfunc_filter`, cuFFT), applying the shared ramp
+    /// definition so the filtered sinogram matches the CPU path.
     #[cfg(feature = "cuda")]
     fn fbp_filter(&self) -> Option<&dyn tomoxide_core::backend::FbpFilter> {
-        self.cpu.fbp_filter()
+        Some(self)
     }
 
     /// Parallel-beam back-projection on the GPU (`cfunc_linerec`).
@@ -105,10 +97,13 @@ mod cuda_impl {
     use super::{ffi, CudaBackend};
     use ndarray::{Array3, Axis};
     use std::os::raw::c_void;
-    use tomoxide_core::backend::{Elementwise, FilteredBackproject, FourierReconstruct};
+    use tomoxide_core::backend::{
+        make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
+    };
     use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
     use tomoxide_core::error::{Error, Result};
     use tomoxide_core::geometry::{Beam, Geometry};
+    use tomoxide_core::params::FilterName;
 
     /// RAII wrapper over a `cudaMalloc` allocation (freed on drop).
     struct DevBuf {
@@ -244,6 +239,106 @@ mod cuda_impl {
             f.to_host_f32(&mut host)?;
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+            Ok(())
+        }
+    }
+
+    impl FbpFilter for CudaBackend {
+        /// Shared FBP filter definition (same ramp the CPU/wgpu backends build),
+        /// so the GPU filter applies an identical kernel.
+        fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
+            make_fbp_filter(name, n)
+        }
+
+        /// FBP filtering on the GPU via tomocupy's `cfunc_filter` (cuFFT R2C →
+        /// ×w → C2R). The complex weight `w` folds the same ramp, signed-
+        /// frequency centre-shift phase, and `1/ne` normalization the CPU
+        /// `FbpFilter` uses, so the result matches the CPU filter (to the FFT
+        /// f32 floor). Edge-replicate padding to `ne = filter.len()`.
+        fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()> {
+            let pad = filter.len();
+            if pad == 0 {
+                return Err(Error::InvalidParam("empty filter".into()));
+            }
+            let orig = sino.layout;
+            let s = sino.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let (nz, nproj, ncols) = s.array.dim();
+            if pad < ncols {
+                return Err(Error::ShapeMismatch {
+                    expected: format!(">= {ncols} (n_cols)"),
+                    found: pad.to_string(),
+                });
+            }
+            let pad_side = pad / 2 - ncols / 2;
+            let nfreq = pad / 2 + 1;
+            let src = s
+                .array
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+            // Complex w[z, k] = ramp[k]·exp(-2πi·k·δ_z/pad)/pad, k in 0..ne/2+1,
+            // δ_z = ncols/2 − center(z). (Half spectrum ⇒ f_k = k ≥ 0.)
+            let half = ncols as f32 / 2.0;
+            let inv_pad = 1.0f32 / pad as f32;
+            let mut w = vec![0.0f32; nz * nfreq * 2];
+            for z in 0..nz {
+                let delta = half - geom.center.at(z);
+                for (k, &fk) in filter[..nfreq].iter().enumerate() {
+                    let ang = -std::f32::consts::TAU * k as f32 * delta / pad as f32;
+                    let idx = z * nfreq + k;
+                    w[2 * idx] = fk * ang.cos() * inv_pad;
+                    w[2 * idx + 1] = fk * ang.sin() * inv_pad;
+                }
+            }
+
+            // Padded real sinogram [nz, nproj, pad], edge-replicated borders.
+            let mut g = vec![0.0f32; nz * nproj * pad];
+            for z in 0..nz {
+                for p in 0..nproj {
+                    let row = (z * nproj + p) * ncols;
+                    let first = src[row];
+                    let last = src[row + ncols - 1];
+                    let dst = (z * nproj + p) * pad;
+                    for x in 0..pad_side {
+                        g[dst + x] = first;
+                    }
+                    for x in 0..ncols {
+                        g[dst + pad_side + x] = src[row + x];
+                    }
+                    for x in (pad_side + ncols)..pad {
+                        g[dst + x] = last;
+                    }
+                }
+            }
+
+            let g_dev = DevBuf::from_host_f32(&g)?;
+            let w_dev = DevBuf::from_host_f32(&w)?;
+            let handle = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
+            if handle.is_null() {
+                return Err(Error::Backend("cfunc_filter allocation failed".into()));
+            }
+            unsafe {
+                ffi::tomoxide_filter_apply(handle, g_dev.ptr, w_dev.ptr, std::ptr::null_mut());
+            }
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            unsafe { ffi::tomoxide_filter_free(handle) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda filter sync failed ({rc})")));
+            }
+            g_dev.to_host_f32(&mut g)?;
+
+            // Crop the centred [pad_side, pad_side+ncols) window back to ncols.
+            let mut out = vec![0.0f32; nz * nproj * ncols];
+            for z in 0..nz {
+                for p in 0..nproj {
+                    let dst = (z * nproj + p) * ncols;
+                    let srcp = (z * nproj + p) * pad + pad_side;
+                    out[dst..dst + ncols].copy_from_slice(&g[srcp..srcp + ncols]);
+                }
+            }
+            let arr = Array3::from_shape_vec((nz, nproj, ncols), out)
+                .map_err(|e| Error::InvalidParam(format!("cuda filter shape: {e}")))?;
+            *sino = Tomo::new(arr, Layout::Sinogram).to_layout(orig);
             Ok(())
         }
     }

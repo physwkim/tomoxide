@@ -138,3 +138,41 @@ fn cuda_fourierrec_matches_cpu_and_phantom() {
     eprintln!("cuda↔phantom fourierrec Pearson = {r_phantom:.5}");
     assert!(r_phantom > 0.9, "CUDA fourierrec recovers phantom poorly: r = {r_phantom:.5}");
 }
+
+#[test]
+fn cuda_fbp_filter_matches_cpu() {
+    use tomoxide::backend::{Backend, FbpFilter};
+    use tomoxide::{FilterName, Layout, Tomo};
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nang, nz) = (128usize, 90usize, 3usize);
+    // A textured sinogram (off-centre rotation axis to exercise the phase).
+    let sino = ndarray::Array3::from_shape_fn((nz, nang, n), |(z, a, x)| {
+        (1.0 + 0.5 * ((a * 5 + x * 3 + z) as f32 * 0.013).sin()) + 0.1 * z as f32
+    });
+    let mut geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    geom.center = tomoxide::Center::Scalar(n as f32 / 2.0 - 3.5); // off-centre
+
+    let kernel = cpu.fbp_filter().unwrap().make_filter(FilterName::Ramp, n).unwrap();
+
+    let mut t_cpu = Tomo::new(sino.clone(), Layout::Sinogram);
+    let mut t_cuda = Tomo::new(sino.clone(), Layout::Sinogram);
+    cpu.fbp_filter().unwrap().apply(&mut t_cpu, &kernel, &geom).unwrap();
+    cuda.fbp_filter().unwrap().apply(&mut t_cuda, &kernel, &geom).unwrap();
+
+    let scale = t_cpu.array.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let max_abs = t_cpu
+        .array
+        .iter()
+        .zip(t_cuda.array.iter())
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+    eprintln!("fbp filter max|Δ| = {max_abs:e} (rel {:e})", max_abs / scale);
+    // cuFFT vs rustfft: f32 FFT round-off floor.
+    assert!(max_abs / scale < 1e-4, "GPU filter ≠ CPU filter: rel {}", max_abs / scale);
+}

@@ -17,6 +17,5 @@ cuda = []
 
 [dependencies]
 tomoxide-core.workspace = true
-tomoxide-cpu.workspace = true
 ndarray.workspace = true
 log.workspace = true

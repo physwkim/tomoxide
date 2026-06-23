@@ -164,10 +164,18 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   slice-pairs into complex, runs the kernel, de-interleaves, with the FBP filter
   on the CPU (shared definition). CUDA↔CPU fourierrec Pearson = 0.9997, ↔phantom
   0.971 (`cuda_fbp_parity.rs`). Needs an even slice count.
-- ⬜ `lprec` GPU back-projection, GPU `cfunc_filter`, and GPU
-  `Elementwise`/stripe/phase to match tomocupy's `proc_functions`. (The GPU
-  filter is low-value: the FBP filter is cheap and already shared from the CPU
-  definition, which both GPU back-projectors consume.)
+- ✅ GPU FBP **filter** (`cfunc_filter`, cuFFT) as `CudaBackend::fbp_filter` —
+  the complex weight folds the shared ramp + signed-frequency centre phase +
+  `1/ne`, so `recon(Fbp/Fourierrec, &CudaBackend)` now filters and
+  back-projects entirely on the device (CudaBackend no longer needs the CPU
+  backend). Direct GPU↔CPU filter rel Δ ≈ 2e-5 (cuFFT vs rustfft).
+- ✅ GPU **Elementwise** (dark/flat + minus-log): darkflat Δ=0, minus_log
+  ≈1e-7 vs CPU (`cuda_elementwise_parity.rs`).
+- ⬜ `lprec` GPU back-projection (needs the precomputed log-polar grids uploaded
+  via `cfunc_lprec::setgrids` in the kernel's exact layout) and GPU
+  stripe/phase. Note: each GPU capability is host-in/out per the `Backend`
+  trait, so these are parity ports — a fused device-resident pipeline (no
+  per-stage host↔device copies) is a separate, larger design change.
 - Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
 ## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`) 🟢 chunked driver done

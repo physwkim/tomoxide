@@ -20,6 +20,7 @@
 
 #include "cfunc_linerec.cuh"
 #include "cfunc_fourierrec.cuh"
+#include "cfunc_filter.cuh"
 
 namespace {
 inline size_t as_size(void* p) { return reinterpret_cast<size_t>(p); }
@@ -72,5 +73,14 @@ void tomoxide_fourierrec_backproject(void* h, void* f, const void* g, void* stre
   static_cast<cfunc_fourierrec*>(h)->backprojection(as_size(f), as_size(g), as_size(stream));
 }
 void tomoxide_fourierrec_free(void* h) { delete static_cast<cfunc_fourierrec*>(h); }
+
+// ---- FBP filter (cfunc_filter) ----
+void* tomoxide_filter_new(size_t nproj, size_t nz, size_t n) {
+  return new cfunc_filter(nproj, nz, n);
+}
+void tomoxide_filter_apply(void* h, void* g, const void* w, void* stream) {
+  static_cast<cfunc_filter*>(h)->filter(as_size(g), as_size(w), as_size(stream));
+}
+void tomoxide_filter_free(void* h) { delete static_cast<cfunc_filter*>(h); }
 
 }  // extern "C"

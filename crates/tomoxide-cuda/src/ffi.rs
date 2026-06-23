@@ -68,6 +68,19 @@ unsafe extern "C" {
     );
     pub fn tomoxide_fourierrec_free(handle: *mut c_void);
 
+    // --- FBP filter (cfunc_filter) ---
+    /// `cfunc_filter(nproj, nz, n)` — `n` is the padded width `ne`.
+    pub fn tomoxide_filter_new(nproj: usize, nz: usize, n: usize) -> *mut c_void;
+    /// `filter(g, w, stream)` — in-place R2C → ×w → C2R on the padded real
+    /// sinogram `g` `[nz, nproj, ne]`; `w` is complex `[nz, ne/2+1]` (device).
+    pub fn tomoxide_filter_apply(
+        handle: *mut c_void,
+        g: *mut c_void,
+        w: *const c_void,
+        stream: *mut c_void,
+    );
+    pub fn tomoxide_filter_free(handle: *mut c_void);
+
     // --- elementwise preprocessing ---
     /// `(data − dark2d) / denom` over a `[nproj, nz, nx]` projection volume;
     /// `dark2d`/`denom` are device `[nz, nx]`. Returns 0 on success.
