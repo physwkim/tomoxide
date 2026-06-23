@@ -122,6 +122,59 @@ impl ReconSteps {
     }
 }
 
+impl ReconSteps {
+    /// Out-of-core streaming reconstruction: read **only each chunk's detector
+    /// rows** from disk ([`read_chunk`](tomoxide_io::DatasetReader::read_chunk)),
+    /// normalize and reconstruct that chunk, and write it — so the host never
+    /// holds the whole dataset (unlike [`run`](ReconSteps::run), which reads it
+    /// all up front). Peak memory is one chunk of projections + one chunk of the
+    /// volume.
+    ///
+    /// Phase retrieval is **not** supported here: Paganin couples detector rows
+    /// within a projection, so it cannot run on a row-chunked read — use
+    /// [`run`](ReconSteps::run) for a phase pipeline. Normalize (per-pixel) and
+    /// stripe/reconstruct (per-slice) chunk cleanly, so the output is identical
+    /// to the full path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_streaming(
+        &self,
+        reader: &mut dyn tomoxide_io::DatasetReader,
+        writer: &mut dyn tomoxide_io::VolumeWriter,
+        geom: &Geometry,
+        algorithm: Algorithm,
+        params: &ReconParams,
+        prep: &PrepOptions,
+        engine: &Engine,
+    ) -> Result<()> {
+        if prep.phase != PhaseMethod::None {
+            return Err(tomoxide_core::error::Error::InvalidParam(
+                "ReconSteps::run_streaming does not support phase retrieval (row-coupled); \
+                 use run() for a phase pipeline"
+                    .into(),
+            ));
+        }
+        let backend = engine.backend();
+        let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+        let chunk = self.chunk_rows.max(1);
+        let mut r0 = 0;
+        while r0 < nz {
+            let r1 = (r0 + chunk).min(nz);
+            let mut ds = reader.read_chunk(r0, r1)?;
+            tomoxide_prep::normalize_dataset(&mut ds, backend)?;
+            let mut sino = ds.data.to_layout(Layout::Sinogram);
+            // to_layout transposes to a non-contiguous view; make it C-contiguous
+            // so the (down-stream) back-projector can take a flat slice.
+            sino.array = sino.array.as_standard_layout().to_owned();
+            tomoxide_prep::remove_stripe(&mut sino, prep.stripe)?;
+            let chunk_geom = chunk_geometry(geom, r0, r1);
+            let vol = tomoxide_recon::recon(&sino, &chunk_geom, algorithm, params, backend)?;
+            writer.write_chunk(&vol, r0, r1)?;
+            r0 = r1;
+        }
+        Ok(())
+    }
+}
+
 /// A copy of `geom` whose rotation center is restricted to detector rows
 /// `[r0, r1)` (so a `PerRow` center lines up with a z-chunk; a scalar center is
 /// unchanged).

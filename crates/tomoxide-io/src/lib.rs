@@ -39,6 +39,17 @@ pub trait DatasetReader {
     fn read_theta(&mut self) -> Result<Vec<f32>>;
     /// Read the whole dataset into memory (the "full"/"steps" entry point).
     fn read_all(&mut self) -> Result<Dataset<f32>>;
+
+    /// Read a detector-row chunk `[row0, row1)`: the projections and any
+    /// flat/dark frames sliced to those rows (axis 1), with the full `theta`.
+    /// This is the out-of-core entry point — only the chunk's rows are read from
+    /// disk. The default is unsupported (in-memory readers should use
+    /// [`read_all`](DatasetReader::read_all)).
+    fn read_chunk(&mut self, _row0: usize, _row1: usize) -> Result<Dataset<f32>> {
+        Err(Error::Io(
+            "read_chunk: out-of-core reads not supported by this reader".into(),
+        ))
+    }
 }
 
 /// A reconstruction writer (port of tomocupy `dataio/writer.py:73`).
@@ -151,6 +162,49 @@ impl DatasetReader for H5DxchangeReader {
         };
         let dark = match self.optional(dxchange::DATA_DARK)? {
             Some(ds) => Some(Frames::new(read_frames(&ds, nz, nx)?)),
+            None => None,
+        };
+        let theta = self.read_theta()?;
+
+        Ok(Dataset {
+            data: Tomo::new(data, Layout::Projection),
+            flat,
+            dark,
+            theta,
+        })
+    }
+
+    fn read_chunk(&mut self, row0: usize, row1: usize) -> Result<Dataset<f32>> {
+        let [nproj, nz, nx] = self.data_shape()?;
+        if row0 > row1 || row1 > nz {
+            return Err(Error::InvalidParam(format!(
+                "read_chunk rows [{row0}, {row1}) out of range for nz={nz}"
+            )));
+        }
+        let rows = row1 - row0;
+
+        // Hyperslab `[:, row0:row1, :]` of each [n, nz, nx] dataset.
+        let slab = |ds: &H5Dataset, n: usize| -> Result<Array3<f32>> {
+            let v = read_f32_slice(ds, &[0, row0, 0], &[n, rows, nx])?;
+            Array3::from_shape_vec((n, rows, nx), v).map_err(|e| Error::ShapeMismatch {
+                expected: format!("[{n}, {rows}, {nx}]"),
+                found: e.to_string(),
+            })
+        };
+
+        let data = slab(&self.required(dxchange::DATA)?, nproj)?;
+        let flat = match self.optional(dxchange::DATA_WHITE)? {
+            Some(ds) => {
+                let nf = ds.shape().first().copied().unwrap_or(0);
+                Some(Frames::new(slab(&ds, nf)?))
+            }
+            None => None,
+        };
+        let dark = match self.optional(dxchange::DATA_DARK)? {
+            Some(ds) => {
+                let nd = ds.shape().first().copied().unwrap_or(0);
+                Some(Frames::new(slab(&ds, nd)?))
+            }
             None => None,
         };
         let theta = self.read_theta()?;
@@ -320,6 +374,90 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
                 .into_iter()
                 .map(|x| x as f32)
                 .collect()
+        }
+        other => {
+            return Err(Error::Io(format!(
+                "unsupported HDF5 datatype for numeric read: {other:?}"
+            )))
+        }
+    };
+    Ok(v)
+}
+
+/// Read an N-dimensional hyperslab (`starts`/`counts`) of a numeric HDF5
+/// dataset as `Vec<f32>` (C-order), casting from its on-disk dtype. Mirrors
+/// [`read_f32_vec`]'s dtype dispatch but via `read_slice` for out-of-core
+/// chunked reads. Kept as its own function (not folded with `read_f32_vec`) so
+/// the whole-dataset path stays untouched.
+fn read_f32_slice(ds: &H5Dataset, starts: &[usize], counts: &[usize]) -> Result<Vec<f32>> {
+    let dt = ds
+        .datatype()
+        .map_err(|e| Error::Io(format!("datatype: {e}")))?;
+    let raw = |e: Hdf5Error| Error::Io(format!("read: {e}"));
+    // cast<T> reads the slice as on-disk type T and casts each element to f32.
+    macro_rules! cast {
+        ($t:ty) => {
+            ds.read_slice::<$t>(starts, counts)
+                .map_err(raw)?
+                .into_iter()
+                .map(|x| x as f32)
+                .collect()
+        };
+    }
+    let v: Vec<f32> = match dt {
+        DatatypeMessage::FloatingPoint {
+            size: 4, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            ds.read_slice::<f32>(starts, counts).map_err(raw)?
+        }
+        DatatypeMessage::FloatingPoint {
+            size: 8, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(f64)
+        }
+        DatatypeMessage::FixedPoint {
+            size: 1, signed: false, ..
+        } => cast!(u8),
+        DatatypeMessage::FixedPoint {
+            size: 1, signed: true, ..
+        } => cast!(i8),
+        DatatypeMessage::FixedPoint {
+            size: 2, signed: false, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(u16)
+        }
+        DatatypeMessage::FixedPoint {
+            size: 2, signed: true, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(i16)
+        }
+        DatatypeMessage::FixedPoint {
+            size: 4, signed: false, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(u32)
+        }
+        DatatypeMessage::FixedPoint {
+            size: 4, signed: true, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(i32)
+        }
+        DatatypeMessage::FixedPoint {
+            size: 8, signed: false, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(u64)
+        }
+        DatatypeMessage::FixedPoint {
+            size: 8, signed: true, byte_order, ..
+        } => {
+            ensure_le(byte_order)?;
+            cast!(i64)
         }
         other => {
             return Err(Error::Io(format!(

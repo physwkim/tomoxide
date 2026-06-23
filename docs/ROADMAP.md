@@ -174,12 +174,16 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   the full in-memory `reconstruct` and chunk-size invariant
   (`crates/tomoxide/tests/recon_steps_parity.rs`) — the analytic methods are
   per-slice independent.
-- ⬜ Overlapped multi-stream optimization (double buffering, 3-stage
-  read→H2D→compute→D2H→write overlap, read/write thread pools) and the
-  `try`/`try_lamino` center & laminography sweeps.
-- ⬜ True out-of-core *reads* (chunked `DatasetReader`) for datasets larger than
-  host memory — the current driver reads the whole dataset to memory (as
-  tomocupy `recon_steps_all` does) and bounds only the recon/write working set.
+- ⬜ The `try`/`try_lamino` center & laminography sweeps.
+- ✅ True out-of-core *reads* — `DatasetReader::read_chunk` (HDF5 hyperslab) +
+  `ReconSteps::run_streaming` read only each chunk's detector rows from disk, so
+  the host never holds the whole dataset (peak = one projection chunk + one
+  volume chunk). Δ=0 vs the read-all path (`recon_steps_streaming.rs`). Phase
+  retrieval is excluded (row-coupled) and routed to `run`.
+- ⬜ Overlapped multi-stream optimization (prefetch read / async write threads)
+  — deferred: the HDF5 file handle and the reader/writer trait objects are not
+  `Send`, and the per-slice reconstruction is already rayon-parallel, so the
+  throughput upside is modest relative to the threading/safety complexity.
 
 ## M6 — Portable GPU (wgpu / Metal)
 
