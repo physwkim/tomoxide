@@ -145,13 +145,24 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
 
 **Done = a full CPU pipeline: HDF in → preprocess → center → FBP → TIFF out.**
 
-## M4 — CUDA backend (parity target: tomocupy)
+## M4 — CUDA backend (parity target: tomocupy) 🟢 FBP back-projection live
 
-- `tomoxide-cuda`: C-ABI shim over tomocupy's `cfunc_*` classes; `build.rs`
-  nvcc compile gated on the `cuda` feature; FFI bindings.
-- Backends for `fourierrec`, `lprec`, `linerec`, `cfunc_filter`.
-- GPU `Elementwise`/stripe/phase to match tomocupy's `proc_functions`.
-- Verification: on a CUDA host, numeric diff vs tomocupy for each method.
+- ✅ `tomoxide-cuda`: C-ABI shim over tomocupy's `cfunc_*` classes + minimal CUDA
+  runtime helpers (device probe, `cudaMalloc`/memcpy/free); `build.rs` nvcc
+  compile of the vendored kernels gated on the `cuda` feature; FFI bindings.
+  `CudaBackend::new` probes `cudaGetDeviceCount`.
+- ✅ `linerec` parallel-beam back-projection on the GPU (`cfunc_linerec`),
+  exposed as the `FilteredBackproject` capability. The FBP **filter** reuses the
+  shared CPU definition (`CudaBackend::fbp_filter` → `CpuBackend`), so
+  `recon(Fbp, &CudaBackend)` filters on the host and back-projects on the device.
+  Verified on an RTX 5000 Ada: CUDA↔CPU back-projection Pearson = 1.00000 (up to
+  the kernel's y-flip + `4/nproj` vs `π/nproj` scale), CUDA↔phantom 0.96
+  (`crates/tomoxide/tests/cuda_fbp_parity.rs`). Needs ≥2 slices (the kernel
+  interpolates vertically).
+- ⬜ `fourierrec`/`lprec` GPU back-projection (cufft, the complex slice-packing),
+  GPU `cfunc_filter`, and GPU `Elementwise`/stripe/phase to match tomocupy's
+  `proc_functions`.
+- Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
 ## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`)
 

@@ -1,8 +1,20 @@
 # tomoxide-cuda — vendored CUDA kernels
 
 This directory holds the C-ABI **shim** (`shim.cpp`) that exposes tomocupy's
-`cfunc_*` C++ kernel classes to Rust. The kernels themselves are **not vendored
-in the repo**; `build.rs` compiles them only when the `cuda` feature is on.
+`cfunc_*` C++ kernel classes to Rust, plus the **vendored** kernel sources
+`build.rs` compiles when the `cuda` feature is on.
+
+## M4 FBP path (current)
+
+The wired path is parallel-beam FBP back-projection: `cfunc_linerec.cu` +
+`cfunc_linerec.cuh`, `kernels_linerec.cuh`, `defs.cuh` are vendored here, and
+the shim adds minimal CUDA-runtime helpers (device probe, `cudaMalloc`/memcpy/
+free). The FBP **filter** runs on the CPU (the shared `tomoxide-core` filter
+definition), so cufft and the other `cfunc_*` classes are not compiled or
+linked. `build.rs` globs the `.cu` files in this directory, so adding more
+kernels here (fourierrec/lprec/filter) extends the build with no other change.
+
+The notes below describe how to bring in additional kernels.
 
 ## Pointing the build at the kernels
 

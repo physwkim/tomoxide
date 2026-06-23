@@ -1700,7 +1700,9 @@ name = "tomoxide-cuda"
 version = "0.0.0"
 dependencies = [
  "log",
+ "ndarray",
  "tomoxide-core",
+ "tomoxide-cpu",
 ]
 
 [[package]]

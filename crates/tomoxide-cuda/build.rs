@@ -89,7 +89,10 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=tomoxide_cuda_kernels");
     println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=cufft");
+    // The shim is C++ (new/delete on the cfunc classes) → needs the C++ runtime.
+    // (cufft is not linked: the M4 FBP path filters on the CPU and only the
+    // texture-free `cfunc_linerec` back-projector runs on the GPU.)
+    println!("cargo:rustc-link-lib=dylib=stdc++");
     if let Some(libdir) = cuda_lib_dir() {
         println!("cargo:rustc-link-search=native={}", libdir.display());
     }

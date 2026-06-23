@@ -27,6 +27,7 @@ pub use tomoxide_core::{
     Volume,
 };
 pub use tomoxide_cpu::CpuBackend;
+pub use tomoxide_cuda::CudaBackend;
 pub use tomoxide_io as io;
 pub use tomoxide_prep as prep;
 pub use tomoxide_recon as recon;
