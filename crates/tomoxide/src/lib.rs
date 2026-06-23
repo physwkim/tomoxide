@@ -26,6 +26,7 @@ pub use tomoxide_core::{
     FilterName, Frames, Geometry, Layout, PhaseMethod, ReconParams, Result, StripeMethod, Tomo,
     Volume,
 };
+pub use tomoxide_core::backend;
 pub use tomoxide_cpu::CpuBackend;
 pub use tomoxide_cuda::CudaBackend;
 pub use tomoxide_io as io;

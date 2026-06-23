@@ -92,15 +92,21 @@ impl Backend for CudaBackend {
     fn fourier_reconstruct(&self) -> Option<&dyn tomoxide_core::backend::FourierReconstruct> {
         Some(self)
     }
+
+    /// Dark/flat correction + minus-log on the GPU.
+    #[cfg(feature = "cuda")]
+    fn elementwise(&self) -> Option<&dyn tomoxide_core::backend::Elementwise> {
+        Some(self)
+    }
 }
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::{ffi, CudaBackend};
-    use ndarray::Array3;
+    use ndarray::{Array3, Axis};
     use std::os::raw::c_void;
-    use tomoxide_core::backend::{FilteredBackproject, FourierReconstruct};
-    use tomoxide_core::data::{Layout, Tomo, Volume};
+    use tomoxide_core::backend::{Elementwise, FilteredBackproject, FourierReconstruct};
+    use tomoxide_core::data::{Frames, Layout, Tomo, Volume};
     use tomoxide_core::error::{Error, Result};
     use tomoxide_core::geometry::{Beam, Geometry};
 
@@ -238,6 +244,100 @@ mod cuda_impl {
             f.to_host_f32(&mut host)?;
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+            Ok(())
+        }
+    }
+
+    impl Elementwise for CudaBackend {
+        /// `(data − mean(dark)) / max(mean(flat) − mean(dark), 1e-6)` on the GPU
+        /// (tomocupy `darkflat_correction`). Frame averages and the clamped
+        /// denominator are computed host-side; the per-projection broadcast runs
+        /// on the device.
+        fn darkflat(
+            &self,
+            data: &mut Tomo<f32>,
+            flat: &Frames<f32>,
+            dark: &Frames<f32>,
+        ) -> Result<()> {
+            let dark2d = dark
+                .array
+                .mean_axis(Axis(0))
+                .ok_or_else(|| Error::InvalidParam("empty dark stack".into()))?;
+            let flat2d = flat
+                .array
+                .mean_axis(Axis(0))
+                .ok_or_else(|| Error::InvalidParam("empty flat stack".into()))?;
+            let mut denom = &flat2d - &dark2d;
+            denom.mapv_inplace(|v| if v.abs() < 1e-6 { 1.0 } else { v });
+
+            let restore = data.layout == Layout::Sinogram;
+            if restore {
+                *data = data.to_layout(Layout::Projection);
+            }
+            let (nproj, nz, nx) = data.array.dim();
+            {
+                let host = data
+                    .array
+                    .as_slice()
+                    .ok_or_else(|| Error::InvalidParam("non-contiguous data".into()))?;
+                let d_data = DevBuf::from_host_f32(host)?;
+                let d_dark = DevBuf::from_host_f32(
+                    dark2d.as_slice().expect("contiguous dark2d"),
+                )?;
+                let d_denom = DevBuf::from_host_f32(
+                    denom.as_slice().expect("contiguous denom"),
+                )?;
+                let rc = unsafe {
+                    ffi::tomoxide_darkflat(
+                        d_data.ptr,
+                        d_dark.ptr,
+                        d_denom.ptr,
+                        nproj,
+                        nz,
+                        nx,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(Error::Backend(format!("cuda darkflat failed ({rc})")));
+                }
+                let sync = unsafe { ffi::tomoxide_cuda_sync() };
+                if sync != 0 {
+                    return Err(Error::Backend(format!("cuda darkflat sync failed ({sync})")));
+                }
+                let out = data
+                    .array
+                    .as_slice_mut()
+                    .ok_or_else(|| Error::InvalidParam("non-contiguous data".into()))?;
+                d_data.to_host_f32(out)?;
+            }
+            if restore {
+                *data = data.to_layout(Layout::Sinogram);
+            }
+            Ok(())
+        }
+
+        /// In-place `−ln(max(x, 1e-6))` (non-finite → 0) on the GPU.
+        fn minus_log(&self, data: &mut Tomo<f32>) -> Result<()> {
+            let n = data.array.len();
+            let host = data
+                .array
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous data".into()))?;
+            let d_data = DevBuf::from_host_f32(host)?;
+            let rc = unsafe { ffi::tomoxide_minuslog(d_data.ptr, n, std::ptr::null_mut()) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda minus_log failed ({rc})")));
+            }
+            let sync = unsafe { ffi::tomoxide_cuda_sync() };
+            if sync != 0 {
+                return Err(Error::Backend(format!("cuda minus_log sync failed ({sync})")));
+            }
+            let out = data
+                .array
+                .as_slice_mut()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous data".into()))?;
+            d_data.to_host_f32(out)?;
             Ok(())
         }
     }

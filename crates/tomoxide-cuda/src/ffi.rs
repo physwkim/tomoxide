@@ -67,4 +67,19 @@ unsafe extern "C" {
         stream: *mut c_void,
     );
     pub fn tomoxide_fourierrec_free(handle: *mut c_void);
+
+    // --- elementwise preprocessing ---
+    /// `(data − dark2d) / denom` over a `[nproj, nz, nx]` projection volume;
+    /// `dark2d`/`denom` are device `[nz, nx]`. Returns 0 on success.
+    pub fn tomoxide_darkflat(
+        data: *mut c_void,
+        dark2d: *const c_void,
+        denom: *const c_void,
+        nproj: usize,
+        nz: usize,
+        nx: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// In-place `−ln(max(x, 1e-6))` (non-finite → 0) over `n` elements.
+    pub fn tomoxide_minuslog(data: *mut c_void, n: usize, stream: *mut c_void) -> i32;
 }
