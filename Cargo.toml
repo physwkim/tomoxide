@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "BSD-3-Clause"
@@ -33,15 +33,15 @@ description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in
 
 [workspace.dependencies]
 # --- internal crates ---
-tomoxide-core = { path = "crates/tomoxide-core", version = "0.0.0" }
-tomoxide-cpu = { path = "crates/tomoxide-cpu", version = "0.0.0" }
-tomoxide-cuda = { path = "crates/tomoxide-cuda", version = "0.0.0" }
-tomoxide-wgpu = { path = "crates/tomoxide-wgpu", version = "0.0.0" }
-tomoxide-recon = { path = "crates/tomoxide-recon", version = "0.0.0" }
-tomoxide-prep = { path = "crates/tomoxide-prep", version = "0.0.0" }
-tomoxide-io = { path = "crates/tomoxide-io", version = "0.0.0" }
-tomoxide-sim = { path = "crates/tomoxide-sim", version = "0.0.0" }
-tomoxide = { path = "crates/tomoxide", version = "0.0.0" }
+tomoxide-core = { path = "crates/tomoxide-core", version = "0.1.0" }
+tomoxide-cpu = { path = "crates/tomoxide-cpu", version = "0.1.0" }
+tomoxide-cuda = { path = "crates/tomoxide-cuda", version = "0.1.0" }
+tomoxide-wgpu = { path = "crates/tomoxide-wgpu", version = "0.1.0" }
+tomoxide-recon = { path = "crates/tomoxide-recon", version = "0.1.0" }
+tomoxide-prep = { path = "crates/tomoxide-prep", version = "0.1.0" }
+tomoxide-io = { path = "crates/tomoxide-io", version = "0.1.0" }
+tomoxide-sim = { path = "crates/tomoxide-sim", version = "0.1.0" }
+tomoxide = { path = "crates/tomoxide", version = "0.1.0" }
 
 # --- x-ray physics (beam hardening; optional, pulled only by the
 # `beam-hardening` feature). Self-contained: vendors the xraylib C sources and

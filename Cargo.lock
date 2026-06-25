@@ -1641,7 +1641,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tomoxide"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "log",
  "ndarray",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "half",
  "log",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-cpu"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "log",
  "ndarray",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-cuda"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "log",
  "ndarray",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-io"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "log",
  "ndarray",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-prep"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "log",
  "ndarray",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-recon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "log",
  "ndarray",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ndarray",
  "tomoxide-core",
@@ -1748,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "tomoxide-wgpu"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytemuck",
  "log",
