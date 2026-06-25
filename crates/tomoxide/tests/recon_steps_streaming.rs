@@ -8,7 +8,7 @@
 //! (`tools/gen_dxchange_streaming_fixture.py`).
 
 use ndarray::{Array3, Axis};
-use tomoxide::io::{self, DatasetReader, VolumeWriter};
+use tomoxide::io::{self, VolumeWriter};
 use tomoxide::{
     Angles, BackendKind, Engine, Geometry, PrepOptions, ReconParams, ReconSteps, Volume,
 };
