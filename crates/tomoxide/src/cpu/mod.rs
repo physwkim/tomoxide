@@ -300,10 +300,19 @@ impl FbpFilter for CpuBackend {
 // ----------------------------------------------------------------------------
 
 impl Fft for CpuBackend {
-    /// `rustfft` is re-entrant (immutable plan, per-call scratch), so host-thread
-    /// fan-out of the backend-agnostic per-slice recon loops is safe and useful.
-    fn host_concurrent(&self) -> bool {
-        true
+    /// `rustfft` is re-entrant (immutable plan, per-call scratch), so fan the
+    /// per-slice recon loop across host cores. Bit-identical to the serial
+    /// default — each slice is independent.
+    fn for_each_slice(
+        &self,
+        out: &mut Array3<f32>,
+        f: &(dyn Fn(usize, ndarray::ArrayViewMut2<f32>) -> Result<()> + Sync),
+    ) -> Result<()> {
+        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
+        slabs
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(row, slab)| f(row, slab))
     }
 
     /// In-place batched 1-D FFT via `rustfft`. `inverse` divides by `len` so

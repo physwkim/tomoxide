@@ -6,6 +6,8 @@
 //! capabilities it supports and exposes them through the accessor methods on
 //! [`Backend`]; missing ones default to `None`. See `docs/ARCHITECTURE.md` §2.
 
+use ndarray::{Array3, ArrayViewMut2, Axis};
+
 use crate::data::{Frames, Tomo, Volume};
 use crate::dtype::{Complex32, Dtype, Element};
 use crate::error::Result;
@@ -100,21 +102,32 @@ pub trait Backend: Send + Sync {
 /// Batched fast Fourier transforms.
 ///
 /// `Send + Sync` so a shared `&dyn Fft` can be handed to concurrent host
-/// workers (rayon); see [`host_concurrent`](Fft::host_concurrent) for whether
-/// that is actually beneficial for a given backend.
+/// workers (rayon, device-pinned pools); see [`for_each_slice`](Fft::for_each_slice)
+/// for how a backend chooses to drive the per-slice reconstruction loop.
 pub trait Fft: Send + Sync {
-    /// Whether `fft_1d`/`fft_2d` may be invoked concurrently from multiple host
-    /// threads with benefit — true for host FFTs (e.g. `rustfft`, which is
-    /// re-entrant and shares an immutable plan), false for device FFTs that
-    /// serialize on a single stream/context (cuFFT, wgpu) and must be driven
-    /// from one host thread.
+    /// Drive a reconstructor's per-slice loop, writing each output slice
+    /// `out[[row, .., ..]]` via `f(row, slab)`. The slices are independent (no
+    /// shared mutable state, no float reassociation), so the *backend* owns the
+    /// execution strategy and every strategy yields a bit-identical volume:
     ///
-    /// Backend-agnostic reconstructors (gridrec / fourierrec / lprec / phase)
-    /// read this to decide whether to parallelize their per-slice loop on the
-    /// host: only the host-FFT path fans the slices across threads; the device
-    /// path keeps the loop serial and does its parallelism on the device.
-    fn host_concurrent(&self) -> bool {
-        false
+    /// - default: serial — correct for device FFTs that must be driven from one
+    ///   host thread (e.g. wgpu, single-stream),
+    /// - [`CpuBackend`](crate::cpu::CpuBackend): rayon across host cores,
+    /// - [`CudaBackend`](crate::cuda::CudaBackend): device-pinned rayon pools
+    ///   that fan slices across the selected GPUs *and* host cores.
+    ///
+    /// Reconstructors (gridrec / fourierrec / lprec / phase) call this instead
+    /// of looping themselves, so multi-core and multi-GPU scheduling lives in
+    /// one place per backend rather than being special-cased at each call site.
+    fn for_each_slice(
+        &self,
+        out: &mut Array3<f32>,
+        f: &(dyn Fn(usize, ArrayViewMut2<f32>) -> Result<()> + Sync),
+    ) -> Result<()> {
+        for (row, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
+            f(row, slab)?;
+        }
+        Ok(())
     }
 
     /// In-place batched 1-D FFT along the last axis.

@@ -27,8 +27,7 @@
 //! bit-for-bit tomocupy numeric parity needs a CUDA golden run, which is
 //! offline-unavailable.
 
-use ndarray::{Array3, ArrayViewMut2, Axis};
-use rayon::prelude::*;
+use ndarray::{Array3, ArrayViewMut2};
 
 use crate::backend::Fft;
 use crate::data::{Layout, Tomo};
@@ -239,18 +238,8 @@ pub fn fourierrec(
         Ok(())
     };
 
-    // Host FFT (rustfft) → fan slices across threads; device FFT → keep serial.
-    // Either path produces the identical volume.
-    if fft.host_concurrent() {
-        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
-        slabs
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(row, slab)| process_row(row, slab))?;
-    } else {
-        for (row, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
-            process_row(row, slab)?;
-        }
-    }
+    // The backend owns the per-slice execution strategy (serial / rayon /
+    // multi-GPU); every strategy yields the identical volume.
+    fft.for_each_slice(&mut out, &process_row)?;
     Ok(out)
 }

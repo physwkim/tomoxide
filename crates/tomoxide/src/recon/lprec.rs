@@ -24,8 +24,7 @@
 //! golden offline; verified by phantom round-trip and cross-method agreement
 //! with gridrec (the `lprec_parity` test).
 
-use ndarray::{Array3, ArrayViewMut2, Axis};
-use rayon::prelude::*;
+use ndarray::{Array3, ArrayViewMut2};
 use std::f32::consts::PI;
 
 use crate::backend::Fft;
@@ -628,19 +627,9 @@ pub fn lprec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Resu
         Ok(())
     };
 
-    // Host FFT (rustfft) → fan slices across threads; device FFT → keep serial.
-    // Either path produces the identical volume.
-    if fft.host_concurrent() {
-        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
-        slabs
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(row, slab)| process_row(row, slab))?;
-    } else {
-        for (row, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
-            process_row(row, slab)?;
-        }
-    }
+    // The backend owns the per-slice execution strategy (serial / rayon /
+    // multi-GPU); every strategy yields the identical volume.
+    fft.for_each_slice(&mut out, &process_row)?;
     // Reference the precomputed dims so the struct fields are all exercised even
     // if a future refactor drops one (keeps the port self-documenting).
     debug_assert_eq!(grids.n, n);

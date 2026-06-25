@@ -2,8 +2,7 @@
 //! `processing/retrieve_phase.py`). Paganin, generalized Paganin (`Gpaganin`),
 //! and Farago single-step retrieval are implemented. See `docs/PORTING.md` §D.
 
-use ndarray::{ArrayViewMut2, Axis};
-use rayon::prelude::*;
+use ndarray::ArrayViewMut2;
 
 use crate::backend::{Backend, Fft};
 use crate::data::{Layout, Tomo};
@@ -325,19 +324,9 @@ fn run_phase(
         Ok(())
     };
 
-    // Host FFT (rustfft) → fan projections across threads; device FFT → keep
-    // serial. Either path produces the identical stack.
-    if fft.host_concurrent() {
-        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
-        slabs
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(m, slab)| process_proj(m, slab))?;
-    } else {
-        for (m, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
-            process_proj(m, slab)?;
-        }
-    }
+    // The backend owns the per-projection execution strategy (serial / rayon /
+    // multi-GPU); every strategy yields the identical stack.
+    fft.for_each_slice(&mut out, &process_proj)?;
 
     *data = Tomo::new(out, Layout::Projection).to_layout(target);
     Ok(())
