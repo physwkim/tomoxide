@@ -300,6 +300,12 @@ impl FbpFilter for CpuBackend {
 // ----------------------------------------------------------------------------
 
 impl Fft for CpuBackend {
+    /// `rustfft` is re-entrant (immutable plan, per-call scratch), so host-thread
+    /// fan-out of the backend-agnostic per-slice recon loops is safe and useful.
+    fn host_concurrent(&self) -> bool {
+        true
+    }
+
     /// In-place batched 1-D FFT via `rustfft`. `inverse` divides by `len` so
     /// `ifft(fft(x)) == x` (rustfft itself applies no normalization).
     fn fft_1d(&self, buf: &mut [Complex32], len: usize, batch: usize, inverse: bool) -> Result<()> {
@@ -318,14 +324,18 @@ impl Fft for CpuBackend {
         } else {
             planner.plan_fft_forward(len)
         };
-        for chunk in buf.chunks_mut(len) {
-            fft.process(chunk);
-        }
+        // The `batch` independent transforms are disjoint length-`len` chunks, so
+        // they run in parallel. The plan (`Arc<dyn rustfft::Fft>`) is Send+Sync and
+        // shared read-only; each worker keeps its own scratch (the same buffer
+        // `process` allocates internally), so the result is identical to serial.
+        let scratch_len = fft.get_inplace_scratch_len();
+        buf.par_chunks_mut(len).for_each_init(
+            || vec![Complex32::new(0.0, 0.0); scratch_len],
+            |scratch, chunk| fft.process_with_scratch(chunk, scratch),
+        );
         if inverse {
             let norm = 1.0 / len as f32;
-            for c in buf.iter_mut() {
-                *c *= norm;
-            }
+            buf.par_iter_mut().for_each(|c| *c *= norm);
         }
         Ok(())
     }
@@ -359,28 +369,40 @@ impl Fft for CpuBackend {
         } else {
             planner.plan_fft_forward(rows)
         };
-        let mut col = vec![Complex32::new(0.0, 0.0); rows];
-        for img in buf.chunks_mut(rows * cols) {
-            // Transform each contiguous row (length `cols`).
-            for row in img.chunks_mut(cols) {
-                row_fft.process(row);
-            }
-            // Transform each column (length `rows`, stride `cols`).
-            for c in 0..cols {
-                for (r, slot) in col.iter_mut().enumerate() {
-                    *slot = img[r * cols + c];
+        // The `batch` images are disjoint `rows*cols` chunks → parallel. Plans are
+        // Send+Sync (shared read-only); each worker owns its column-gather buffer
+        // and per-plan scratch, so every image's separable row-then-column pass is
+        // byte-identical to the serial path.
+        let row_scratch = row_fft.get_inplace_scratch_len();
+        let col_scratch = col_fft.get_inplace_scratch_len();
+        buf.par_chunks_mut(rows * cols).for_each_init(
+            || {
+                (
+                    vec![Complex32::new(0.0, 0.0); rows],
+                    vec![Complex32::new(0.0, 0.0); row_scratch],
+                    vec![Complex32::new(0.0, 0.0); col_scratch],
+                )
+            },
+            |(col, rscr, cscr), img| {
+                // Transform each contiguous row (length `cols`).
+                for row in img.chunks_mut(cols) {
+                    row_fft.process_with_scratch(row, rscr);
                 }
-                col_fft.process(&mut col);
-                for (r, &v) in col.iter().enumerate() {
-                    img[r * cols + c] = v;
+                // Transform each column (length `rows`, stride `cols`).
+                for c in 0..cols {
+                    for (r, slot) in col.iter_mut().enumerate() {
+                        *slot = img[r * cols + c];
+                    }
+                    col_fft.process_with_scratch(col, cscr);
+                    for (r, &v) in col.iter().enumerate() {
+                        img[r * cols + c] = v;
+                    }
                 }
-            }
-        }
+            },
+        );
         if inverse {
             let norm = 1.0 / (rows * cols) as f32;
-            for c in buf.iter_mut() {
-                *c *= norm;
-            }
+            buf.par_iter_mut().for_each(|c| *c *= norm);
         }
         Ok(())
     }

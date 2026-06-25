@@ -19,7 +19,9 @@
 //! (`shepp`, `hann`, …) are a follow-up — `params.filter_name` is not yet read
 //! here.
 
-use ndarray::Array3;
+use ndarray::{Array3, ArrayViewMut2, Axis};
+use rayon::prelude::*;
+
 use crate::backend::Fft;
 use crate::data::Tomo;
 use crate::dtype::Complex32;
@@ -126,7 +128,11 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
     let mut out = Array3::<f32>::zeros((nz, n, n));
     let off = (m - n) / 2;
 
-    for row in 0..nz {
+    // One slice's reconstruction, writing into its own `[n, n]` output view. Reads
+    // only shared immutable state (`bdata`, `trig`, `rho`, `deapod`, `geom`, `fft`),
+    // so slices are independent and produce bit-identical output whether run
+    // serially or fanned across host threads.
+    let process_row = |row: usize, mut slab: ArrayViewMut2<f32>| -> Result<()> {
         // 1. Radial 1-D FFTs of all projections (zero-padded from index 0).
         let mut radial = vec![Complex32::new(0.0, 0.0); nang * pad];
         for ia in 0..nang {
@@ -201,8 +207,24 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
                 let gx = off + ix;
                 let de = deapod[gy] * deapod[gx];
                 let v = grid[gy * m + gx].re;
-                out[[row, iy, ix]] = if de.abs() > 1e-6 { v / de } else { v };
+                slab[[iy, ix]] = if de.abs() > 1e-6 { v / de } else { v };
             }
+        }
+        Ok(())
+    };
+
+    // Host FFT (rustfft) → fan slices across threads; device FFT → keep serial
+    // (its parallelism is on-device, and concurrent host calls would race the
+    // single stream). Either path produces the identical volume.
+    if fft.host_concurrent() {
+        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
+        slabs
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(row, slab)| process_row(row, slab))?;
+    } else {
+        for (row, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
+            process_row(row, slab)?;
         }
     }
     Ok(out)

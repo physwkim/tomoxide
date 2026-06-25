@@ -24,8 +24,10 @@
 //! golden offline; verified by phantom round-trip and cross-method agreement
 //! with gridrec (the `lprec_parity` test).
 
-use ndarray::Array3;
+use ndarray::{Array3, ArrayViewMut2, Axis};
+use rayon::prelude::*;
 use std::f32::consts::PI;
+
 use crate::backend::Fft;
 use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
@@ -559,7 +561,10 @@ pub fn lprec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Resu
         .expect("contiguous sinogram (to_layout yields a standard-layout copy)");
     let mut out = Array3::<f32>::zeros((nz, n, n));
 
-    for row in 0..nz {
+    // One slice's reconstruction, writing into its own `[n, n]` output view. Reads
+    // only shared immutable state (`bdata`, `grids`, `fft`), so slices are
+    // independent and bit-identical whether serial or fanned across host threads.
+    let process_row = |row: usize, mut slab: ArrayViewMut2<f32>| -> Result<()> {
         // Cubic-B-spline prefilter the sinogram slice [nproj, n] into spline
         // coefficients: first along the detector axis, then along the angle axis.
         let mut g = vec![0.0f32; nang * n];
@@ -617,8 +622,23 @@ pub fn lprec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Resu
 
         for iy in 0..n {
             for ix in 0..n {
-                out[[row, iy, ix]] = f[iy * n + ix];
+                slab[[iy, ix]] = f[iy * n + ix];
             }
+        }
+        Ok(())
+    };
+
+    // Host FFT (rustfft) → fan slices across threads; device FFT → keep serial.
+    // Either path produces the identical volume.
+    if fft.host_concurrent() {
+        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
+        slabs
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(row, slab)| process_row(row, slab))?;
+    } else {
+        for (row, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
+            process_row(row, slab)?;
         }
     }
     // Reference the precomputed dims so the struct fields are all exercised even

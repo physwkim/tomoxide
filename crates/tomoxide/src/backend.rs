@@ -98,7 +98,25 @@ pub trait Backend: Send + Sync {
 }
 
 /// Batched fast Fourier transforms.
-pub trait Fft {
+///
+/// `Send + Sync` so a shared `&dyn Fft` can be handed to concurrent host
+/// workers (rayon); see [`host_concurrent`](Fft::host_concurrent) for whether
+/// that is actually beneficial for a given backend.
+pub trait Fft: Send + Sync {
+    /// Whether `fft_1d`/`fft_2d` may be invoked concurrently from multiple host
+    /// threads with benefit — true for host FFTs (e.g. `rustfft`, which is
+    /// re-entrant and shares an immutable plan), false for device FFTs that
+    /// serialize on a single stream/context (cuFFT, wgpu) and must be driven
+    /// from one host thread.
+    ///
+    /// Backend-agnostic reconstructors (gridrec / fourierrec / lprec / phase)
+    /// read this to decide whether to parallelize their per-slice loop on the
+    /// host: only the host-FFT path fans the slices across threads; the device
+    /// path keeps the loop serial and does its parallelism on the device.
+    fn host_concurrent(&self) -> bool {
+        false
+    }
+
     /// In-place batched 1-D FFT along the last axis.
     ///
     /// `len` is the transform length and `batch` the number of independent

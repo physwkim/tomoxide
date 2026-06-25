@@ -2,6 +2,9 @@
 //! `processing/retrieve_phase.py`). Paganin, generalized Paganin (`Gpaganin`),
 //! and Farago single-step retrieval are implemented. See `docs/PORTING.md` §D.
 
+use ndarray::{ArrayViewMut2, Axis};
+use rayon::prelude::*;
+
 use crate::backend::{Backend, Fft};
 use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
@@ -263,9 +266,13 @@ fn run_phase(
     let (filt, maxf) = build_filter(nx, ny);
 
     let mut out = ndarray::Array3::<f32>::zeros((nproj, dy, dz));
-    let mut buf = vec![Complex32::new(0.0, 0.0); nx * ny];
-    let mut prj = vec![0.0f32; nx * ny];
-    for m in 0..nproj {
+
+    // One projection's phase retrieval, writing into its own `[dy, dz]` view. Reads
+    // only shared immutable state (`src`, `filt`, `fft`), so projections are
+    // independent and bit-identical whether serial or fanned across host threads.
+    let process_proj = |m: usize, mut slab: ArrayViewMut2<f32>| -> Result<()> {
+        let mut buf = vec![Complex32::new(0.0, 0.0); nx * ny];
+        let mut prj = vec![0.0f32; nx * ny];
         // Edge-replicate pad (tomopy `_retrieve_phase`: rows first, then cols).
         for k in prj.iter_mut() {
             *k = val;
@@ -312,8 +319,23 @@ fn run_phase(
         // Real part, cropped back to the original window.
         for i in 0..dy {
             for j in 0..dz {
-                out[[m, i, j]] = buf[(i + pad_r) * ny + (j + pad_c)].re;
+                slab[[i, j]] = buf[(i + pad_r) * ny + (j + pad_c)].re;
             }
+        }
+        Ok(())
+    };
+
+    // Host FFT (rustfft) → fan projections across threads; device FFT → keep
+    // serial. Either path produces the identical stack.
+    if fft.host_concurrent() {
+        let slabs: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
+        slabs
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(m, slab)| process_proj(m, slab))?;
+    } else {
+        for (m, slab) in out.axis_iter_mut(Axis(0)).enumerate() {
+            process_proj(m, slab)?;
         }
     }
 
