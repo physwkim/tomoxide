@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn advertises_cuda_device() {
-        let b = CudaBackend::default();
+        let b = CudaBackend;
         assert_eq!(b.name(), "cuda");
         assert_eq!(b.device(), DeviceKind::Cuda);
         assert!(b.supports(Dtype::F16));
