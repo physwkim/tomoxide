@@ -69,6 +69,11 @@ fn main() {
         .arg("-fPIC")
         .arg("-O3")
         .arg("--std=c++17");
+    // Per-thread default stream: each host thread gets its own implicit stream,
+    // so concurrent `for_each_slice` workers (one per GPU, fanned across host
+    // cores) overlap their FFTs/copies instead of serializing on the legacy
+    // null stream. The thread-local cuFFT plan cache in fft.cu relies on this.
+    cmd.arg("--default-stream").arg("per-thread");
     cmd.arg(format!("-I{}", manifest_dir.join("cuda").display()));
     let include = tomocupy_include(&kernel_dir);
     if let Some(inc) = &include {
