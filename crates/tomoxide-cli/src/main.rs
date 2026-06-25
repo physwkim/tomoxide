@@ -9,8 +9,8 @@ use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use tomoxide::io::DatasetReader;
 use tomoxide::{Angles, BackendKind, Engine, Geometry, ReconParams};
-use tomoxide_core::geometry::Center;
-use tomoxide_core::params::Algorithm;
+use tomoxide::Center;
+use tomoxide::Algorithm;
 
 use crate::config::Config;
 

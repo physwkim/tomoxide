@@ -10,14 +10,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tomoxide-core",
-    "crates/tomoxide-cpu",
-    "crates/tomoxide-cuda",
-    "crates/tomoxide-wgpu",
-    "crates/tomoxide-recon",
-    "crates/tomoxide-prep",
-    "crates/tomoxide-io",
-    "crates/tomoxide-sim",
     "crates/tomoxide",
     "crates/tomoxide-cli",
 ]
@@ -32,15 +24,7 @@ authors = ["tomoxide contributors"]
 description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in Rust)"
 
 [workspace.dependencies]
-# --- internal crates ---
-tomoxide-core = { path = "crates/tomoxide-core", version = "0.1.0" }
-tomoxide-cpu = { path = "crates/tomoxide-cpu", version = "0.1.0" }
-tomoxide-cuda = { path = "crates/tomoxide-cuda", version = "0.1.0" }
-tomoxide-wgpu = { path = "crates/tomoxide-wgpu", version = "0.1.0" }
-tomoxide-recon = { path = "crates/tomoxide-recon", version = "0.1.0" }
-tomoxide-prep = { path = "crates/tomoxide-prep", version = "0.1.0" }
-tomoxide-io = { path = "crates/tomoxide-io", version = "0.1.0" }
-tomoxide-sim = { path = "crates/tomoxide-sim", version = "0.1.0" }
+# --- the single library crate (used by the CLI binary) ---
 tomoxide = { path = "crates/tomoxide", version = "0.1.0" }
 
 # --- x-ray physics (beam hardening; optional, pulled only by the

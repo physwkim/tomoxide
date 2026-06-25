@@ -1,13 +1,13 @@
 //! Backend selection. [`Engine`] owns a boxed [`Backend`] and is the single
 //! place that knows all three backend crates exist (see ARCHITECTURE §2.4).
 
-use tomoxide_core::backend::Backend;
-use tomoxide_core::error::Result;
-use tomoxide_core::params::BackendKind;
+use crate::backend::Backend;
+use crate::error::Result;
+use crate::params::BackendKind;
 
-use tomoxide_cpu::CpuBackend;
-use tomoxide_cuda::CudaBackend;
-use tomoxide_wgpu::WgpuBackend;
+use crate::cpu::CpuBackend;
+use crate::cuda::CudaBackend;
+use crate::wgpu::WgpuBackend;
 
 /// A reconstruction engine bound to one backend.
 pub struct Engine {

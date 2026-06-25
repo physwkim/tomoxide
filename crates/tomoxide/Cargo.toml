@@ -6,31 +6,48 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "tomoxide — GPU/CPU tomographic reconstruction (umbrella crate)"
+description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in Rust)"
+build = "build.rs"
+# Test golden fixtures are dev-only and large; keep them out of the published
+# package. The vendored CUDA kernels (`cuda/`) and bending-magnet spectra
+# (`data/`) stay — they are compiled (`build.rs`) / `include_str!`'d.
+exclude = ["tests/fixtures"]
 
 [features]
 default = []
-# Forward backend features to the backend crates.
-cuda = ["tomoxide-cuda/cuda"]
-gpu-wgpu = ["tomoxide-wgpu/gpu-wgpu"]
-beam-hardening = ["tomoxide-prep/beam-hardening"]
-sift-center = ["tomoxide-recon/sift-center"]
+# CUDA backend (nvcc-compiled vendored kernels; build.rs gates on this feature).
+cuda = []
+# Portable GPU backend (wgpu / Metal).
+gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Beam-hardening correction (pulls xraylib; its build runs bindgen → needs libclang).
+beam-hardening = ["dep:xraylib"]
+# SIFT center finding (pulls the opencv crate; links OpenCV, bindgen at build).
+sift-center = ["dep:opencv"]
 
 [dependencies]
-tomoxide-core.workspace = true
-tomoxide-cpu.workspace = true
-tomoxide-cuda.workspace = true
-tomoxide-wgpu.workspace = true
-tomoxide-recon.workspace = true
-tomoxide-prep.workspace = true
-tomoxide-io.workspace = true
-tomoxide-sim.workspace = true
+# numerics
 ndarray.workspace = true
+ndarray-npy.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
+half.workspace = true
+rayon.workspace = true
+rustfft.workspace = true
+# diagnostics
+thiserror.workspace = true
 log.workspace = true
+# I/O — pure-Rust HDF5 (physwkim/rust-hdf5) + TIFF (image-rs); no C/libhdf5.
+rust-hdf5 = "0.2"
+tiff = "0.11"
+# optional GPU (wgpu / Metal) — only with `gpu-wgpu`
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+# optional x-ray physics (beam hardening) / computer vision (SIFT center)
+xraylib = { workspace = true, optional = true }
+opencv = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndarray.workspace = true
 ndarray-npy.workspace = true
-# Read back the per-slice TIFF the pipeline writes (same version tomoxide-io
-# writes with); reused approved dep, no new third-party crate.
 tiff = "0.11"

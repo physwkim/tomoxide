@@ -6,10 +6,10 @@
 //! and write **by sinogram chunks**, so the volume is streamed to the writer a
 //! chunk at a time instead of being held whole (see `docs/ARCHITECTURE.md` §5).
 
-use tomoxide_core::data::{Dataset, Layout, Tomo, Volume};
-use tomoxide_core::error::Result;
-use tomoxide_core::geometry::Geometry;
-use tomoxide_core::params::{Algorithm, PhaseMethod, ReconParams, StripeMethod};
+use crate::data::{Dataset, Layout, Tomo, Volume};
+use crate::error::Result;
+use crate::geometry::Geometry;
+use crate::params::{Algorithm, PhaseMethod, ReconParams, StripeMethod};
 
 use crate::engine::Engine;
 
@@ -26,7 +26,7 @@ pub struct PrepOptions {
 /// reconstruct. Ports tomocupy `rec.py::GPURec` at a high level.
 ///
 /// In this scaffold it runs the real preprocessing wrappers and dispatches to
-/// [`tomoxide_recon::recon`]; it surfaces `NotImplemented` from the first
+/// [`crate::recon::recon`]; it surfaces `NotImplemented` from the first
 /// unported numeric kernel (the FBP filter / back-projection), which is the
 /// expected behaviour until milestone M1.
 pub fn reconstruct(
@@ -40,15 +40,15 @@ pub fn reconstruct(
     let backend = engine.backend();
 
     // 1. Flat/dark correction + minus-log (real on the CPU backend).
-    tomoxide_prep::normalize_dataset(&mut ds, backend)?;
+    crate::prep::normalize_dataset(&mut ds, backend)?;
 
     // 2. Optional projection-domain corrections.
-    tomoxide_prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+    crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
 
     // 3. To sinogram order, then stripe removal, then reconstruct.
     let mut sino = ds.data.to_layout(Layout::Sinogram);
-    tomoxide_prep::remove_stripe(&mut sino, prep.stripe)?;
-    tomoxide_recon::recon(&sino, geom, algorithm, params, backend)
+    crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+    crate::recon::recon(&sino, geom, algorithm, params, backend)
 }
 
 /// Chunked/streaming reconstruction driver (port of tomocupy
@@ -84,8 +84,8 @@ impl ReconSteps {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        reader: &mut dyn tomoxide_io::DatasetReader,
-        writer: &mut dyn tomoxide_io::VolumeWriter,
+        reader: &mut dyn crate::io::DatasetReader,
+        writer: &mut dyn crate::io::VolumeWriter,
         geom: &Geometry,
         algorithm: Algorithm,
         params: &ReconParams,
@@ -97,8 +97,8 @@ impl ReconSteps {
         // Read-all + row-coupling stages once (tomocupy recon_steps_all reads
         // the whole dataset to memory before processing by steps).
         let mut ds = reader.read_all()?;
-        tomoxide_prep::normalize_dataset(&mut ds, backend)?;
-        tomoxide_prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+        crate::prep::normalize_dataset(&mut ds, backend)?;
+        crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
         let sino = ds.data.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
         let nz = sino.n_rows();
 
@@ -112,9 +112,9 @@ impl ReconSteps {
                 .slice_axis(ndarray::Axis(0), ndarray::Slice::from(r0..r1))
                 .to_owned();
             let mut sub = Tomo::new(sub, Layout::Sinogram);
-            tomoxide_prep::remove_stripe(&mut sub, prep.stripe)?;
+            crate::prep::remove_stripe(&mut sub, prep.stripe)?;
             let chunk_geom = chunk_geometry(geom, r0, r1);
-            let vol = tomoxide_recon::recon(&sub, &chunk_geom, algorithm, params, backend)?;
+            let vol = crate::recon::recon(&sub, &chunk_geom, algorithm, params, backend)?;
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
@@ -124,7 +124,7 @@ impl ReconSteps {
 
 impl ReconSteps {
     /// Out-of-core streaming reconstruction: read **only each chunk's detector
-    /// rows** from disk ([`read_chunk`](tomoxide_io::DatasetReader::read_chunk)),
+    /// rows** from disk ([`read_chunk`](crate::io::DatasetReader::read_chunk)),
     /// normalize and reconstruct that chunk, and write it — so the host never
     /// holds the whole dataset (unlike [`run`](ReconSteps::run), which reads it
     /// all up front). Peak memory is one chunk of projections + one chunk of the
@@ -138,8 +138,8 @@ impl ReconSteps {
     #[allow(clippy::too_many_arguments)]
     pub fn run_streaming(
         &self,
-        reader: &mut dyn tomoxide_io::DatasetReader,
-        writer: &mut dyn tomoxide_io::VolumeWriter,
+        reader: &mut dyn crate::io::DatasetReader,
+        writer: &mut dyn crate::io::VolumeWriter,
         geom: &Geometry,
         algorithm: Algorithm,
         params: &ReconParams,
@@ -147,7 +147,7 @@ impl ReconSteps {
         engine: &Engine,
     ) -> Result<()> {
         if prep.phase != PhaseMethod::None {
-            return Err(tomoxide_core::error::Error::InvalidParam(
+            return Err(crate::error::Error::InvalidParam(
                 "ReconSteps::run_streaming does not support phase retrieval (row-coupled); \
                  use run() for a phase pipeline"
                     .into(),
@@ -160,14 +160,14 @@ impl ReconSteps {
         while r0 < nz {
             let r1 = (r0 + chunk).min(nz);
             let mut ds = reader.read_chunk(r0, r1)?;
-            tomoxide_prep::normalize_dataset(&mut ds, backend)?;
+            crate::prep::normalize_dataset(&mut ds, backend)?;
             let mut sino = ds.data.to_layout(Layout::Sinogram);
             // to_layout transposes to a non-contiguous view; make it C-contiguous
             // so the (down-stream) back-projector can take a flat slice.
             sino.array = sino.array.as_standard_layout().to_owned();
-            tomoxide_prep::remove_stripe(&mut sino, prep.stripe)?;
+            crate::prep::remove_stripe(&mut sino, prep.stripe)?;
             let chunk_geom = chunk_geometry(geom, r0, r1);
-            let vol = tomoxide_recon::recon(&sino, &chunk_geom, algorithm, params, backend)?;
+            let vol = crate::recon::recon(&sino, &chunk_geom, algorithm, params, backend)?;
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
@@ -179,7 +179,7 @@ impl ReconSteps {
 /// `[r0, r1)` (so a `PerRow` center lines up with a z-chunk; a scalar center is
 /// unchanged).
 fn chunk_geometry(geom: &Geometry, r0: usize, r1: usize) -> Geometry {
-    use tomoxide_core::geometry::Center;
+    use crate::geometry::Center;
     let center = match &geom.center {
         Center::Scalar(c) => Center::Scalar(*c),
         Center::PerRow(v) => Center::PerRow(v[r0..r1].to_vec()),

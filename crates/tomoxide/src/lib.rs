@@ -1,8 +1,14 @@
 //! # tomoxide
 //!
-//! Umbrella crate for the tomoxide tomographic reconstruction toolkit. It
-//! re-exports the data model, algorithms, and preprocessing, and owns the
-//! [`Engine`] (backend selection) and the high-level [`pipeline`].
+//! A Rust tomographic reconstruction toolkit — the algorithmic breadth of
+//! tomopy (CPU `libtomo`) and the GPU streaming reconstruction of tomocupy
+//! (CUDA), behind one tri-backend abstraction (CPU / CUDA / wgpu).
+//!
+//! This is a single crate; its modules are the foundational data model and
+//! backend traits ([`backend`], [`data`], [`dtype`], [`error`], [`geometry`],
+//! [`params`]), the backends ([`cpu`], [`cuda`], [`wgpu`]), reconstruction
+//! ([`recon`]), preprocessing ([`prep`]), I/O ([`io`]), simulation ([`sim`]),
+//! and the high-level [`engine`] + [`pipeline`].
 //!
 //! ```no_run
 //! use tomoxide::{Engine, BackendKind};
@@ -12,27 +18,45 @@
 //! ```
 //!
 //! See `docs/ARCHITECTURE.md` for the design and `docs/ROADMAP.md` for status.
-#![forbid(unsafe_code)]
 
+// Foundational layer (was tomoxide-core).
+pub mod backend;
+pub mod data;
+pub mod dtype;
+pub mod error;
+pub mod geometry;
+pub mod params;
+
+// Backends.
+pub mod cpu;
+pub mod cuda;
+pub mod wgpu;
+
+// Algorithms, preprocessing, I/O, simulation.
+pub mod io;
+pub mod prep;
+pub mod recon;
+pub mod sim;
+
+// High-level orchestration.
 pub mod engine;
 pub mod pipeline;
 
 pub use engine::Engine;
 pub use pipeline::{reconstruct, PrepOptions, ReconSteps};
 
-// Re-export the building blocks so downstream code needs one dependency.
-pub use tomoxide_core::{
-    Algorithm, Angles, Backend, BackendKind, Beam, Center, Complex32, Dataset, Detector, Dtype,
-    Error, FilterName, Frames, Geometry, Layout, PhaseMethod, ReconParams, Result, StripeMethod,
-    Tomo, Volume,
+// Flat re-exports of the common building blocks (was tomoxide-core's root).
+pub use backend::{
+    Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
+    ForwardProject, RankFilter,
 };
-pub use tomoxide_core::backend;
-pub use tomoxide_cpu::CpuBackend;
-pub use tomoxide_cuda::CudaBackend;
-pub use tomoxide_io as io;
-pub use tomoxide_prep as prep;
-pub use tomoxide_recon as recon;
-pub use tomoxide_sim as sim;
+pub use cpu::CpuBackend;
+pub use cuda::CudaBackend;
+pub use data::{Dataset, Frames, Layout, Slice2D, Tomo, Volume};
+pub use dtype::{Complex32, Dtype, Element};
+pub use error::{Error, Result};
+pub use geometry::{Angles, Beam, Center, Detector, Geometry};
+pub use params::{Algorithm, BackendKind, FilterName, PhaseMethod, ReconParams, StripeMethod};
 
 #[cfg(test)]
 mod tests {
@@ -55,5 +79,29 @@ mod tests {
     #[test]
     fn cuda_engine_unavailable_without_feature() {
         assert!(Engine::new(BackendKind::Cuda).is_err());
+    }
+
+    // --- foundational sanity checks (were tomoxide-core's unit tests) ---
+    #[test]
+    fn angles_uniform_spans_half_turn() {
+        let a = Angles::uniform(4, 0.0, std::f32::consts::PI);
+        assert_eq!(a.len(), 4);
+        assert!((a.0[2] - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tomo_layout_roundtrip_swaps_axes() {
+        let arr = ndarray::Array3::<f32>::zeros((3, 5, 7));
+        let t = Tomo::new(arr, Layout::Projection);
+        let s = t.to_layout(Layout::Sinogram);
+        assert_eq!(s.array.shape(), &[5, 3, 7]);
+        assert_eq!(s.n_angles(), 3);
+    }
+
+    #[test]
+    fn algorithm_parses_and_classifies() {
+        assert_eq!("fbp".parse::<Algorithm>().unwrap(), Algorithm::Fbp);
+        assert!(Algorithm::Fbp.is_analytic());
+        assert!(!Algorithm::Sirt.is_analytic());
     }
 }

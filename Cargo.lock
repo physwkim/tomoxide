@@ -1643,18 +1643,22 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 name = "tomoxide"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "half",
  "log",
  "ndarray",
  "ndarray-npy",
+ "num-complex",
+ "num-traits",
+ "opencv",
+ "pollster",
+ "rayon",
+ "rust-hdf5",
+ "rustfft",
+ "thiserror 2.0.18",
  "tiff",
- "tomoxide-core",
- "tomoxide-cpu",
- "tomoxide-cuda",
- "tomoxide-io",
- "tomoxide-prep",
- "tomoxide-recon",
- "tomoxide-sim",
- "tomoxide-wgpu",
+ "wgpu",
+ "xraylib",
 ]
 
 [[package]]
@@ -1668,95 +1672,6 @@ dependencies = [
  "serde",
  "toml",
  "tomoxide",
- "tomoxide-core",
-]
-
-[[package]]
-name = "tomoxide-core"
-version = "0.1.0"
-dependencies = [
- "half",
- "log",
- "ndarray",
- "num-complex",
- "num-traits",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "tomoxide-cpu"
-version = "0.1.0"
-dependencies = [
- "log",
- "ndarray",
- "num-complex",
- "rayon",
- "rustfft",
- "tomoxide-core",
-]
-
-[[package]]
-name = "tomoxide-cuda"
-version = "0.1.0"
-dependencies = [
- "log",
- "ndarray",
- "tomoxide-core",
-]
-
-[[package]]
-name = "tomoxide-io"
-version = "0.1.0"
-dependencies = [
- "log",
- "ndarray",
- "ndarray-npy",
- "rust-hdf5",
- "tiff",
- "tomoxide-core",
-]
-
-[[package]]
-name = "tomoxide-prep"
-version = "0.1.0"
-dependencies = [
- "log",
- "ndarray",
- "tomoxide-core",
- "xraylib",
-]
-
-[[package]]
-name = "tomoxide-recon"
-version = "0.1.0"
-dependencies = [
- "log",
- "ndarray",
- "ndarray-npy",
- "opencv",
- "tomoxide-core",
- "tomoxide-cpu",
-]
-
-[[package]]
-name = "tomoxide-sim"
-version = "0.1.0"
-dependencies = [
- "ndarray",
- "tomoxide-core",
-]
-
-[[package]]
-name = "tomoxide-wgpu"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "log",
- "ndarray",
- "pollster",
- "tomoxide-core",
- "tomoxide-cpu",
- "wgpu",
 ]
 
 [[package]]
