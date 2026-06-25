@@ -301,6 +301,133 @@ mod cuda_impl {
         Ok(())
     }
 
+    /// Pad → cuFFT filter → crop → `cfunc_linerec` back-projection for one
+    /// z-chunk, entirely on the **current** device. Every device buffer is local
+    /// to the calling thread, so this is safe to run on many devices at once (one
+    /// thread per GPU, each having called `cudaSetDevice`). Returns the chunk's
+    /// volume `[nz, n, n]`. `w` is the filter weight slice for *these* z rows.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fbp_chunk(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let sino_dev = DevBuf::from_host_f32(raw)?;
+        let w_dev = DevBuf::from_host_f32(w)?;
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_pad(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+            },
+            "pad",
+        )?;
+        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
+        if fh.is_null() {
+            return Err(Error::Backend("cfunc_filter allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
+        unsafe { ffi::tomoxide_filter_free(fh) };
+        let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
+        ck(
+            unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
+            "crop",
+        )?;
+        let f = DevBuf::zeroed(nz * n * n * fsz)?;
+        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, nz) };
+        if h.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+        unsafe {
+            ffi::tomoxide_linerec_backproject(
+                h,
+                f.ptr,
+                gf.ptr,
+                theta_dev.ptr as *const f32,
+                std::f32::consts::FRAC_PI_2,
+                0,
+                null,
+            );
+        }
+        unsafe { ffi::tomoxide_linerec_free(h) };
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        let mut host = vec![0.0f32; nz * n * n];
+        f.to_host_f32(&mut host)?;
+        Ok(host)
+    }
+
+    /// Pad → cuFFT filter → crop → pack pairs → `cfunc_fourierrec` → unpack for
+    /// the whole stack on the **current** device. Single-device only: the complex
+    /// slice-pairing `(s, s+nz/2)` spans the full z-axis, and the kernel's
+    /// atomic-scatter gather is run-to-run nondeterministic, so a multi-GPU split
+    /// would be neither clean nor bit-verifiable. Returns the volume `[nz, n, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fourierrec(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let sino_dev = DevBuf::from_host_f32(raw)?;
+        let w_dev = DevBuf::from_host_f32(w)?;
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_pad(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+            },
+            "pad",
+        )?;
+        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
+        if fh.is_null() {
+            return Err(Error::Backend("cfunc_filter allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
+        unsafe { ffi::tomoxide_filter_free(fh) };
+        let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
+        ck(
+            unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
+            "crop",
+        )?;
+        let gc = DevBuf::zeroed(nz * nproj * ncols * fsz)?; // complex [nz/2,nproj,ncols]
+        ck(
+            unsafe { ffi::tomoxide_pack_pairs(gf.ptr, gc.ptr, nz, nproj, ncols, null) },
+            "pack",
+        )?;
+        let fc = DevBuf::zeroed(nz * n * n * fsz)?; // complex [nz/2,n,n]
+        let h =
+            unsafe { ffi::tomoxide_fourierrec_new(nproj, nz / 2, n, theta_dev.ptr as *const f32) };
+        if h.is_null() {
+            return Err(Error::Backend("cfunc_fourierrec allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_fourierrec_backproject(h, fc.ptr, gc.ptr, null) };
+        unsafe { ffi::tomoxide_fourierrec_free(h) };
+        let vol_dev = DevBuf::zeroed(nz * n * n * fsz)?;
+        ck(
+            unsafe { ffi::tomoxide_unpack_pairs(fc.ptr, vol_dev.ptr, nz, n, null) },
+            "unpack",
+        )?;
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        let mut host = vec![0.0f32; nz * n * n];
+        vol_dev.to_host_f32(&mut host)?;
+        Ok(host)
+    }
+
     impl crate::backend::AnalyticReconstruct for CudaBackend {
         /// Fused, device-resident analytic reconstruction: upload the raw
         /// sinogram once, then pad → cuFFT filter → crop → back-projection
@@ -346,59 +473,70 @@ mod cuda_impl {
             let pad = filter.len();
             let pad_side = pad / 2 - ncols / 2;
             let w = build_filter_w(&filter, geom, nz, ncols, pad);
-            let fsz = std::mem::size_of::<f32>();
-            let null = std::ptr::null_mut::<c_void>();
-
-            // Upload the raw sinogram + filter weights + angles ONCE.
-            let sino_dev = DevBuf::from_host_f32(raw)?;
-            let w_dev = DevBuf::from_host_f32(&w)?;
-            let theta_dev = DevBuf::from_host_f32(theta)?;
-
-            // pad → filter → crop, all device-resident.
-            let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
-            ck(
-                unsafe {
-                    ffi::tomoxide_pad(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
-                },
-                "pad",
-            )?;
-            let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-            if fh.is_null() {
-                return Err(Error::Backend("cfunc_filter allocation failed".into()));
-            }
-            unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-            unsafe { ffi::tomoxide_filter_free(fh) };
-            let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
-            ck(
-                unsafe {
-                    ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null)
-                },
-                "crop",
-            )?;
+            let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
 
             let vol = match algorithm {
                 Algorithm::Fbp | Algorithm::Linerec => {
-                    let f = DevBuf::zeroed(nz * n * n * fsz)?;
-                    let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, nz) };
-                    if h.is_null() {
-                        return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+                    let devices = selected_devices();
+                    if devices.len() <= 1 {
+                        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                        analytic_fbp_chunk(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
+                    } else {
+                        // Contiguous z-chunks (sizes differ by ≤1), one GPU each,
+                        // run concurrently; each thread owns its device's buffers.
+                        let d = devices.len();
+                        let base = nz / d;
+                        let rem = nz % d;
+                        let mut ranges = Vec::with_capacity(d);
+                        let mut z0 = 0;
+                        for i in 0..d {
+                            let len = base + if i < rem { 1 } else { 0 };
+                            ranges.push((z0, z0 + len));
+                            z0 += len;
+                        }
+                        // Capture as shared slices so each `move` worker copies a
+                        // reference rather than moving the owned buffers.
+                        let w: &[f32] = &w;
+                        let parts: Vec<Result<Vec<f32>>> = std::thread::scope(|scope| {
+                            ranges
+                                .iter()
+                                .copied()
+                                .zip(devices.iter().copied())
+                                .map(|((a, b), dev)| {
+                                    scope.spawn(move || -> Result<Vec<f32>> {
+                                        unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                                        let nzc = b - a;
+                                        if nzc == 0 {
+                                            return Ok(Vec::new());
+                                        }
+                                        analytic_fbp_chunk(
+                                            &raw[a * nproj * ncols..b * nproj * ncols],
+                                            &w[a * nfreq2..b * nfreq2],
+                                            theta,
+                                            nzc,
+                                            nproj,
+                                            ncols,
+                                            n,
+                                            pad,
+                                            pad_side,
+                                        )
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .map(|h| {
+                                    h.join().unwrap_or_else(|_| {
+                                        Err(Error::Backend("cuda analytic worker panicked".into()))
+                                    })
+                                })
+                                .collect()
+                        });
+                        let mut vol = Vec::with_capacity(nz * n * n);
+                        for p in parts {
+                            vol.extend(p?);
+                        }
+                        vol
                     }
-                    unsafe {
-                        ffi::tomoxide_linerec_backproject(
-                            h,
-                            f.ptr,
-                            gf.ptr,
-                            theta_dev.ptr as *const f32,
-                            std::f32::consts::FRAC_PI_2,
-                            0,
-                            null,
-                        );
-                    }
-                    unsafe { ffi::tomoxide_linerec_free(h) };
-                    ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                    let mut host = vec![0.0f32; nz * n * n];
-                    f.to_host_f32(&mut host)?;
-                    host
                 }
                 Algorithm::Fourierrec => {
                     if nz % 2 != 0 {
@@ -406,29 +544,9 @@ mod cuda_impl {
                             "cuda fourierrec needs an even slice count; got nz={nz}"
                         )));
                     }
-                    let gc = DevBuf::zeroed(nz * nproj * ncols * fsz)?; // complex [nz/2,nproj,ncols]
-                    ck(
-                        unsafe { ffi::tomoxide_pack_pairs(gf.ptr, gc.ptr, nz, nproj, ncols, null) },
-                        "pack",
-                    )?;
-                    let fc = DevBuf::zeroed(nz * n * n * fsz)?; // complex [nz/2,n,n]
-                    let h = unsafe {
-                        ffi::tomoxide_fourierrec_new(nproj, nz / 2, n, theta_dev.ptr as *const f32)
-                    };
-                    if h.is_null() {
-                        return Err(Error::Backend("cfunc_fourierrec allocation failed".into()));
-                    }
-                    unsafe { ffi::tomoxide_fourierrec_backproject(h, fc.ptr, gc.ptr, null) };
-                    unsafe { ffi::tomoxide_fourierrec_free(h) };
-                    let vol_dev = DevBuf::zeroed(nz * n * n * fsz)?;
-                    ck(
-                        unsafe { ffi::tomoxide_unpack_pairs(fc.ptr, vol_dev.ptr, nz, n, null) },
-                        "unpack",
-                    )?;
-                    ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                    let mut host = vec![0.0f32; nz * n * n];
-                    vol_dev.to_host_f32(&mut host)?;
-                    host
+                    let devices = selected_devices();
+                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                    analytic_fourierrec(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                 }
                 other => {
                     return Err(Error::InvalidParam(format!(
