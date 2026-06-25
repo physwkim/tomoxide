@@ -22,9 +22,9 @@ pub use pipeline::{reconstruct, PrepOptions, ReconSteps};
 
 // Re-export the building blocks so downstream code needs one dependency.
 pub use tomoxide_core::{
-    Algorithm, Angles, Backend, BackendKind, Beam, Center, Dataset, Detector, Dtype, Error,
-    FilterName, Frames, Geometry, Layout, PhaseMethod, ReconParams, Result, StripeMethod, Tomo,
-    Volume,
+    Algorithm, Angles, Backend, BackendKind, Beam, Center, Complex32, Dataset, Detector, Dtype,
+    Error, FilterName, Frames, Geometry, Layout, PhaseMethod, ReconParams, Result, StripeMethod,
+    Tomo, Volume,
 };
 pub use tomoxide_core::backend;
 pub use tomoxide_cpu::CpuBackend;

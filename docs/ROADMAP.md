@@ -171,26 +171,31 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   backend). Direct GPU↔CPU filter rel Δ ≈ 2e-5 (cuFFT vs rustfft).
 - ✅ GPU **Elementwise** (dark/flat + minus-log): darkflat Δ=0, minus_log
   ≈1e-7 vs CPU (`cuda_elementwise_parity.rs`).
-- ⬜ `lprec` GPU back-projection — **deferred (cost/value + layering).** The
-  kernel (`cfunc_lprec`) is straightforward to wire, but its `setgrids` wants
-  the 10 precomputed log-polar grids (fZ half-spectrum, `lp2p*`/`C2lp*`,
-  `lpids`/`wids`/`cids`) in the kernel's exact cuFFT-2D-R2C layout. Those grids
-  live in `recon::lprec`'s private precompute, so wiring them would either invert
-  the layering (`tomoxide-cuda` → `tomoxide-recon`, which the architecture
-  forbids — backends depend on `tomoxide-core` only) or duplicate ~200 lines of
-  precompute, all for a parity-only third analytic method (GPU `fourierrec`
-  already covers analytic recon on the device). Revisit if the lprec precompute
-  is promoted into `tomoxide-core`.
+- ✅ **CUDA `Fft` capability** (cuFFT C2C, 1-D + 2-D batched, inverse-normalized
+  to tomoxide's convention). This composes every Fft-based method onto CUDA
+  through the backend-agnostic code — the same way they run on wgpu — so it
+  unlocks at once:
+  - ✅ `gridrec` on CUDA (cuda↔cpu rel ≈ 7e-7),
+  - ✅ `lprec` on CUDA via the Fft-composed `recon::lprec` (rel ≈ 1e-6) — this
+    sidesteps the `cfunc_lprec` grid-layout/layering problem entirely, so no
+    `cfunc_lprec` wiring is needed,
+  - ✅ Paganin/GPaganin/Farago **phase** on CUDA (`retrieve_phase` uses
+    `backend.fft()`; Paganin cuda↔cpu rel ≈ 3e-7).
+  (`cuda_fft_compose.rs`.) Each `Fft` call is host-in/out; the fused
+  `AnalyticReconstruct` path remains the zero-copy route for FBP/fourierrec.
 - ✅ Fused **device-resident analytic pipeline** (`AnalyticReconstruct`
   capability): `recon(Fbp/Linerec/Fourierrec, &CudaBackend)` now uploads the raw
   sinogram once, runs pad → cuFFT filter → crop → back-projection (or pack →
   fourierrec → unpack) entirely on the device, and downloads the volume once —
   no per-stage host↔device copies. Device kernels for pad/crop/pack/unpack.
   Δ=0 vs composing the per-capability stages (`cuda_fbp_parity.rs`).
-- ⬜ GPU stripe/phase. Note: the per-capability `Backend` accessors are still
-  host-in/out (used standalone); the fused `AnalyticReconstruct` is the
-  zero-copy path for the analytic chain. Folding stripe/phase into a fused
-  preprocessing+recon device path is a further extension.
+- ✅ GPU **phase** (via the CUDA `Fft` above). ⬜ GPU **stripe**: `remove_stripe`
+  is CPU-only by design (it takes no backend — it uses its own internal FFT/
+  wavelet/sort kernels), and several Vo/Ti methods (CG solve, sorting, median)
+  are poorly GPU-suited, so a GPU stripe path would be a separate per-method
+  effort rather than a capability compose. Folding preprocessing into a single
+  fused device pipeline (beyond the analytic `AnalyticReconstruct`) is a further
+  extension.
 - Verification: on a CUDA host, numeric diff vs the CPU backend per method.
 
 ## M5 — Streaming pipeline (parity target: tomocupy `rec_steps`) 🟢 chunked driver done

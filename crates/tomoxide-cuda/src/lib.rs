@@ -15,7 +15,10 @@
 //! `recon(Fbp/Linerec/Fourierrec, &CudaBackend)` uploads the sinogram once,
 //! runs pad → filter → crop → back-projection (or pack → fourierrec → unpack)
 //! all on the device, and downloads the volume once — no per-stage host copies.
-//! Still on the CPU/wgpu side only: `lprec` and GPU stripe/phase.
+//! A cuFFT-backed [`Fft`](tomoxide_core::backend::Fft) capability additionally
+//! composes every Fft-based method onto CUDA through the backend-agnostic code:
+//! `gridrec`, `lprec`, and Paganin/GPaganin/Farago phase all run on the GPU.
+//! Still CPU-only: stripe removal (`remove_stripe` takes no backend).
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 #[cfg(feature = "cuda")]
@@ -98,6 +101,14 @@ impl Backend for CudaBackend {
     /// Dark/flat correction + minus-log on the GPU.
     #[cfg(feature = "cuda")]
     fn elementwise(&self) -> Option<&dyn tomoxide_core::backend::Elementwise> {
+        Some(self)
+    }
+
+    /// Batched C2C FFT (cuFFT). Implementing this composes every Fft-based
+    /// method (gridrec, lprec, Paganin/GPaganin/Farago phase, Fourier-wavelet
+    /// stripe) onto CUDA through the backend-agnostic code.
+    #[cfg(feature = "cuda")]
+    fn fft(&self) -> Option<&dyn tomoxide_core::backend::Fft> {
         Some(self)
     }
 }
@@ -513,6 +524,81 @@ mod cuda_impl {
                 .map_err(|e| Error::InvalidParam(format!("cuda filter shape: {e}")))?;
             *sino = Tomo::new(arr, Layout::Sinogram).to_layout(orig);
             Ok(())
+        }
+    }
+
+    impl tomoxide_core::backend::Fft for CudaBackend {
+        fn fft_1d(
+            &self,
+            buf: &mut [tomoxide_core::dtype::Complex32],
+            len: usize,
+            batch: usize,
+            inverse: bool,
+        ) -> Result<()> {
+            if len == 0 || batch == 0 {
+                return Ok(());
+            }
+            if buf.len() != len * batch {
+                return Err(Error::ShapeMismatch {
+                    expected: (len * batch).to_string(),
+                    found: buf.len().to_string(),
+                });
+            }
+            let mut flat = complex_to_flat(buf);
+            let d = DevBuf::from_host_f32(&flat)?;
+            ck(
+                unsafe { ffi::tomoxide_fft_1d(d.ptr, len, batch, inverse as i32) },
+                "fft_1d",
+            )?;
+            d.to_host_f32(&mut flat)?;
+            flat_to_complex(&flat, buf);
+            Ok(())
+        }
+
+        fn fft_2d(
+            &self,
+            buf: &mut [tomoxide_core::dtype::Complex32],
+            rows: usize,
+            cols: usize,
+            batch: usize,
+            inverse: bool,
+        ) -> Result<()> {
+            if rows == 0 || cols == 0 || batch == 0 {
+                return Ok(());
+            }
+            if buf.len() != rows * cols * batch {
+                return Err(Error::ShapeMismatch {
+                    expected: (rows * cols * batch).to_string(),
+                    found: buf.len().to_string(),
+                });
+            }
+            let mut flat = complex_to_flat(buf);
+            let d = DevBuf::from_host_f32(&flat)?;
+            ck(
+                unsafe { ffi::tomoxide_fft_2d(d.ptr, rows, cols, batch, inverse as i32) },
+                "fft_2d",
+            )?;
+            d.to_host_f32(&mut flat)?;
+            flat_to_complex(&flat, buf);
+            Ok(())
+        }
+    }
+
+    /// Interleave `[re, im, …]` from a complex slice for upload.
+    fn complex_to_flat(buf: &[tomoxide_core::dtype::Complex32]) -> Vec<f32> {
+        let mut flat = vec![0.0f32; buf.len() * 2];
+        for (i, c) in buf.iter().enumerate() {
+            flat[2 * i] = c.re;
+            flat[2 * i + 1] = c.im;
+        }
+        flat
+    }
+
+    /// Write an interleaved `[re, im, …]` buffer back into a complex slice.
+    fn flat_to_complex(flat: &[f32], buf: &mut [tomoxide_core::dtype::Complex32]) {
+        for (i, c) in buf.iter_mut().enumerate() {
+            c.re = flat[2 * i];
+            c.im = flat[2 * i + 1];
         }
     }
 

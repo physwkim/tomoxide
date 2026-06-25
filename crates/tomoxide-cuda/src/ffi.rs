@@ -136,4 +136,18 @@ unsafe extern "C" {
         n: usize,
         stream: *mut c_void,
     ) -> i32;
+
+    // --- batched C2C FFT (cuFFT) ---
+    /// In-place batched 1-D C2C FFT (`data` = device interleaved float2, length
+    /// `n*batch`); inverse is normalized by `1/n`. Returns 0 on success.
+    pub fn tomoxide_fft_1d(data: *mut c_void, n: usize, batch: usize, inverse: i32) -> i32;
+    /// In-place batched 2-D C2C FFT (`rows*cols*batch`); inverse normalized by
+    /// `1/(rows*cols)`.
+    pub fn tomoxide_fft_2d(
+        data: *mut c_void,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        inverse: i32,
+    ) -> i32;
 }
