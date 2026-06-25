@@ -15,6 +15,8 @@ unsafe extern "C" {
     // --- device runtime helpers ---
     /// Number of CUDA devices (0 if none / driver missing).
     pub fn tomoxide_cuda_device_count() -> i32;
+    /// Bind the calling host thread to a device (multi-GPU pools); 0 on success.
+    pub fn tomoxide_cuda_set_device(dev: i32) -> i32;
     /// `cudaMalloc` — returns a device pointer or null on failure.
     pub fn tomoxide_cuda_malloc(bytes: usize) -> *mut c_void;
     /// `cudaFree`.

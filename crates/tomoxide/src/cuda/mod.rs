@@ -116,8 +116,11 @@ impl Backend for CudaBackend {
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::{ffi, CudaBackend};
-    use ndarray::{Array3, Axis};
+    use ndarray::{Array3, ArrayViewMut2, Axis};
+    use rayon::prelude::*;
+    use rayon::{ThreadPool, ThreadPoolBuilder};
     use std::os::raw::c_void;
+    use std::sync::OnceLock;
     use crate::backend::{
         make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
     };
@@ -527,7 +530,126 @@ mod cuda_impl {
         }
     }
 
+    /// Devices to spread the per-slice loop over. Default is **all** visible
+    /// devices (multi-GPU); `TOMOXIDE_CUDA_DEVICES` overrides with a
+    /// comma-separated index list — e.g. `0` pins a single GPU, `0,2` uses two.
+    /// Out-of-range / unparsable entries are dropped; an empty result falls back
+    /// to device 0.
+    fn selected_devices() -> Vec<i32> {
+        let count = unsafe { ffi::tomoxide_cuda_device_count() }.max(0);
+        if let Ok(s) = std::env::var("TOMOXIDE_CUDA_DEVICES") {
+            if !s.trim().is_empty() {
+                let v: Vec<i32> = s
+                    .split(',')
+                    .filter_map(|t| t.trim().parse::<i32>().ok())
+                    .filter(|&d| d >= 0 && d < count)
+                    .collect();
+                return if v.is_empty() { vec![0] } else { v };
+            }
+        }
+        if count <= 0 {
+            vec![0]
+        } else {
+            (0..count).collect()
+        }
+    }
+
+    /// One device-pinned rayon pool per selected GPU, built once. Each pool's
+    /// worker threads call `cudaSetDevice` at startup, so their `cudaMalloc`,
+    /// cuFFT plans (thread-local cache), and per-thread default stream all land
+    /// on that GPU. Host cores are split evenly across the pools.
+    struct DevicePools {
+        devices: Vec<i32>,
+        pools: Vec<ThreadPool>,
+    }
+
+    fn device_pools() -> &'static DevicePools {
+        static POOLS: OnceLock<DevicePools> = OnceLock::new();
+        POOLS.get_or_init(|| {
+            let devices = selected_devices();
+            let total = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let per = (total / devices.len().max(1)).max(1);
+            let pools = devices
+                .iter()
+                .map(|&dev| {
+                    ThreadPoolBuilder::new()
+                        .num_threads(per)
+                        .start_handler(move |_| {
+                            unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                        })
+                        .build()
+                        .expect("build cuda device pool")
+                })
+                .collect();
+            DevicePools { devices, pools }
+        })
+    }
+
     impl crate::backend::Fft for CudaBackend {
+        /// Fan the per-slice loop across the selected GPUs (and host cores).
+        /// Slices are partitioned into one contiguous chunk per device; each
+        /// chunk runs on that device's pinned pool, all devices concurrently.
+        /// Bit-identical to the serial default — slices are independent and the
+        /// per-device cuFFT is deterministic.
+        fn for_each_slice(
+            &self,
+            out: &mut Array3<f32>,
+            f: &(dyn Fn(usize, ArrayViewMut2<f32>) -> Result<()> + Sync),
+        ) -> Result<()> {
+            let dp = device_pools();
+            let d = dp.devices.len();
+            let slabs: Vec<ArrayViewMut2<f32>> = out.axis_iter_mut(Axis(0)).collect();
+            let nz = slabs.len();
+
+            // Single device: one pinned pool, rayon across its host cores.
+            if d <= 1 {
+                return dp.pools[0].install(|| {
+                    slabs
+                        .into_par_iter()
+                        .enumerate()
+                        .try_for_each(|(row, slab)| f(row, slab))
+                });
+            }
+
+            // Multi-GPU: contiguous chunks (sizes differ by ≤1), one per device.
+            let base = nz / d;
+            let rem = nz % d;
+            let mut chunks: Vec<(usize, Vec<ArrayViewMut2<f32>>)> = Vec::with_capacity(d);
+            let mut remaining = slabs;
+            let mut offset = 0;
+            for i in 0..d {
+                let len = base + if i < rem { 1 } else { 0 };
+                let tail = remaining.split_off(len);
+                chunks.push((offset, remaining));
+                remaining = tail;
+                offset += len;
+            }
+
+            std::thread::scope(|scope| -> Result<()> {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .zip(dp.pools.iter())
+                    .map(|((off, chunk), pool)| {
+                        scope.spawn(move || -> Result<()> {
+                            pool.install(|| {
+                                chunk
+                                    .into_par_iter()
+                                    .enumerate()
+                                    .try_for_each(|(i, slab)| f(off + i, slab))
+                            })
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join()
+                        .map_err(|_| Error::Backend("cuda slice worker panicked".into()))??;
+                }
+                Ok(())
+            })
+        }
+
         fn fft_1d(
             &self,
             buf: &mut [crate::dtype::Complex32],

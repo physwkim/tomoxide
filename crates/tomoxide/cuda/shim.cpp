@@ -35,6 +35,8 @@ int tomoxide_cuda_device_count() {
   if (cudaGetDeviceCount(&n) != cudaSuccess) return 0;
   return n;
 }
+// Bind the calling host thread to a device (for multi-GPU pools). 0 on success.
+int tomoxide_cuda_set_device(int dev) { return (int) cudaSetDevice(dev); }
 // Returns a device pointer (as void*) or null on failure.
 void* tomoxide_cuda_malloc(size_t bytes) {
   void* p = nullptr;
