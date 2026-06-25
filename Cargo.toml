@@ -27,7 +27,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "BSD-3-Clause"
-repository = "https://github.com/stevek/tomoxide"
+repository = "https://github.com/physwkim/tomoxide"
 authors = ["tomoxide contributors"]
 description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in Rust)"
 
@@ -47,7 +47,7 @@ tomoxide = { path = "crates/tomoxide", version = "0.1.0" }
 # `beam-hardening` feature). Self-contained: vendors the xraylib C sources and
 # data tables, so no system libxrl. Its build runs bindgen, which needs
 # libclang at compile time (see crates/tomoxide-prep docs). ---
-xraylib = { path = "../xraylib-rs/crates/xraylib" }
+xraylib = { path = "../xraylib-rs/crates/xraylib", version = "0.1" }
 
 # --- computer vision (SIFT center finding; optional, `sift-center` feature).
 # Links a system/conda OpenCV (≥4.x); its build runs bindgen → needs clang. ---
