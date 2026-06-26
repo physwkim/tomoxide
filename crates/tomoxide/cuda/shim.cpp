@@ -60,6 +60,42 @@ int tomoxide_cuda_mem_info(size_t* free_bytes, size_t* total_bytes) {
   return (int) cudaMemGetInfo(free_bytes, total_bytes);
 }
 
+// ---- async pipeline: streams, pinned host memory, async copies ----
+// These back the double-buffered H2D ∥ compute ∥ D2H overlap (tomocupy JSR 2023
+// Fig. 1). A CUDA stream serializes the work it carries but runs concurrently
+// with other streams; page-locked (pinned) host memory is what lets a
+// cudaMemcpyAsync overlap kernel execution instead of falling back to a
+// synchronous staged copy.
+void* tomoxide_cuda_stream_create() {
+  cudaStream_t s = nullptr;
+  if (cudaStreamCreate(&s) != cudaSuccess) return nullptr;
+  return reinterpret_cast<void*>(s);
+}
+void tomoxide_cuda_stream_destroy(void* s) {
+  if (s) cudaStreamDestroy(static_cast<cudaStream_t>(s));
+}
+int tomoxide_cuda_stream_sync(void* s) {
+  return (int) cudaStreamSynchronize(static_cast<cudaStream_t>(s));
+}
+// Page-locked host buffer (cudaHostAlloc) — required for true async overlap.
+void* tomoxide_cuda_host_alloc(size_t bytes) {
+  void* p = nullptr;
+  if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) return nullptr;
+  return p;
+}
+void tomoxide_cuda_host_free(void* p) { cudaFreeHost(p); }
+int tomoxide_cuda_memcpy_h2d_async(void* dst, const void* src, size_t bytes, void* stream) {
+  return (int) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
+                               static_cast<cudaStream_t>(stream));
+}
+int tomoxide_cuda_memcpy_d2h_async(void* dst, const void* src, size_t bytes, void* stream) {
+  return (int) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
+                               static_cast<cudaStream_t>(stream));
+}
+int tomoxide_cuda_memset_async(void* p, int value, size_t bytes, void* stream) {
+  return (int) cudaMemsetAsync(p, value, bytes, static_cast<cudaStream_t>(stream));
+}
+
 // ---- linerec (cfunc_linerec) ----
 void* tomoxide_linerec_new(size_t nproj, size_t nz, size_t n, size_t ncproj, size_t ncz) {
   return new cfunc_linerec(nproj, nz, n, ncproj, ncz);

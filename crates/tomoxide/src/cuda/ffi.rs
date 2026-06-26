@@ -32,6 +32,39 @@ unsafe extern "C" {
     /// `cudaMemGetInfo` — free / total bytes on the current device; 0 on success.
     pub fn tomoxide_cuda_mem_info(free_bytes: *mut usize, total_bytes: *mut usize) -> i32;
 
+    // --- async pipeline: streams, pinned host memory, async copies ---
+    /// `cudaStreamCreate` — returns an opaque `cudaStream_t` or null on failure.
+    pub fn tomoxide_cuda_stream_create() -> *mut c_void;
+    /// `cudaStreamDestroy`.
+    pub fn tomoxide_cuda_stream_destroy(stream: *mut c_void);
+    /// `cudaStreamSynchronize` — block until the stream's work completes; 0 on ok.
+    pub fn tomoxide_cuda_stream_sync(stream: *mut c_void) -> i32;
+    /// `cudaHostAlloc` (page-locked) — returns a pinned host pointer or null.
+    pub fn tomoxide_cuda_host_alloc(bytes: usize) -> *mut c_void;
+    /// `cudaFreeHost`.
+    pub fn tomoxide_cuda_host_free(p: *mut c_void);
+    /// `cudaMemcpyAsync` host→device on `stream`; 0 on success.
+    pub fn tomoxide_cuda_memcpy_h2d_async(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `cudaMemcpyAsync` device→host on `stream`; 0 on success.
+    pub fn tomoxide_cuda_memcpy_d2h_async(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `cudaMemsetAsync` on `stream`; 0 on success.
+    pub fn tomoxide_cuda_memset_async(
+        p: *mut c_void,
+        value: i32,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     // --- linerec (cfunc_linerec) ---
     /// `cfunc_linerec(nproj, nz, n, ncproj, ncz)`.
     pub fn tomoxide_linerec_new(
