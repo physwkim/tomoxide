@@ -365,10 +365,19 @@ mod cuda_impl {
     }
 
     /// Pad → cuFFT filter → crop → pack pairs → `cfunc_fourierrec` → unpack for
-    /// the whole stack on the **current** device. Single-device only: the complex
-    /// slice-pairing `(s, s+nz/2)` spans the full z-axis, and the kernel's
-    /// atomic-scatter gather is run-to-run nondeterministic, so a multi-GPU split
-    /// would be neither clean nor bit-verifiable. Returns the volume `[nz, n, n]`.
+    /// the whole stack on the **current** device. Returns the volume `[nz, n, n]`.
+    ///
+    /// Single-device only, by design. tomocupy's `gather`/`wrap` kernels scatter
+    /// onto the oversampled grid with `atomicAdd` (overlapping Gaussian stencils),
+    /// so float accumulation order — hence the low bits of the output — is
+    /// **run-to-run nondeterministic** (~1e-7 relative, single-precision floor;
+    /// the result is correlation-verified against the CPU `fourierrec`, not
+    /// bit-exact). Because the output is already nondeterministic and the complex
+    /// slice-pairing `(s, s+nz/2)` spans the whole z-axis, a multi-GPU split would
+    /// add complexity without a verifiable benefit, so it is deliberately not
+    /// done. Determinizing the gather would need a pull-based rewrite (no inverse
+    /// index ⇒ O(n³·nproj) per grid point) that would also break parity with the
+    /// vendored kernel; out of scope for this port.
     #[allow(clippy::too_many_arguments)]
     fn analytic_fourierrec(
         raw: &[f32],
@@ -484,6 +493,17 @@ mod cuda_impl {
                     } else {
                         // Contiguous z-chunks (sizes differ by ≤1), one GPU each,
                         // run concurrently; each thread owns its device's buffers.
+                        //
+                        // The back-projection is deterministic and per-slice
+                        // independent, but the cuFFT filter batch is nz_chunk·nproj
+                        // — cuFFT picks its algorithm by batch size, so chunked vs
+                        // whole-stack filtering round differently. Multi-GPU output
+                        // therefore differs from single-GPU at the single-precision
+                        // FFT floor (~1e-7 relative); each device is bit-identical
+                        // to the others and every config is internally
+                        // deterministic. Bit-exactness across device counts would
+                        // require filtering the full stack on every device (4×
+                        // redundant filter+upload) and is intentionally not paid.
                         let d = devices.len();
                         let base = nz / d;
                         let rem = nz % d;
@@ -709,8 +729,15 @@ mod cuda_impl {
         /// Fan the per-slice loop across the selected GPUs (and host cores).
         /// Slices are partitioned into one contiguous chunk per device; each
         /// chunk runs on that device's pinned pool, all devices concurrently.
-        /// Bit-identical to the serial default — slices are independent and the
-        /// per-device cuFFT is deterministic.
+        ///
+        /// Bit-identical regardless of device count: each slice's cuFFT uses a
+        /// fixed per-slice batch (independent of how slices are spread), and the
+        /// host gather/deapodize is deterministic f32 — so gridrec/lprec/phase
+        /// give max|Δ|=0 single-GPU vs multi-GPU. (This is *not* true of the
+        /// fused filter path, whose batch scales with the chunk; see
+        /// [`analytic_fbp_chunk`]'s caller.) Note gridrec is host-gather bound:
+        /// one GPU already saturates the host cores, so extra GPUs help the
+        /// GPU-heavier lprec/phase far more than gridrec.
         fn for_each_slice(
             &self,
             out: &mut Array3<f32>,
