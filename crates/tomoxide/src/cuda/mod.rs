@@ -301,7 +301,7 @@ mod cuda_impl {
                     "cuda back-projection supports parallel beam only".into(),
                 ));
             }
-            let s = sino.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let nz = s.n_rows();
             let nproj = s.n_angles();
             let ncols = s.n_cols();
@@ -985,7 +985,7 @@ mod cuda_impl {
                     "cuda analytic reconstruct supports parallel beam only".into(),
                 ));
             }
-            let s = sino.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let (nz, nproj, ncols) = s.array.dim();
             let n = params.num_gridx.unwrap_or(ncols);
             if n != ncols {
@@ -1157,7 +1157,7 @@ mod cuda_impl {
                 return Err(Error::InvalidParam("empty filter".into()));
             }
             let orig = sino.layout;
-            let s = sino.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let (nz, nproj, ncols) = s.array.dim();
             if pad < ncols {
                 return Err(Error::ShapeMismatch {
@@ -1726,7 +1726,7 @@ mod cuda_impl {
             geom: &Geometry,
             n: usize,
         ) -> Result<Volume<f32>> {
-            let s = filtered.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let s = filtered.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let nz = s.n_rows();
             let nproj = s.n_angles();
             let ncols = s.n_cols();

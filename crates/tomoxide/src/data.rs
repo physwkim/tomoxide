@@ -66,6 +66,22 @@ impl<T: Clone> Tomo<T> {
             layout: target,
         }
     }
+
+    /// Borrow in the requested layout, allocating only when a transpose is
+    /// actually needed. When `self` is already in `target` this returns a
+    /// borrow (no copy); otherwise it transposes into an owned copy.
+    ///
+    /// Prefer this over [`to_layout`] on read-only paths: `to_layout` always
+    /// allocates — it `clone()`s the full array even when the layout already
+    /// matches — which on a reconstruction-sized sinogram is hundreds of MB
+    /// copied per call for nothing.
+    pub fn as_layout(&self, target: Layout) -> std::borrow::Cow<'_, Tomo<T>> {
+        if self.layout == target {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            std::borrow::Cow::Owned(self.to_layout(target))
+        }
+    }
 }
 
 /// A reconstructed 3-D volume, axes `[z(row), y, x]`.
@@ -121,4 +137,29 @@ pub struct Dataset<T = f32> {
     pub dark: Option<Frames<T>>,
     /// Projection angles in radians, length = number of angles.
     pub theta: Vec<f32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn as_layout_borrows_when_matching_and_transposes_otherwise() {
+        let a = Array3::from_shape_fn((2, 3, 4), |(i, j, k)| (i * 100 + j * 10 + k) as f32);
+        let t = Tomo::new(a.clone(), Layout::Projection);
+
+        // Already in the target layout → borrow, no allocation.
+        let same = t.as_layout(Layout::Projection);
+        assert!(matches!(same, Cow::Borrowed(_)));
+        assert_eq!(same.array, a);
+
+        // Different layout → owned transpose [row, angle, col], same as to_layout.
+        let swapped = t.as_layout(Layout::Sinogram);
+        assert!(matches!(swapped, Cow::Owned(_)));
+        assert_eq!(swapped.layout, Layout::Sinogram);
+        assert_eq!(swapped.array.dim(), (3, 2, 4));
+        assert_eq!(swapped.array[[1, 0, 2]], a[[0, 1, 2]]);
+        assert_eq!(swapped.array, t.to_layout(Layout::Sinogram).array);
+    }
 }
