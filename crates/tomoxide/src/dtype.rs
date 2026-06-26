@@ -36,6 +36,20 @@ impl Dtype {
     }
 }
 
+impl std::str::FromStr for Dtype {
+    type Err = String;
+
+    /// Parse a `--dtype` value: `float32`/`f32` or `float16`/`f16` (the `half`
+    /// alias is accepted too). Case-insensitive.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "float32" | "f32" | "fp32" => Ok(Dtype::F32),
+            "float16" | "f16" | "fp16" | "half" => Ok(Dtype::F16),
+            other => Err(format!("unknown dtype '{other}' (float32|float16)")),
+        }
+    }
+}
+
 /// A scalar element that can live in a device buffer.
 ///
 /// Sealed in spirit: only `f32` and `half::f16` implement it.
@@ -57,5 +71,23 @@ impl Element for half::f16 {
     const DTYPE: Dtype = Dtype::F16;
     fn zero() -> Self {
         half::f16::from_f32_const(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dtype;
+
+    #[test]
+    fn dtype_from_str_aliases() {
+        for s in ["float32", "f32", "FP32", " Float32 "] {
+            assert_eq!(s.parse::<Dtype>().unwrap(), Dtype::F32, "{s}");
+        }
+        for s in ["float16", "f16", "FP16", "half"] {
+            assert_eq!(s.parse::<Dtype>().unwrap(), Dtype::F16, "{s}");
+        }
+        assert!("float8".parse::<Dtype>().is_err());
+        // Round-trips through the canonical name.
+        assert_eq!(Dtype::F16.as_str().parse::<Dtype>().unwrap(), Dtype::F16);
     }
 }

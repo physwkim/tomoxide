@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use tomoxide::io::DatasetReader;
-use tomoxide::{Angles, BackendKind, Engine, Geometry, ReconParams};
+use tomoxide::{Angles, BackendKind, Dtype, Engine, Geometry, ReconParams};
 use tomoxide::Center;
 use tomoxide::Algorithm;
 
@@ -53,11 +53,18 @@ enum Command {
         /// Rotation-axis column (omit to auto-find).
         #[arg(long)]
         center: Option<f32>,
+        /// Reconstruction precision: float32 | float16 (CUDA fbp/linerec/
+        /// fourierrec only).
+        #[arg(long, default_value = "float32")]
+        dtype: String,
     },
     /// Chunked / streaming reconstruction (out-of-core).
     ReconSteps {
         /// Input DXchange HDF5 file.
         file: PathBuf,
+        /// Reconstruction precision: float32 | float16 (CUDA only).
+        #[arg(long, default_value = "float32")]
+        dtype: String,
     },
 }
 
@@ -99,19 +106,22 @@ fn main() -> anyhow::Result<()> {
             file,
             algorithm,
             center,
+            dtype,
         } => {
             let engine = Engine::new(backend_kind)?;
             let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
+            let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
             println!(
-                "recon: file={} algorithm={:?} center={:?} backend={}",
+                "recon: file={} algorithm={:?} center={:?} dtype={} backend={}",
                 file.display(),
                 algo,
                 center,
+                dtype.as_str(),
                 engine.name()
             );
             let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
             let geom = geometry_from_reader(reader.as_mut(), center)?;
-            let params = recon_params(&geom);
+            let params = recon_params(&geom, dtype);
             let ds = reader.read_all()?;
             let vol = tomoxide::reconstruct(
                 ds,
@@ -127,11 +137,13 @@ fn main() -> anyhow::Result<()> {
             writer.write_chunk(&vol, 0, nz)?;
             println!("wrote {nz} reconstructed slices to {out}");
         }
-        Command::ReconSteps { file } => {
+        Command::ReconSteps { file, dtype } => {
             let engine = Engine::new(backend_kind)?;
+            let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
             println!(
-                "recon_steps: file={} backend={}",
+                "recon_steps: file={} dtype={} backend={}",
                 file.display(),
+                dtype.as_str(),
                 engine.name()
             );
             let path = file.to_string_lossy().into_owned();
@@ -140,7 +152,7 @@ fn main() -> anyhow::Result<()> {
             let mut probe = tomoxide::io::open_dxchange(&path)?;
             let geom = geometry_from_reader(probe.as_mut(), None)?;
             drop(probe);
-            let params = recon_params(&geom);
+            let params = recon_params(&geom, dtype);
             let out = recon_out_path(&file);
             let read_path = path.clone();
             let write_path = out.clone();
@@ -175,9 +187,10 @@ fn geometry_from_reader(
 }
 
 /// Reconstruction params with the grid sized to the detector width.
-fn recon_params(geom: &Geometry) -> ReconParams {
+fn recon_params(geom: &Geometry, dtype: Dtype) -> ReconParams {
     ReconParams {
         num_gridx: Some(geom.detector.width),
+        dtype,
         ..Default::default()
     }
 }
