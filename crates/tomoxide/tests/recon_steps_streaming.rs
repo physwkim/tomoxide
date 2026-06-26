@@ -33,6 +33,23 @@ impl VolumeWriter for CollectWriter {
     }
 }
 
+/// Writer that assembles chunks into a volume shared across threads, so the
+/// pipelined path (which builds its writer on the writer thread) can be compared
+/// after the run.
+struct SharedCollectWriter {
+    vol: std::sync::Arc<std::sync::Mutex<Array3<f32>>>,
+}
+impl VolumeWriter for SharedCollectWriter {
+    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> tomoxide::Result<()> {
+        self.vol
+            .lock()
+            .unwrap()
+            .slice_axis_mut(Axis(0), ndarray::Slice::from(start..end))
+            .assign(&vol.array);
+        Ok(())
+    }
+}
+
 #[test]
 fn run_streaming_matches_run_all() {
     use tomoxide::Algorithm;
@@ -69,6 +86,70 @@ fn run_streaming_matches_run_all() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert_eq!(max_d, 0.0, "out-of-core differs from read-all: max |Δ| = {max_d}");
+}
+
+#[test]
+fn run_streaming_pipelined_matches_run_streaming() {
+    use std::sync::{Arc, Mutex};
+    use tomoxide::Algorithm;
+    let path = format!("{FIXTURES}/streaming_dxchange.h5");
+    let engine = Engine::new(BackendKind::Cpu).unwrap();
+
+    let mut probe = io::open_dxchange(&path).unwrap();
+    let (_nproj, nz, nx, _nf, _nd) = probe.read_sizes().unwrap();
+    let theta = probe.read_theta().unwrap();
+    drop(probe);
+    let geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
+    let params = ReconParams {
+        num_gridx: Some(nx),
+        ..Default::default()
+    };
+    let prep = PrepOptions::default();
+
+    // Sequential streaming reference (already proven == read-all run).
+    let mut r_seq = io::open_dxchange(&path).unwrap();
+    let mut w_seq = CollectWriter::new(nz, nx);
+    ReconSteps::new(4)
+        .run_streaming(
+            &mut *r_seq,
+            &mut w_seq,
+            &geom,
+            Algorithm::Fbp,
+            &params,
+            &prep,
+            &engine,
+        )
+        .unwrap();
+
+    // Pipelined path: reader/writer built on their own threads via factories;
+    // the writer collects into a shared volume.
+    let shared = Arc::new(Mutex::new(Array3::<f32>::zeros((nz, nx, nx))));
+    let read_path = path.clone();
+    let shared_w = Arc::clone(&shared);
+    ReconSteps::new(4)
+        .run_streaming_pipelined(
+            move || io::open_dxchange(&read_path),
+            move || Ok(Box::new(SharedCollectWriter { vol: shared_w }) as Box<dyn VolumeWriter>),
+            &geom,
+            Algorithm::Fbp,
+            &params,
+            &prep,
+            &engine,
+        )
+        .unwrap();
+    let piped = shared.lock().unwrap();
+
+    assert_eq!(w_seq.vol.dim(), piped.dim());
+    let max_d = w_seq
+        .vol
+        .iter()
+        .zip(piped.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert_eq!(
+        max_d, 0.0,
+        "pipelined differs from sequential streaming: max |Δ| = {max_d}"
+    );
 }
 
 #[test]

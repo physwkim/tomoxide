@@ -134,14 +134,19 @@ fn main() -> anyhow::Result<()> {
                 file.display(),
                 engine.name()
             );
-            let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
-            let geom = geometry_from_reader(reader.as_mut(), None)?;
+            let path = file.to_string_lossy().into_owned();
+            // Probe geometry from a short-lived reader open (metadata only); the
+            // pipeline builds its own reader on the reader thread.
+            let mut probe = tomoxide::io::open_dxchange(&path)?;
+            let geom = geometry_from_reader(probe.as_mut(), None)?;
+            drop(probe);
             let params = recon_params(&geom);
             let out = recon_out_path(&file);
-            let mut writer = tomoxide::io::create_writer(&out, tomoxide::io::SaveFormat::Tiff)?;
-            tomoxide::ReconSteps::new(64).run(
-                reader.as_mut(),
-                writer.as_mut(),
+            let read_path = path.clone();
+            let write_path = out.clone();
+            tomoxide::ReconSteps::new(64).run_streaming_pipelined(
+                move || tomoxide::io::open_dxchange(&read_path),
+                move || tomoxide::io::create_writer(&write_path, tomoxide::io::SaveFormat::Tiff),
                 &geom,
                 Algorithm::Fbp,
                 &params,

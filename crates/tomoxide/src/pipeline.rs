@@ -175,6 +175,143 @@ impl ReconSteps {
     }
 }
 
+/// In-flight chunk slack per channel for [`ReconSteps::run_streaming_pipelined`].
+///
+/// `sync_channel(PIPELINE_DEPTH)` lets the reader run up to `PIPELINE_DEPTH`
+/// chunks ahead of compute (and compute that many ahead of the writer) before
+/// back-pressure stalls it, so peak host memory is bounded to ~`PIPELINE_DEPTH`
+/// extra projection chunks + volume chunks rather than the whole dataset. Depth
+/// 1 already overlaps all three stages (the classic double-buffer); 2 absorbs
+/// per-chunk jitter at the cost of one more buffered chunk each way.
+const PIPELINE_DEPTH: usize = 2;
+
+impl ReconSteps {
+    /// Pipelined out-of-core reconstruction — same numerics as
+    /// [`run_streaming`](ReconSteps::run_streaming) but overlapping disk **read**,
+    /// **compute**, and disk **write** across chunks (the tomocupy
+    /// `rec.py`/`rec_steps.py` conveyor: read chunk *i+1* while reconstructing
+    /// chunk *i* while writing chunk *i-1*).
+    ///
+    /// Because the HDF5 reader/writer (`rust-hdf5`'s `H5File`) are `!Send`, they
+    /// cannot cross a thread boundary. Instead each I/O object is **constructed on
+    /// the thread that owns it** via a factory closure: `make_reader` runs on the
+    /// reader thread, `make_writer` on the writer thread, and compute (which holds
+    /// the backend) stays on the calling thread. Only [`Dataset`]/[`Volume`] (both
+    /// `Send`) cross the bounded channels, so no trait change is needed.
+    ///
+    /// Chunks carry their own row range `[r0, r1)` to the writer, which addresses
+    /// each chunk by offset ([`VolumeWriter::write_chunk`](crate::io::VolumeWriter::write_chunk)),
+    /// so the pipeline is correct regardless of completion order. The per-chunk
+    /// work is identical to `run_streaming`, so the volume is bit-for-bit the same.
+    ///
+    /// Like `run_streaming`, phase retrieval is rejected (Paganin couples detector
+    /// rows within a projection, which a row-chunked read cannot satisfy).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_streaming_pipelined<RF, WF>(
+        &self,
+        make_reader: RF,
+        make_writer: WF,
+        geom: &Geometry,
+        algorithm: Algorithm,
+        params: &ReconParams,
+        prep: &PrepOptions,
+        engine: &Engine,
+    ) -> Result<()>
+    where
+        RF: FnOnce() -> Result<Box<dyn crate::io::DatasetReader>> + Send,
+        WF: FnOnce() -> Result<Box<dyn crate::io::VolumeWriter>> + Send,
+    {
+        if prep.phase != PhaseMethod::None {
+            return Err(crate::error::Error::InvalidParam(
+                "ReconSteps::run_streaming_pipelined does not support phase retrieval \
+                 (row-coupled); use run() for a phase pipeline"
+                    .into(),
+            ));
+        }
+        let backend = engine.backend();
+        let chunk = self.chunk_rows.max(1);
+
+        // read thread → compute (this thread) → write thread, each bounded.
+        let (read_tx, read_rx) =
+            std::sync::mpsc::sync_channel::<(usize, usize, Dataset<f32>)>(PIPELINE_DEPTH);
+        let (write_tx, write_rx) =
+            std::sync::mpsc::sync_channel::<(usize, usize, Volume<f32>)>(PIPELINE_DEPTH);
+
+        std::thread::scope(|s| {
+            // Reader thread: build its own reader, stream each chunk's rows.
+            let reader_handle = s.spawn(move || -> Result<()> {
+                let mut reader = make_reader()?;
+                let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+                let mut r0 = 0;
+                while r0 < nz {
+                    let r1 = (r0 + chunk).min(nz);
+                    let ds = reader.read_chunk(r0, r1)?;
+                    // A send error means compute hung up (errored/aborted); stop
+                    // reading — the compute side already owns the real error.
+                    if read_tx.send((r0, r1, ds)).is_err() {
+                        break;
+                    }
+                    r0 = r1;
+                }
+                Ok(())
+                // read_tx drops here → compute's recv loop ends.
+            });
+
+            // Writer thread: build its own writer, drain results by row range.
+            let writer_handle = s.spawn(move || -> Result<()> {
+                let mut writer = make_writer()?;
+                while let Ok((r0, r1, vol)) = write_rx.recv() {
+                    writer.write_chunk(&vol, r0, r1)?;
+                }
+                Ok(())
+            });
+
+            // Compute on this thread (the backend lives here). Owns write_tx so it
+            // drops at the end of the loop, terminating the writer thread.
+            let compute = compute_chunks(read_rx, write_tx, backend, geom, algorithm, params, prep);
+
+            // Join I/O threads, then surface the first error in causal order:
+            // a reader error truncates the stream (compute ends Ok) so it must be
+            // reported; a compute error is the root when reads succeeded.
+            let read_res = reader_handle.join().expect("reader thread panicked");
+            let write_res = writer_handle.join().expect("writer thread panicked");
+            compute.and(read_res).and(write_res)
+        })
+    }
+}
+
+/// Compute stage of [`ReconSteps::run_streaming_pipelined`]: pull each read chunk,
+/// run the per-chunk numeric pipeline (identical to `run_streaming`), and push the
+/// reconstructed volume to the writer. Takes `write_tx` by value so it is dropped
+/// when the stream ends, signalling the writer thread to finish.
+#[allow(clippy::too_many_arguments)]
+fn compute_chunks(
+    read_rx: std::sync::mpsc::Receiver<(usize, usize, Dataset<f32>)>,
+    write_tx: std::sync::mpsc::SyncSender<(usize, usize, Volume<f32>)>,
+    backend: &dyn crate::backend::Backend,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+) -> Result<()> {
+    while let Ok((r0, r1, mut ds)) = read_rx.recv() {
+        crate::prep::normalize_dataset(&mut ds, backend)?;
+        let mut sino = ds.data.to_layout(Layout::Sinogram);
+        // to_layout transposes to a non-contiguous view; make it C-contiguous so
+        // the back-projector can take a flat slice (mirrors run_streaming).
+        sino.array = sino.array.as_standard_layout().to_owned();
+        crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+        let chunk_geom = chunk_geometry(geom, r0, r1);
+        let vol = crate::recon::recon(&sino, &chunk_geom, algorithm, params, backend)?;
+        // A send error means the writer hung up (errored); stop — the writer
+        // thread owns the real error, surfaced after join.
+        if write_tx.send((r0, r1, vol)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// A copy of `geom` whose rotation center is restricted to detector rows
 /// `[r0, r1)` (so a `PerRow` center lines up with a z-chunk; a scalar center is
 /// unchanged).
