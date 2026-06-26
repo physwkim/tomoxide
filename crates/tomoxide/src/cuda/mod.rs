@@ -253,30 +253,35 @@ mod cuda_impl {
     /// A page-locked (pinned) host buffer of `f32`. Async H2D/D2H copies only
     /// overlap kernel execution when their host side is pinned — pageable memory
     /// forces the driver into a synchronous staged copy, defeating the pipeline.
-    struct PinnedBuf {
+    struct PinnedBuf<T = f32> {
         ptr: *mut c_void,
         len: usize, // elements
+        _marker: std::marker::PhantomData<T>,
     }
 
-    impl PinnedBuf {
+    impl<T: Copy> PinnedBuf<T> {
         fn new(len: usize) -> Result<Self> {
-            let ptr = unsafe { ffi::tomoxide_cuda_host_alloc(len * std::mem::size_of::<f32>()) };
+            let ptr = unsafe { ffi::tomoxide_cuda_host_alloc(len * std::mem::size_of::<T>()) };
             if ptr.is_null() {
-                return Err(Error::Backend(format!("cudaHostAlloc({len} f32) failed")));
+                return Err(Error::Backend(format!("cudaHostAlloc({len} elems) failed")));
             }
-            Ok(PinnedBuf { ptr, len })
+            Ok(PinnedBuf {
+                ptr,
+                len,
+                _marker: std::marker::PhantomData,
+            })
         }
 
-        fn as_mut_slice(&mut self) -> &mut [f32] {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len) }
+        fn as_mut_slice(&mut self) -> &mut [T] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) }
         }
 
-        fn as_slice(&self) -> &[f32] {
-            unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len) }
+        fn as_slice(&self) -> &[T] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) }
         }
     }
 
-    impl Drop for PinnedBuf {
+    impl<T> Drop for PinnedBuf<T> {
         fn drop(&mut self) {
             unsafe { ffi::tomoxide_cuda_host_free(self.ptr) };
         }
@@ -781,6 +786,260 @@ mod cuda_impl {
         analytic_fbp_pipeline(raw, w, theta, &chunks, nz, nproj, ncols, n, pad, pad_side)
     }
 
+    /// f16 counterpart of [`FbpSlot`]: half device + pinned buffers. `theta` is
+    /// shared (uploaded once) and stays f32, so it is not a slot field.
+    struct FbpSlotF16 {
+        stream: Stream,
+        sino: DevBuf,
+        gpad: DevBuf,
+        gf: DevBuf,
+        f: DevBuf,
+        w: DevBuf,
+        pin_in: PinnedBuf<half::f16>,
+        pin_w: PinnedBuf<half::f16>,
+        pin_out: PinnedBuf<half::f16>,
+        inflight: Option<usize>,
+        filt: *mut c_void,
+        lrec: *mut c_void,
+    }
+
+    /// Half-precision counterpart of [`analytic_fbp_pipeline`]. Same double-
+    /// buffered H2D∥compute∥D2H overlap, but device/pinned buffers are `f16` and
+    /// the per-chunk host staging *converts* (f32→f16 into the pinned input, and
+    /// f16→f32 out of the pinned output on drain). Those conversions — the single
+    /// largest host cost of the f16 path — run on CPU worker threads while a
+    /// previous chunk's kernels run on the GPU, so together with the halved
+    /// transfers they are hidden behind compute. Numerically equal per chunk to
+    /// [`analytic_fbp_chunk_f16`] (correlation vs f32, not bit-exact).
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fbp_pipeline_f16(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        chunks: &[(usize, usize)],
+        nz_total: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let hsz = std::mem::size_of::<half::f16>();
+        let nfreq2 = (pad / 2 + 1) * 2;
+        let maxlen = chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        if maxlen == 0 {
+            return Ok(Vec::new());
+        }
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+
+        let mut slots: Vec<FbpSlotF16> = Vec::with_capacity(2);
+        for _ in 0..2 {
+            slots.push(FbpSlotF16 {
+                stream: Stream::new()?,
+                sino: DevBuf::new(maxlen * nproj * ncols * hsz)?,
+                gpad: DevBuf::new(maxlen * nproj * pad * hsz)?,
+                gf: DevBuf::new(maxlen * nproj * ncols * hsz)?,
+                f: DevBuf::new(maxlen * n * n * hsz)?,
+                w: DevBuf::new(maxlen * nfreq2 * hsz)?,
+                pin_in: PinnedBuf::new(maxlen * nproj * ncols)?,
+                pin_w: PinnedBuf::new(maxlen * nfreq2)?,
+                pin_out: PinnedBuf::new(maxlen * n * n)?,
+                inflight: None,
+                filt: std::ptr::null_mut(),
+                lrec: std::ptr::null_mut(),
+            });
+        }
+
+        let mut out = vec![0.0f32; nz_total * n * n];
+
+        for k in 0..chunks.len() {
+            let s = k % 2;
+            if let Some(ci) = slots[s].inflight.take() {
+                drain_fbp_slot_f16(&mut slots[s], ci, chunks, n, &mut out)?;
+            }
+
+            let (z0, len) = chunks[k];
+            let st = slots[s].stream.ptr;
+            // Stage host inputs into pinned buffers, converting f32→f16 in
+            // parallel. This runs while the other slot's chunk computes on the GPU.
+            {
+                let src = &raw[z0 * nproj * ncols..(z0 + len) * nproj * ncols];
+                slots[s].pin_in.as_mut_slice()[..len * nproj * ncols]
+                    .par_iter_mut()
+                    .zip(src.par_iter())
+                    .for_each(|(d, &x)| *d = half::f16::from_f32(x));
+                let srcw = &w[z0 * nfreq2..(z0 + len) * nfreq2];
+                slots[s].pin_w.as_mut_slice()[..len * nfreq2]
+                    .par_iter_mut()
+                    .zip(srcw.par_iter())
+                    .for_each(|(d, &x)| *d = half::f16::from_f32(x));
+            }
+
+            ck(
+                unsafe {
+                    ffi::tomoxide_cuda_memcpy_h2d_async(
+                        slots[s].sino.ptr,
+                        slots[s].pin_in.ptr,
+                        len * nproj * ncols * hsz,
+                        st,
+                    )
+                },
+                "h2d sino f16",
+            )?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_cuda_memcpy_h2d_async(
+                        slots[s].w.ptr,
+                        slots[s].pin_w.ptr,
+                        len * nfreq2 * hsz,
+                        st,
+                    )
+                },
+                "h2d w f16",
+            )?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_pad_fp16(
+                        slots[s].sino.ptr,
+                        slots[s].gpad.ptr,
+                        len,
+                        nproj,
+                        ncols,
+                        pad,
+                        pad_side,
+                        st,
+                    )
+                },
+                "pad_fp16",
+            )?;
+            let filt = unsafe { ffi::tomoxide_filter_fp16_new(nproj, len, pad) };
+            if filt.is_null() {
+                return Err(Error::Backend(
+                    "cfunc_filter (f16) allocation failed".into(),
+                ));
+            }
+            slots[s].filt = filt;
+            unsafe { ffi::tomoxide_filter_fp16_apply(filt, slots[s].gpad.ptr, slots[s].w.ptr, st) };
+            ck(
+                unsafe {
+                    ffi::tomoxide_crop_fp16(
+                        slots[s].gpad.ptr,
+                        slots[s].gf.ptr,
+                        len,
+                        nproj,
+                        ncols,
+                        pad,
+                        pad_side,
+                        st,
+                    )
+                },
+                "crop_fp16",
+            )?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_cuda_memset_async(slots[s].f.ptr, 0, len * n * n * hsz, st)
+                },
+                "memset f f16",
+            )?;
+            let lrec = unsafe { ffi::tomoxide_linerec_fp16_new(nproj, len, n, nproj, len) };
+            if lrec.is_null() {
+                return Err(Error::Backend(
+                    "cfunc_linerec (f16) allocation failed".into(),
+                ));
+            }
+            slots[s].lrec = lrec;
+            unsafe {
+                ffi::tomoxide_linerec_fp16_backproject(
+                    lrec,
+                    slots[s].f.ptr,
+                    slots[s].gf.ptr,
+                    theta_dev.ptr as *const f32,
+                    std::f32::consts::FRAC_PI_2,
+                    0,
+                    st,
+                );
+            }
+            ck(
+                unsafe {
+                    ffi::tomoxide_cuda_memcpy_d2h_async(
+                        slots[s].pin_out.ptr,
+                        slots[s].f.ptr,
+                        len * n * n * hsz,
+                        st,
+                    )
+                },
+                "d2h vol f16",
+            )?;
+            slots[s].inflight = Some(k);
+        }
+
+        for slot in &mut slots {
+            if let Some(ci) = slot.inflight.take() {
+                drain_fbp_slot_f16(slot, ci, chunks, n, &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// f16 counterpart of [`drain_fbp_slot`]: wait for the slot's stream, free its
+    /// per-chunk handles, then widen its downloaded f16 volume into `out` (the
+    /// f16→f32 round runs in parallel and overlaps later chunks' GPU work).
+    fn drain_fbp_slot_f16(
+        slot: &mut FbpSlotF16,
+        ci: usize,
+        chunks: &[(usize, usize)],
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        slot.stream.sync()?;
+        unsafe {
+            ffi::tomoxide_filter_fp16_free(slot.filt);
+            ffi::tomoxide_linerec_fp16_free(slot.lrec);
+        }
+        slot.filt = std::ptr::null_mut();
+        slot.lrec = std::ptr::null_mut();
+        let (z0, len) = chunks[ci];
+        out[z0 * n * n..(z0 + len) * n * n]
+            .par_iter_mut()
+            .zip(slot.pin_out.as_slice()[..len * n * n].par_iter())
+            .for_each(|(d, &h)| *d = h.to_f32());
+        Ok(())
+    }
+
+    /// f16 driver for the fused Fbp/Linerec path, mirroring [`analytic_fbp_stream`]:
+    /// when the whole stack fits one tile, a single [`analytic_fbp_chunk_f16`] —
+    /// the fastest path, since the GPU back-projection (memory-bandwidth bound, so
+    /// already ~2× faster in half) dominates and forcing tiles would only add
+    /// per-tile cuFFT-plan and pinned-allocation overhead. Only when the stack is
+    /// genuinely out-of-core does it tile and run the async pipeline, which there
+    /// lets f16 process a z-stack 2× larger than f32 would before tiling. The
+    /// current device must be selected.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fbp_stream_f16(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        // f16 elements are half the bytes of the f32 sizing `fbp_tile_z` assumes,
+        // so double the budget handed to it; its 32-bit index ceiling is
+        // element-count based and dtype-independent.
+        let budget = device_free_bytes().saturating_mul(2);
+        let tile_full = fbp_tile_z(nproj, ncols, n, pad, budget).min(nz.max(1));
+        if tile_full >= nz {
+            return analytic_fbp_chunk_f16(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
+        }
+        let tile = fbp_tile_z(nproj, ncols, n, pad, budget / 2).min(nz.max(1));
+        let k = linerec_chunk_count(nz, nz.div_ceil(tile));
+        let chunks = even_z_chunks(nz, k);
+        analytic_fbp_pipeline_f16(raw, w, theta, &chunks, nz, nproj, ncols, n, pad, pad_side)
+    }
+
     /// Pad → cuFFT filter → crop → pack pairs → `cfunc_fourierrec` → unpack for
     /// the whole stack on the **current** device. Returns the volume `[nz, n, n]`.
     ///
@@ -1028,7 +1287,7 @@ mod cuda_impl {
                 unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
                 let vol = match algorithm {
                     Algorithm::Fbp | Algorithm::Linerec => {
-                        analytic_fbp_chunk_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
+                        analytic_fbp_stream_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     Algorithm::Fourierrec => {
                         if nz % 2 != 0 {
@@ -1279,6 +1538,14 @@ mod cuda_impl {
     /// `cudaSetDevice`'d the device it means to allocate on. Falls back to a
     /// conservative 2 GiB if the query fails, so streaming still makes progress.
     fn device_free_bytes() -> usize {
+        // Test/debug hook: cap the reported free memory to force the streaming
+        // tiler + async pipeline onto stacks that would otherwise fit one chunk
+        // (the only way to exercise the out-of-core path on a large GPU).
+        if let Some(v) = std::env::var_os("TOMOXIDE_CUDA_MAX_FREE_BYTES") {
+            if let Some(n) = v.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
+                return n;
+            }
+        }
         let mut free: usize = 0;
         let mut total: usize = 0;
         let rc = unsafe { ffi::tomoxide_cuda_mem_info(&mut free, &mut total) };
