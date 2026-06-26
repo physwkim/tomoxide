@@ -706,53 +706,72 @@ mod cuda_impl {
                 .as_slice()
                 .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
+            // Complex weight `w` [nz, pad/2+1] — small (≈ nz·pad·8 B) and
+            // per-z (folds `geom.center.at(z)`). Built whole once, then sliced by
+            // z-tile so each tile keeps its own slices' centre-shift phases.
+            let nfreq = pad / 2 + 1;
             let w = build_filter_w(filter, geom, nz, ncols, pad);
 
-            // Padded real sinogram [nz, nproj, pad], edge-replicated borders.
-            let mut g = vec![0.0f32; nz * nproj * pad];
-            for z in 0..nz {
-                for p in 0..nproj {
-                    let row = (z * nproj + p) * ncols;
-                    let first = src[row];
-                    let last = src[row + ncols - 1];
-                    let dst = (z * nproj + p) * pad;
-                    for x in 0..pad_side {
-                        g[dst + x] = first;
-                    }
-                    for x in 0..ncols {
-                        g[dst + pad_side + x] = src[row + x];
-                    }
-                    for x in (pad_side + ncols)..pad {
-                        g[dst + x] = last;
-                    }
-                }
-            }
-
-            let g_dev = DevBuf::from_host_f32(&g)?;
-            let w_dev = DevBuf::from_host_f32(&w)?;
-            let handle = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-            if handle.is_null() {
-                return Err(Error::Backend("cfunc_filter allocation failed".into()));
-            }
-            unsafe {
-                ffi::tomoxide_filter_apply(handle, g_dev.ptr, w_dev.ptr, std::ptr::null_mut());
-            }
-            let rc = unsafe { ffi::tomoxide_cuda_sync() };
-            unsafe { ffi::tomoxide_filter_free(handle) };
-            if rc != 0 {
-                return Err(Error::Backend(format!("cuda filter sync failed ({rc})")));
-            }
-            g_dev.to_host_f32(&mut g)?;
-
-            // Crop the centred [pad_side, pad_side+ncols) window back to ncols.
+            // The padded device buffer `tile·nproj·pad` and the filter's internal
+            // R2C buffer index in 32-bit `int`, so the z-stack is processed in
+            // tiles kept strictly under 2³¹ elements and inside free memory (same
+            // overflow class the fused path tiles via `analytic_fbp_stream`).
+            // Unfiltered `nz·nproj·pad` faulted lprec at nd=2048, nz=256 (= 2³¹).
+            let tile = filter_tile_z(nproj, pad, device_free_bytes()).min(nz.max(1));
             let mut out = vec![0.0f32; nz * nproj * ncols];
-            for z in 0..nz {
-                for p in 0..nproj {
-                    let dst = (z * nproj + p) * ncols;
-                    let srcp = (z * nproj + p) * pad + pad_side;
-                    out[dst..dst + ncols].copy_from_slice(&g[srcp..srcp + ncols]);
+            let mut z0 = 0;
+            while z0 < nz {
+                let tz = tile.min(nz - z0);
+
+                // Padded real sinogram for this z-tile [tz, nproj, pad],
+                // edge-replicated borders.
+                let mut g = vec![0.0f32; tz * nproj * pad];
+                for z in 0..tz {
+                    for p in 0..nproj {
+                        let row = ((z0 + z) * nproj + p) * ncols;
+                        let first = src[row];
+                        let last = src[row + ncols - 1];
+                        let dst = (z * nproj + p) * pad;
+                        for x in 0..pad_side {
+                            g[dst + x] = first;
+                        }
+                        for x in 0..ncols {
+                            g[dst + pad_side + x] = src[row + x];
+                        }
+                        for x in (pad_side + ncols)..pad {
+                            g[dst + x] = last;
+                        }
+                    }
                 }
+
+                let g_dev = DevBuf::from_host_f32(&g)?;
+                let w_dev = DevBuf::from_host_f32(&w[z0 * nfreq * 2..(z0 + tz) * nfreq * 2])?;
+                let handle = unsafe { ffi::tomoxide_filter_new(nproj, tz, pad) };
+                if handle.is_null() {
+                    return Err(Error::Backend("cfunc_filter allocation failed".into()));
+                }
+                unsafe {
+                    ffi::tomoxide_filter_apply(handle, g_dev.ptr, w_dev.ptr, std::ptr::null_mut());
+                }
+                let rc = unsafe { ffi::tomoxide_cuda_sync() };
+                unsafe { ffi::tomoxide_filter_free(handle) };
+                if rc != 0 {
+                    return Err(Error::Backend(format!("cuda filter sync failed ({rc})")));
+                }
+                g_dev.to_host_f32(&mut g)?;
+
+                // Crop the centred [pad_side, pad_side+ncols) window back to ncols
+                // into this tile's z-slices of the output.
+                for z in 0..tz {
+                    for p in 0..nproj {
+                        let dst = ((z0 + z) * nproj + p) * ncols;
+                        let srcp = (z * nproj + p) * pad + pad_side;
+                        out[dst..dst + ncols].copy_from_slice(&g[srcp..srcp + ncols]);
+                    }
+                }
+                z0 += tz;
             }
+
             let arr = Array3::from_shape_vec((nz, nproj, ncols), out)
                 .map_err(|e| Error::InvalidParam(format!("cuda filter shape: {e}")))?;
             *sino = Tomo::new(arr, Layout::Sinogram).to_layout(orig);
@@ -818,6 +837,22 @@ mod cuda_impl {
         let by_mem = (free_bytes / 100 * 80) / per_z.max(1);
         // 88% of 2³¹ over the dominant per-z stride leaves >200M headroom for the
         // in-plane offset terms the kernels add on top of `z·nproj·pad`.
+        let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (nproj * pad).max(1);
+        by_mem.min(by_idx).max(1)
+    }
+
+    /// Largest z-tile for the **composed** FBP filter (`FbpFilter::apply`, used by
+    /// the gridrec/lprec path, which filters before its own back-projection).
+    /// Same 32-bit ceiling as the fused path: the padded device buffer
+    /// `tile·nproj·pad` and the filter's internal R2C complex buffer both index
+    /// in `int`, so a single tile of `nz·nproj·pad ≥ 2³¹` overflows (lprec at
+    /// nd=2048, nz=256 hits exactly 2³¹ and SIGSEGVs). Bound by 88% of 2³¹ over
+    /// `nproj·pad` and ~80% of free memory over the per-z device footprint
+    /// (padded buffer + the internal R2C buffer, ≈ padded again).
+    fn filter_tile_z(nproj: usize, pad: usize, free_bytes: usize) -> usize {
+        let fsz = std::mem::size_of::<f32>();
+        let per_z = 2 * nproj * pad * fsz;
+        let by_mem = (free_bytes / 100 * 80) / per_z.max(1);
         let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (nproj * pad).max(1);
         by_mem.min(by_idx).max(1)
     }
