@@ -57,6 +57,40 @@ cargo build -p tomoxide-cuda --features cuda
 The `cuda` feature never compiles on a machine without `nvcc`; the default
 build selects the CPU backend so the whole workspace builds on this Mac.
 
+## Choosing a backend (performance)
+
+Not every algorithm is faster on the GPU — there are two reconstruction paths
+and they scale very differently:
+
+- **Fused analytic path — `Fbp`, `Linerec`, `Fourierrec`.** Filtering and
+  back-projection stay resident on the device (one upload, one download), so
+  the GPU wins decisively and scales across multiple GPUs.
+- **Composed FFT path — `lprec`, `gridrec`.** Only the per-slice FFT is
+  offloaded (cuFFT); the log-polar / Fourier-grid build, the gather/scatter and
+  the Cartesian resampling all run on the host. These are **host-gather bound**:
+  on a strong multi-core CPU the GPU's FFT offload does not pay for the host
+  gather plus the upload/download round-trip.
+
+Measured on this machine (96-core CPU, 4× RTX 5000 Ada), `lprec`:
+
+| size | CPU | CUDA (4-GPU) | faster |
+|---|---|---|---|
+| nd=1024, nz=64  | **2.20 s**  | 3.26 s  | CPU 1.48× |
+| nd=1024, nz=256 | **7.43 s**  | 8.20 s  | CPU 1.10× |
+| nd=2048, nz=64  | **10.82 s** | 12.51 s | CPU 1.16× |
+
+So for `lprec` (and `gridrec`) prefer the **CPU** backend, unless the data is
+already on the GPU from an adjacent stage (e.g. Paganin phase retrieval or an
+`Fbp` pass) and moving it back to the host would cost more than the gather. The
+exact numbers are hardware-specific — a weaker CPU or a single faster GPU shifts
+the crossover — but the structural reason (host-gather bound) holds regardless.
+Reproduce with the `bench_parallel` example:
+
+```sh
+cargo run --release --features cuda --example bench_parallel -- cpu  1024 1024 256 1 lprec
+cargo run --release --features cuda --example bench_parallel -- cuda 1024 1024 256 1 lprec
+```
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline.
