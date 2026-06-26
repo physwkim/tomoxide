@@ -62,6 +62,10 @@ pub use params::{Algorithm, BackendKind, FilterName, PhaseMethod, ReconParams, S
 mod tests {
     use super::*;
 
+    // Asserts the default (no GPU backend compiled in) Auto→CPU fallback, so it
+    // only holds when neither GPU feature is enabled; under `--features cuda`
+    // Auto resolves to cuda.
+    #[cfg(not(any(feature = "cuda", feature = "gpu-wgpu")))]
     #[test]
     fn auto_engine_falls_back_to_cpu() {
         let e = Engine::new(BackendKind::Auto).unwrap();
@@ -76,6 +80,9 @@ mod tests {
         assert!(e.backend().elementwise().is_some());
     }
 
+    // Only meaningful when the cuda feature is absent; with `--features cuda`
+    // on a CUDA host the engine is available, which is the correct behaviour.
+    #[cfg(not(feature = "cuda"))]
     #[test]
     fn cuda_engine_unavailable_without_feature() {
         assert!(Engine::new(BackendKind::Cuda).is_err());
