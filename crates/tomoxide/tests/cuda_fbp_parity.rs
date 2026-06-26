@@ -179,10 +179,15 @@ fn cuda_fbp_filter_matches_cpu() {
 
 #[test]
 fn cuda_fused_equals_per_stage() {
-    // The fused on-device analytic path (recon → analytic_reconstruct) must
-    // produce exactly the same volume as composing the per-capability stages
-    // (filter then back-project) — same kernels, same data, only the
-    // intermediate stays on the device. So Δ = 0.
+    // The fused on-device analytic path (recon → analytic_reconstruct) reconstructs
+    // the same volume as composing the per-capability stages (filter then
+    // back-project) — same kernels, same data, only the intermediate stays on the
+    // device. The match is to the single-precision FFT floor, not bit-exact: on a
+    // multi-GPU host the fused path splits the z-stack across devices, so its cuFFT
+    // filter batch (nz_chunk·nproj) is smaller than the per-stage whole-stack batch
+    // and cuFFT picks a different algorithm per batch size (documented in the cuda
+    // module). The tolerance sits ~5 orders below the output scale, so the all-zero
+    // regression that a <2-slice linerec chunk produces still trips it.
     use tomoxide::backend::Backend;
     use tomoxide::{FilterName, Layout, Tomo, Volume};
     let cuda = match CudaBackend::new() {
@@ -212,11 +217,19 @@ fn cuda_fused_equals_per_stage() {
     let mut vol = Volume::new(ndarray::Array3::zeros((nz, n, n)));
     cuda.backprojector().unwrap().backproject(&filtered, &geom, &mut vol).unwrap();
 
+    let maxabs = vol.array.iter().fold(0.0f32, |m, &b| m.max(b.abs()));
     let max_d = fused
         .array
         .iter()
         .zip(vol.array.iter())
         .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
-    eprintln!("fused vs per-stage max|Δ| = {max_d:e}");
-    assert_eq!(max_d, 0.0, "fused device path differs from per-stage: {max_d}");
+    eprintln!("fused vs per-stage max|Δ| = {max_d:e}  (max|val| = {maxabs:e})");
+    // Per-stage must itself be a real reconstruction (guards against both paths
+    // degenerating to zeros, which would make the diff trivially pass).
+    assert!(maxabs > 1e-3, "per-stage reconstruction is degenerate: max|val| = {maxabs:e}");
+    assert!(
+        max_d <= 1e-4 * maxabs,
+        "fused device path differs from per-stage by {max_d:e} (> 1e-4·{maxabs:e}) — \
+         an all-zero or wrong-path regression, not the FFT floor"
+    );
 }

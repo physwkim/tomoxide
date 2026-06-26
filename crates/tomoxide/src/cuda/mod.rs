@@ -388,13 +388,16 @@ mod cuda_impl {
     ) -> Result<Vec<f32>> {
         let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
         let tile = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes()).min(nz.max(1));
-        if tile >= nz {
+        // Even split into the fewest ≤tile chunks, never a <2-slice chunk: a
+        // greedy `[tile, …, tile, 1]` tail would silently zero its last slice
+        // (cfunc_linerec interpolates across z). `k == 1` ⇒ whole stack in one
+        // chunk (identical to the un-streamed path).
+        let k = linerec_chunk_count(nz, nz.div_ceil(tile));
+        if k <= 1 {
             return analytic_fbp_chunk(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
         }
         let mut out = Vec::with_capacity(nz * n * n);
-        let mut z0 = 0;
-        while z0 < nz {
-            let t = tile.min(nz - z0);
+        for (z0, t) in even_z_chunks(nz, k) {
             let v = analytic_fbp_chunk(
                 &raw[z0 * nproj * ncols..(z0 + t) * nproj * ncols],
                 &w[z0 * nfreq2..(z0 + t) * nfreq2],
@@ -407,7 +410,6 @@ mod cuda_impl {
                 pad_side,
             )?;
             out.extend(v);
-            z0 += t;
         }
         Ok(out)
     }
@@ -579,7 +581,12 @@ mod cuda_impl {
             let vol = match algorithm {
                 Algorithm::Fbp | Algorithm::Linerec => {
                     let devices = selected_devices();
-                    if devices.len() <= 1 {
+                    // cfunc_linerec interpolates across z, so each device's chunk
+                    // must hold ≥2 slices or it back-projects to zeros. Cap the
+                    // split at nz/2 GPUs: a 4-GPU nz=4 job would otherwise hand
+                    // every GPU a single slice and reconstruct an all-zero volume.
+                    let k = linerec_chunk_count(nz, devices.len());
+                    if k <= 1 {
                         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
                         analytic_fbp_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     } else {
@@ -596,36 +603,22 @@ mod cuda_impl {
                         // deterministic. Bit-exactness across device counts would
                         // require filtering the full stack on every device (4×
                         // redundant filter+upload) and is intentionally not paid.
-                        let d = devices.len();
-                        let base = nz / d;
-                        let rem = nz % d;
-                        let mut ranges = Vec::with_capacity(d);
-                        let mut z0 = 0;
-                        for i in 0..d {
-                            let len = base + if i < rem { 1 } else { 0 };
-                            ranges.push((z0, z0 + len));
-                            z0 += len;
-                        }
+                        //
                         // Capture as shared slices so each `move` worker copies a
                         // reference rather than moving the owned buffers.
                         let w: &[f32] = &w;
                         let parts: Vec<Result<Vec<f32>>> = std::thread::scope(|scope| {
-                            ranges
-                                .iter()
-                                .copied()
+                            even_z_chunks(nz, k)
+                                .into_iter()
                                 .zip(devices.iter().copied())
-                                .map(|((a, b), dev)| {
+                                .map(|((a, len), dev)| {
                                     scope.spawn(move || -> Result<Vec<f32>> {
                                         unsafe { ffi::tomoxide_cuda_set_device(dev) };
-                                        let nzc = b - a;
-                                        if nzc == 0 {
-                                            return Ok(Vec::new());
-                                        }
                                         analytic_fbp_stream(
-                                            &raw[a * nproj * ncols..b * nproj * ncols],
-                                            &w[a * nfreq2..b * nfreq2],
+                                            &raw[a * nproj * ncols..(a + len) * nproj * ncols],
+                                            &w[a * nfreq2..(a + len) * nfreq2],
                                             theta,
-                                            nzc,
+                                            len,
                                             nproj,
                                             ncols,
                                             n,
@@ -839,6 +832,36 @@ mod cuda_impl {
         // in-plane offset terms the kernels add on top of `z·nproj·pad`.
         let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (nproj * pad).max(1);
         by_mem.min(by_idx).max(1)
+    }
+
+    /// Single owner of cfunc_linerec's "chunk needs ≥2 z-slices" invariant: the
+    /// kernel interpolates the back-projection vertically across slices, so a
+    /// chunk holding a single slice reconstructs to **all zeros**. Given a desired
+    /// number of contiguous z-chunks `want` (device count for the multi-GPU split,
+    /// or the memory/index tile count for single-GPU streaming), returns a count
+    /// that keeps an even split at ≥2 slices per chunk — capped at `nz/2`, floored
+    /// at 1. `nz < 4` collapses to a single whole-stack chunk (two ≥2 chunks don't
+    /// fit); `nz < 2` is the kernel's own single-slice degenerate case, which no
+    /// chunking can rescue.
+    fn linerec_chunk_count(nz: usize, want: usize) -> usize {
+        want.min(nz / 2).max(1)
+    }
+
+    /// Split `nz` into `k` contiguous chunks whose lengths differ by at most one
+    /// (the first `nz % k` chunks get one extra slice), as `(start, len)` pairs
+    /// summing to `nz`. With `k` from [`linerec_chunk_count`] every chunk holds
+    /// ≥2 slices, so no chunk back-projects to zeros.
+    fn even_z_chunks(nz: usize, k: usize) -> Vec<(usize, usize)> {
+        let base = nz / k;
+        let rem = nz % k;
+        let mut chunks = Vec::with_capacity(k);
+        let mut z0 = 0;
+        for i in 0..k {
+            let len = base + if i < rem { 1 } else { 0 };
+            chunks.push((z0, len));
+            z0 += len;
+        }
+        chunks
     }
 
     /// Largest z-tile for the **composed** FBP filter (`FbpFilter::apply`, used by
