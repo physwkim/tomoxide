@@ -434,7 +434,7 @@ impl FilteredBackproject for CpuBackend {
                 "cpu back-projection currently supports parallel beam only".into(),
             ));
         }
-        let s = sino.to_layout(Layout::Sinogram); // [row, angle, col], contiguous
+        let s = sino.as_layout(Layout::Sinogram); // [row, angle, col], contiguous
         let nz = s.n_rows();
         let nang = s.n_angles();
         let ncols = s.n_cols();

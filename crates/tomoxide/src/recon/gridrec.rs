@@ -90,7 +90,7 @@ fn quadrant_swap(g: &mut [Complex32], m: usize) {
 
 /// Fourier-grid reconstruction of every slice in `sino` (sinogram layout).
 pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Result<Array3<f32>> {
-    let b = sino.to_layout(crate::data::Layout::Sinogram);
+    let b = sino.as_layout(crate::data::Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let ncols = b.n_cols();

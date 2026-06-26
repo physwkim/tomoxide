@@ -145,7 +145,7 @@ impl FilteredBackproject for WgpuBackend {
                 "wgpu back-projection currently supports parallel beam only".into(),
             ));
         }
-        let s = sino.to_layout(Layout::Sinogram); // [row, angle, col]
+        let s = sino.as_layout(Layout::Sinogram); // [row, angle, col]
         let nz = s.n_rows();
         let nang = s.n_angles();
         let ncols = s.n_cols();

@@ -49,7 +49,7 @@ use crate::error::{Error, Result};
 ///
 /// Bit-exact against tomopy 1.15.3 `stripes_detect3d`.
 pub fn stripes_detect3d(tomo: &Tomo<f32>, size: usize, radius: usize) -> Result<Array3<f32>> {
-    let proj = tomo.to_layout(Layout::Projection);
+    let proj = tomo.as_layout(Layout::Projection);
     let input = &proj.array; // [angle(dz), detY(dy), detX(dx)]
     let (dz, dy, dx) = input.dim();
 

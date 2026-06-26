@@ -60,7 +60,7 @@ pub fn fourierrec(
     n: usize,
     fft: &dyn Fft,
 ) -> Result<Array3<f32>> {
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let nd = b.n_cols(); // detector width == tomocupy's `n`

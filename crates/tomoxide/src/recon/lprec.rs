@@ -531,7 +531,7 @@ fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGrids> {
 
 /// Log-polar reconstruction of every slice of a **pre-filtered** sinogram.
 pub fn lprec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Result<Array3<f32>> {
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let nd = b.n_cols();

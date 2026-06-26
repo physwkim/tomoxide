@@ -50,7 +50,7 @@ fn linspace(start: f64, stop: f64, num: usize) -> Vec<f64> {
 /// so the result matches tomopy bit-for-bit (Δ = 0).
 pub fn sino_360_to_180(data: &Tomo<f32>, overlap: usize, rotation: Rotation) -> Result<Tomo<f32>> {
     // tomopy indexes `data.shape = (dx, dy, dz) = (proj, row, col)`.
-    let src = data.to_layout(Layout::Projection);
+    let src = data.as_layout(Layout::Projection);
     let (dx, dy, dz) = src.array.dim();
     if overlap > dz {
         return Err(Error::InvalidParam(format!(

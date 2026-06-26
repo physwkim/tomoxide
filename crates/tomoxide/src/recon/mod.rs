@@ -223,7 +223,7 @@ fn sirt(
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
     let nz = sino.n_rows();
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nang = b.n_angles();
     let ncols = b.n_cols();
 
@@ -271,7 +271,7 @@ fn mlem(
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
     let nz = sino.n_rows();
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nang = b.n_angles();
     let ncols = b.n_cols();
 
@@ -410,7 +410,7 @@ fn osem(
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let subsets = build_subsets(&b, geom, n, params, bp)?;
 
@@ -533,7 +533,7 @@ fn ospml(
     delta: Option<f32>,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let reg = params.reg_par.first().copied().unwrap_or(0.0);
 
@@ -598,7 +598,7 @@ fn gradient_descent(
     tikhonov: Option<(f32, Array3<f32>)>,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let ncols = b.n_cols();
@@ -738,7 +738,7 @@ fn tv(
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let ncols = b.n_cols();
@@ -834,7 +834,7 @@ fn art(
     rp: &dyn RayProject,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let ncols = b.n_cols();
@@ -892,7 +892,7 @@ fn bart(
     rp: &dyn RayProject,
 ) -> Result<Volume<f32>> {
     let n = grid_size(sino, params);
-    let b = sino.to_layout(Layout::Sinogram);
+    let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
     let ncols = b.n_cols();

@@ -42,7 +42,7 @@ pub fn find_center(
         backend: backend.name(),
         capability: "Fft",
     })?;
-    let sino = tomo.to_layout(Layout::Sinogram); // [row, angle, col]
+    let sino = tomo.as_layout(Layout::Sinogram); // [row, angle, col]
     let (nrows, nang, ncol) = sino.array.dim();
     if theta.len() != nang {
         return Err(Error::ShapeMismatch {
@@ -439,7 +439,7 @@ pub fn write_center(
         backend: backend.name(),
         capability: "Fft",
     })?;
-    let sino = tomo.to_layout(Layout::Sinogram); // [row, angle, col]
+    let sino = tomo.as_layout(Layout::Sinogram); // [row, angle, col]
     let (nrows, nang, ncol) = sino.array.dim();
     if theta.len() != nang {
         return Err(Error::ShapeMismatch {
@@ -1033,7 +1033,7 @@ fn mirror_index(idx: isize, len: isize) -> usize {
 /// Pull a single 2-D sinogram slice `(angle, col)`, averaging ±5 rows around
 /// `ind` for SNR when there are more than 10 slices (tomopy rotation.py:240-249).
 fn extract_slice(tomo: &Tomo<f32>, ind: Option<usize>) -> Array2<f32> {
-    let sino = tomo.to_layout(Layout::Sinogram); // [row, angle, col]
+    let sino = tomo.as_layout(Layout::Sinogram); // [row, angle, col]
     let nrows = sino.array.dim().0;
     let ind = ind.unwrap_or(nrows / 2).min(nrows.saturating_sub(1));
     if nrows > 10 {

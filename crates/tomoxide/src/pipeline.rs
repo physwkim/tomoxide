@@ -99,7 +99,7 @@ impl ReconSteps {
         let mut ds = reader.read_all()?;
         crate::prep::normalize_dataset(&mut ds, backend)?;
         crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
-        let sino = ds.data.to_layout(Layout::Sinogram); // [nz, nproj, ncols]
+        let sino = ds.data.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
         let nz = sino.n_rows();
 
         let chunk = self.chunk_rows.max(1);

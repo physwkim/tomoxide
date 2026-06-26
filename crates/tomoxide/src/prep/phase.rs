@@ -237,7 +237,7 @@ fn run_phase(
     build_filter: impl Fn(usize, usize) -> (Vec<f32>, f32),
 ) -> Result<()> {
     let target = data.layout;
-    let proj = data.to_layout(Layout::Projection); // [angle, dy, dz]
+    let proj = data.as_layout(Layout::Projection); // [angle, dy, dz]
     let (nproj, dy, dz) = proj.array.dim();
     if nproj == 0 || dy == 0 || dz == 0 {
         return Ok(());
