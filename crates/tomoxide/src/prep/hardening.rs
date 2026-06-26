@@ -43,10 +43,10 @@ pub use disabled::beam_correct;
 
 #[cfg(feature = "beam-hardening")]
 mod enabled {
-    use ndarray::Array2;
-    use std::sync::Once;
     use crate::data::Tomo;
     use crate::error::{Error, Result};
+    use ndarray::Array2;
+    use std::sync::Once;
 
     static XRL_INIT: Once = Once::new();
     fn xrl_init() {
@@ -103,10 +103,16 @@ mod enabled {
         fn default() -> Self {
             BeamHardeningConfig {
                 scintillator: Layer {
-                    material: Material { formula: "Lu3Al5O12".into(), density: 6.73 },
+                    material: Material {
+                        formula: "Lu3Al5O12".into(),
+                        density: 6.73,
+                    },
                     thickness_um: 100.0,
                 },
-                sample: Material { formula: "Fe".into(), density: 7.87 },
+                sample: Material {
+                    formula: "Fe".into(),
+                    density: 7.87,
+                },
                 filters: Vec::new(),
                 ref_trans: 0.1,
                 threshold_trans: 1e-5,
@@ -120,7 +126,12 @@ mod enabled {
     /// (eV). `photo` selects the photoelectric (`CS_Photo_CP`) vs total
     /// (`CS_Total_CP`) cross section. xraydb returns the same product
     /// `ρ · CS`, with xraylib energies in keV.
-    fn material_mu(formula: &str, density: f64, energies_ev: &[f64], photo: bool) -> Result<Vec<f64>> {
+    fn material_mu(
+        formula: &str,
+        density: f64,
+        energies_ev: &[f64],
+        photo: bool,
+    ) -> Result<Vec<f64>> {
         xrl_init();
         let mut out = Vec::with_capacity(energies_ev.len());
         for &e in energies_ev {
@@ -130,7 +141,9 @@ mod enabled {
             } else {
                 xraylib::cs_total_cp(formula, kev)
             }
-            .map_err(|e| Error::InvalidParam(format!("xraylib cross section for {formula}: {e}")))?;
+            .map_err(|e| {
+                Error::InvalidParam(format!("xraylib cross section for {formula}: {e}"))
+            })?;
             out.push(cs * density);
         }
         Ok(out)
@@ -307,7 +320,9 @@ mod enabled {
         /// per-angle pathlength at `ref_trans`, normalised to the centerline.
         pub fn new(cfg: &BeamHardeningConfig, spectra: &[Spectrum]) -> Result<Self> {
             if spectra.is_empty() {
-                return Err(Error::InvalidParam("beam hardening: no source spectra".into()));
+                return Err(Error::InvalidParam(
+                    "beam hardening: no source spectra".into(),
+                ));
             }
             let mut order: Vec<usize> = (0..spectra.len()).collect();
             order.sort_by(|&a, &b| spectra[a].angle_urad.total_cmp(&spectra[b].angle_urad));
@@ -320,7 +335,12 @@ mod enabled {
                 // apply_filters: multiply by exp(-mu*thickness) for each filter.
                 let mut power = s.power.clone();
                 for f in &cfg.filters {
-                    let att = material_mu(&f.material.formula, f.material.density, &s.energies_ev, false)?;
+                    let att = material_mu(
+                        &f.material.formula,
+                        f.material.density,
+                        &s.energies_ev,
+                        false,
+                    )?;
                     for k in 0..power.len() {
                         power[k] *= (-(att[k] * f.thickness_um * 1e-4)).exp();
                     }
@@ -391,7 +411,12 @@ mod enabled {
         /// `data` is `[nproj, nrows, ncols]`; `[start_row, end_row)` selects the
         /// absolute detector rows this chunk spans (indexing the [`find_angles`]
         /// table for the angular pass).
-        pub fn correct(&self, data: &mut Tomo<f32>, start_row: usize, end_row: usize) -> Result<()> {
+        pub fn correct(
+            &self,
+            data: &mut Tomo<f32>,
+            start_row: usize,
+            end_row: usize,
+        ) -> Result<()> {
             use crate::data::Layout;
             if data.layout != Layout::Projection {
                 return Err(Error::InvalidParam(
@@ -497,7 +522,11 @@ mod enabled {
                 }
             }
         }
-        Spectrum { angle_urad, energies_ev, power }
+        Spectrum {
+            angle_urad,
+            energies_ev,
+            power,
+        }
     }
 
     /// The bundled APS bending-magnet source spectra (XOP-generated

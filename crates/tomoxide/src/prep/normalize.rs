@@ -6,10 +6,10 @@
 //! Background (air-region) normalization is a per-row reduction, so it is a
 //! direct CPU port matching the libtomo C bit-for-bit.
 
-use ndarray::Array2;
 use crate::backend::Backend;
 use crate::data::{Dataset, Frames, Layout, Tomo};
 use crate::error::{Error, Result};
+use ndarray::Array2;
 
 fn elementwise(backend: &dyn Backend) -> Result<&dyn crate::backend::Elementwise> {
     backend.elementwise().ok_or(Error::MissingCapability {

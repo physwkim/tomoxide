@@ -73,7 +73,9 @@ fn main() {
         "linerec" => Algorithm::Linerec,
         "fourierrec" => Algorithm::Fourierrec,
         other => {
-            eprintln!("bench_dtype: algorithm '{other}' has no f16 path (use fbp|linerec|fourierrec)");
+            eprintln!(
+                "bench_dtype: algorithm '{other}' has no f16 path (use fbp|linerec|fourierrec)"
+            );
             return;
         }
     };
@@ -94,7 +96,12 @@ fn main() {
         0.5 + 0.4 * ((fx * 6.0 + z as f32 * 0.01).cos() * (fp * std::f32::consts::TAU).sin())
     });
     let sino = Tomo::new(sino_arr, Layout::Sinogram);
-    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let geom = Geometry::parallel(
+        Angles::uniform(nproj, 0.0, std::f32::consts::PI),
+        n,
+        nz,
+        1.0,
+    );
 
     let p32 = ReconParams {
         num_gridx: Some(n),

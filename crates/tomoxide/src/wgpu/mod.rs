@@ -244,11 +244,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- Elementwise capability: parity vs the CPU backend ------------------
     // GPU f32 transcendentals/divisions differ from libm by a few ULP, so the
     // bar is a small relative+absolute tolerance, not bit-for-bit.
-    use ndarray::Array3;
     use crate::backend::Backend;
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::dtype::Complex32;
     use crate::geometry::{Angles, Center, Geometry};
+    use ndarray::Array3;
 
     /// Assert two flat f32 sequences agree within a relative+absolute tolerance.
     fn assert_close(gpu: &[f32], cpu: &[f32], rtol: f32, atol: f32) {

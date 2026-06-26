@@ -100,8 +100,8 @@ pub fn blur_edges(data: &mut Tomo<f32>, low: f64, high: f64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array3;
     use crate::data::Layout;
+    use ndarray::Array3;
 
     #[test]
     fn scale_normalizes_by_peak_magnitude() {

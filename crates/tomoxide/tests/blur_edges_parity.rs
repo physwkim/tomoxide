@@ -10,8 +10,8 @@
 
 use ndarray::{Array2, Array4, Axis};
 use ndarray_npy::read_npy;
-use tomoxide::prep::blur_edges;
 use tomoxide::data::{Layout, Tomo};
+use tomoxide::prep::blur_edges;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 

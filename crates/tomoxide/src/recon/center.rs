@@ -5,12 +5,12 @@
 //! `find_center_sift` is implemented behind the `sift-center` feature (it links
 //! OpenCV). See `docs/PORTING.md` §C.
 
-use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
 use crate::backend::{Backend, Fft};
 use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
+use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
 
 /// Entropy-based center finding (tomopy `rotation.py:82`).
 ///
@@ -205,7 +205,11 @@ pub fn find_center_pc(
 /// Available only with the **`sift-center`** feature (it links OpenCV via the
 /// `opencv` crate). See [`sift`] for the implementation.
 #[cfg(not(feature = "sift-center"))]
-pub fn find_center_sift(_proj0: &Array2<f32>, _proj180: &Array2<f32>, _threshold: f32) -> Result<f32> {
+pub fn find_center_sift(
+    _proj0: &Array2<f32>,
+    _proj180: &Array2<f32>,
+    _threshold: f32,
+) -> Result<f32> {
     Err(Error::todo(
         "center::find_center_sift (build with the `sift-center` feature)",
         "tomocupy find_center.py:99",

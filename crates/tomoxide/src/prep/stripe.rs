@@ -5,10 +5,10 @@
 //! dead-stripe (`VoDead`), and Vo fitting-based (`VoFit`) methods are
 //! implemented. See `docs/PORTING.md` §D. Dispatch on [`StripeMethod`].
 
-use ndarray::Array2;
 use crate::data::{Layout, Tomo};
 use crate::error::Result;
 use crate::params::StripeMethod;
+use ndarray::Array2;
 
 use crate::prep::{fft, wavelet};
 

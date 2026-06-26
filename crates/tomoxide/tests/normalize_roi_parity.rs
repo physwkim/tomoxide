@@ -14,8 +14,8 @@
 
 use ndarray::{Array2, Array3, Array4, Axis};
 use ndarray_npy::read_npy;
-use tomoxide::prep::normalize_roi;
 use tomoxide::data::{Layout, Tomo};
+use tomoxide::prep::normalize_roi;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 

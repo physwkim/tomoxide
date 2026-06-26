@@ -86,13 +86,23 @@ fn cuda_fbp_matches_cpu_and_phantom() {
     // CUDA vs CPU back-projector: identical up to the kernel's y-flip + scale.
     let r_cpu = pearson_disk(&cuda_slice, &flipud(&cpu_slice), n, 0.85);
     eprintln!("cuda↔cpu (y-flipped) Pearson = {r_cpu:.5}");
-    assert!(r_cpu > 0.99, "CUDA FBP disagrees with CPU FBP: r = {r_cpu:.5}");
+    assert!(
+        r_cpu > 0.99,
+        "CUDA FBP disagrees with CPU FBP: r = {r_cpu:.5}"
+    );
 
     // Round-trip: CUDA reconstruction recovers the phantom (best of both flips).
-    let r_phantom = pearson_disk(&cuda_slice, &phantom, n, 0.85)
-        .max(pearson_disk(&flipud(&cuda_slice), &phantom, n, 0.85));
+    let r_phantom = pearson_disk(&cuda_slice, &phantom, n, 0.85).max(pearson_disk(
+        &flipud(&cuda_slice),
+        &phantom,
+        n,
+        0.85,
+    ));
     eprintln!("cuda↔phantom Pearson = {r_phantom:.5}");
-    assert!(r_phantom > 0.85, "CUDA FBP recovers phantom poorly: r = {r_phantom:.5}");
+    assert!(
+        r_phantom > 0.85,
+        "CUDA FBP recovers phantom poorly: r = {r_phantom:.5}"
+    );
 }
 
 #[test]
@@ -130,15 +140,29 @@ fn cuda_fourierrec_matches_cpu_and_phantom() {
 
     // GPU cfunc_fourierrec vs CPU fourierrec: same central-slice-theorem method,
     // possibly differing by the grid handedness (scale/flip-invariant compare).
-    let r_cpu = pearson_disk(&cuda_slice, &cpu_slice, n, 0.85)
-        .max(pearson_disk(&flipud(&cuda_slice), &cpu_slice, n, 0.85));
+    let r_cpu = pearson_disk(&cuda_slice, &cpu_slice, n, 0.85).max(pearson_disk(
+        &flipud(&cuda_slice),
+        &cpu_slice,
+        n,
+        0.85,
+    ));
     eprintln!("cuda↔cpu fourierrec Pearson = {r_cpu:.5}");
-    assert!(r_cpu > 0.97, "CUDA fourierrec disagrees with CPU: r = {r_cpu:.5}");
+    assert!(
+        r_cpu > 0.97,
+        "CUDA fourierrec disagrees with CPU: r = {r_cpu:.5}"
+    );
 
-    let r_phantom = pearson_disk(&cuda_slice, &phantom, n, 0.85)
-        .max(pearson_disk(&flipud(&cuda_slice), &phantom, n, 0.85));
+    let r_phantom = pearson_disk(&cuda_slice, &phantom, n, 0.85).max(pearson_disk(
+        &flipud(&cuda_slice),
+        &phantom,
+        n,
+        0.85,
+    ));
     eprintln!("cuda↔phantom fourierrec Pearson = {r_phantom:.5}");
-    assert!(r_phantom > 0.9, "CUDA fourierrec recovers phantom poorly: r = {r_phantom:.5}");
+    assert!(
+        r_phantom > 0.9,
+        "CUDA fourierrec recovers phantom poorly: r = {r_phantom:.5}"
+    );
 }
 
 #[test]
@@ -161,12 +185,22 @@ fn cuda_fbp_filter_matches_cpu() {
     let mut geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
     geom.center = tomoxide::Center::Scalar(n as f32 / 2.0 - 3.5); // off-centre
 
-    let kernel = cpu.fbp_filter().unwrap().make_filter(FilterName::Ramp, n).unwrap();
+    let kernel = cpu
+        .fbp_filter()
+        .unwrap()
+        .make_filter(FilterName::Ramp, n)
+        .unwrap();
 
     let mut t_cpu = Tomo::new(sino.clone(), Layout::Sinogram);
     let mut t_cuda = Tomo::new(sino.clone(), Layout::Sinogram);
-    cpu.fbp_filter().unwrap().apply(&mut t_cpu, &kernel, &geom).unwrap();
-    cuda.fbp_filter().unwrap().apply(&mut t_cuda, &kernel, &geom).unwrap();
+    cpu.fbp_filter()
+        .unwrap()
+        .apply(&mut t_cpu, &kernel, &geom)
+        .unwrap();
+    cuda.fbp_filter()
+        .unwrap()
+        .apply(&mut t_cuda, &kernel, &geom)
+        .unwrap();
 
     let scale = t_cpu.array.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let max_abs = t_cpu
@@ -174,9 +208,16 @@ fn cuda_fbp_filter_matches_cpu() {
         .iter()
         .zip(t_cuda.array.iter())
         .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
-    eprintln!("fbp filter max|Δ| = {max_abs:e} (rel {:e})", max_abs / scale);
+    eprintln!(
+        "fbp filter max|Δ| = {max_abs:e} (rel {:e})",
+        max_abs / scale
+    );
     // cuFFT vs rustfft: f32 FFT round-off floor.
-    assert!(max_abs / scale < 1e-4, "GPU filter ≠ CPU filter: rel {}", max_abs / scale);
+    assert!(
+        max_abs / scale < 1e-4,
+        "GPU filter ≠ CPU filter: rel {}",
+        max_abs / scale
+    );
 }
 
 #[test]
@@ -200,7 +241,10 @@ fn cuda_fused_equals_per_stage() {
         }
     };
     let (n, nang, nz) = (96usize, 72usize, 4usize);
-    let params = ReconParams { num_gridx: Some(n), ..Default::default() };
+    let params = ReconParams {
+        num_gridx: Some(n),
+        ..Default::default()
+    };
     let phantom = sim::shepp2d(n).unwrap();
     let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
     for z in 0..nz {
@@ -213,11 +257,21 @@ fn cuda_fused_equals_per_stage() {
     let fused = recon::recon(&sino, &geom, Algorithm::Fbp, &params, &cuda).unwrap();
 
     // Per-stage path through the same GPU capabilities.
-    let kernel = cuda.fbp_filter().unwrap().make_filter(FilterName::Ramp, n).unwrap();
+    let kernel = cuda
+        .fbp_filter()
+        .unwrap()
+        .make_filter(FilterName::Ramp, n)
+        .unwrap();
     let mut filtered = Tomo::new(sino.array.clone(), Layout::Sinogram);
-    cuda.fbp_filter().unwrap().apply(&mut filtered, &kernel, &geom).unwrap();
+    cuda.fbp_filter()
+        .unwrap()
+        .apply(&mut filtered, &kernel, &geom)
+        .unwrap();
     let mut vol = Volume::new(ndarray::Array3::zeros((nz, n, n)));
-    cuda.backprojector().unwrap().backproject(&filtered, &geom, &mut vol).unwrap();
+    cuda.backprojector()
+        .unwrap()
+        .backproject(&filtered, &geom, &mut vol)
+        .unwrap();
 
     let maxabs = vol.array.iter().fold(0.0f32, |m, &b| m.max(b.abs()));
     let max_d = fused
@@ -228,7 +282,10 @@ fn cuda_fused_equals_per_stage() {
     eprintln!("fused vs per-stage max|Δ| = {max_d:e}  (max|val| = {maxabs:e})");
     // Per-stage must itself be a real reconstruction (guards against both paths
     // degenerating to zeros, which would make the diff trivially pass).
-    assert!(maxabs > 1e-3, "per-stage reconstruction is degenerate: max|val| = {maxabs:e}");
+    assert!(
+        maxabs > 1e-3,
+        "per-stage reconstruction is degenerate: max|val| = {maxabs:e}"
+    );
     assert!(
         max_d <= 1e-4 * maxabs,
         "fused device path differs from per-stage by {max_d:e} (> 1e-4·{maxabs:e}) — \
@@ -291,9 +348,13 @@ fn cuda_fbp_f16_matches_f32_and_phantom() {
 
     // And it still recovers the phantom (half precision is approximate but the
     // structure must survive).
-    let r_ph = pearson_disk(&s16, &phantom, n, 0.85).max(pearson_disk(&flipud(&s16), &phantom, n, 0.85));
+    let r_ph =
+        pearson_disk(&s16, &phantom, n, 0.85).max(pearson_disk(&flipud(&s16), &phantom, n, 0.85));
     eprintln!("cuda FBP f16↔phantom Pearson = {r_ph:.5}");
-    assert!(r_ph > 0.85, "f16 FBP recovers phantom poorly: r = {r_ph:.5}");
+    assert!(
+        r_ph > 0.85,
+        "f16 FBP recovers phantom poorly: r = {r_ph:.5}"
+    );
 }
 
 #[test]
@@ -329,7 +390,11 @@ fn cuda_fourierrec_f16_matches_f32_and_phantom() {
     eprintln!("cuda fourierrec f16↔f32 Pearson = {r:.5}");
     assert!(r > 0.97, "f16 fourierrec disagrees with f32: r = {r:.5}");
 
-    let r_ph = pearson_disk(&s16, &phantom, n, 0.85).max(pearson_disk(&flipud(&s16), &phantom, n, 0.85));
+    let r_ph =
+        pearson_disk(&s16, &phantom, n, 0.85).max(pearson_disk(&flipud(&s16), &phantom, n, 0.85));
     eprintln!("cuda fourierrec f16↔phantom Pearson = {r_ph:.5}");
-    assert!(r_ph > 0.9, "f16 fourierrec recovers phantom poorly: r = {r_ph:.5}");
+    assert!(
+        r_ph > 0.9,
+        "f16 fourierrec recovers phantom poorly: r = {r_ph:.5}"
+    );
 }

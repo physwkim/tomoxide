@@ -37,22 +37,30 @@ fn max_rel(a: &[f32], b: &[f32]) -> f32 {
 fn cuda_fft_roundtrips() {
     let Some(cuda) = cuda_or_skip() else { return };
     // 1-D: ifft(fft(x)) == x.
-    let orig: Vec<tomoxide::Complex32> =
-        (0..16).map(|k| tomoxide::Complex32::new(k as f32, -(k as f32) * 0.3)).collect();
+    let orig: Vec<tomoxide::Complex32> = (0..16)
+        .map(|k| tomoxide::Complex32::new(k as f32, -(k as f32) * 0.3))
+        .collect();
     let mut buf = orig.clone();
     Fft::fft_1d(&cuda, &mut buf, 8, 2, false).unwrap();
     Fft::fft_1d(&cuda, &mut buf, 8, 2, true).unwrap();
     for (a, b) in buf.iter().zip(&orig) {
-        assert!((a.re - b.re).abs() < 1e-3 && (a.im - b.im).abs() < 1e-3, "fft_1d rt");
+        assert!(
+            (a.re - b.re).abs() < 1e-3 && (a.im - b.im).abs() < 1e-3,
+            "fft_1d rt"
+        );
     }
     // 2-D: ifft2(fft2(x)) == x.
-    let orig2: Vec<tomoxide::Complex32> =
-        (0..12).map(|k| tomoxide::Complex32::new(k as f32, 1.0)).collect();
+    let orig2: Vec<tomoxide::Complex32> = (0..12)
+        .map(|k| tomoxide::Complex32::new(k as f32, 1.0))
+        .collect();
     let mut b2 = orig2.clone();
     cuda.fft_2d(&mut b2, 3, 4, 1, false).unwrap();
     cuda.fft_2d(&mut b2, 3, 4, 1, true).unwrap();
     for (a, b) in b2.iter().zip(&orig2) {
-        assert!((a.re - b.re).abs() < 1e-3 && (a.im - b.im).abs() < 1e-3, "fft_2d rt");
+        assert!(
+            (a.re - b.re).abs() < 1e-3 && (a.im - b.im).abs() < 1e-3,
+            "fft_2d rt"
+        );
     }
 }
 
@@ -73,7 +81,10 @@ fn cuda_gridrec_matches_cpu() {
     let cpu = CpuBackend::new();
     let (n, nang) = (128usize, 180usize);
     let (s, geom, _) = sino(n, nang, 1, &cpu);
-    let params = ReconParams { num_gridx: Some(n), ..Default::default() };
+    let params = ReconParams {
+        num_gridx: Some(n),
+        ..Default::default()
+    };
     let rc = recon::recon(&s, &geom, Algorithm::Gridrec, &params, &cpu).unwrap();
     let rg = recon::recon(&s, &geom, Algorithm::Gridrec, &params, &cuda).unwrap();
     let d = max_rel(rc.array.as_slice().unwrap(), rg.array.as_slice().unwrap());
@@ -87,7 +98,10 @@ fn cuda_lprec_matches_cpu() {
     let cpu = CpuBackend::new();
     let (n, nang) = (128usize, 180usize);
     let (s, geom, _) = sino(n, nang, 1, &cpu);
-    let params = ReconParams { num_gridx: Some(n), ..Default::default() };
+    let params = ReconParams {
+        num_gridx: Some(n),
+        ..Default::default()
+    };
     let rc = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cpu).unwrap();
     let rg = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cuda).unwrap();
     let d = max_rel(rc.array.as_slice().unwrap(), rg.array.as_slice().unwrap());
@@ -102,13 +116,21 @@ fn cuda_paganin_matches_cpu() {
     let (n, nang) = (128usize, 16usize);
     let (s, _geom, _) = sino(n, nang, 1, &cpu);
     let data = s.to_layout(Layout::Projection);
-    let phase = PhaseMethod::Paganin { pixel_size: 1e-4, dist: 50.0, energy: 30.0, alpha: 1e-3 };
+    let phase = PhaseMethod::Paganin {
+        pixel_size: 1e-4,
+        dist: 50.0,
+        energy: 30.0,
+        alpha: 1e-3,
+    };
 
     let mut d_cpu = data.clone();
     let mut d_cuda = data.clone();
     prep::retrieve_phase(&mut d_cpu, phase, &cpu).unwrap();
     prep::retrieve_phase(&mut d_cuda, phase, &cuda).unwrap();
-    let d = max_rel(d_cpu.array.as_slice().unwrap(), d_cuda.array.as_slice().unwrap());
+    let d = max_rel(
+        d_cpu.array.as_slice().unwrap(),
+        d_cuda.array.as_slice().unwrap(),
+    );
     eprintln!("paganin cuda↔cpu max rel = {d:e}");
     assert!(d < 2e-3, "paganin GPU≠CPU: rel {d}");
 }

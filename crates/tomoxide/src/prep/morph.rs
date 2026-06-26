@@ -5,9 +5,9 @@
 //! linear seam cross-fade) and `downsample`/`upsample` (power-of-two binning /
 //! replication along one axis, ports of `libtomo/misc/morph.c`).
 
-use ndarray::Array3;
 use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
+use ndarray::Array3;
 
 /// Side of the field of view the rotation axis is closest to (tomopy's
 /// `rotation='left'`/`'right'`).

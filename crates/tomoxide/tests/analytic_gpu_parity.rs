@@ -22,8 +22,8 @@
 #![cfg(feature = "gpu-wgpu")]
 
 use ndarray::{Array2, Axis};
-use tomoxide::{recon, sim, Algorithm, Angles, Backend, CpuBackend, Geometry, ReconParams, Volume};
 use tomoxide::wgpu::WgpuBackend;
+use tomoxide::{recon, sim, Algorithm, Angles, Backend, CpuBackend, Geometry, ReconParams, Volume};
 
 /// Pearson correlation between two slices over a centered disk (amplitude-scale
 /// invariant), kept inside the phantom support away from clipped corners.

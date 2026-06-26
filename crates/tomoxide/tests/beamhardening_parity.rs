@@ -39,14 +39,38 @@ fn max_rel(a: &[f64], b: &[f64]) -> f64 {
 fn config() -> BeamHardeningConfig {
     BeamHardeningConfig {
         scintillator: Layer {
-            material: Material { formula: "Lu3Al5O12".into(), density: 6.73 },
+            material: Material {
+                formula: "Lu3Al5O12".into(),
+                density: 6.73,
+            },
             thickness_um: 100.0,
         },
-        sample: Material { formula: "Fe".into(), density: 7.87 },
+        sample: Material {
+            formula: "Fe".into(),
+            density: 7.87,
+        },
         filters: vec![
-            Layer { material: Material { formula: "Al".into(), density: 2.7 }, thickness_um: 750.0 },
-            Layer { material: Material { formula: "Cu".into(), density: 8.96 }, thickness_um: 50.0 },
-            Layer { material: Material { formula: "Be".into(), density: 1.85 }, thickness_um: 250.0 },
+            Layer {
+                material: Material {
+                    formula: "Al".into(),
+                    density: 2.7,
+                },
+                thickness_um: 750.0,
+            },
+            Layer {
+                material: Material {
+                    formula: "Cu".into(),
+                    density: 8.96,
+                },
+                thickness_um: 50.0,
+            },
+            Layer {
+                material: Material {
+                    formula: "Be".into(),
+                    density: 1.85,
+                },
+                thickness_um: 250.0,
+            },
         ],
         ref_trans: 0.1,
         threshold_trans: 1e-5,
@@ -62,10 +86,22 @@ fn luts_match_reference() {
     let (ang, fac) = corr.angular_lut();
     // Measured residuals are at the f64 floor: ext ≈ 4e-12, path ≈ 2e-15,
     // angular factor ≈ 3e-14 (numpy pairwise-sum / vectorised exp vs scalar libm).
-    assert!(max_rel(ext, &f64v("bh_centerline_ext.npy")) < 1e-10, "centerline ext");
-    assert!(max_rel(path, &f64v("bh_centerline_path.npy")) < 1e-12, "centerline path");
-    assert!(max_rel(ang, &f64v("bh_angular_angles.npy")) < 1e-12, "angular angles");
-    assert!(max_rel(fac, &f64v("bh_angular_corr.npy")) < 1e-11, "angular corr");
+    assert!(
+        max_rel(ext, &f64v("bh_centerline_ext.npy")) < 1e-10,
+        "centerline ext"
+    );
+    assert!(
+        max_rel(path, &f64v("bh_centerline_path.npy")) < 1e-12,
+        "centerline path"
+    );
+    assert!(
+        max_rel(ang, &f64v("bh_angular_angles.npy")) < 1e-12,
+        "angular angles"
+    );
+    assert!(
+        max_rel(fac, &f64v("bh_angular_corr.npy")) < 1e-11,
+        "angular corr"
+    );
 }
 
 #[test]
@@ -73,7 +109,10 @@ fn find_angles_match_reference() {
     let mut corr = BeamCorrector::new(&config(), &default_aps_bm_spectra()).unwrap();
     let flat: Array2<f32> = read_npy(format!("{FIXTURES}/bh_flat.npy")).unwrap();
     corr.find_angles(&flat);
-    assert!(max_rel(corr.row_angles(), &f64v("bh_row_angles.npy")) < 1e-12, "row angles");
+    assert!(
+        max_rel(corr.row_angles(), &f64v("bh_row_angles.npy")) < 1e-12,
+        "row angles"
+    );
 }
 
 #[test]

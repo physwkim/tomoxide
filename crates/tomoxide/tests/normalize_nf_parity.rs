@@ -22,7 +22,14 @@ fn load(name: &str) -> Array3<f32> {
 }
 
 fn run_case(flats_file: &str, golden_file: &str, flat_loc: &[usize], cutoff: Option<f32>) {
-    run_case_full("normalize_nf_dark.npy", flats_file, golden_file, flat_loc, cutoff, Averaging::Mean);
+    run_case_full(
+        "normalize_nf_dark.npy",
+        flats_file,
+        golden_file,
+        flat_loc,
+        cutoff,
+        Averaging::Mean,
+    );
 }
 
 fn run_case_full(

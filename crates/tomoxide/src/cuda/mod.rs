@@ -116,11 +116,6 @@ impl Backend for CudaBackend {
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::{ffi, CudaBackend};
-    use ndarray::{Array3, ArrayViewMut2, Axis};
-    use rayon::prelude::*;
-    use rayon::{ThreadPool, ThreadPoolBuilder};
-    use std::os::raw::c_void;
-    use std::sync::{Condvar, Mutex, OnceLock};
     use crate::backend::{
         make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
     };
@@ -128,6 +123,11 @@ mod cuda_impl {
     use crate::error::{Error, Result};
     use crate::geometry::{Beam, Geometry};
     use crate::params::FilterName;
+    use ndarray::{Array3, ArrayViewMut2, Axis};
+    use rayon::prelude::*;
+    use rayon::{ThreadPool, ThreadPoolBuilder};
+    use std::os::raw::c_void;
+    use std::sync::{Condvar, Mutex, OnceLock};
 
     /// RAII wrapper over a `cudaMalloc` allocation (freed on drop).
     struct DevBuf {
@@ -191,7 +191,9 @@ mod cuda_impl {
                 ffi::tomoxide_cuda_memcpy_h2d(buf.ptr, h.as_ptr() as *const c_void, bytes)
             };
             if rc != 0 {
-                return Err(Error::Backend(format!("cudaMemcpy H2D (f16) failed ({rc})")));
+                return Err(Error::Backend(format!(
+                    "cudaMemcpy H2D (f16) failed ({rc})"
+                )));
             }
             Ok(buf)
         }
@@ -205,7 +207,9 @@ mod cuda_impl {
                 ffi::tomoxide_cuda_memcpy_d2h(h.as_mut_ptr() as *mut c_void, self.ptr, bytes)
             };
             if rc != 0 {
-                return Err(Error::Backend(format!("cudaMemcpy D2H (f16) failed ({rc})")));
+                return Err(Error::Backend(format!(
+                    "cudaMemcpy D2H (f16) failed ({rc})"
+                )));
             }
             // Widen f16→f32 in parallel (see from_host_f16); order preserved.
             Ok(h.par_iter().map(|x| x.to_f32()).collect())
@@ -238,7 +242,9 @@ mod cuda_impl {
         fn sync(&self) -> Result<()> {
             let rc = unsafe { ffi::tomoxide_cuda_stream_sync(self.ptr) };
             if rc != 0 {
-                return Err(Error::Backend(format!("cudaStreamSynchronize failed ({rc})")));
+                return Err(Error::Backend(format!(
+                    "cudaStreamSynchronize failed ({rc})"
+                )));
             }
             Ok(())
         }
@@ -429,7 +435,16 @@ mod cuda_impl {
         let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
         ck(
             unsafe {
-                ffi::tomoxide_pad(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+                ffi::tomoxide_pad(
+                    sino_dev.ptr,
+                    gpad.ptr,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    null,
+                )
             },
             "pad",
         )?;
@@ -495,13 +510,24 @@ mod cuda_impl {
         let gpad = DevBuf::zeroed(nz * nproj * pad * hsz)?;
         ck(
             unsafe {
-                ffi::tomoxide_pad_fp16(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+                ffi::tomoxide_pad_fp16(
+                    sino_dev.ptr,
+                    gpad.ptr,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    null,
+                )
             },
             "pad_fp16",
         )?;
         let fh = unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) };
         if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter (f16) allocation failed".into()));
+            return Err(Error::Backend(
+                "cfunc_filter (f16) allocation failed".into(),
+            ));
         }
         unsafe { ffi::tomoxide_filter_fp16_apply(fh, gpad.ptr, w_dev.ptr, null) };
         unsafe { ffi::tomoxide_filter_fp16_free(fh) };
@@ -515,7 +541,9 @@ mod cuda_impl {
         let f = DevBuf::zeroed(nz * n * n * hsz)?;
         let h = unsafe { ffi::tomoxide_linerec_fp16_new(nproj, nz, n, nproj, nz) };
         if h.is_null() {
-            return Err(Error::Backend("cfunc_linerec (f16) allocation failed".into()));
+            return Err(Error::Backend(
+                "cfunc_linerec (f16) allocation failed".into(),
+            ));
         }
         unsafe {
             ffi::tomoxide_linerec_fp16_backproject(
@@ -683,7 +711,9 @@ mod cuda_impl {
             )?;
             // linerec accumulates into `f`, so zero it first (on the stream).
             ck(
-                unsafe { ffi::tomoxide_cuda_memset_async(slots[s].f.ptr, 0, len * n * n * fsz, st) },
+                unsafe {
+                    ffi::tomoxide_cuda_memset_async(slots[s].f.ptr, 0, len * n * n * fsz, st)
+                },
                 "memset f",
             )?;
             let lrec = unsafe { ffi::tomoxide_linerec_new(nproj, len, n, nproj, len) };
@@ -1074,7 +1104,16 @@ mod cuda_impl {
         let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
         ck(
             unsafe {
-                ffi::tomoxide_pad(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+                ffi::tomoxide_pad(
+                    sino_dev.ptr,
+                    gpad.ptr,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    null,
+                )
             },
             "pad",
         )?;
@@ -1139,13 +1178,24 @@ mod cuda_impl {
         let gpad = DevBuf::zeroed(nz * nproj * pad * hsz)?;
         ck(
             unsafe {
-                ffi::tomoxide_pad_fp16(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+                ffi::tomoxide_pad_fp16(
+                    sino_dev.ptr,
+                    gpad.ptr,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    null,
+                )
             },
             "pad_fp16",
         )?;
         let fh = unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) };
         if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter (f16) allocation failed".into()));
+            return Err(Error::Backend(
+                "cfunc_filter (f16) allocation failed".into(),
+            ));
         }
         unsafe { ffi::tomoxide_filter_fp16_apply(fh, gpad.ptr, w_dev.ptr, null) };
         unsafe { ffi::tomoxide_filter_fp16_free(fh) };
@@ -1166,7 +1216,9 @@ mod cuda_impl {
             ffi::tomoxide_fourierrec_fp16_new(nproj, nz / 2, n, theta_dev.ptr as *const f32)
         };
         if h.is_null() {
-            return Err(Error::Backend("cfunc_fourierrec (f16) allocation failed".into()));
+            return Err(Error::Backend(
+                "cfunc_fourierrec (f16) allocation failed".into(),
+            ));
         }
         unsafe { ffi::tomoxide_fourierrec_fp16_backproject(h, fc.ptr, gc.ptr, null) };
         unsafe { ffi::tomoxide_fourierrec_fp16_free(h) };
@@ -1644,14 +1696,14 @@ mod cuda_impl {
         // sizes we run this is 4, so 2n+2m = 2n+8.
         let stride = 2 * n + 8;
         let grid_pair = stride * stride * 2 * fsz; // real2 grid per pair (fde)
-        // Per-pair device bytes: fde grid + padded/cropped/packed/output buffers
-        // (≈ 2·nproj·pad real for the padded stages, plus n·n complex output).
+                                                   // Per-pair device bytes: fde grid + padded/cropped/packed/output buffers
+                                                   // (≈ 2·nproj·pad real for the padded stages, plus n·n complex output).
         let per_pair = grid_pair + (2 * nproj * pad + 4 * n * n) * fsz;
         let by_mem = (free_bytes / 100 * 80) / per_pair.max(1); // pairs
-        // 88% of 2³¹, in *pairs*, bounded by BOTH index-bearing stages: the
-        // padded buffer (`z·nproj·pad`, z = 2·pairs real slices) and the
-        // oversampled grid (`pair·stride²`). The grid's gather adds an in-plane
-        // offset up to ~6n·stride on top, which the 12% headroom absorbs.
+                                                                // 88% of 2³¹, in *pairs*, bounded by BOTH index-bearing stages: the
+                                                                // padded buffer (`z·nproj·pad`, z = 2·pairs real slices) and the
+                                                                // oversampled grid (`pair·stride²`). The grid's gather adds an in-plane
+                                                                // offset up to ~6n·stride on top, which the 12% headroom absorbs.
         let margin = I32_INDEX_LIMIT / 100 * 88;
         let by_pad = margin / (2 * nproj * pad).max(1);
         let by_grid = margin / (stride * stride).max(1);
@@ -1705,7 +1757,10 @@ mod cuda_impl {
 
     impl Semaphore {
         fn new(permits: usize) -> Self {
-            Self { permits: Mutex::new(permits), cv: Condvar::new() }
+            Self {
+                permits: Mutex::new(permits),
+                cv: Condvar::new(),
+            }
         }
         fn acquire(&self) -> SemGuard<'_> {
             let mut p = self.permits.lock().unwrap();
@@ -1774,10 +1829,13 @@ mod cuda_impl {
                 let threads = dp.pools[0].current_num_threads();
                 return dp.pools[0].install(move || {
                     let sem = Semaphore::new(max_inflight(n, device_free_bytes(), threads));
-                    slabs.into_par_iter().enumerate().try_for_each(|(row, slab)| {
-                        let _permit = sem.acquire();
-                        f(row, slab)
-                    })
+                    slabs
+                        .into_par_iter()
+                        .enumerate()
+                        .try_for_each(|(row, slab)| {
+                            let _permit = sem.acquire();
+                            f(row, slab)
+                        })
                 });
             }
 
@@ -1928,12 +1986,8 @@ mod cuda_impl {
                     .as_slice()
                     .ok_or_else(|| Error::InvalidParam("non-contiguous data".into()))?;
                 let d_data = DevBuf::from_host_f32(host)?;
-                let d_dark = DevBuf::from_host_f32(
-                    dark2d.as_slice().expect("contiguous dark2d"),
-                )?;
-                let d_denom = DevBuf::from_host_f32(
-                    denom.as_slice().expect("contiguous denom"),
-                )?;
+                let d_dark = DevBuf::from_host_f32(dark2d.as_slice().expect("contiguous dark2d"))?;
+                let d_denom = DevBuf::from_host_f32(denom.as_slice().expect("contiguous denom"))?;
                 let rc = unsafe {
                     ffi::tomoxide_darkflat(
                         d_data.ptr,
@@ -1950,7 +2004,9 @@ mod cuda_impl {
                 }
                 let sync = unsafe { ffi::tomoxide_cuda_sync() };
                 if sync != 0 {
-                    return Err(Error::Backend(format!("cuda darkflat sync failed ({sync})")));
+                    return Err(Error::Backend(format!(
+                        "cuda darkflat sync failed ({sync})"
+                    )));
                 }
                 let out = data
                     .array
@@ -1978,7 +2034,9 @@ mod cuda_impl {
             }
             let sync = unsafe { ffi::tomoxide_cuda_sync() };
             if sync != 0 {
-                return Err(Error::Backend(format!("cuda minus_log sync failed ({sync})")));
+                return Err(Error::Backend(format!(
+                    "cuda minus_log sync failed ({sync})"
+                )));
             }
             let out = data
                 .array
@@ -2068,7 +2126,9 @@ mod cuda_impl {
             let rc = unsafe { ffi::tomoxide_cuda_sync() };
             unsafe { ffi::tomoxide_fourierrec_free(handle) };
             if rc != 0 {
-                return Err(Error::Backend(format!("cuda fourierrec sync failed ({rc})")));
+                return Err(Error::Backend(format!(
+                    "cuda fourierrec sync failed ({rc})"
+                )));
             }
 
             let mut fbuf = vec![0.0f32; nz * n * n];

@@ -22,12 +22,12 @@ mod lprec;
 pub mod ring;
 pub mod vector;
 
-use ndarray::{Array3, Axis};
 use crate::backend::{Backend, FilteredBackproject, ForwardProject, RayProject, RayRow};
 use crate::data::{Layout, Tomo, Volume};
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Center, Geometry};
 use crate::params::{Algorithm, ReconParams};
+use ndarray::{Array3, Axis};
 
 fn missing(capability: &'static str, backend: &dyn Backend) -> Error {
     Error::MissingCapability {

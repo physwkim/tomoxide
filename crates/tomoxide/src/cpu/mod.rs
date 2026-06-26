@@ -9,9 +9,6 @@
 //! [`Error::NotImplemented`] with the upstream `file:line` to port from.
 #![forbid(unsafe_code)]
 
-use ndarray::{Array3, Axis};
-use rayon::prelude::*;
-use rustfft::FftPlanner;
 use crate::backend::{
     Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
     ForwardProject, RankFilter, RayProject, RayRow,
@@ -21,6 +18,9 @@ use crate::dtype::{Complex32, Dtype, Element};
 use crate::error::{Error, Result};
 use crate::geometry::{Beam, Center, Geometry};
 use crate::params::FilterName;
+use ndarray::{Array3, Axis};
+use rayon::prelude::*;
+use rustfft::FftPlanner;
 
 /// A host-resident buffer. On the CPU backend "device memory" is just a `Vec`.
 #[derive(Clone, Debug, Default)]
@@ -739,9 +739,9 @@ impl RankFilter for CpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Angles;
     use ndarray::Array3;
     use std::f32::consts::PI;
-    use crate::geometry::Angles;
 
     #[test]
     fn minus_log_matches_definition() {

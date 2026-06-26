@@ -24,9 +24,9 @@
 //! normal approximation would flatten) matches a true Poisson, not just its
 //! first two moments.
 
-use ndarray::{Array2, Array3};
 use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
+use ndarray::{Array2, Array3};
 
 /// SplitMix64 — a tiny, fast, seedable PRNG (Steele, Lea & Flood 2014).
 ///

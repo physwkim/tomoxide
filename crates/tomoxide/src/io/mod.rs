@@ -10,11 +10,11 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
+use crate::data::{Dataset, Frames, Layout, Tomo, Volume};
+use crate::error::{Error, Result};
 use ndarray::{Array3, Axis, Slice};
 use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, Hdf5Error, VarLenUnicode};
 use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
-use crate::data::{Dataset, Frames, Layout, Tomo, Volume};
-use crate::error::{Error, Result};
 
 /// DXchange HDF5 dataset paths (tomocupy `dataio/reader.py`).
 pub mod dxchange {
@@ -406,55 +406,81 @@ fn read_f32_slice(ds: &H5Dataset, starts: &[usize], counts: &[usize]) -> Result<
     }
     let v: Vec<f32> = match dt {
         DatatypeMessage::FloatingPoint {
-            size: 4, byte_order, ..
+            size: 4,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             ds.read_slice::<f32>(starts, counts).map_err(raw)?
         }
         DatatypeMessage::FloatingPoint {
-            size: 8, byte_order, ..
+            size: 8,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(f64)
         }
         DatatypeMessage::FixedPoint {
-            size: 1, signed: false, ..
+            size: 1,
+            signed: false,
+            ..
         } => cast!(u8),
         DatatypeMessage::FixedPoint {
-            size: 1, signed: true, ..
+            size: 1,
+            signed: true,
+            ..
         } => cast!(i8),
         DatatypeMessage::FixedPoint {
-            size: 2, signed: false, byte_order, ..
+            size: 2,
+            signed: false,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(u16)
         }
         DatatypeMessage::FixedPoint {
-            size: 2, signed: true, byte_order, ..
+            size: 2,
+            signed: true,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(i16)
         }
         DatatypeMessage::FixedPoint {
-            size: 4, signed: false, byte_order, ..
+            size: 4,
+            signed: false,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(u32)
         }
         DatatypeMessage::FixedPoint {
-            size: 4, signed: true, byte_order, ..
+            size: 4,
+            signed: true,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(i32)
         }
         DatatypeMessage::FixedPoint {
-            size: 8, signed: false, byte_order, ..
+            size: 8,
+            signed: false,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(u64)
         }
         DatatypeMessage::FixedPoint {
-            size: 8, signed: true, byte_order, ..
+            size: 8,
+            signed: true,
+            byte_order,
+            ..
         } => {
             ensure_le(byte_order)?;
             cast!(i64)

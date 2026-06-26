@@ -5,8 +5,6 @@
 //! order and approximate transcendentals), so the parity bar here is a
 //! tolerance, not Δ=0 — see the `gpu_tests` in [`crate`].
 
-use bytemuck::{Pod, Zeroable};
-use ndarray::{Array3, Axis};
 use crate::backend::{
     make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject, RankFilter,
 };
@@ -15,6 +13,8 @@ use crate::dtype::Complex32;
 use crate::error::{Error, Result};
 use crate::geometry::{Beam, Geometry};
 use crate::params::FilterName;
+use bytemuck::{Pod, Zeroable};
+use ndarray::{Array3, Axis};
 
 use crate::wgpu::shaders::{
     BACKPROJECT_WGSL, BLUESTEIN_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_TRANSPOSE_WGSL,

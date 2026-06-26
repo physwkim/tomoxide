@@ -15,7 +15,9 @@ use tomoxide::recon::center::sift::{find_center_sift, normalize_to_u8, register_
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
 fn slices(a: &Array3<f32>) -> Vec<Array2<f32>> {
-    (0..a.dim().0).map(|i| a.index_axis(ndarray::Axis(0), i).to_owned()).collect()
+    (0..a.dim().0)
+        .map(|i| a.index_axis(ndarray::Axis(0), i).to_owned())
+        .collect()
 }
 
 fn fliplr(a: &Array2<f32>) -> Array2<f32> {
@@ -33,7 +35,10 @@ fn uint8_normalization_matches_numpy() {
         let got = normalize_to_u8(&img);
         let want: Vec<u8> = u2.index_axis(ndarray::Axis(0), i).iter().copied().collect();
         let diffs = got.iter().zip(&want).filter(|(a, b)| a != b).count();
-        assert_eq!(diffs, 0, "uint8 normalization mismatch in image {i}: {diffs} px");
+        assert_eq!(
+            diffs, 0,
+            "uint8 normalization mismatch in image {i}: {diffs} px"
+        );
     }
 }
 
@@ -61,7 +66,11 @@ fn shifts_and_center_match_cv2() {
     let ncol = datap1.dim().2 as f32;
     let mean_dx = (0..shifts.dim().0).map(|i| shifts[[i, 1]]).sum::<f32>() / shifts.dim().0 as f32;
     let center = ncol / 2.0 - mean_dx / 2.0;
-    assert!((center - g_center[0]).abs() < 1e-4, "center {center} vs {}", g_center[0]);
+    assert!(
+        (center - g_center[0]).abs() < 1e-4,
+        "center {center} vs {}",
+        g_center[0]
+    );
 
     // find_center_sift on pair 0: it flips proj180 internally, so feed
     // proj180 = fliplr(datap2[0]) to reconstruct the golden datap2[0].
@@ -69,5 +78,8 @@ fn shifts_and_center_match_cv2() {
     let proj180 = fliplr(&d2[0]);
     let c0 = find_center_sift(&proj0, &proj180, 0.5).unwrap();
     let want0 = ncol / 2.0 - g_shifts[[0, 1]] / 2.0;
-    assert!((c0 - want0).abs() < 1e-4, "find_center_sift {c0} vs {want0}");
+    assert!(
+        (c0 - want0).abs() < 1e-4,
+        "find_center_sift {c0} vs {want0}"
+    );
 }

@@ -2,9 +2,9 @@
 //! analytic rasterizer; `shepp3d` is a faithful f64 parity port of the 3-D
 //! ellipsoid phantom; the rest are stubs.
 
-use ndarray::{Array2, Array3};
 use crate::data::{Slice2D, Volume};
 use crate::error::{Error, Result};
+use ndarray::{Array2, Array3};
 
 /// One ellipse: `(intensity, a, b, x0, y0, angle_deg)` in normalized `[-1,1]`
 /// coordinates. These are the modified (Toft) Shepp-Logan parameters.

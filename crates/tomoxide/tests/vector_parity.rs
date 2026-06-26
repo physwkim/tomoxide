@@ -76,8 +76,22 @@ fn vector3_matches_tomopy() {
     let t3 = load3("vector3_tomo3.npy");
     let theta = load1("vector3_theta1.npy");
     let th = theta.as_slice().unwrap();
-    let (r1, r2, r3) =
-        vector3(t1.view(), t2.view(), t3.view(), th, th, th, None, None, None, 4, 0, 1, 2).unwrap();
+    let (r1, r2, r3) = vector3(
+        t1.view(),
+        t2.view(),
+        t3.view(),
+        th,
+        th,
+        th,
+        None,
+        None,
+        None,
+        4,
+        0,
+        1,
+        2,
+    )
+    .unwrap();
 
     let d1 = max_abs_diff(&r1, &load3("vector3_out1.npy"));
     let d2 = max_abs_diff(&r2, &load3("vector3_out2.npy"));

@@ -21,7 +21,9 @@ struct CollectWriter {
 }
 impl CollectWriter {
     fn new(nz: usize, n: usize) -> Self {
-        CollectWriter { vol: Array3::zeros((nz, n, n)) }
+        CollectWriter {
+            vol: Array3::zeros((nz, n, n)),
+        }
     }
 }
 impl VolumeWriter for CollectWriter {
@@ -61,21 +63,40 @@ fn run_streaming_matches_run_all() {
     let (_nproj, nz, nx, _nf, _nd) = probe.read_sizes().unwrap();
     let theta = probe.read_theta().unwrap();
     let geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
-    let params = ReconParams { num_gridx: Some(nx), ..Default::default() };
+    let params = ReconParams {
+        num_gridx: Some(nx),
+        ..Default::default()
+    };
     let prep = PrepOptions::default();
 
     // Full (read_all) path.
     let mut r_full = io::open_dxchange(&path).unwrap();
     let mut w_full = CollectWriter::new(nz, nx);
     ReconSteps::new(4)
-        .run(&mut *r_full, &mut w_full, &geom, Algorithm::Fbp, &params, &prep, &engine)
+        .run(
+            &mut *r_full,
+            &mut w_full,
+            &geom,
+            Algorithm::Fbp,
+            &params,
+            &prep,
+            &engine,
+        )
         .unwrap();
 
     // Out-of-core (read_chunk) path, chunk size 4 over nz=6 → chunks [0,4),[4,6).
     let mut r_oc = io::open_dxchange(&path).unwrap();
     let mut w_oc = CollectWriter::new(nz, nx);
     ReconSteps::new(4)
-        .run_streaming(&mut *r_oc, &mut w_oc, &geom, Algorithm::Fbp, &params, &prep, &engine)
+        .run_streaming(
+            &mut *r_oc,
+            &mut w_oc,
+            &geom,
+            Algorithm::Fbp,
+            &params,
+            &prep,
+            &engine,
+        )
         .unwrap();
 
     assert_eq!(w_full.vol.dim(), w_oc.vol.dim());
@@ -85,7 +106,10 @@ fn run_streaming_matches_run_all() {
         .zip(w_oc.vol.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert_eq!(max_d, 0.0, "out-of-core differs from read-all: max |Δ| = {max_d}");
+    assert_eq!(
+        max_d, 0.0,
+        "out-of-core differs from read-all: max |Δ| = {max_d}"
+    );
 }
 
 #[test]
@@ -161,7 +185,10 @@ fn run_streaming_rejects_phase() {
     let (_p, nz, nx, _f, _d) = probe.read_sizes().unwrap();
     let theta = probe.read_theta().unwrap();
     let geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
-    let params = ReconParams { num_gridx: Some(nx), ..Default::default() };
+    let params = ReconParams {
+        num_gridx: Some(nx),
+        ..Default::default()
+    };
     let prep = PrepOptions {
         phase: PhaseMethod::Paganin {
             pixel_size: 1e-4,
@@ -174,7 +201,13 @@ fn run_streaming_rejects_phase() {
     let mut reader = io::open_dxchange(&path).unwrap();
     let mut writer = CollectWriter::new(nz, nx);
     let err = ReconSteps::new(4).run_streaming(
-        &mut *reader, &mut writer, &geom, Algorithm::Fbp, &params, &prep, &engine,
+        &mut *reader,
+        &mut writer,
+        &geom,
+        Algorithm::Fbp,
+        &params,
+        &prep,
+        &engine,
     );
     assert!(err.is_err(), "phase must be rejected in out-of-core mode");
 }

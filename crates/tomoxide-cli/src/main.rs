@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use tomoxide::io::DatasetReader;
-use tomoxide::{Angles, BackendKind, Dtype, Engine, Geometry, ReconParams};
-use tomoxide::Center;
 use tomoxide::Algorithm;
+use tomoxide::Center;
+use tomoxide::{Angles, BackendKind, Dtype, Engine, Geometry, ReconParams};
 
 use crate::config::Config;
 

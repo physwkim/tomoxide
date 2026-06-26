@@ -5,10 +5,10 @@
 //! (`median_filter3d`, `remove_outlier3d`) route through the backend (stubbed).
 //! See `docs/PORTING.md` §E.
 
-use ndarray::{Array2, Array3, Axis};
 use crate::backend::Backend;
 use crate::data::{Tomo, Volume};
 use crate::error::{Error, Result};
+use ndarray::{Array2, Array3, Axis};
 
 /// Zero everything outside a centred circle of radius `ratio · (min_dim/2)` in
 /// every slice (tomopy `misc/corr.py:852`).
@@ -1176,8 +1176,8 @@ fn vicinity_nonzero(g: &Geom, pos: (usize, usize, usize), output: &[f32]) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array3;
     use crate::data::Layout;
+    use ndarray::Array3;
 
     #[test]
     fn circ_mask_zeros_corners_keeps_center() {

@@ -14,8 +14,8 @@
 
 use ndarray::{Array3, Array4, Axis};
 use ndarray_npy::read_npy;
-use tomoxide::prep::filters::remove_outlier;
 use tomoxide::data::{Layout, Tomo};
+use tomoxide::prep::filters::remove_outlier;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 

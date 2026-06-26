@@ -123,7 +123,10 @@ fn recon_steps_matches_full_reconstruct() {
         .zip(writer.vol.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert_eq!(max_d, 0.0, "chunked recon differs from full: max |Δ| = {max_d}");
+    assert_eq!(
+        max_d, 0.0,
+        "chunked recon differs from full: max |Δ| = {max_d}"
+    );
 }
 
 #[test]
@@ -143,7 +146,15 @@ fn recon_steps_chunk_size_invariant() {
         let mut reader = MemReader { ds };
         let mut writer = CollectWriter::new(nz, n);
         ReconSteps::new(chunk)
-            .run(&mut reader, &mut writer, &geom, Algorithm::Fbp, &params, &prep, &engine)
+            .run(
+                &mut reader,
+                &mut writer,
+                &geom,
+                Algorithm::Fbp,
+                &params,
+                &prep,
+                &engine,
+            )
             .unwrap();
         writer.vol
     };

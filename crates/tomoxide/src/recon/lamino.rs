@@ -43,10 +43,10 @@
 //! forward-project → reconstruct round-trip of a 3-D phantom (the matched
 //! [`lamino_project`] forward model and [`lamino`] reconstruction recover it).
 
-use std::f32::consts::PI;
 use crate::backend::Fft;
 use crate::dtype::Complex32;
 use crate::error::Result;
+use std::f32::consts::PI;
 
 /// Gridding accuracy target (tomocupy hardcodes `EPS = 1e-3`).
 const EPS: f64 = 1e-3;

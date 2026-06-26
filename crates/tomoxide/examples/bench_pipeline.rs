@@ -77,7 +77,8 @@ impl DatasetReader for DiskFileReader {
             dark: Some(Frames::new(Array3::zeros((1, rows, self.nx)))),
             theta: self.theta.clone(),
         };
-        self.read_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.read_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(ds)
     }
 }
@@ -91,7 +92,12 @@ struct DiskFileWriter {
 }
 
 impl VolumeWriter for DiskFileWriter {
-    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, _end: usize) -> tomoxide::Result<()> {
+    fn write_chunk(
+        &mut self,
+        vol: &Volume<f32>,
+        start: usize,
+        _end: usize,
+    ) -> tomoxide::Result<()> {
         let t = Instant::now();
         let slice = vol
             .array
@@ -110,7 +116,8 @@ impl VolumeWriter for DiskFileWriter {
         self.file
             .write_all(&bytes)
             .map_err(|e| tomoxide::Error::Io(e.to_string()))?;
-        self.write_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.write_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -268,10 +275,7 @@ fn main() {
     let mut bp = Vec::new();
     File::open(&out_seq).unwrap().read_to_end(&mut bs).unwrap();
     File::open(&out_pipe).unwrap().read_to_end(&mut bp).unwrap();
-    println!(
-        "output identical: {}",
-        bs == bp && !bs.is_empty()
-    );
+    println!("output identical: {}", bs == bp && !bs.is_empty());
 
     for p in [&proj_path, &out_seq, &out_pipe] {
         std::fs::remove_file(p).ok();

@@ -25,10 +25,10 @@
 //! allowed module-wide to keep the port literal).
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+use crate::error::{Error, Result};
 use ndarray::{Array3, ArrayView3};
 use std::f32::consts::PI as PI_F32;
 use std::f64::consts::PI as PI_F64;
-use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // Shared ray-tracing helpers (tomopy libtomo/recon/utils.c)
@@ -36,7 +36,14 @@ use crate::error::{Error, Result};
 
 /// tomopy `preprocessing`: build the Cartesian grid lines and the detector
 /// shift `mov` for one slice. `gridx`/`gridy` have `ry+1`/`rz+1` entries.
-fn preprocessing(ry: i32, rz: i32, num_pixels: i32, center: f32, gridx: &mut [f32], gridy: &mut [f32]) -> f32 {
+fn preprocessing(
+    ry: i32,
+    rz: i32,
+    num_pixels: i32,
+    center: f32,
+    gridx: &mut [f32],
+    gridy: &mut [f32],
+) -> f32 {
     for i in 0..=ry as usize {
         gridx[i] = -ry as f32 * 0.5 + i as f32;
     }
@@ -387,16 +394,43 @@ pub fn vector(
                     let xi = (-(ngridx as i32) - ngridy as i32) as f32;
                     let yi = calc_yi(dxi, d as i32, mov);
                     let (vx, vy) = ray_dir(xi, yi, sin_p, cos_p);
-                    calc_coords(rx, rz, xi, yi, sin_p, cos_p, &sc.gridx, &sc.gridy, &mut sc.coordx, &mut sc.coordy);
+                    calc_coords(
+                        rx,
+                        rz,
+                        xi,
+                        yi,
+                        sin_p,
+                        cos_p,
+                        &sc.gridx,
+                        &sc.gridy,
+                        &mut sc.coordx,
+                        &mut sc.coordy,
+                    );
                     let (asize, bsize) = trim_coords(
-                        rx, rz, &sc.coordx, &sc.coordy, &sc.gridx, &sc.gridy, &mut sc.ax, &mut sc.ay,
-                        &mut sc.bx, &mut sc.by,
+                        rx, rz, &sc.coordx, &sc.coordy, &sc.gridx, &sc.gridy, &mut sc.ax,
+                        &mut sc.ay, &mut sc.bx, &mut sc.by,
                     );
                     let csize = sort_intersections(
-                        quadrant, asize, &sc.ax, &sc.ay, bsize, &sc.bx, &sc.by, &mut sc.coorx,
+                        quadrant,
+                        asize,
+                        &sc.ax,
+                        &sc.ay,
+                        bsize,
+                        &sc.bx,
+                        &sc.by,
+                        &mut sc.coorx,
                         &mut sc.coory,
                     );
-                    calc_dist2(rx, rz, csize, &sc.coorx, &sc.coory, &mut sc.indx, &mut sc.indy, &mut sc.dist);
+                    calc_dist2(
+                        rx,
+                        rz,
+                        csize,
+                        &sc.coorx,
+                        &sc.coory,
+                        &mut sc.indx,
+                        &mut sc.indy,
+                        &mut sc.dist,
+                    );
 
                     // calc_simdata2: project both components onto (vx, vy).
                     let ind_data = d + p * dx + s * dt * dx;
@@ -412,7 +446,8 @@ pub fn vector(
                     if csize >= 1 {
                         for n in 0..csize - 1 {
                             sum_dist2 += sc.dist[n] * sc.dist[n];
-                            sum_dist[sc.indy[n] as usize + sc.indx[n] as usize * ngridy] += sc.dist[n];
+                            sum_dist[sc.indy[n] as usize + sc.indx[n] as usize * ngridy] +=
+                                sc.dist[n];
                         }
                     }
                     if sum_dist2 != 0.0 {
@@ -501,20 +536,55 @@ fn vector_pass(
                 let xi = (-(ngridx as i32) - ngridy as i32) as f32;
                 let yi = calc_yi(dxi, d as i32, mov);
                 let (vx, vy) = ray_dir(xi, yi, sin_p, cos_p);
-                calc_coords(rx, rz, xi, yi, sin_p, cos_p, &sc.gridx, &sc.gridy, &mut sc.coordx, &mut sc.coordy);
+                calc_coords(
+                    rx,
+                    rz,
+                    xi,
+                    yi,
+                    sin_p,
+                    cos_p,
+                    &sc.gridx,
+                    &sc.gridy,
+                    &mut sc.coordx,
+                    &mut sc.coordy,
+                );
                 let (asize, bsize) = trim_coords(
                     rx, rz, &sc.coordx, &sc.coordy, &sc.gridx, &sc.gridy, &mut sc.ax, &mut sc.ay,
                     &mut sc.bx, &mut sc.by,
                 );
                 let csize = sort_intersections(
-                    quadrant, asize, &sc.ax, &sc.ay, bsize, &sc.bx, &sc.by, &mut sc.coorx, &mut sc.coory,
+                    quadrant,
+                    asize,
+                    &sc.ax,
+                    &sc.ay,
+                    bsize,
+                    &sc.bx,
+                    &sc.by,
+                    &mut sc.coorx,
+                    &mut sc.coory,
                 );
-                calc_dist2(rx, rz, csize, &sc.coorx, &sc.coory, &mut sc.indx, &mut sc.indy, &mut sc.dist);
+                calc_dist2(
+                    rx,
+                    rz,
+                    csize,
+                    &sc.coorx,
+                    &sc.coory,
+                    &mut sc.indx,
+                    &mut sc.indy,
+                    &mut sc.dist,
+                );
 
                 let ind_data = d + p * dx + s * dt * dx;
                 if csize >= 1 {
                     for n in 0..csize - 1 {
-                        let ri = idx_axis(axis, sc.indx[n] as usize, sc.indy[n] as usize, s, ngridx, ngridy);
+                        let ri = idx_axis(
+                            axis,
+                            sc.indx[n] as usize,
+                            sc.indy[n] as usize,
+                            s,
+                            ngridx,
+                            ngridy,
+                        );
                         simdata[ind_data] += (comp_a[ri] * vx + comp_b[ri] * vy) * sc.dist[n];
                     }
                 }
@@ -619,7 +689,9 @@ pub fn vector2(
 ) -> Result<(Array3<f32>, Array3<f32>, Array3<f32>)> {
     let (dt, dy, dx) = check_dims(tomo1, theta1, "vector2")?;
     if tomo2.dim() != (dt, dy, dx) {
-        return Err(Error::InvalidParam("vector2: tomo1/tomo2 shapes must match".into()));
+        return Err(Error::InvalidParam(
+            "vector2: tomo1/tomo2 shapes must match".into(),
+        ));
     }
     require_cube(dy, dx, "vector2")?;
     let center = resolve_center(center1, dy, dx)?;
@@ -635,10 +707,14 @@ pub fn vector2(
     for _ in 0..num_iter {
         let (a, b) = axis_components(axis1);
         let (ca, cb) = pick2(&mut r1, &mut r2, &mut r3, a, b);
-        vector_pass(&data1, theta1, &center, dt, dy, dx, ngridx, ngridy, axis1, ca, cb, &mut sc);
+        vector_pass(
+            &data1, theta1, &center, dt, dy, dx, ngridx, ngridy, axis1, ca, cb, &mut sc,
+        );
         let (a, b) = axis_components(axis2);
         let (ca, cb) = pick2(&mut r1, &mut r2, &mut r3, a, b);
-        vector_pass(&data2, theta1, &center, dt, dy, dx, ngridx, ngridy, axis2, ca, cb, &mut sc);
+        vector_pass(
+            &data2, theta1, &center, dt, dy, dx, ngridx, ngridy, axis2, ca, cb, &mut sc,
+        );
     }
 
     finalize3(dy, ngridx, ngridy, r1, r2, r3)
@@ -665,7 +741,9 @@ pub fn vector3(
 ) -> Result<(Array3<f32>, Array3<f32>, Array3<f32>)> {
     let (dt, dy, dx) = check_dims(tomo1, theta1, "vector3")?;
     if tomo2.dim() != (dt, dy, dx) || tomo3.dim() != (dt, dy, dx) {
-        return Err(Error::InvalidParam("vector3: all tomo shapes must match".into()));
+        return Err(Error::InvalidParam(
+            "vector3: all tomo shapes must match".into(),
+        ));
     }
     require_cube(dy, dx, "vector3")?;
     let center = resolve_center(center1, dy, dx)?;
@@ -683,7 +761,9 @@ pub fn vector3(
         for (data, axis) in [(&data1, axis1), (&data2, axis2), (&data3, axis3)] {
             let (a, b) = axis_components(axis);
             let (ca, cb) = pick2(&mut r1, &mut r2, &mut r3, a, b);
-            vector_pass(data, theta1, &center, dt, dy, dx, ngridx, ngridy, axis, ca, cb, &mut sc);
+            vector_pass(
+                data, theta1, &center, dt, dy, dx, ngridx, ngridy, axis, ca, cb, &mut sc,
+            );
         }
     }
 

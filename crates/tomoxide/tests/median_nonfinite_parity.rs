@@ -11,8 +11,8 @@
 
 use ndarray::{Array1, Array4, Axis};
 use ndarray_npy::read_npy;
-use tomoxide::prep::filters::median_filter_nonfinite;
 use tomoxide::data::{Layout, Tomo};
+use tomoxide::prep::filters::median_filter_nonfinite;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
