@@ -163,6 +163,11 @@ pub struct ReconParams {
     pub num_block: usize,
     /// Per-block angle indices (`ind_block`).
     pub ind_block: Vec<i32>,
+    /// Reconstruction precision (tomocupy `--dtype`). `F32` everywhere by
+    /// default; `F16` selects the half-precision GPU analytic path (CUDA only,
+    /// power-of-two padded width). Ignored by backends/algorithms that do not
+    /// implement it.
+    pub dtype: crate::dtype::Dtype,
 }
 
 impl Default for ReconParams {
@@ -177,6 +182,7 @@ impl Default for ReconParams {
             reg_data: Vec::new(),
             num_block: 0,
             ind_block: Vec::new(),
+            dtype: crate::dtype::Dtype::F32,
         }
     }
 }

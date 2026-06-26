@@ -12,7 +12,9 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::{Array2, Axis};
-use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, CudaBackend, Geometry, ReconParams};
+use tomoxide::{
+    recon, sim, Algorithm, Angles, CpuBackend, CudaBackend, Dtype, Geometry, ReconParams,
+};
 
 fn pearson_disk(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) -> f32 {
     let c = (n as f32 - 1.0) / 2.0;
@@ -232,4 +234,102 @@ fn cuda_fused_equals_per_stage() {
         "fused device path differs from per-stage by {max_d:e} (> 1e-4·{maxabs:e}) — \
          an all-zero or wrong-path regression, not the FFT floor"
     );
+}
+
+/// Build the stacked-phantom sinogram shared by the f16 parity tests.
+fn f16_phantom_sino(
+    cpu: &CpuBackend,
+    n: usize,
+    nz: usize,
+    nang: usize,
+) -> (Array2<f32>, Geometry, tomoxide::Tomo<f32>) {
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let vol = tomoxide::Volume::new(stack);
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let sino = sim::project(&vol, &geom, cpu).unwrap();
+    (phantom, geom, sino)
+}
+
+#[test]
+fn cuda_fbp_f16_matches_f32_and_phantom() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    // pad = (4·n).next_power_of_two() ⇒ the half cuFFT's power-of-two width holds.
+    let (n, nang, nz) = (128usize, 180usize, 4usize);
+    let (phantom, geom, sino) = f16_phantom_sino(&cpu, n, nz, nang);
+
+    let p32 = ReconParams {
+        num_gridx: Some(n),
+        ..Default::default()
+    };
+    let p16 = ReconParams {
+        num_gridx: Some(n),
+        dtype: Dtype::F16,
+        ..Default::default()
+    };
+    let rec32 = recon::recon(&sino, &geom, Algorithm::Fbp, &p32, &cuda).unwrap();
+    let rec16 = recon::recon(&sino, &geom, Algorithm::Fbp, &p16, &cuda).unwrap();
+    let mid = nz / 2;
+    let s32 = rec32.array.index_axis(Axis(0), mid).to_owned();
+    let s16 = rec16.array.index_axis(Axis(0), mid).to_owned();
+    assert_eq!(s16.dim(), (n, n));
+
+    // f16 keeps the same geometry/scale as f32 — straight Pearson, no flip.
+    let r = pearson_disk(&s16, &s32, n, 0.85);
+    eprintln!("cuda FBP f16↔f32 Pearson = {r:.5}");
+    assert!(r > 0.99, "f16 FBP disagrees with f32 FBP: r = {r:.5}");
+
+    // And it still recovers the phantom (half precision is approximate but the
+    // structure must survive).
+    let r_ph = pearson_disk(&s16, &phantom, n, 0.85).max(pearson_disk(&flipud(&s16), &phantom, n, 0.85));
+    eprintln!("cuda FBP f16↔phantom Pearson = {r_ph:.5}");
+    assert!(r_ph > 0.85, "f16 FBP recovers phantom poorly: r = {r_ph:.5}");
+}
+
+#[test]
+fn cuda_fourierrec_f16_matches_f32_and_phantom() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nang, nz) = (128usize, 180usize, 4usize);
+    let (phantom, geom, sino) = f16_phantom_sino(&cpu, n, nz, nang);
+
+    let p32 = ReconParams {
+        num_gridx: Some(n),
+        ..Default::default()
+    };
+    let p16 = ReconParams {
+        num_gridx: Some(n),
+        dtype: Dtype::F16,
+        ..Default::default()
+    };
+    let rec32 = recon::recon(&sino, &geom, Algorithm::Fourierrec, &p32, &cuda).unwrap();
+    let rec16 = recon::recon(&sino, &geom, Algorithm::Fourierrec, &p16, &cuda).unwrap();
+    let mid = nz / 2;
+    let s32 = rec32.array.index_axis(Axis(0), mid).to_owned();
+    let s16 = rec16.array.index_axis(Axis(0), mid).to_owned();
+    assert_eq!(s16.dim(), (n, n));
+
+    let r = pearson_disk(&s16, &s32, n, 0.85).max(pearson_disk(&flipud(&s16), &s32, n, 0.85));
+    eprintln!("cuda fourierrec f16↔f32 Pearson = {r:.5}");
+    assert!(r > 0.97, "f16 fourierrec disagrees with f32: r = {r:.5}");
+
+    let r_ph = pearson_disk(&s16, &phantom, n, 0.85).max(pearson_disk(&flipud(&s16), &phantom, n, 0.85));
+    eprintln!("cuda fourierrec f16↔phantom Pearson = {r_ph:.5}");
+    assert!(r_ph > 0.9, "f16 fourierrec recovers phantom poorly: r = {r_ph:.5}");
 }

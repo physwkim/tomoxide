@@ -174,6 +174,88 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // --- FP16 (half-precision) variants (cuda/shim_fp16.cu) ---
+    // Same semantics as the f32 entry points above, but the device buffers hold
+    // `half` (`real = half`) — 2 bytes/element — and the filter runs a
+    // half-precision cuFFT (requires power-of-two `ne`). theta/shift stay f32.
+    /// `cfunc_filter` compiled with `-DHALF`.
+    pub fn tomoxide_filter_fp16_new(nproj: usize, nz: usize, n: usize) -> *mut c_void;
+    pub fn tomoxide_filter_fp16_apply(
+        handle: *mut c_void,
+        g: *mut c_void,
+        w: *const c_void,
+        stream: *mut c_void,
+    );
+    pub fn tomoxide_filter_fp16_free(handle: *mut c_void);
+    /// `cfunc_linerec` compiled with `-DHALF`.
+    pub fn tomoxide_linerec_fp16_new(
+        nproj: usize,
+        nz: usize,
+        n: usize,
+        ncproj: usize,
+        ncz: usize,
+    ) -> *mut c_void;
+    pub fn tomoxide_linerec_fp16_backproject(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        theta: *const f32,
+        phi: f32,
+        sz: i32,
+        stream: *mut c_void,
+    );
+    pub fn tomoxide_linerec_fp16_free(handle: *mut c_void);
+    /// `cfunc_fourierrec` compiled with `-DHALF`.
+    pub fn tomoxide_fourierrec_fp16_new(
+        nproj: usize,
+        nz: usize,
+        n: usize,
+        theta: *const f32,
+    ) -> *mut c_void;
+    pub fn tomoxide_fourierrec_fp16_backproject(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        stream: *mut c_void,
+    );
+    pub fn tomoxide_fourierrec_fp16_free(handle: *mut c_void);
+    /// Half-precision pad/crop/pack/unpack (pure `__half` data moves).
+    pub fn tomoxide_pad_fp16(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        ne: usize,
+        pad_side: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn tomoxide_crop_fp16(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        ne: usize,
+        pad_side: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn tomoxide_pack_pairs_fp16(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn tomoxide_unpack_pairs_fp16(
+        src: *const c_void,
+        dst: *mut c_void,
+        nz: usize,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     // --- batched C2C FFT (cuFFT) ---
     /// In-place batched 1-D C2C FFT (`data` = device interleaved float2, length
     /// `n*batch`); inverse is normalized by `1/n`. Returns 0 on success.

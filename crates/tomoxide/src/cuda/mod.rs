@@ -176,6 +176,36 @@ mod cuda_impl {
             }
             Ok(())
         }
+
+        /// Upload `data` (host f32) as half-precision: each element is rounded to
+        /// `f16` so the device buffer holds 2 bytes/element. Used for the f16
+        /// analytic path (sinogram and filter weights).
+        fn from_host_f16(data: &[f32]) -> Result<Self> {
+            let h: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let bytes = std::mem::size_of_val(h.as_slice());
+            let buf = DevBuf::new(bytes)?;
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_h2d(buf.ptr, h.as_ptr() as *const c_void, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaMemcpy H2D (f16) failed ({rc})")));
+            }
+            Ok(buf)
+        }
+
+        /// Download `count` half-precision elements and widen them back to f32.
+        fn to_host_f16_as_f32(&self, count: usize) -> Result<Vec<f32>> {
+            let mut h = vec![half::f16::from_f32(0.0); count];
+            let bytes = std::mem::size_of_val(h.as_slice());
+            debug_assert!(bytes <= self.bytes);
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_d2h(h.as_mut_ptr() as *mut c_void, self.ptr, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaMemcpy D2H (f16) failed ({rc})")));
+            }
+            Ok(h.iter().map(|x| x.to_f32()).collect())
+        }
     }
 
     impl Drop for DevBuf {
@@ -426,6 +456,72 @@ mod cuda_impl {
         let mut host = vec![0.0f32; nz * n * n];
         f.to_host_f32(&mut host)?;
         Ok(host)
+    }
+
+    /// Half-precision (`Dtype::F16`) FBP/Linerec on the **current** device, whole
+    /// stack in one chunk. Mirrors [`analytic_fbp_chunk`] but the sinogram, filter
+    /// weights, padded/filtered buffers and volume are `f16` (2 bytes/element) and
+    /// the filter runs a half-precision cuFFT — so the padded width `pad` MUST be a
+    /// power of two (enforced by the caller). theta stays f32. The result is the
+    /// f32-widened volume; because the half cuFFT and the half back-projection
+    /// accumulate in 16-bit, it matches the f32 path only by correlation, not
+    /// bit-exactly (tomocupy `--dtype float16`).
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fbp_chunk_f16(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let hsz = std::mem::size_of::<half::f16>();
+        let null = std::ptr::null_mut::<c_void>();
+        let sino_dev = DevBuf::from_host_f16(raw)?;
+        let w_dev = DevBuf::from_host_f16(w)?;
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let gpad = DevBuf::zeroed(nz * nproj * pad * hsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_pad_fp16(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+            },
+            "pad_fp16",
+        )?;
+        let fh = unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) };
+        if fh.is_null() {
+            return Err(Error::Backend("cfunc_filter (f16) allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_filter_fp16_apply(fh, gpad.ptr, w_dev.ptr, null) };
+        unsafe { ffi::tomoxide_filter_fp16_free(fh) };
+        let gf = DevBuf::zeroed(nz * nproj * ncols * hsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_crop_fp16(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null)
+            },
+            "crop_fp16",
+        )?;
+        let f = DevBuf::zeroed(nz * n * n * hsz)?;
+        let h = unsafe { ffi::tomoxide_linerec_fp16_new(nproj, nz, n, nproj, nz) };
+        if h.is_null() {
+            return Err(Error::Backend("cfunc_linerec (f16) allocation failed".into()));
+        }
+        unsafe {
+            ffi::tomoxide_linerec_fp16_backproject(
+                h,
+                f.ptr,
+                gf.ptr,
+                theta_dev.ptr as *const f32,
+                std::f32::consts::FRAC_PI_2,
+                0,
+                null,
+            );
+        }
+        unsafe { ffi::tomoxide_linerec_fp16_free(h) };
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        f.to_host_f16_as_f32(nz * n * n)
     }
 
     /// State for one double-buffer slot of the async FBP pipeline: its own stream,
@@ -754,6 +850,72 @@ mod cuda_impl {
         Ok(host)
     }
 
+    /// Half-precision (`Dtype::F16`) Fourierrec on the **current** device, whole
+    /// stack in one chunk. Mirrors [`analytic_fourierrec`] with `f16` buffers and a
+    /// half-precision cuFFT filter (`pad` must be a power of two; enforced by the
+    /// caller). theta stays f32. Like the vendored f32 path the gather scatters with
+    /// `atomicAdd`, so the low bits are nondeterministic; in f16 the precision floor
+    /// is coarser — correlation-verified against f32, not bit-exact.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fourierrec_f16(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let hsz = std::mem::size_of::<half::f16>();
+        let null = std::ptr::null_mut::<c_void>();
+        let sino_dev = DevBuf::from_host_f16(raw)?;
+        let w_dev = DevBuf::from_host_f16(w)?;
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let gpad = DevBuf::zeroed(nz * nproj * pad * hsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_pad_fp16(sino_dev.ptr, gpad.ptr, nz, nproj, ncols, pad, pad_side, null)
+            },
+            "pad_fp16",
+        )?;
+        let fh = unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) };
+        if fh.is_null() {
+            return Err(Error::Backend("cfunc_filter (f16) allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_filter_fp16_apply(fh, gpad.ptr, w_dev.ptr, null) };
+        unsafe { ffi::tomoxide_filter_fp16_free(fh) };
+        let gf = DevBuf::zeroed(nz * nproj * ncols * hsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_crop_fp16(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null)
+            },
+            "crop_fp16",
+        )?;
+        let gc = DevBuf::zeroed(nz * nproj * ncols * hsz)?; // complex [nz/2,nproj,ncols]
+        ck(
+            unsafe { ffi::tomoxide_pack_pairs_fp16(gf.ptr, gc.ptr, nz, nproj, ncols, null) },
+            "pack_fp16",
+        )?;
+        let fc = DevBuf::zeroed(nz * n * n * hsz)?; // complex [nz/2,n,n]
+        let h = unsafe {
+            ffi::tomoxide_fourierrec_fp16_new(nproj, nz / 2, n, theta_dev.ptr as *const f32)
+        };
+        if h.is_null() {
+            return Err(Error::Backend("cfunc_fourierrec (f16) allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_fourierrec_fp16_backproject(h, fc.ptr, gc.ptr, null) };
+        unsafe { ffi::tomoxide_fourierrec_fp16_free(h) };
+        let vol_dev = DevBuf::zeroed(nz * n * n * hsz)?;
+        ck(
+            unsafe { ffi::tomoxide_unpack_pairs_fp16(fc.ptr, vol_dev.ptr, nz, n, null) },
+            "unpack_fp16",
+        )?;
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        vol_dev.to_host_f16_as_f32(nz * n * n)
+    }
+
     /// Memory-safe driver for the fused Fourierrec path: split the z-stack into
     /// **even** tiles sized by [`fourierrec_tile_z`] and run [`analytic_fourierrec`]
     /// on each. Pairing `(s, s+nz/2)` is just a real-FFT packing trick, so
@@ -844,6 +1006,45 @@ mod cuda_impl {
             let pad_side = pad / 2 - ncols / 2;
             let w = build_filter_w(&filter, geom, nz, ncols, pad);
             let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
+
+            // Half-precision path (tomocupy `--dtype float16`): single GPU, whole
+            // stack in one chunk. The half cuFFT filter needs a power-of-two
+            // transform width, so `pad` must be a power of two. f16 tiling, the
+            // async pipeline, and the multi-GPU split are not implemented here yet
+            // (f16 already doubles the per-GPU capacity); a stack too large for one
+            // device surfaces as a `cudaMalloc` failure.
+            if params.dtype == crate::dtype::Dtype::F16 {
+                if !pad.is_power_of_two() {
+                    return Err(Error::InvalidParam(format!(
+                        "cuda f16 analytic path needs a power-of-two padded width (half cuFFT); \
+                         filter pad={pad}. Use a power-of-two detector width, or the default f32 dtype."
+                    )));
+                }
+                let devices = selected_devices();
+                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                let vol = match algorithm {
+                    Algorithm::Fbp | Algorithm::Linerec => {
+                        analytic_fbp_chunk_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
+                    }
+                    Algorithm::Fourierrec => {
+                        if nz % 2 != 0 {
+                            return Err(Error::InvalidParam(format!(
+                                "cuda fourierrec needs an even slice count; got nz={nz}"
+                            )));
+                        }
+                        analytic_fourierrec_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
+                    }
+                    other => {
+                        return Err(Error::InvalidParam(format!(
+                            "cuda f16 analytic reconstruct: unsupported algorithm {other:?}"
+                        )))
+                    }
+                };
+                return Ok(Volume::new(
+                    Array3::from_shape_vec((nz, n, n), vol)
+                        .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
+                ));
+            }
 
             let vol = match algorithm {
                 Algorithm::Fbp | Algorithm::Linerec => {
