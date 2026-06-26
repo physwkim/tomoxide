@@ -24,7 +24,8 @@ void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float ph
     dim3 dimBlock(32,32,1);    
     dim3 GS3d0;  
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
-    backprojection_ker <<<GS3d0, dimBlock, 0, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
+    size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
+    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
 }                                            
 
 void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size_t sh_, float phi, int sz,  size_t stream_) {
@@ -38,7 +39,8 @@ void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size
     dim3 dimBlock(32,32,1);    
     dim3 GS3d0;  
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
-    backprojection_try_ker<<<GS3d0, dimBlock, 0, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, sh, ncz, n, nz, ncproj);
+    size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
+    backprojection_try_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, sh, ncz, n, nz, ncproj);
 }                                            
 
 void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz,  size_t stream_) {
@@ -51,5 +53,6 @@ void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta
     dim3 dimBlock(32,32,1);    
     dim3 GS3d0;  
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
-    backprojection_try_lamino_ker<<<GS3d0, dimBlock, 0, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
+    size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
+    backprojection_try_lamino_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
 }                                            
