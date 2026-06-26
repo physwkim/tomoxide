@@ -55,6 +55,10 @@ int tomoxide_cuda_memset(void* p, int value, size_t bytes) {
   return (int) cudaMemset(p, value, bytes);
 }
 int tomoxide_cuda_sync() { return (int) cudaDeviceSynchronize(); }
+// Free / total memory on the current device (bytes). 0 on success.
+int tomoxide_cuda_mem_info(size_t* free_bytes, size_t* total_bytes) {
+  return (int) cudaMemGetInfo(free_bytes, total_bytes);
+}
 
 // ---- linerec (cfunc_linerec) ----
 void* tomoxide_linerec_new(size_t nproj, size_t nz, size_t n, size_t ncproj, size_t ncz) {

@@ -120,7 +120,7 @@ mod cuda_impl {
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
     use std::os::raw::c_void;
-    use std::sync::OnceLock;
+    use std::sync::{Condvar, Mutex, OnceLock};
     use crate::backend::{
         make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
     };
@@ -364,6 +364,54 @@ mod cuda_impl {
         Ok(host)
     }
 
+    /// Memory-safe driver for the fused Fbp/Linerec path: split the z-stack into
+    /// tiles sized by [`fbp_tile_z`] (free device memory + the 32-bit index
+    /// ceiling) and run [`analytic_fbp_chunk`] on each, concatenating the volumes.
+    /// When the whole stack already fits in one tile this is a single chunk call
+    /// (numerically identical to the un-streamed path). When it tiles, the cuFFT
+    /// filter batch becomes the tile size, so — like the multi-GPU split — the
+    /// result shifts at the single-precision FFT floor (~1e-7) and, since the
+    /// tile size tracks free device memory, is not bit-reproducible across hosts
+    /// with different free memory. The current device must already be selected.
+    /// Returns the volume `[nz, n, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fbp_stream(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
+        let tile = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes()).min(nz.max(1));
+        if tile >= nz {
+            return analytic_fbp_chunk(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
+        }
+        let mut out = Vec::with_capacity(nz * n * n);
+        let mut z0 = 0;
+        while z0 < nz {
+            let t = tile.min(nz - z0);
+            let v = analytic_fbp_chunk(
+                &raw[z0 * nproj * ncols..(z0 + t) * nproj * ncols],
+                &w[z0 * nfreq2..(z0 + t) * nfreq2],
+                theta,
+                t,
+                nproj,
+                ncols,
+                n,
+                pad,
+                pad_side,
+            )?;
+            out.extend(v);
+            z0 += t;
+        }
+        Ok(out)
+    }
+
     /// Pad → cuFFT filter → crop → pack pairs → `cfunc_fourierrec` → unpack for
     /// the whole stack on the **current** device. Returns the volume `[nz, n, n]`.
     ///
@@ -437,6 +485,50 @@ mod cuda_impl {
         Ok(host)
     }
 
+    /// Memory-safe driver for the fused Fourierrec path: split the z-stack into
+    /// **even** tiles sized by [`fourierrec_tile_z`] and run [`analytic_fourierrec`]
+    /// on each. Pairing `(s, s+nz/2)` is just a real-FFT packing trick, so
+    /// re-pairing within each contiguous tile reconstructs the same per-slice
+    /// volume; tiles concatenate in z-order. `nz` is even (checked by the caller).
+    /// The current device must already be selected. Returns volume `[nz, n, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_fourierrec_stream(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+    ) -> Result<Vec<f32>> {
+        let nfreq2 = (pad / 2 + 1) * 2;
+        let tile = fourierrec_tile_z(nproj, n, pad, device_free_bytes()).min(nz.max(2));
+        if tile >= nz {
+            return analytic_fourierrec(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
+        }
+        let mut out = Vec::with_capacity(nz * n * n);
+        let mut z0 = 0;
+        while z0 < nz {
+            let t = tile.min(nz - z0); // even: even tile, even remainder
+            let v = analytic_fourierrec(
+                &raw[z0 * nproj * ncols..(z0 + t) * nproj * ncols],
+                &w[z0 * nfreq2..(z0 + t) * nfreq2],
+                theta,
+                t,
+                nproj,
+                ncols,
+                n,
+                pad,
+                pad_side,
+            )?;
+            out.extend(v);
+            z0 += t;
+        }
+        Ok(out)
+    }
+
     impl crate::backend::AnalyticReconstruct for CudaBackend {
         /// Fused, device-resident analytic reconstruction: upload the raw
         /// sinogram once, then pad → cuFFT filter → crop → back-projection
@@ -489,7 +581,7 @@ mod cuda_impl {
                     let devices = selected_devices();
                     if devices.len() <= 1 {
                         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-                        analytic_fbp_chunk(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
+                        analytic_fbp_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     } else {
                         // Contiguous z-chunks (sizes differ by ≤1), one GPU each,
                         // run concurrently; each thread owns its device's buffers.
@@ -529,7 +621,7 @@ mod cuda_impl {
                                         if nzc == 0 {
                                             return Ok(Vec::new());
                                         }
-                                        analytic_fbp_chunk(
+                                        analytic_fbp_stream(
                                             &raw[a * nproj * ncols..b * nproj * ncols],
                                             &w[a * nfreq2..b * nfreq2],
                                             theta,
@@ -566,7 +658,7 @@ mod cuda_impl {
                     }
                     let devices = selected_devices();
                     unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-                    analytic_fourierrec(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
+                    analytic_fourierrec_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                 }
                 other => {
                     return Err(Error::InvalidParam(format!(
@@ -692,6 +784,71 @@ mod cuda_impl {
         }
     }
 
+    /// Hard ceiling on a single CUDA buffer's element count. The vendored
+    /// tomocupy kernels compute linear indices in 32-bit `int`, so any buffer
+    /// whose element count reaches 2³¹ overflows to a negative index and writes
+    /// out of bounds (SIGSEGV). Streaming keeps every tile's largest buffer
+    /// strictly under this — independent of how much memory is free.
+    const I32_INDEX_LIMIT: usize = i32::MAX as usize; // 2³¹ − 1
+
+    /// Free memory (bytes) on the **current** device. Caller must have already
+    /// `cudaSetDevice`'d the device it means to allocate on. Falls back to a
+    /// conservative 2 GiB if the query fails, so streaming still makes progress.
+    fn device_free_bytes() -> usize {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let rc = unsafe { ffi::tomoxide_cuda_mem_info(&mut free, &mut total) };
+        if rc == 0 && free > 0 {
+            free
+        } else {
+            2 * 1024 * 1024 * 1024
+        }
+    }
+
+    /// Largest z-tile for the fused Fbp/Linerec path on the current device.
+    /// Bounded by BOTH (a) the 32-bit index ceiling on the padded buffer
+    /// `tile·nproj·pad`, and (b) ~80% of free device memory against the
+    /// per-z footprint (sino + padded + cropped + volume + the filter's own
+    /// internal R2C buffers, ≈ padded again). Always ≥ 1.
+    fn fbp_tile_z(nproj: usize, ncols: usize, n: usize, pad: usize, free_bytes: usize) -> usize {
+        let fsz = std::mem::size_of::<f32>();
+        // Per-z device bytes (conservative: cfunc_filter allocates ~one more
+        // padded buffer internally, so count `nproj·pad` twice).
+        let per_z = (nproj * ncols + 2 * nproj * pad + nproj * ncols + n * n) * fsz;
+        let by_mem = (free_bytes / 100 * 80) / per_z.max(1);
+        // 88% of 2³¹ over the dominant per-z stride leaves >200M headroom for the
+        // in-plane offset terms the kernels add on top of `z·nproj·pad`.
+        let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (nproj * pad).max(1);
+        by_mem.min(by_idx).max(1)
+    }
+
+    /// Largest z-tile (in real slices) for the fused Fourierrec path. The
+    /// oversampled grid is `(2n+2m)²` complex per *pair* (= 2 real slices), and
+    /// `cfunc_fourierrec` indexes it with `int`, so the pair count
+    /// `tile/2 · (2n+2m)²` must stay under the 32-bit ceiling; memory is bounded
+    /// by the same grid (`fde`) which dominates. Returned value is **even**
+    /// (pairs) and ≥ 2.
+    fn fourierrec_tile_z(nproj: usize, n: usize, pad: usize, free_bytes: usize) -> usize {
+        let fsz = std::mem::size_of::<f32>();
+        // m = ceil(2n·(1/π)·sqrt(-mu·ln eps + (mu·n)²/4)) with eps=1e-3; for the
+        // sizes we run this is 4, so 2n+2m = 2n+8.
+        let stride = 2 * n + 8;
+        let grid_pair = stride * stride * 2 * fsz; // real2 grid per pair (fde)
+        // Per-pair device bytes: fde grid + padded/cropped/packed/output buffers
+        // (≈ 2·nproj·pad real for the padded stages, plus n·n complex output).
+        let per_pair = grid_pair + (2 * nproj * pad + 4 * n * n) * fsz;
+        let by_mem = (free_bytes / 100 * 80) / per_pair.max(1); // pairs
+        // 88% of 2³¹, in *pairs*, bounded by BOTH index-bearing stages: the
+        // padded buffer (`z·nproj·pad`, z = 2·pairs real slices) and the
+        // oversampled grid (`pair·stride²`). The grid's gather adds an in-plane
+        // offset up to ~6n·stride on top, which the 12% headroom absorbs.
+        let margin = I32_INDEX_LIMIT / 100 * 88;
+        let by_pad = margin / (2 * nproj * pad).max(1);
+        let by_grid = margin / (stride * stride).max(1);
+        let pairs = by_mem.min(by_pad).min(by_grid).max(1);
+        (pairs * 2).max(2)
+    }
+
     /// One device-pinned rayon pool per selected GPU, built once. Each pool's
     /// worker threads call `cudaSetDevice` at startup, so their `cudaMalloc`,
     /// cuFFT plans (thread-local cache), and per-thread default stream all land
@@ -725,6 +882,58 @@ mod cuda_impl {
         })
     }
 
+    /// Minimal counting semaphore (std-only) used to bound how many per-slice
+    /// reconstructions hold device buffers at once. A worker blocks in
+    /// [`acquire`](Semaphore::acquire) until a permit is free; the returned guard
+    /// returns the permit on drop.
+    struct Semaphore {
+        permits: Mutex<usize>,
+        cv: Condvar,
+    }
+
+    struct SemGuard<'a>(&'a Semaphore);
+
+    impl Semaphore {
+        fn new(permits: usize) -> Self {
+            Self { permits: Mutex::new(permits), cv: Condvar::new() }
+        }
+        fn acquire(&self) -> SemGuard<'_> {
+            let mut p = self.permits.lock().unwrap();
+            while *p == 0 {
+                p = self.cv.wait(p).unwrap();
+            }
+            *p -= 1;
+            SemGuard(self)
+        }
+    }
+
+    impl Drop for SemGuard<'_> {
+        fn drop(&mut self) {
+            *self.0.permits.lock().unwrap() += 1;
+            self.0.cv.notify_one();
+        }
+    }
+
+    /// How many per-slice reconstructions may run concurrently on one device.
+    /// The composed path allocates an oversampled `(2n)²` complex grid (plus
+    /// cuFFT workspace) per in-flight slice; fanning all host cores at large `n`
+    /// over-subscribes 32 GB and OOMs. Cap concurrency at ~70% of free device
+    /// memory over a conservative per-slice footprint, clamped to the pool size.
+    /// `TOMOXIDE_CUDA_MAX_INFLIGHT` overrides the computed value.
+    fn max_inflight(n: usize, free_bytes: usize, pool_threads: usize) -> usize {
+        if let Ok(s) = std::env::var("TOMOXIDE_CUDA_MAX_INFLIGHT") {
+            if let Ok(v) = s.trim().parse::<usize>() {
+                if v >= 1 {
+                    return v.min(pool_threads);
+                }
+            }
+        }
+        // ~3× the (2n)² complex grid covers grid + plan workspace + staging.
+        let per_slice = 3 * (2 * n) * (2 * n) * std::mem::size_of::<crate::dtype::Complex32>();
+        let by_mem = (free_bytes / 100 * 70) / per_slice.max(1);
+        by_mem.clamp(1, pool_threads.max(1))
+    }
+
     impl crate::backend::Fft for CudaBackend {
         /// Fan the per-slice loop across the selected GPUs (and host cores).
         /// Slices are partitioned into one contiguous chunk per device; each
@@ -745,16 +954,20 @@ mod cuda_impl {
         ) -> Result<()> {
             let dp = device_pools();
             let d = dp.devices.len();
+            let n = out.shape()[1]; // square recon grid width, before `out` is borrowed
             let slabs: Vec<ArrayViewMut2<f32>> = out.axis_iter_mut(Axis(0)).collect();
             let nz = slabs.len();
 
-            // Single device: one pinned pool, rayon across its host cores.
+            // Single device: one pinned pool, rayon across its host cores, with
+            // in-flight slices capped to fit device memory (see `max_inflight`).
             if d <= 1 {
-                return dp.pools[0].install(|| {
-                    slabs
-                        .into_par_iter()
-                        .enumerate()
-                        .try_for_each(|(row, slab)| f(row, slab))
+                let threads = dp.pools[0].current_num_threads();
+                return dp.pools[0].install(move || {
+                    let sem = Semaphore::new(max_inflight(n, device_free_bytes(), threads));
+                    slabs.into_par_iter().enumerate().try_for_each(|(row, slab)| {
+                        let _permit = sem.acquire();
+                        f(row, slab)
+                    })
                 });
             }
 
@@ -778,11 +991,14 @@ mod cuda_impl {
                     .zip(dp.pools.iter())
                     .map(|((off, chunk), pool)| {
                         scope.spawn(move || -> Result<()> {
+                            let threads = pool.current_num_threads();
                             pool.install(|| {
-                                chunk
-                                    .into_par_iter()
-                                    .enumerate()
-                                    .try_for_each(|(i, slab)| f(off + i, slab))
+                                let sem =
+                                    Semaphore::new(max_inflight(n, device_free_bytes(), threads));
+                                chunk.into_par_iter().enumerate().try_for_each(|(i, slab)| {
+                                    let _permit = sem.acquire();
+                                    f(off + i, slab)
+                                })
                             })
                         })
                     })

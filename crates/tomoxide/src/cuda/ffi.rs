@@ -29,6 +29,8 @@ unsafe extern "C" {
     pub fn tomoxide_cuda_memset(p: *mut c_void, value: i32, bytes: usize) -> i32;
     /// `cudaDeviceSynchronize`; returns 0 on success.
     pub fn tomoxide_cuda_sync() -> i32;
+    /// `cudaMemGetInfo` — free / total bytes on the current device; 0 on success.
+    pub fn tomoxide_cuda_mem_info(free_bytes: *mut usize, total_bytes: *mut usize) -> i32;
 
     // --- linerec (cfunc_linerec) ---
     /// `cfunc_linerec(nproj, nz, n, ncproj, ncz)`.
