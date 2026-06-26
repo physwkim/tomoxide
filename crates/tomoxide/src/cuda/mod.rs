@@ -772,7 +772,7 @@ mod cuda_impl {
     ) -> Result<Vec<f32>> {
         // Whole stack fits in one tile at the full memory budget → no tiling and
         // no pipeline; one chunk, byte-identical to the un-streamed path.
-        let tile_full = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes()).min(nz.max(1));
+        let tile_full = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes(), false).min(nz.max(1));
         if tile_full >= nz {
             return analytic_fbp_chunk(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
         }
@@ -780,7 +780,7 @@ mod cuda_impl {
         // budget) and run them through the async H2D∥compute∥D2H pipeline. Chunks
         // are an even split that stays ≥2 slices (the cfunc_linerec invariant) —
         // a greedy `[tile, …, 1]` tail would silently zero its last slice.
-        let tile = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes() / 2).min(nz.max(1));
+        let tile = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes() / 2, false).min(nz.max(1));
         let k = linerec_chunk_count(nz, nz.div_ceil(tile));
         let chunks = even_z_chunks(nz, k);
         analytic_fbp_pipeline(raw, w, theta, &chunks, nz, nproj, ncols, n, pad, pad_side)
@@ -1030,11 +1030,11 @@ mod cuda_impl {
         // so double the budget handed to it; its 32-bit index ceiling is
         // element-count based and dtype-independent.
         let budget = device_free_bytes().saturating_mul(2);
-        let tile_full = fbp_tile_z(nproj, ncols, n, pad, budget).min(nz.max(1));
+        let tile_full = fbp_tile_z(nproj, ncols, n, pad, budget, true).min(nz.max(1));
         if tile_full >= nz {
             return analytic_fbp_chunk_f16(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
         }
-        let tile = fbp_tile_z(nproj, ncols, n, pad, budget / 2).min(nz.max(1));
+        let tile = fbp_tile_z(nproj, ncols, n, pad, budget / 2, true).min(nz.max(1));
         let k = linerec_chunk_count(nz, nz.div_ceil(tile));
         let chunks = even_z_chunks(nz, k);
         analytic_fbp_pipeline_f16(raw, w, theta, &chunks, nz, nproj, ncols, n, pad, pad_side)
@@ -1560,12 +1560,25 @@ mod cuda_impl {
     /// Bounded by BOTH (a) the 32-bit index ceiling on the padded buffer
     /// `tile·nproj·pad`, and (b) ~80% of free device memory against the
     /// per-z footprint (sino + padded + cropped + volume + the filter's own
-    /// internal R2C buffers, ≈ padded again). Always ≥ 1.
-    fn fbp_tile_z(nproj: usize, ncols: usize, n: usize, pad: usize, free_bytes: usize) -> usize {
+    /// internal R2C buffers, ≈ padded again). When `tex_array` is set (the f16
+    /// path), one more cropped-sinogram-sized buffer is added for
+    /// cfunc_linerec's hardware-interpolation texture array. Always ≥ 1.
+    fn fbp_tile_z(
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        free_bytes: usize,
+        tex_array: bool,
+    ) -> usize {
         let fsz = std::mem::size_of::<f32>();
         // Per-z device bytes (conservative: cfunc_filter allocates ~one more
-        // padded buffer internally, so count `nproj·pad` twice).
-        let per_z = (nproj * ncols + 2 * nproj * pad + nproj * ncols + n * n) * fsz;
+        // padded buffer internally, so count `nproj·pad` twice). The trailing
+        // `nproj·ncols` (f16 only) is cfunc_linerec's layered texture array,
+        // a second copy of the cropped filtered sinogram, so tiling does not
+        // OOM on it.
+        let tex = if tex_array { nproj * ncols } else { 0 };
+        let per_z = (nproj * ncols + 2 * nproj * pad + nproj * ncols + n * n + tex) * fsz;
         let by_mem = (free_bytes / 100 * 80) / per_z.max(1);
         // 88% of 2³¹ over the dominant per-z stride leaves >200M headroom for the
         // in-plane offset terms the kernels add on top of `z·nproj·pad`.

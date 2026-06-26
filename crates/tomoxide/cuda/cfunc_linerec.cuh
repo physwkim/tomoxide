@@ -8,7 +8,22 @@
 
 class cfunc_linerec {
   bool is_free = false;
-  
+
+#ifdef HALF
+  // Hardware-texture back-projection state (f16 build only; the f32 build keeps
+  // the direct-gather kernel — see kernels_linerec.cuh for why). The filtered
+  // sinogram is uploaded into a layered cudaArray so the inner loop can use one
+  // tex2DLayered linear fetch instead of a 4-tap gather + float bilinear
+  // interpolation. Allocated lazily on first backprojection, freed in the
+  // destructor (which the FFI calls only after the stream is synced, so freeing
+  // the array post-launch is safe).
+  cudaArray_t tex_array = nullptr;
+  cudaTextureObject_t tex_obj = 0;
+  cudaSurfaceObject_t surf_obj = 0;
+  bool tex_init = false;
+  void ensure_texture();
+#endif
+
 public:
   size_t n;      // width of square slices
   size_t nproj; // number of angles
