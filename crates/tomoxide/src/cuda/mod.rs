@@ -181,7 +181,10 @@ mod cuda_impl {
         /// `f16` so the device buffer holds 2 bytes/element. Used for the f16
         /// analytic path (sinogram and filter weights).
         fn from_host_f16(data: &[f32]) -> Result<Self> {
-            let h: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
+            // The f32→f16 round of a full sinogram/volume is tens-to-hundreds of
+            // millions of scalars; single-threaded it dominated the f16 path's
+            // overhead. par_iter().collect() keeps element order.
+            let h: Vec<half::f16> = data.par_iter().map(|&x| half::f16::from_f32(x)).collect();
             let bytes = std::mem::size_of_val(h.as_slice());
             let buf = DevBuf::new(bytes)?;
             let rc = unsafe {
@@ -204,7 +207,8 @@ mod cuda_impl {
             if rc != 0 {
                 return Err(Error::Backend(format!("cudaMemcpy D2H (f16) failed ({rc})")));
             }
-            Ok(h.iter().map(|x| x.to_f32()).collect())
+            // Widen f16→f32 in parallel (see from_host_f16); order preserved.
+            Ok(h.par_iter().map(|x| x.to_f32()).collect())
         }
     }
 
