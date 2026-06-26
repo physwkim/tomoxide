@@ -141,7 +141,7 @@ fn cuda_fourierrec_matches_cpu_and_phantom() {
 
 #[test]
 fn cuda_fbp_filter_matches_cpu() {
-    use tomoxide::backend::{Backend, FbpFilter};
+    use tomoxide::backend::Backend;
     use tomoxide::{FilterName, Layout, Tomo};
     let cuda = match CudaBackend::new() {
         Ok(b) => b,
@@ -183,7 +183,7 @@ fn cuda_fused_equals_per_stage() {
     // produce exactly the same volume as composing the per-capability stages
     // (filter then back-project) — same kernels, same data, only the
     // intermediate stays on the device. So Δ = 0.
-    use tomoxide::backend::{Backend, FbpFilter, FilteredBackproject};
+    use tomoxide::backend::Backend;
     use tomoxide::{FilterName, Layout, Tomo, Volume};
     let cuda = match CudaBackend::new() {
         Ok(b) => b,

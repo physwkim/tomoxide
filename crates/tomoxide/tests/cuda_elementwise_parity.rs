@@ -3,7 +3,7 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::Array3;
-use tomoxide::backend::{Backend, Elementwise};
+use tomoxide::backend::Backend;
 use tomoxide::{CpuBackend, CudaBackend, Frames, Layout, Tomo};
 
 fn max_abs(a: &Tomo<f32>, b: &Tomo<f32>) -> f32 {
