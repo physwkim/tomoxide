@@ -550,19 +550,26 @@ impl TiffWriter {
 
 impl VolumeWriter for TiffWriter {
     fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()> {
-        let (nz, ny, nx) = vol.dims();
-        if start > end || end > nz {
+        // `vol` is the chunk for global slice range `[start, end)`, so it holds
+        // exactly `end - start` slices indexed *locally* 0..(end-start). The
+        // global index only names the output file. Validate the chunk extent
+        // (not `end <= vol.nz`, which conflated the global range with the chunk
+        // size and broke every chunk after the first in the streaming path).
+        let (cz, ny, nx) = vol.dims();
+        if start > end || cz != end - start {
             return Err(Error::InvalidParam(format!(
-                "write_chunk: slice range [{start}, {end}) out of bounds for {nz} slices"
+                "write_chunk: volume has {cz} slices but global range [{start}, {end}) expects {}",
+                end - start
             )));
         }
-        for i in start..end {
-            // Slice i is [y, x], contiguous row-major (x fastest) in z-major
+        for local in 0..cz {
+            // Slice is [y, x], contiguous row-major (x fastest) in z-major
             // Volume storage — exactly TIFF's width=nx, height=ny order.
-            let slice = vol.array.index_axis(Axis(0), i);
+            let slice = vol.array.index_axis(Axis(0), local);
             let buf: Vec<f32> = slice.iter().copied().collect();
 
-            let fname = format!("{}_{i:05}.tiff", self.prefix);
+            let global = start + local;
+            let fname = format!("{}_{global:05}.tiff", self.prefix);
             let file =
                 File::create(&fname).map_err(|e| Error::Io(format!("create {fname}: {e}")))?;
             let mut enc = TiffEncoder::new(BufWriter::new(file))
@@ -842,6 +849,48 @@ mod tests {
             open_dxchange("definitely-not-a-real-file.h5"),
             Err(Error::Io(_))
         ));
+    }
+
+    #[test]
+    fn tiff_writer_streams_per_chunk_volumes_with_global_indices() {
+        // The streaming driver (`run_streaming_pipelined`) hands the writer a
+        // *per-chunk* volume of `end-start` slices and the global range
+        // `[start, end)`. The TIFF file is named by the global index; the chunk
+        // array is indexed locally. The old code indexed the chunk by the global
+        // index and bounds-checked `end <= chunk.nz`, so every chunk after the
+        // first failed ("out of bounds for N slices"). Reproduce the streaming
+        // call pattern: two separate 2-slice chunks covering global [0,4).
+        let dir = std::env::temp_dir().join("tomoxide_tiff_stream_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("recon");
+        let prefix = prefix.to_str().unwrap();
+
+        let mut w = create_writer(prefix, SaveFormat::Tiff).unwrap();
+        // Each chunk is its own [2, ny, nx] volume; value encodes global slice.
+        let chunk0 = Volume::new(Array3::from_shape_fn((2, 2, 3), |(z, y, x)| {
+            (z * 100 + y * 10 + x) as f32
+        }));
+        let chunk1 = Volume::new(Array3::from_shape_fn((2, 2, 3), |(z, y, x)| {
+            ((2 + z) * 100 + y * 10 + x) as f32
+        }));
+        w.write_chunk(&chunk0, 0, 2).unwrap();
+        w.write_chunk(&chunk1, 2, 4).unwrap(); // would have errored before the fix
+
+        // One file per global slice index, named by the global index.
+        for g in 0..4 {
+            let f = format!("{prefix}_{g:05}.tiff");
+            assert!(std::path::Path::new(&f).is_file(), "missing {f}");
+        }
+
+        // A wrong-sized chunk (volume slices != end-start) must be rejected.
+        let bad = Volume::new(Array3::<f32>::zeros((3, 2, 3)));
+        assert!(matches!(
+            w.write_chunk(&bad, 4, 6),
+            Err(Error::InvalidParam(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
