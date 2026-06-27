@@ -75,7 +75,11 @@ fn write_chunk_range_is_validated() {
 
 #[test]
 fn write_chunk_writes_only_the_requested_range() {
-    let vol = Volume::new(Array3::<f32>::zeros((4, 2, 2)));
+    // Per-chunk contract: the volume holds exactly `end - start` slices indexed
+    // *locally* 0..(end-start); the global range only names the output files
+    // (see `tiff_writer_streams_per_chunk_volumes_with_global_indices`). So a
+    // 2-slice chunk written at global range [1, 3) lands in files 00001/00002.
+    let vol = Volume::new(Array3::<f32>::zeros((2, 2, 2)));
     let dir = scratch("range");
     let prefix = dir.join("recon");
     let mut w = create_writer(prefix.to_str().unwrap(), SaveFormat::Tiff).unwrap();
