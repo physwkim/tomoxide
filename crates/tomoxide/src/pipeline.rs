@@ -104,6 +104,7 @@ impl ReconSteps {
 
         let chunk = self.chunk_rows.max(1);
         let mut r0 = 0;
+        let mut recon = None; // handle-reusing reconstructor, built on chunk 0
         while r0 < nz {
             let r1 = (r0 + chunk).min(nz);
             // Per-slice-independent stages on this z-chunk.
@@ -114,7 +115,15 @@ impl ReconSteps {
             let mut sub = Tomo::new(sub, Layout::Sinogram);
             crate::prep::remove_stripe(&mut sub, prep.stripe)?;
             let chunk_geom = chunk_geometry(geom, r0, r1);
-            let vol = crate::recon::recon(&sub, &chunk_geom, algorithm, params, backend)?;
+            let vol = recon_chunk_reusing(
+                &mut recon,
+                backend,
+                &sub,
+                geom,
+                &chunk_geom,
+                algorithm,
+                params,
+            )?;
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
@@ -157,6 +166,7 @@ impl ReconSteps {
         let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
         let chunk = self.chunk_rows.max(1);
         let mut r0 = 0;
+        let mut recon = None; // handle-reusing reconstructor, built on chunk 0
         while r0 < nz {
             let r1 = (r0 + chunk).min(nz);
             let mut ds = reader.read_chunk(r0, r1)?;
@@ -167,7 +177,15 @@ impl ReconSteps {
             sino.array = sino.array.as_standard_layout().to_owned();
             crate::prep::remove_stripe(&mut sino, prep.stripe)?;
             let chunk_geom = chunk_geometry(geom, r0, r1);
-            let vol = crate::recon::recon(&sino, &chunk_geom, algorithm, params, backend)?;
+            let vol = recon_chunk_reusing(
+                &mut recon,
+                backend,
+                &sino,
+                geom,
+                &chunk_geom,
+                algorithm,
+                params,
+            )?;
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
@@ -294,6 +312,10 @@ fn compute_chunks(
     params: &ReconParams,
     prep: &PrepOptions,
 ) -> Result<()> {
+    // Reuse one backend reconstructor across all chunks (see
+    // `recon_chunk_reusing`): a many-chunk job pays the cuFFT-plan / f16-texture
+    // setup once, not per chunk.
+    let mut recon = None;
     while let Ok((r0, r1, mut ds)) = read_rx.recv() {
         crate::prep::normalize_dataset(&mut ds, backend)?;
         let mut sino = ds.data.to_layout(Layout::Sinogram);
@@ -302,7 +324,15 @@ fn compute_chunks(
         sino.array = sino.array.as_standard_layout().to_owned();
         crate::prep::remove_stripe(&mut sino, prep.stripe)?;
         let chunk_geom = chunk_geometry(geom, r0, r1);
-        let vol = crate::recon::recon(&sino, &chunk_geom, algorithm, params, backend)?;
+        let vol = recon_chunk_reusing(
+            &mut recon,
+            backend,
+            &sino,
+            geom,
+            &chunk_geom,
+            algorithm,
+            params,
+        )?;
         // A send error means the writer hung up (errored); stop — the writer
         // thread owns the real error, surfaced after join.
         if write_tx.send((r0, r1, vol)).is_err() {
@@ -324,5 +354,38 @@ fn chunk_geometry(geom: &Geometry, r0: usize, r1: usize) -> Geometry {
     Geometry {
         center,
         ..geom.clone()
+    }
+}
+
+/// Reconstruct one z-chunk, reusing a single backend reconstructor across chunks.
+///
+/// On the first chunk it asks the backend for a handle-reusing
+/// [`StreamingAnalytic`] sized to that chunk's `nz` (the largest, since chunks
+/// shrink), and reuses it for every later chunk — so a streaming run pays the
+/// FBP-filter / back-projection setup (cuFFT plans, f16 texture arrays) **once**
+/// instead of per chunk. `slot` carries it across calls: `None` = not yet built,
+/// `Some(None)` = the backend declined for this algorithm (CPU backend,
+/// gridrec/lprec/fourierrec) so use the stateless [`crate::recon::recon`],
+/// `Some(Some(_))` = reuse. Output is identical to the stateless path (the
+/// reconstructors are per-slice independent).
+fn recon_chunk_reusing(
+    slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
+    backend: &dyn crate::backend::Backend,
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    chunk_geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+) -> Result<Volume<f32>> {
+    if slot.is_none() {
+        let built = match backend.analytic_reconstruct() {
+            Some(ar) => ar.streaming(algorithm, params, geom, sino.n_cols(), sino.n_rows())?,
+            None => None,
+        };
+        *slot = Some(built);
+    }
+    match slot.as_mut().expect("slot built above").as_mut() {
+        Some(s) => s.reconstruct_chunk(sino, chunk_geom),
+        None => crate::recon::recon(sino, chunk_geom, algorithm, params, backend),
     }
 }

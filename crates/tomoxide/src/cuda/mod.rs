@@ -118,6 +118,7 @@ mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
         make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
+        StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -196,6 +197,39 @@ mod cuda_impl {
                 )));
             }
             Ok(buf)
+        }
+
+        /// Upload host f32 `data` into this **already-allocated** buffer (no
+        /// realloc). Used by the streaming reconstructor, which reuses one buffer
+        /// across chunks. `data` must fit (`len*4 ≤ self.bytes`).
+        fn copy_from_host_f32(&self, data: &[f32]) -> Result<()> {
+            let bytes = std::mem::size_of_val(data);
+            debug_assert!(bytes <= self.bytes);
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_h2d(self.ptr, data.as_ptr() as *const c_void, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaMemcpy H2D failed ({rc})")));
+            }
+            Ok(())
+        }
+
+        /// Upload host f32 `data` rounded to `f16` into this already-allocated
+        /// buffer (no realloc). f16 streaming counterpart of
+        /// [`copy_from_host_f32`]; `len*2 ≤ self.bytes`.
+        fn copy_from_host_f16(&self, data: &[f32]) -> Result<()> {
+            let h: Vec<half::f16> = data.par_iter().map(|&x| half::f16::from_f32(x)).collect();
+            let bytes = std::mem::size_of_val(h.as_slice());
+            debug_assert!(bytes <= self.bytes);
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_h2d(self.ptr, h.as_ptr() as *const c_void, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!(
+                    "cudaMemcpy H2D (f16) failed ({rc})"
+                )));
+            }
+            Ok(())
         }
 
         /// Download `count` half-precision elements and widen them back to f32.
@@ -559,6 +593,294 @@ mod cuda_impl {
         unsafe { ffi::tomoxide_linerec_fp16_free(h) };
         ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         f.to_host_f16_as_f32(nz * n * n)
+    }
+
+    /// Handle-reusing fused FBP/Linerec reconstructor for streaming
+    /// ([`StreamingAnalytic`]). The cuFFT filter plan (`filt`), the back-projection
+    /// handle (`lrec`; for f16 this owns the layered texture array), the device
+    /// buffers and the uploaded `theta` live for the whole stream, so an N-chunk
+    /// job pays that setup **once** instead of the per-chunk new/free that
+    /// [`analytic_fbp_chunk`]/[`analytic_fbp_chunk_f16`] do. Buffers and handles are
+    /// sized to `max_nz` (the first/largest chunk); a smaller trailing chunk reuses
+    /// them zero-padded to `max_nz` so the cuFFT batch stays fixed. Holds raw device
+    /// pointers and is created/driven on a single compute thread — `!Send`/`!Sync`
+    /// by construction (matches the per-thread-device contract of the chunk fns).
+    struct CudaFbpStream {
+        f16: bool,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+        max_nz: usize,
+        filter: Vec<f32>, // ramp kernel (length `pad`), built once
+        sino: DevBuf,
+        gpad: DevBuf,
+        gf: DevBuf,
+        f: DevBuf,
+        w: DevBuf,
+        theta: DevBuf,
+        filt: *mut c_void,
+        lrec: *mut c_void,
+    }
+
+    impl CudaFbpStream {
+        /// Allocate the persistent buffers and `cfunc_filter`/`cfunc_linerec`
+        /// handles for a `max_nz`-slice chunk. `filter` is the ramp kernel
+        /// (`make_fbp_filter`), `theta` the chunk-invariant angles. The current
+        /// device must already be selected (the caller binds it).
+        fn new(
+            filter: Vec<f32>,
+            theta: &[f32],
+            ncols: usize,
+            n: usize,
+            max_nz: usize,
+            f16: bool,
+        ) -> Result<Self> {
+            let nproj = theta.len();
+            let pad = filter.len();
+            let pad_side = pad / 2 - ncols / 2;
+            let esz = if f16 {
+                std::mem::size_of::<half::f16>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
+            let nfreq2 = (pad / 2 + 1) * 2;
+            let sino = DevBuf::zeroed(max_nz * nproj * ncols * esz)?;
+            let gpad = DevBuf::zeroed(max_nz * nproj * pad * esz)?;
+            let gf = DevBuf::zeroed(max_nz * nproj * ncols * esz)?;
+            let f = DevBuf::zeroed(max_nz * n * n * esz)?;
+            let w = DevBuf::zeroed(max_nz * nfreq2 * esz)?;
+            let theta_dev = DevBuf::from_host_f32(theta)?;
+            let (filt, lrec) = unsafe {
+                if f16 {
+                    (
+                        ffi::tomoxide_filter_fp16_new(nproj, max_nz, pad),
+                        ffi::tomoxide_linerec_fp16_new(nproj, max_nz, n, nproj, max_nz),
+                    )
+                } else {
+                    (
+                        ffi::tomoxide_filter_new(nproj, max_nz, pad),
+                        ffi::tomoxide_linerec_new(nproj, max_nz, n, nproj, max_nz),
+                    )
+                }
+            };
+            if filt.is_null() || lrec.is_null() {
+                // Free whichever allocation succeeded so a partial failure leaks
+                // nothing (the Drop guard only runs on a fully-built value).
+                unsafe {
+                    if !filt.is_null() {
+                        if f16 {
+                            ffi::tomoxide_filter_fp16_free(filt)
+                        } else {
+                            ffi::tomoxide_filter_free(filt)
+                        }
+                    }
+                    if !lrec.is_null() {
+                        if f16 {
+                            ffi::tomoxide_linerec_fp16_free(lrec)
+                        } else {
+                            ffi::tomoxide_linerec_free(lrec)
+                        }
+                    }
+                }
+                return Err(Error::Backend(
+                    "cuda streaming reconstructor: cfunc handle allocation failed".into(),
+                ));
+            }
+            Ok(Self {
+                f16,
+                nproj,
+                ncols,
+                n,
+                pad,
+                pad_side,
+                max_nz,
+                filter,
+                sino,
+                gpad,
+                gf,
+                f,
+                w,
+                theta: theta_dev,
+                filt,
+                lrec,
+            })
+        }
+    }
+
+    impl Drop for CudaFbpStream {
+        fn drop(&mut self) {
+            unsafe {
+                if self.f16 {
+                    ffi::tomoxide_filter_fp16_free(self.filt);
+                    ffi::tomoxide_linerec_fp16_free(self.lrec);
+                } else {
+                    ffi::tomoxide_filter_free(self.filt);
+                    ffi::tomoxide_linerec_free(self.lrec);
+                }
+            }
+        }
+    }
+
+    impl StreamingAnalytic for CudaFbpStream {
+        fn reconstruct_chunk(&mut self, sino: &Tomo<f32>, geom: &Geometry) -> Result<Volume<f32>> {
+            let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let (nz, nproj, ncols) = s.array.dim();
+            if nproj != self.nproj || ncols != self.ncols {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("nproj={} ncols={}", self.nproj, self.ncols),
+                    found: format!("nproj={nproj} ncols={ncols}"),
+                });
+            }
+            if nz > self.max_nz {
+                return Err(Error::InvalidParam(format!(
+                    "streaming reconstruct_chunk: nz={nz} exceeds max_nz={}",
+                    self.max_nz
+                )));
+            }
+            let std = s.array.as_standard_layout();
+            let raw = std
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+            let w_host = build_filter_w(&self.filter, geom, nz, ncols, self.pad);
+            let null = std::ptr::null_mut::<c_void>();
+            let partial = nz < self.max_nz;
+            // Zero the unused tail of a partial trailing chunk so the always-`max_nz`
+            // kernels and the fixed cuFFT batch see zeros there (→ zero output we
+            // drop); full chunks overwrite the whole buffer so they skip the memset.
+            if partial {
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.sino.ptr, 0, self.sino.bytes) },
+                    "memset sino",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.w.ptr, 0, self.w.bytes) },
+                    "memset w",
+                )?;
+            }
+            if self.f16 {
+                self.sino.copy_from_host_f16(raw)?;
+                self.w.copy_from_host_f16(&w_host)?;
+            } else {
+                self.sino.copy_from_host_f32(raw)?;
+                self.w.copy_from_host_f32(&w_host)?;
+            }
+            // pad → cuFFT filter → crop → back-project, all at the handle's `max_nz`
+            // batch. `cfunc_linerec` accumulates into `f`, so zero it each chunk.
+            let m = self.max_nz;
+            let (pad, ps, n) = (self.pad, self.pad_side, self.n);
+            if self.f16 {
+                ck(
+                    unsafe {
+                        ffi::tomoxide_pad_fp16(
+                            self.sino.ptr,
+                            self.gpad.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "pad_fp16",
+                )?;
+                unsafe {
+                    ffi::tomoxide_filter_fp16_apply(self.filt, self.gpad.ptr, self.w.ptr, null)
+                };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_crop_fp16(
+                            self.gpad.ptr,
+                            self.gf.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "crop_fp16",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.f.ptr, 0, self.f.bytes) },
+                    "memset f f16",
+                )?;
+                unsafe {
+                    ffi::tomoxide_linerec_fp16_backproject(
+                        self.lrec,
+                        self.f.ptr,
+                        self.gf.ptr,
+                        self.theta.ptr as *const f32,
+                        std::f32::consts::FRAC_PI_2,
+                        0,
+                        null,
+                    );
+                }
+                ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                let host = self.f.to_host_f16_as_f32(nz * n * n)?;
+                Ok(Volume::new(
+                    Array3::from_shape_vec((nz, n, n), host)
+                        .expect("nz*n*n volume length matches shape"),
+                ))
+            } else {
+                ck(
+                    unsafe {
+                        ffi::tomoxide_pad(
+                            self.sino.ptr,
+                            self.gpad.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "pad",
+                )?;
+                unsafe { ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_crop(
+                            self.gpad.ptr,
+                            self.gf.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "crop",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.f.ptr, 0, self.f.bytes) },
+                    "memset f",
+                )?;
+                unsafe {
+                    ffi::tomoxide_linerec_backproject(
+                        self.lrec,
+                        self.f.ptr,
+                        self.gf.ptr,
+                        self.theta.ptr as *const f32,
+                        std::f32::consts::FRAC_PI_2,
+                        0,
+                        null,
+                    );
+                }
+                ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                let mut host = vec![0.0f32; nz * n * n];
+                self.f.to_host_f32(&mut host)?;
+                Ok(Volume::new(
+                    Array3::from_shape_vec((nz, n, n), host)
+                        .expect("nz*n*n volume length matches shape"),
+                ))
+            }
+        }
     }
 
     /// State for one double-buffer slot of the async FBP pipeline: its own stream,
@@ -1447,6 +1769,41 @@ mod cuda_impl {
                 Array3::from_shape_vec((nz, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
             ))
+        }
+
+        /// Reuse one set of `cfunc_filter`/`cfunc_linerec` handles across all
+        /// streaming chunks (see [`CudaFbpStream`]). Only the fused FBP/Linerec
+        /// back-projection path is handle-reusing here; `Fourierrec` (its packing +
+        /// `cfunc_fourierrec`), gridrec and lprec return `None` and the caller falls
+        /// back to per-chunk [`reconstruct`]. Binds the first selected device, as the
+        /// f16 one-shot path does, since the handles are device-resident.
+        fn streaming(
+            &self,
+            algorithm: crate::params::Algorithm,
+            params: &crate::params::ReconParams,
+            geom: &Geometry,
+            ncols: usize,
+            max_nz: usize,
+        ) -> Result<Option<Box<dyn StreamingAnalytic>>> {
+            use crate::params::Algorithm;
+            if geom.beam != Beam::Parallel
+                || !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec)
+            {
+                return Ok(None);
+            }
+            let n = params.num_gridx.unwrap_or(ncols);
+            if n != ncols {
+                return Ok(None); // square-grid only, like `reconstruct`
+            }
+            let f16 = params.dtype == crate::dtype::Dtype::F16;
+            // `make_fbp_filter` pads to `(4·ncols).next_power_of_two()`, always a
+            // power of two, so the f16 half-cuFFT width constraint holds by
+            // construction (mirrors the assert in `reconstruct`).
+            let filter = make_fbp_filter(params.filter_name, ncols)?;
+            let devices = selected_devices();
+            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+            let recon = CudaFbpStream::new(filter, &geom.angles.0, ncols, n, max_nz, f16)?;
+            Ok(Some(Box::new(recon)))
         }
     }
 

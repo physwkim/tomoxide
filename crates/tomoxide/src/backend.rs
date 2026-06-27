@@ -251,6 +251,41 @@ pub trait AnalyticReconstruct {
         algorithm: crate::params::Algorithm,
         params: &crate::params::ReconParams,
     ) -> Result<Volume<f32>>;
+
+    /// Build a [`StreamingAnalytic`] bound to fixed `(algorithm, params, ncols,
+    /// max_nz)` so a multi-chunk streaming job creates the FBP-filter / back-
+    /// projection handles (cuFFT plans, f16 textures) **once** and reuses them
+    /// across z-chunks, instead of the per-chunk new/free [`reconstruct`] does.
+    ///
+    /// `geom` supplies the (chunk-invariant) projection angles; per-chunk centre
+    /// shifts are taken from the geometry handed to
+    /// [`StreamingAnalytic::reconstruct_chunk`]. Returns `Ok(None)` when this
+    /// backend cannot reuse handles for `algorithm` (e.g. the CPU backend, or
+    /// gridrec/lprec) — the caller falls back to per-chunk [`reconstruct`].
+    fn streaming(
+        &self,
+        _algorithm: crate::params::Algorithm,
+        _params: &crate::params::ReconParams,
+        _geom: &Geometry,
+        _ncols: usize,
+        _max_nz: usize,
+    ) -> Result<Option<Box<dyn StreamingAnalytic>>> {
+        Ok(None)
+    }
+}
+
+/// A reusable analytic reconstructor bound to fixed dims (see
+/// [`AnalyticReconstruct::streaming`]). Holds the device-resident FBP-filter and
+/// back-projection handles for its whole lifetime so the streaming driver pays
+/// the cuFFT-plan / f16-texture-array setup once per run rather than per chunk —
+/// matching tomocupy's create-once `BackprojFunctions`. Single-threaded by
+/// construction: it is created and driven on the streaming compute thread.
+pub trait StreamingAnalytic {
+    /// Reconstruct one z-chunk's volume `[nz, n, n]` from the **unfiltered**
+    /// sinogram `[nz, nproj, ncols]`. `nz` may be ≤ the `max_nz` the
+    /// reconstructor was built with (a smaller trailing chunk reuses the same
+    /// handles, zero-padded to `max_nz`); `nz > max_nz` is an error.
+    fn reconstruct_chunk(&mut self, sino: &Tomo<f32>, geom: &Geometry) -> Result<Volume<f32>>;
 }
 
 /// Direct Fourier-gridding reconstruction (sinogram → volume) for a backend
