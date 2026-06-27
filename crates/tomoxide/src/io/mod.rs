@@ -556,7 +556,15 @@ impl VolumeWriter for TiffWriter {
         // (not `end <= vol.nz`, which conflated the global range with the chunk
         // size and broke every chunk after the first in the streaming path).
         let (cz, ny, nx) = vol.dims();
-        if start > end || cz != end - start {
+        // Validate the range orientation first, so `end - start` (a `usize`) is
+        // only evaluated once `end >= start` — otherwise the chunk-size message
+        // below would underflow-panic on an inverted range.
+        if start > end {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: inverted global range [{start}, {end})"
+            )));
+        }
+        if cz != end - start {
             return Err(Error::InvalidParam(format!(
                 "write_chunk: volume has {cz} slices but global range [{start}, {end}) expects {}",
                 end - start
