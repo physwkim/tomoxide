@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::data::{Dataset, Frames, Layout, Tomo, Volume};
 use crate::error::{Error, Result};
-use ndarray::{Array3, Axis, Slice};
+use ndarray::{Array3, Axis};
 use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, Hdf5Error, VarLenUnicode};
 use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
 
@@ -54,7 +54,25 @@ pub trait DatasetReader {
 
 /// A reconstruction writer (port of tomocupy `dataio/writer.py:73`).
 pub trait VolumeWriter {
-    /// Write a contiguous chunk of slices `[start, end)` of the volume.
+    /// Declare the full output slice count `total_nz` before the first chunk.
+    ///
+    /// Writers that pre-allocate a single container (H5, Zarr) size their
+    /// dataset/store to `total_nz` slices here; the cross-section `(ny, nx)` is
+    /// taken from the first [`write_chunk`](Self::write_chunk). Per-file writers
+    /// (TIFF) need nothing and keep the default no-op. Every driver
+    /// ([`ReconSteps::run`](crate::ReconSteps::run), `run_streaming`,
+    /// `run_streaming_pipelined`) calls this exactly once before any chunk.
+    fn reserve(&mut self, _total_nz: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Write one **per-chunk** volume — exactly `end - start` slices, indexed
+    /// *locally* `0..(end - start)` — to the global slice range `[start, end)`.
+    ///
+    /// The global range only addresses where the chunk lands in the output
+    /// (TIFF file index; H5/Zarr dataset rows); the volume itself is the chunk,
+    /// not the whole reconstruction. `start <= end` and the volume's slice count
+    /// must equal `end - start`, mirroring the streaming driver's per-chunk call.
     fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()>;
 }
 
@@ -68,6 +86,22 @@ pub enum SaveFormat {
     H5,
     /// Zarr store.
     Zarr,
+}
+
+impl std::str::FromStr for SaveFormat {
+    type Err = Error;
+    /// Parse tomocupy's `--save-format` values (`tiff` | `h5` | `zarr`),
+    /// case-insensitively.
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tiff" | "tif" => Ok(SaveFormat::Tiff),
+            "h5" | "hdf5" => Ok(SaveFormat::H5),
+            "zarr" => Ok(SaveFormat::Zarr),
+            other => Err(Error::InvalidParam(format!(
+                "unknown save format {other:?} (expected tiff | h5 | zarr)"
+            ))),
+        }
+    }
 }
 
 /// Open a DXchange HDF5 file for reading.
@@ -594,9 +628,10 @@ impl VolumeWriter for TiffWriter {
 ///
 /// Writes one **contiguous** `/exchange/data` dataset of shape `[nz, ny, nx]`
 /// (float32) under an `exchange` group, carrying tomocupy's
-/// `axes`/`description`/`units` attributes. The dataset is sized on the first
-/// `write_chunk` from the volume's full extents; each chunk fills its
-/// `[start, end)` slice range via an HDF5 hyperslab, and the file is flushed so
+/// `axes`/`description`/`units` attributes. The dataset is sized to the
+/// `reserve(total_nz)` slice count (the cross-section `(ny, nx)` comes from the
+/// first per-chunk volume); each `write_chunk` lands its chunk's slices in the
+/// global `[start, end)` rows via an HDF5 hyperslab, and the file is flushed so
 /// a streaming caller's partial output is durable. `path` is the output base —
 /// `.h5` is appended if absent (mirroring tomocupy `fnameout += '.h5'`).
 ///
@@ -605,6 +640,9 @@ impl VolumeWriter for TiffWriter {
 struct H5Writer {
     /// Resolved `.h5` output path.
     path: std::path::PathBuf,
+    /// Total output slices, set by [`VolumeWriter::reserve`] before the first
+    /// chunk; the dataset's `nz` extent. `None` until reserved.
+    total_nz: Option<usize>,
     /// File + dataset, created lazily on the first `write_chunk`.
     state: Option<H5WriteState>,
 }
@@ -635,6 +673,7 @@ impl H5Writer {
         }
         Ok(Self {
             path: out,
+            total_nz: None,
             state: None,
         })
     }
@@ -674,41 +713,59 @@ impl H5Writer {
 }
 
 impl VolumeWriter for H5Writer {
+    fn reserve(&mut self, total_nz: usize) -> Result<()> {
+        self.total_nz = Some(total_nz);
+        Ok(())
+    }
+
     fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()> {
-        let (nz, ny, nx) = vol.dims();
-        if start > end || end > nz {
+        // Per-chunk contract: `vol` holds exactly `end - start` locally-indexed
+        // slices that land in global dataset rows `[start, end)` (see the trait
+        // doc); the dataset's `nz` extent comes from `reserve`, not from `vol`.
+        let (cz, ny, nx) = vol.dims();
+        if start > end {
             return Err(Error::InvalidParam(format!(
-                "write_chunk: slice range [{start}, {end}) out of bounds for {nz} slices"
+                "write_chunk: inverted global range [{start}, {end})"
             )));
         }
-        // The dataset is fixed to the first volume's full extents; every later
-        // chunk must come from a volume of the same shape (tomocupy pre-allocates
-        // the whole `/exchange/data` before filling chunks).
+        if cz != end - start {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: volume has {cz} slices but global range [{start}, {end}) expects {}",
+                end - start
+            )));
+        }
+        let total_nz = self.total_nz.ok_or_else(|| {
+            Error::InvalidParam(
+                "write_chunk: reserve(total_nz) must be called before writing H5 chunks".into(),
+            )
+        })?;
+        if end > total_nz {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: global range [{start}, {end}) exceeds the reserved {total_nz} slices"
+            )));
+        }
+        // Size the dataset to the reserved `nz` and the first chunk's `(ny, nx)`;
+        // every later chunk must share that cross-section.
         if self.state.is_none() {
-            self.state = Some(self.create_dataset(nz, ny, nx)?);
+            self.state = Some(self.create_dataset(total_nz, ny, nx)?);
         }
         let state = self.state.as_ref().unwrap();
-        if state.dims != (nz, ny, nx) {
+        if state.dims != (total_nz, ny, nx) {
             return Err(Error::InvalidParam(format!(
-                "write_chunk: volume dims {:?} differ from the created dataset {:?}",
-                (nz, ny, nx),
-                state.dims
+                "write_chunk: chunk cross-section {:?} differs from the created dataset {:?}",
+                (ny, nx),
+                (state.dims.1, state.dims.2)
             )));
         }
-        if start == end {
+        if cz == 0 {
             return Ok(());
         }
-        // Row-major [z, y, x] slab for rows [start, end), written into the same
-        // rows of the dataset (tomocupy `dset[st:end] = rec`).
-        let slab: Vec<f32> = vol
-            .array
-            .slice_axis(Axis(0), Slice::from(start..end))
-            .iter()
-            .copied()
-            .collect();
+        // The whole chunk (local rows `0..cz`, C-order `[cz, ny, nx]`) is written
+        // into global rows `[start, end)` (tomocupy `dset[st:end] = rec`).
+        let slab: Vec<f32> = vol.array.iter().copied().collect();
         state
             .dataset
-            .write_slice(&[start, 0, 0], &[end - start, ny, nx], &slab)
+            .write_slice(&[start, 0, 0], &[cz, ny, nx], &slab)
             .map_err(|e| Error::Io(format!("write /exchange/data[{start}..{end}]: {e}")))?;
         state
             .file
@@ -746,7 +803,11 @@ impl VolumeWriter for H5Writer {
 struct ZarrWriter {
     /// Resolved `{path}.zarr` store root.
     root: std::path::PathBuf,
-    /// Full array extents `(nz, ny, nx)`, fixed on the first `write_chunk`.
+    /// Total output slices, set by [`VolumeWriter::reserve`] before the first
+    /// chunk; the array's `nz` extent. `None` until reserved.
+    total_nz: Option<usize>,
+    /// Full array extents `(nz, ny, nx)`, fixed on the first `write_chunk` from
+    /// the reserved `nz` and the first chunk's `(ny, nx)`.
     dims: Option<(usize, usize, usize)>,
 }
 
@@ -765,7 +826,11 @@ impl ZarrWriter {
                     .map_err(|e| Error::Io(format!("create dir {}: {e}", parent.display())))?;
             }
         }
-        Ok(Self { root, dims: None })
+        Ok(Self {
+            root,
+            total_nz: None,
+            dims: None,
+        })
     }
 
     /// Create the store directories and write the `.zgroup`/`.zarray`/`.zattrs`
@@ -801,38 +866,63 @@ impl ZarrWriter {
 }
 
 impl VolumeWriter for ZarrWriter {
+    fn reserve(&mut self, total_nz: usize) -> Result<()> {
+        self.total_nz = Some(total_nz);
+        Ok(())
+    }
+
     fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()> {
-        let (nz, ny, nx) = vol.dims();
-        if start > end || end > nz {
+        // Per-chunk contract: `vol` holds exactly `end - start` locally-indexed
+        // slices that land in global chunk files `{start+local}.0.0` (see the
+        // trait doc); the array's `nz` extent comes from `reserve`, not `vol`.
+        let (cz, ny, nx) = vol.dims();
+        if start > end {
             return Err(Error::InvalidParam(format!(
-                "write_chunk: slice range [{start}, {end}) out of bounds for {nz} slices"
+                "write_chunk: inverted global range [{start}, {end})"
             )));
         }
-        // The store is sized to the first volume's full extents; every later
-        // chunk must come from a volume of the same shape (the array shape in
-        // `.zarray` is fixed once written), mirroring H5Writer.
+        if cz != end - start {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: volume has {cz} slices but global range [{start}, {end}) expects {}",
+                end - start
+            )));
+        }
+        let total_nz = self.total_nz.ok_or_else(|| {
+            Error::InvalidParam(
+                "write_chunk: reserve(total_nz) must be called before writing Zarr chunks".into(),
+            )
+        })?;
+        if end > total_nz {
+            return Err(Error::InvalidParam(format!(
+                "write_chunk: global range [{start}, {end}) exceeds the reserved {total_nz} slices"
+            )));
+        }
+        // Size the store to the reserved `nz` and the first chunk's `(ny, nx)`;
+        // every later chunk must share that cross-section.
         if self.dims.is_none() {
-            self.init_store(nz, ny, nx)?;
-            self.dims = Some((nz, ny, nx));
+            self.init_store(total_nz, ny, nx)?;
+            self.dims = Some((total_nz, ny, nx));
         }
         let dims = self.dims.unwrap();
-        if dims != (nz, ny, nx) {
+        if dims != (total_nz, ny, nx) {
             return Err(Error::InvalidParam(format!(
-                "write_chunk: volume dims {:?} differ from the created store {:?}",
-                (nz, ny, nx),
-                dims
+                "write_chunk: chunk cross-section {:?} differs from the created store {:?}",
+                (ny, nx),
+                (dims.1, dims.2)
             )));
         }
         let data_dir = self.root.join("exchange").join("data");
-        // One chunk file per z-slice: chunk grid coord (z, 0, 0) → "z.0.0".
-        for z in start..end {
-            let slice = vol.array.index_axis(Axis(0), z);
+        // One chunk file per z-slice: local row `local` → global chunk grid coord
+        // `(start + local, 0, 0)` → "{global}.0.0".
+        for local in 0..cz {
+            let slice = vol.array.index_axis(Axis(0), local);
             // C-order (y-major, x fastest) little-endian f32 — exactly `<f4`.
             let mut bytes = Vec::with_capacity(ny * nx * 4);
             for &v in slice.iter() {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            let chunk = data_dir.join(format!("{z}.0.0"));
+            let global = start + local;
+            let chunk = data_dir.join(format!("{global}.0.0"));
             std::fs::write(&chunk, &bytes)
                 .map_err(|e| Error::Io(format!("write {}: {e}", chunk.display())))?;
         }
@@ -843,6 +933,7 @@ impl VolumeWriter for ZarrWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Slice;
 
     #[test]
     fn dxchange_paths_are_stable() {
@@ -910,12 +1001,15 @@ mod tests {
 
         // 3 slices of 2x2 with distinct, C-order-distinguishable values.
         let arr = Array3::from_shape_fn((3, 2, 2), |(z, y, x)| (z * 100 + y * 10 + x) as f32);
-        let vol = Volume::new(arr.clone());
 
-        // Stream it in two calls to exercise the per-slice chunk writes.
+        // Stream it as two per-chunk volumes (global ranges [0,2) then [2,3))
+        // after reserving the full 3 slices — the per-chunk + reserve contract.
         let mut w = create_writer(base.to_str().unwrap(), SaveFormat::Zarr).unwrap();
-        w.write_chunk(&vol, 0, 2).unwrap();
-        w.write_chunk(&vol, 2, 3).unwrap();
+        w.reserve(3).unwrap();
+        let c0 = Volume::new(arr.slice_axis(Axis(0), Slice::from(0..2)).to_owned());
+        let c1 = Volume::new(arr.slice_axis(Axis(0), Slice::from(2..3)).to_owned());
+        w.write_chunk(&c0, 0, 2).unwrap();
+        w.write_chunk(&c1, 2, 3).unwrap();
 
         // Structure: group markers + array metadata exist.
         assert!(root.join(".zgroup").is_file());
@@ -950,10 +1044,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         let mut w = create_writer(base.to_str().unwrap(), SaveFormat::Zarr).unwrap();
+        w.reserve(2).unwrap();
         let a = Volume::new(Array3::zeros((2, 4, 4)));
         w.write_chunk(&a, 0, 2).unwrap();
-        // A second volume with different extents must be rejected (the store
-        // shape is fixed by the first write), mirroring H5Writer.
+        // A second chunk with a different cross-section must be rejected (the
+        // store shape is fixed by the first write), mirroring H5Writer.
         let b = Volume::new(Array3::zeros((2, 8, 8)));
         assert!(matches!(
             w.write_chunk(&b, 0, 2),
@@ -961,6 +1056,60 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn h5_writer_streams_per_chunk_volumes_and_round_trips() {
+        // Per-chunk streaming into one /exchange/data dataset: reserve the full
+        // nz, write two per-chunk volumes at their global ranges, then read the
+        // dataset back and compare bit-exact — the H5 analogue of the TIFF
+        // streaming test.
+        let base = std::env::temp_dir().join(format!("tomoxide_h5_stream_{}", std::process::id()));
+        let base_str = base.to_str().unwrap();
+        let out = std::path::PathBuf::from(format!("{base_str}.h5"));
+        let _ = std::fs::remove_file(&out);
+
+        let arr = Array3::from_shape_fn((3, 2, 2), |(z, y, x)| (z * 100 + y * 10 + x) as f32);
+        let mut w = create_writer(base_str, SaveFormat::H5).unwrap();
+        w.reserve(3).unwrap();
+        let c0 = Volume::new(arr.slice_axis(Axis(0), Slice::from(0..2)).to_owned());
+        let c1 = Volume::new(arr.slice_axis(Axis(0), Slice::from(2..3)).to_owned());
+        w.write_chunk(&c0, 0, 2).unwrap();
+        w.write_chunk(&c1, 2, 3).unwrap();
+        drop(w); // close the file before reopening it for read-back
+
+        let f = H5File::open(&out).unwrap();
+        let ds = f.dataset("exchange/data").unwrap();
+        let got = ds.read_raw::<f32>().unwrap();
+        let want: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(got, want, "h5 streamed round-trip");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn h5_and_zarr_reject_write_before_reserve() {
+        // The pre-allocating writers need the total slice count before sizing
+        // their container; a write_chunk with no reserve is rejected (and for
+        // H5, no file is created since the guard precedes dataset creation).
+        let v = Volume::new(Array3::<f32>::zeros((1, 2, 2)));
+
+        let zb =
+            std::env::temp_dir().join(format!("tomoxide_zarr_noreserve_{}", std::process::id()));
+        let mut zw = create_writer(zb.to_str().unwrap(), SaveFormat::Zarr).unwrap();
+        assert!(matches!(
+            zw.write_chunk(&v, 0, 1),
+            Err(Error::InvalidParam(_))
+        ));
+        let _ = std::fs::remove_dir_all(zb.with_extension("zarr"));
+
+        let hb = std::env::temp_dir().join(format!("tomoxide_h5_noreserve_{}", std::process::id()));
+        let mut hw = create_writer(hb.to_str().unwrap(), SaveFormat::H5).unwrap();
+        assert!(matches!(
+            hw.write_chunk(&v, 0, 1),
+            Err(Error::InvalidParam(_))
+        ));
+        let _ = std::fs::remove_file(format!("{}.h5", hb.to_str().unwrap()));
     }
 
     #[test]

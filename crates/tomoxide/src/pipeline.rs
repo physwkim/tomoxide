@@ -102,6 +102,9 @@ impl ReconSteps {
         let sino = ds.data.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
         let nz = sino.n_rows();
 
+        // Pre-size single-container writers (H5/Zarr) to the full slice count
+        // before the first chunk; TIFF's default no-op ignores it.
+        writer.reserve(nz)?;
         let chunk = self.chunk_rows.max(1);
         let mut r0 = 0;
         let mut recon = None; // handle-reusing reconstructor, built on chunk 0
@@ -164,6 +167,9 @@ impl ReconSteps {
         }
         let backend = engine.backend();
         let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+        // Pre-size single-container writers (H5/Zarr) to the full slice count
+        // before the first chunk; TIFF's default no-op ignores it.
+        writer.reserve(nz)?;
         let chunk = self.chunk_rows.max(1);
         let mut r0 = 0;
         let mut recon = None; // handle-reusing reconstructor, built on chunk 0
@@ -254,12 +260,20 @@ impl ReconSteps {
             std::sync::mpsc::sync_channel::<(usize, usize, Dataset<f32>)>(PIPELINE_DEPTH);
         let (write_tx, write_rx) =
             std::sync::mpsc::sync_channel::<(usize, usize, Volume<f32>)>(PIPELINE_DEPTH);
+        // One-shot: the reader thread (which owns `read_sizes`) hands the total
+        // slice count to the writer thread so it can `reserve` before chunk 0
+        // (H5/Zarr pre-size their container; TIFF's no-op ignores it).
+        let (nz_tx, nz_rx) = std::sync::mpsc::sync_channel::<usize>(1);
 
         std::thread::scope(|s| {
             // Reader thread: build its own reader, stream each chunk's rows.
             let reader_handle = s.spawn(move || -> Result<()> {
                 let mut reader = make_reader()?;
                 let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+                // Hand the writer the total slice count for `reserve` (ignore a
+                // send error: a dropped receiver means the writer/compute side
+                // already aborted, which the join below surfaces).
+                let _ = nz_tx.send(nz);
                 let mut r0 = 0;
                 while r0 < nz {
                     let r1 = (r0 + chunk).min(nz);
@@ -278,6 +292,12 @@ impl ReconSteps {
             // Writer thread: build its own writer, drain results by row range.
             let writer_handle = s.spawn(move || -> Result<()> {
                 let mut writer = make_writer()?;
+                // Reserve from the reader's slice count before the first chunk.
+                // A recv error means the reader died before sending nz — then no
+                // chunks arrive either, so the loop below is a no-op.
+                if let Ok(total_nz) = nz_rx.recv() {
+                    writer.reserve(total_nz)?;
+                }
                 while let Ok((r0, r1, vol)) = write_rx.recv() {
                     writer.write_chunk(&vol, r0, r1)?;
                 }

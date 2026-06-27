@@ -7,7 +7,7 @@
 //! `Volume`. The data is read straight from the file via the same pure-Rust
 //! `rust-hdf5` the writer uses, so this also exercises its write→read path.
 
-use ndarray::Array3;
+use ndarray::{Array3, Axis, Slice};
 use rust_hdf5::H5File;
 use tomoxide::data::Volume;
 use tomoxide::io::{create_writer, SaveFormat};
@@ -31,6 +31,7 @@ fn write_then_read_back_bit_exact() {
     let base = dir.join("recon");
     {
         let mut w = create_writer(base.to_str().unwrap(), SaveFormat::H5).unwrap();
+        w.reserve(nz).unwrap();
         w.write_chunk(&vol, 0, nz).unwrap();
     } // drop the writer; the file was flushed after the chunk write.
 
@@ -73,8 +74,8 @@ fn write_chunk_range_is_validated() {
 
 #[test]
 fn write_chunks_fill_disjoint_ranges() {
-    // Two calls fill [0,1) then [1,3): the dataset is sized from the first
-    // volume and the hyperslab writes cover it completely.
+    // reserve(nz) sizes the dataset, then two per-chunk volumes — local slices
+    // [0,1) and [1,3) — land in their global ranges and cover it completely.
     let (nz, ny, nx) = (3usize, 2usize, 2usize);
     let vol = Volume::new(Array3::from_shape_fn((nz, ny, nx), |(z, y, x)| {
         (z * 100 + y * 10 + x) as f32 + 0.25
@@ -83,8 +84,11 @@ fn write_chunks_fill_disjoint_ranges() {
     let base = dir.join("recon");
     {
         let mut w = create_writer(base.to_str().unwrap(), SaveFormat::H5).unwrap();
-        w.write_chunk(&vol, 0, 1).unwrap();
-        w.write_chunk(&vol, 1, nz).unwrap();
+        w.reserve(nz).unwrap();
+        let c0 = Volume::new(vol.array.slice_axis(Axis(0), Slice::from(0..1)).to_owned());
+        let c1 = Volume::new(vol.array.slice_axis(Axis(0), Slice::from(1..nz)).to_owned());
+        w.write_chunk(&c0, 0, 1).unwrap();
+        w.write_chunk(&c1, 1, nz).unwrap();
     }
 
     let file = H5File::open(dir.join("recon.h5").to_str().unwrap()).unwrap();

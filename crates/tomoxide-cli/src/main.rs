@@ -57,6 +57,9 @@ enum Command {
         /// fourierrec only).
         #[arg(long, default_value = "float32")]
         dtype: String,
+        /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
+        #[arg(long, default_value = "tiff")]
+        save_format: String,
     },
     /// Chunked / streaming reconstruction (out-of-core).
     ReconSteps {
@@ -65,6 +68,9 @@ enum Command {
         /// Reconstruction precision: float32 | float16 (CUDA only).
         #[arg(long, default_value = "float32")]
         dtype: String,
+        /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
+        #[arg(long, default_value = "tiff")]
+        save_format: String,
     },
 }
 
@@ -107,10 +113,13 @@ fn main() -> anyhow::Result<()> {
             algorithm,
             center,
             dtype,
+            save_format,
         } => {
             let engine = Engine::new(backend_kind)?;
             let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
             let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
+            let save_format: tomoxide::io::SaveFormat =
+                save_format.parse().map_err(|e| anyhow!("{e}"))?;
             println!(
                 "recon: file={} algorithm={:?} center={:?} dtype={} backend={}",
                 file.display(),
@@ -132,14 +141,21 @@ fn main() -> anyhow::Result<()> {
                 &engine,
             )?;
             let out = recon_out_path(&file);
-            let mut writer = tomoxide::io::create_writer(&out, tomoxide::io::SaveFormat::Tiff)?;
+            let mut writer = tomoxide::io::create_writer(&out, save_format)?;
             let nz = vol.dims().0;
+            writer.reserve(nz)?;
             writer.write_chunk(&vol, 0, nz)?;
             println!("wrote {nz} reconstructed slices to {out}");
         }
-        Command::ReconSteps { file, dtype } => {
+        Command::ReconSteps {
+            file,
+            dtype,
+            save_format,
+        } => {
             let engine = Engine::new(backend_kind)?;
             let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
+            let save_format: tomoxide::io::SaveFormat =
+                save_format.parse().map_err(|e| anyhow!("{e}"))?;
             println!(
                 "recon_steps: file={} dtype={} backend={}",
                 file.display(),
@@ -158,7 +174,7 @@ fn main() -> anyhow::Result<()> {
             let write_path = out.clone();
             tomoxide::ReconSteps::new(64).run_streaming_pipelined(
                 move || tomoxide::io::open_dxchange(&read_path),
-                move || tomoxide::io::create_writer(&write_path, tomoxide::io::SaveFormat::Tiff),
+                move || tomoxide::io::create_writer(&write_path, save_format),
                 &geom,
                 Algorithm::Fbp,
                 &params,
