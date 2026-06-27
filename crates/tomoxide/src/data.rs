@@ -55,12 +55,24 @@ impl<T: Clone> Tomo<T> {
     }
 
     /// Return a copy in the requested layout (swapping axes 0/1 if needed).
+    ///
+    /// Always yields a **C-contiguous** (standard-layout) array so downstream
+    /// `array.as_slice()` succeeds. `permuted_axes(..).to_owned()` does *not*
+    /// guarantee this: `to_owned()` preserves the source's memory order, so a
+    /// transposed view becomes an owned array with non-standard strides whose
+    /// `as_slice()` returns `None`. `as_standard_layout()` forces the
+    /// C-contiguous copy. The matching-layout branch standardizes too, so the
+    /// invariant holds uniformly regardless of the caller's input strides.
     pub fn to_layout(&self, target: Layout) -> Tomo<T> {
-        if self.layout == target {
-            return self.clone();
-        }
-        // Swap the angle/row axes; `to_owned` yields a contiguous C-layout copy.
-        let array = self.array.view().permuted_axes([1, 0, 2]).to_owned();
+        let array = if self.layout == target {
+            self.array.as_standard_layout().into_owned()
+        } else {
+            self.array
+                .view()
+                .permuted_axes([1, 0, 2])
+                .as_standard_layout()
+                .into_owned()
+        };
         Tomo {
             array,
             layout: target,
@@ -161,5 +173,13 @@ mod tests {
         assert_eq!(swapped.array.dim(), (3, 2, 4));
         assert_eq!(swapped.array[[1, 0, 2]], a[[0, 1, 2]]);
         assert_eq!(swapped.array, t.to_layout(Layout::Sinogram).array);
+        // The transpose must be C-contiguous: the CUDA/CPU recon paths take
+        // `array.as_slice()`, which returns `None` on a non-standard layout.
+        // `to_owned()` on a permuted view preserves the source strides and
+        // would fail this; `as_standard_layout()` is what makes it hold.
+        assert!(
+            swapped.array.as_slice().is_some(),
+            "transposed sinogram must be C-contiguous for as_slice()"
+        );
     }
 }
