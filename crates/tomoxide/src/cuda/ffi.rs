@@ -255,6 +255,20 @@ unsafe extern "C" {
         n: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// On-device cast of `n` contiguous `f32` elements to `f16`, on `stream`.
+    pub fn tomoxide_cast_f32_to_f16(
+        src: *const c_void,
+        dst: *mut c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// On-device cast of `n` contiguous `f16` elements to `f32`, on `stream`.
+    pub fn tomoxide_cast_f16_to_f32(
+        src: *const c_void,
+        dst: *mut c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
 
     // --- batched C2C FFT (cuFFT) ---
     /// In-place batched 1-D C2C FFT (`data` = device interleaved float2, length

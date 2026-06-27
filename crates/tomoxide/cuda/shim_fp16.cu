@@ -82,6 +82,20 @@ __global__ void unpack_ker_h(const __half* src, __half* dst, int nz, int n) {
   dst[(s + half) * per + pr] = src[2 * i + 1];
 }
 
+// ---- on-device f32 <-> f16 cast (tomocupy does the dtype cast on the GPU as
+// part of proc_sino, so the host never converts; we mirror that so the streaming
+// f16 path uploads/downloads f32 and casts here instead of on the host) ----
+__global__ void f2h_ker(const float* src, __half* dst, long long total) {
+  long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  dst[i] = __float2half(src[i]);
+}
+__global__ void h2f_ker(const __half* src, float* dst, long long total) {
+  long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  dst[i] = __half2float(src[i]);
+}
+
 namespace {
 inline size_t as_size(void* p) { return reinterpret_cast<size_t>(p); }
 inline size_t as_size(const void* p) { return reinterpret_cast<size_t>(p); }
@@ -150,6 +164,21 @@ int tomoxide_unpack_pairs_fp16(const void* src, void* dst, size_t nz, size_t n, 
   int block = 256, grid = (int) ((total + block - 1) / block);
   unpack_ker_h<<<grid, block, 0, (cudaStream_t) stream>>>((const __half*) src, (__half*) dst,
                                                           (int) nz, (int) n);
+  return (int) cudaGetLastError();
+}
+
+// f32 (device) -> f16 (device) cast over `n` contiguous elements, on `stream`.
+int tomoxide_cast_f32_to_f16(const void* src, void* dst, size_t n, void* stream) {
+  long long total = (long long) n;
+  int block = 256, grid = (int) ((total + block - 1) / block);
+  f2h_ker<<<grid, block, 0, (cudaStream_t) stream>>>((const float*) src, (__half*) dst, total);
+  return (int) cudaGetLastError();
+}
+// f16 (device) -> f32 (device) cast over `n` contiguous elements, on `stream`.
+int tomoxide_cast_f16_to_f32(const void* src, void* dst, size_t n, void* stream) {
+  long long total = (long long) n;
+  int block = 256, grid = (int) ((total + block - 1) / block);
+  h2f_ker<<<grid, block, 0, (cudaStream_t) stream>>>((const __half*) src, (float*) dst, total);
   return (int) cudaGetLastError();
 }
 

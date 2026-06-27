@@ -620,6 +620,13 @@ mod cuda_impl {
         f: DevBuf,
         w: DevBuf,
         theta: DevBuf,
+        // f16 only: device-side f32 staging so the host uploads/downloads f32 and
+        // the f32↔f16 cast runs on the GPU (`f2h_ker`/`h2f_ker`), instead of the
+        // host rayon convert. `sino_f32` receives the H2D'd f32 sinogram (cast →
+        // `sino`); `f_f32` receives the GPU-cast f32 volume (← `f`) before D2H. None
+        // on the f32 path, which needs no cast. Mirrors tomocupy's GPU-side astype.
+        sino_f32: Option<DevBuf>,
+        f_f32: Option<DevBuf>,
         filt: *mut c_void,
         lrec: *mut c_void,
     }
@@ -652,6 +659,16 @@ mod cuda_impl {
             let f = DevBuf::zeroed(max_nz * n * n * esz)?;
             let w = DevBuf::zeroed(max_nz * nfreq2 * esz)?;
             let theta_dev = DevBuf::from_host_f32(theta)?;
+            // f16: device f32 staging for the GPU-side cast (see field docs).
+            let fsz = std::mem::size_of::<f32>();
+            let (sino_f32, f_f32) = if f16 {
+                (
+                    Some(DevBuf::zeroed(max_nz * nproj * ncols * fsz)?),
+                    Some(DevBuf::zeroed(max_nz * n * n * fsz)?),
+                )
+            } else {
+                (None, None)
+            };
             let (filt, lrec) = unsafe {
                 if f16 {
                     (
@@ -703,6 +720,8 @@ mod cuda_impl {
                 f,
                 w,
                 theta: theta_dev,
+                sino_f32,
+                f_f32,
                 filt,
                 lrec,
             })
@@ -760,7 +779,23 @@ mod cuda_impl {
                 )?;
             }
             if self.f16 {
-                self.sino.copy_from_host_f16(raw)?;
+                // Upload f32 and cast f32→f16 on the GPU (no host rayon convert).
+                // For a partial chunk only the valid `nz` rows are uploaded+cast;
+                // the memset above already zeroed `sino`'s tail. `w` is tiny
+                // (nz·nfreq2) so it keeps the host convert.
+                let sino_f32 = self.sino_f32.as_ref().expect("f16 path has sino_f32");
+                sino_f32.copy_from_host_f32(raw)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cast_f32_to_f16(
+                            sino_f32.ptr,
+                            self.sino.ptr,
+                            nz * nproj * ncols,
+                            null,
+                        )
+                    },
+                    "cast f32->f16 sino",
+                )?;
                 self.w.copy_from_host_f16(&w_host)?;
             } else {
                 self.sino.copy_from_host_f32(raw)?;
@@ -819,8 +854,17 @@ mod cuda_impl {
                         null,
                     );
                 }
+                // Cast the f16 volume to f32 on the GPU, then D2H f32 (no host widen).
+                let f_f32 = self.f_f32.as_ref().expect("f16 path has f_f32");
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cast_f16_to_f32(self.f.ptr, f_f32.ptr, nz * n * n, null)
+                    },
+                    "cast f16->f32 vol",
+                )?;
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                let host = self.f.to_host_f16_as_f32(nz * n * n)?;
+                let mut host = vec![0.0f32; nz * n * n];
+                f_f32.to_host_f32(&mut host)?;
                 Ok(Volume::new(
                     Array3::from_shape_vec((nz, n, n), host)
                         .expect("nz*n*n volume length matches shape"),
