@@ -286,6 +286,28 @@ pub trait StreamingAnalytic {
     /// reconstructor was built with (a smaller trailing chunk reuses the same
     /// handles, zero-padded to `max_nz`); `nz > max_nz` is an error.
     fn reconstruct_chunk(&mut self, sino: &Tomo<f32>, geom: &Geometry) -> Result<Volume<f32>>;
+
+    /// Device-resident fast path: reconstruct one z-chunk directly from the
+    /// **raw, un-normalized** projection chunk `[nproj, nz, ncols]` (plus
+    /// optional `flat`/`dark` frames), performing dark/flat correction,
+    /// minus-log, and the projection→sinogram transpose **on the device** so the
+    /// chunk crosses PCIe exactly once up and the volume once down — no host
+    /// normalize round-trip and no host transpose copy.
+    ///
+    /// Returns `Ok(None)` when this reconstructor has no device-resident path
+    /// (the caller then falls back to host normalize + transpose +
+    /// [`reconstruct_chunk`]). Callers MUST NOT use this when stripe removal is
+    /// requested: that runs on the host sinogram, which this path never
+    /// materializes. `data` must be [`Layout::Projection`](crate::data::Layout).
+    fn reconstruct_chunk_raw(
+        &mut self,
+        _data: &Tomo<f32>,
+        _flat: Option<&Frames<f32>>,
+        _dark: Option<&Frames<f32>>,
+        _geom: &Geometry,
+    ) -> Result<Option<Volume<f32>>> {
+        Ok(None)
+    }
 }
 
 /// Direct Fourier-gridding reconstruction (sinogram → volume) for a backend

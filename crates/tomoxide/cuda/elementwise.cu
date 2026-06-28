@@ -30,6 +30,22 @@ __global__ void minuslog_ker(float* data, long long total) {
   data[i] = isfinite(o) ? o : 0.0f;
 }
 
+// Projection→sinogram transpose: src [nproj, nz, ncols] -> dst [nz, nproj, ncols]
+// (swap the two outer axes; the inner detector lane is untouched). A pure index
+// reorder — bit-identical to the host `to_layout(Sinogram)` permute, no
+// arithmetic. One thread per source element.
+__global__ void transpose_ker(const float* src, float* dst, int nproj, int nz, int ncols) {
+  long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+  long long total = (long long) nproj * nz * ncols;
+  if (i >= total) return;
+  int x = (int) (i % ncols);
+  long long row = i / ncols;          // (p, z) lane index in source order
+  int z = (int) (row % nz);
+  int p = (int) (row / nz);
+  long long dst_idx = ((long long) z * nproj + p) * ncols + x;
+  dst[dst_idx] = src[i];
+}
+
 // --- device-resident analytic pipeline helpers (no host round-trips) ---
 
 // Edge-replicate pad each [ncols] detector lane into [ne], centred at pad_side
@@ -145,6 +161,16 @@ int tomoxide_minuslog(void* data, size_t n, void* stream) {
   int block = 256;
   int grid = (int) ((total + block - 1) / block);
   minuslog_ker<<<grid, block, 0, (cudaStream_t) stream>>>((float*) data, total);
+  return (int) cudaGetLastError();
+}
+
+int tomoxide_transpose(const void* src, void* dst, size_t nproj, size_t nz, size_t ncols,
+                       void* stream) {
+  long long total = (long long) nproj * nz * ncols;
+  int block = 256;
+  int grid = (int) ((total + block - 1) / block);
+  transpose_ker<<<grid, block, 0, (cudaStream_t) stream>>>((const float*) src, (float*) dst,
+                                                           (int) nproj, (int) nz, (int) ncols);
   return (int) cudaGetLastError();
 }
 

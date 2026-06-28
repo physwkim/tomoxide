@@ -132,6 +132,17 @@ unsafe extern "C" {
     ) -> i32;
     /// In-place `−ln(max(x, 1e-6))` (non-finite → 0) over `n` elements.
     pub fn tomoxide_minuslog(data: *mut c_void, n: usize, stream: *mut c_void) -> i32;
+    /// Projection→sinogram transpose: `[nproj, nz, ncols]` → `[nz, nproj, ncols]`
+    /// (swap the two outer axes). Pure reorder; matches the host `to_layout`
+    /// permute bit-for-bit. Returns 0 on success.
+    pub fn tomoxide_transpose(
+        src: *const c_void,
+        dst: *mut c_void,
+        nproj: usize,
+        nz: usize,
+        ncols: usize,
+        stream: *mut c_void,
+    ) -> i32;
 
     // --- device-resident analytic pipeline helpers ---
     /// Edge-replicate pad `[nz,nproj,ncols]` → `[nz,nproj,ne]` (centred at `pad_side`).

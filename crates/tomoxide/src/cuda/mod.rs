@@ -649,6 +649,15 @@ mod cuda_impl {
         f: DevBuf,
         w: DevBuf,
         theta: DevBuf,
+        // Device-resident raw path (`reconstruct_chunk_raw`): the raw projection
+        // chunk lands here as f32 `[nproj, nz, ncols]`, is dark/flat-corrected and
+        // minus-logged in place, then transposed into `sino`. Always f32 (the
+        // darkflat/minuslog kernels are f32); the f16 cast happens at the
+        // transpose step. `dark2d`/`denom` hold the host-averaged `[nz, ncols]`
+        // correction frames (matching `CudaBackend::darkflat`).
+        proj: DevBuf,
+        dark2d: DevBuf,
+        denom: DevBuf,
         // f16 only: device-side f32 staging so the host uploads/downloads f32 and
         // the f32↔f16 cast runs on the GPU (`f2h_ker`/`h2f_ker`), instead of the
         // host rayon convert. `sino_f32` receives the H2D'd f32 sinogram (cast →
@@ -688,6 +697,12 @@ mod cuda_impl {
             let f = DevBuf::zeroed(max_nz * n * n * esz)?;
             let w = DevBuf::zeroed(max_nz * nfreq2 * esz)?;
             let theta_dev = DevBuf::from_host_f32(theta)?;
+            // Raw-path staging (always f32): the projection chunk plus the small
+            // per-chunk dark/denominator frames.
+            let fsz_proj = std::mem::size_of::<f32>();
+            let proj = DevBuf::zeroed(max_nz * nproj * ncols * fsz_proj)?;
+            let dark2d = DevBuf::zeroed(max_nz * ncols * fsz_proj)?;
+            let denom = DevBuf::zeroed(max_nz * ncols * fsz_proj)?;
             // f16: device f32 staging for the GPU-side cast (see field docs).
             let fsz = std::mem::size_of::<f32>();
             let (sino_f32, f_f32) = if f16 {
@@ -749,6 +764,9 @@ mod cuda_impl {
                 f,
                 w,
                 theta: theta_dev,
+                proj,
+                dark2d,
+                denom,
                 sino_f32,
                 f_f32,
                 filt,
@@ -791,27 +809,22 @@ mod cuda_impl {
             let raw = std
                 .as_slice()
                 .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
-            let w_host = build_filter_w(&self.filter, geom, nz, ncols, self.pad);
             let null = std::ptr::null_mut::<c_void>();
             let partial = nz < self.max_nz;
             // Zero the unused tail of a partial trailing chunk so the always-`max_nz`
-            // kernels and the fixed cuFFT batch see zeros there (→ zero output we
-            // drop); full chunks overwrite the whole buffer so they skip the memset.
+            // kernels see zeros there (→ zero output we drop); full chunks overwrite
+            // the whole `sino` so they skip the memset. (`w`'s tail is zeroed in
+            // `finish_recon`.)
             if partial {
                 ck(
                     unsafe { ffi::tomoxide_cuda_memset(self.sino.ptr, 0, self.sino.bytes) },
                     "memset sino",
                 )?;
-                ck(
-                    unsafe { ffi::tomoxide_cuda_memset(self.w.ptr, 0, self.w.bytes) },
-                    "memset w",
-                )?;
             }
             if self.f16 {
                 // Upload f32 and cast f32→f16 on the GPU (no host rayon convert).
                 // For a partial chunk only the valid `nz` rows are uploaded+cast;
-                // the memset above already zeroed `sino`'s tail. `w` is tiny
-                // (nz·nfreq2) so it keeps the host convert.
+                // the memset above already zeroed `sino`'s tail.
                 let sino_f32 = self.sino_f32.as_ref().expect("f16 path has sino_f32");
                 sino_f32.copy_from_host_f32(raw)?;
                 ck(
@@ -825,9 +838,162 @@ mod cuda_impl {
                     },
                     "cast f32->f16 sino",
                 )?;
-                self.w.copy_from_host_f16(&w_host)?;
             } else {
                 self.sino.copy_from_host_f32(raw)?;
+            }
+            self.finish_recon(nz, geom)
+        }
+
+        fn reconstruct_chunk_raw(
+            &mut self,
+            data: &Tomo<f32>,
+            flat: Option<&Frames<f32>>,
+            dark: Option<&Frames<f32>>,
+            geom: &Geometry,
+        ) -> Result<Option<Volume<f32>>> {
+            // The device-resident path consumes the raw projection-layout chunk;
+            // for any other layout defer to the host path (`Ok(None)`).
+            if data.layout != Layout::Projection {
+                return Ok(None);
+            }
+            let (nproj, nz, ncols) = data.array.dim();
+            if nproj != self.nproj || ncols != self.ncols {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("nproj={} ncols={}", self.nproj, self.ncols),
+                    found: format!("nproj={nproj} ncols={ncols}"),
+                });
+            }
+            if nz > self.max_nz {
+                return Err(Error::InvalidParam(format!(
+                    "streaming reconstruct_chunk_raw: nz={nz} exceeds max_nz={}",
+                    self.max_nz
+                )));
+            }
+            let std = data.array.as_standard_layout();
+            let raw = std
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous projection chunk".into()))?;
+            let null = std::ptr::null_mut::<c_void>();
+            // One H2D: the raw projection chunk as the contiguous [nproj, nz, ncols]
+            // prefix of the max-sized f32 `proj` buffer.
+            self.proj.copy_from_host_f32(raw)?;
+            // Dark/flat correction on the device, mirroring `CudaBackend::darkflat`
+            // (host-averaged `dark2d`, clamped `denom`, device broadcast) so the
+            // output is bit-identical to the host normalize path. Skipped when
+            // flat/dark are absent (already-normalized input).
+            if let (Some(flat), Some(dark)) = (flat, dark) {
+                let dark2d = dark
+                    .array
+                    .mean_axis(Axis(0))
+                    .ok_or_else(|| Error::InvalidParam("empty dark stack".into()))?;
+                let flat2d = flat
+                    .array
+                    .mean_axis(Axis(0))
+                    .ok_or_else(|| Error::InvalidParam("empty flat stack".into()))?;
+                if dark2d.dim() != (nz, ncols) {
+                    return Err(Error::ShapeMismatch {
+                        expected: format!("flat/dark frame [{nz}, {ncols}]"),
+                        found: format!("{:?}", dark2d.dim()),
+                    });
+                }
+                let mut denom = &flat2d - &dark2d;
+                denom.mapv_inplace(|v| if v.abs() < 1e-6 { 1.0 } else { v });
+                self.dark2d
+                    .copy_from_host_f32(dark2d.as_slice().expect("contiguous dark2d"))?;
+                self.denom
+                    .copy_from_host_f32(denom.as_slice().expect("contiguous denom"))?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_darkflat(
+                            self.proj.ptr,
+                            self.dark2d.ptr,
+                            self.denom.ptr,
+                            nproj,
+                            nz,
+                            ncols,
+                            null,
+                        )
+                    },
+                    "darkflat",
+                )?;
+            }
+            // minus-log over the valid [nproj, nz, ncols] prefix.
+            ck(
+                unsafe { ffi::tomoxide_minuslog(self.proj.ptr, nproj * nz * ncols, null) },
+                "minuslog",
+            )?;
+            // Transpose projection → sinogram on the device. The transpose writes
+            // only the `nz` valid rows of the sinogram, so zero the tail first on a
+            // partial chunk (as `reconstruct_chunk` does). The f16 path transposes
+            // into the f32 staging buffer, then casts into the f16 `sino`.
+            let partial = nz < self.max_nz;
+            if partial {
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.sino.ptr, 0, self.sino.bytes) },
+                    "memset sino",
+                )?;
+            }
+            if self.f16 {
+                let sino_f32 = self.sino_f32.as_ref().expect("f16 path has sino_f32");
+                ck(
+                    unsafe {
+                        ffi::tomoxide_transpose(self.proj.ptr, sino_f32.ptr, nproj, nz, ncols, null)
+                    },
+                    "transpose",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cast_f32_to_f16(
+                            sino_f32.ptr,
+                            self.sino.ptr,
+                            nz * nproj * ncols,
+                            null,
+                        )
+                    },
+                    "cast f32->f16 sino",
+                )?;
+            } else {
+                ck(
+                    unsafe {
+                        ffi::tomoxide_transpose(
+                            self.proj.ptr,
+                            self.sino.ptr,
+                            nproj,
+                            nz,
+                            ncols,
+                            null,
+                        )
+                    },
+                    "transpose",
+                )?;
+            }
+            Ok(Some(self.finish_recon(nz, geom)?))
+        }
+    }
+
+    impl CudaFbpStream {
+        /// Shared back half of both streaming entry points. `self.sino` already
+        /// holds the chunk's sinogram for the valid `nz` rows (f16-cast when
+        /// `self.f16`; the tail zeroed by the caller when `nz < max_nz`). Builds
+        /// and uploads the per-chunk filter weights, then runs pad → cuFFT filter
+        /// → crop → back-project at the handle's fixed `max_nz` batch and downloads
+        /// the `[nz, n, n]` volume.
+        fn finish_recon(&mut self, nz: usize, geom: &Geometry) -> Result<Volume<f32>> {
+            let (nproj, ncols) = (self.nproj, self.ncols);
+            let w_host = build_filter_w(&self.filter, geom, nz, ncols, self.pad);
+            let null = std::ptr::null_mut::<c_void>();
+            let partial = nz < self.max_nz;
+            // `w` is the only buffer `finish_recon` fills partially; zero its tail on
+            // a partial chunk so the fixed-batch cuFFT sees zeros there.
+            if partial {
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.w.ptr, 0, self.w.bytes) },
+                    "memset w",
+                )?;
+            }
+            if self.f16 {
+                self.w.copy_from_host_f16(&w_host)?;
+            } else {
                 self.w.copy_from_host_f32(&w_host)?;
             }
             // pad → cuFFT filter → crop → back-project, all at the handle's `max_nz`

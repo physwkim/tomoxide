@@ -175,22 +175,17 @@ impl ReconSteps {
         let mut recon = None; // handle-reusing reconstructor, built on chunk 0
         while r0 < nz {
             let r1 = (r0 + chunk).min(nz);
-            let mut ds = reader.read_chunk(r0, r1)?;
-            crate::prep::normalize_dataset(&mut ds, backend)?;
-            let mut sino = ds.data.to_layout(Layout::Sinogram);
-            // to_layout transposes to a non-contiguous view; make it C-contiguous
-            // so the (down-stream) back-projector can take a flat slice.
-            sino.array = sino.array.as_standard_layout().to_owned();
-            crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+            let ds = reader.read_chunk(r0, r1)?;
             let chunk_geom = chunk_geometry(geom, r0, r1);
-            let vol = recon_chunk_reusing(
+            let vol = chunk_to_volume(
                 &mut recon,
                 backend,
-                &sino,
+                ds,
                 geom,
                 &chunk_geom,
                 algorithm,
                 params,
+                prep,
             )?;
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
@@ -336,22 +331,17 @@ fn compute_chunks(
     // `recon_chunk_reusing`): a many-chunk job pays the cuFFT-plan / f16-texture
     // setup once, not per chunk.
     let mut recon = None;
-    while let Ok((r0, r1, mut ds)) = read_rx.recv() {
-        crate::prep::normalize_dataset(&mut ds, backend)?;
-        let mut sino = ds.data.to_layout(Layout::Sinogram);
-        // to_layout transposes to a non-contiguous view; make it C-contiguous so
-        // the back-projector can take a flat slice (mirrors run_streaming).
-        sino.array = sino.array.as_standard_layout().to_owned();
-        crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+    while let Ok((r0, r1, ds)) = read_rx.recv() {
         let chunk_geom = chunk_geometry(geom, r0, r1);
-        let vol = recon_chunk_reusing(
+        let vol = chunk_to_volume(
             &mut recon,
             backend,
-            &sino,
+            ds,
             geom,
             &chunk_geom,
             algorithm,
             params,
+            prep,
         )?;
         // A send error means the writer hung up (errored); stop — the writer
         // thread owns the real error, surfaced after join.
@@ -377,7 +367,10 @@ fn chunk_geometry(geom: &Geometry, r0: usize, r1: usize) -> Geometry {
     }
 }
 
-/// Reconstruct one z-chunk, reusing a single backend reconstructor across chunks.
+/// Turn one raw read chunk into its reconstructed volume, reusing a single
+/// backend reconstructor across chunks. Shared by [`run_streaming`] and the
+/// pipelined `compute_chunks` so both run the identical per-chunk numeric
+/// pipeline.
 ///
 /// On the first chunk it asks the backend for a handle-reusing
 /// [`StreamingAnalytic`] sized to that chunk's `nz` (the largest, since chunks
@@ -386,8 +379,70 @@ fn chunk_geometry(geom: &Geometry, r0: usize, r1: usize) -> Geometry {
 /// instead of per chunk. `slot` carries it across calls: `None` = not yet built,
 /// `Some(None)` = the backend declined for this algorithm (CPU backend,
 /// gridrec/lprec/fourierrec) so use the stateless [`crate::recon::recon`],
-/// `Some(Some(_))` = reuse. Output is identical to the stateless path (the
-/// reconstructors are per-slice independent).
+/// `Some(Some(_))` = reuse.
+///
+/// Two routes, identical output:
+/// - **Device-resident** (CUDA, `stripe == None`): the raw projection chunk goes
+///   straight to [`StreamingAnalytic::reconstruct_chunk_raw`], which does
+///   dark/flat correction, minus-log, and the projection→sinogram transpose on
+///   the device — one PCIe upload, one download, no host normalize round-trip or
+///   transpose copy. Skipped when stripe removal is requested (it runs on the
+///   host sinogram this route never materializes), or when the reconstructor
+///   declines (`Ok(None)`).
+/// - **Host** (CPU/wgpu, or stripe removal requested): normalize → transpose →
+///   stripe removal on the host, then `reconstruct_chunk` / stateless `recon`.
+#[allow(clippy::too_many_arguments)]
+fn chunk_to_volume(
+    slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
+    backend: &dyn crate::backend::Backend,
+    mut ds: Dataset<f32>,
+    geom: &Geometry,
+    chunk_geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+) -> Result<Volume<f32>> {
+    // Build the reusable reconstructor on the first chunk, sized to that chunk's
+    // (largest) projection dims.
+    if slot.is_none() {
+        let built = match backend.analytic_reconstruct() {
+            Some(ar) => {
+                ar.streaming(algorithm, params, geom, ds.data.n_cols(), ds.data.n_rows())?
+            }
+            None => None,
+        };
+        *slot = Some(built);
+    }
+    // Device-resident fast path: only when no host sinogram stage is needed.
+    if prep.stripe == StripeMethod::None {
+        if let Some(Some(s)) = slot.as_mut() {
+            if let Some(vol) =
+                s.reconstruct_chunk_raw(&ds.data, ds.flat.as_ref(), ds.dark.as_ref(), chunk_geom)?
+            {
+                return Ok(vol);
+            }
+        }
+    }
+    // Host path: normalize → transpose (to C-contiguous sinogram so the
+    // back-projector can take a flat slice) → stripe removal → reconstruct from
+    // the prepared sinogram (`slot` is already built above; `recon_chunk_reusing`
+    // just dispatches).
+    crate::prep::normalize_dataset(&mut ds, backend)?;
+    let mut sino = ds.data.to_layout(Layout::Sinogram);
+    sino.array = sino.array.as_standard_layout().to_owned();
+    crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+    recon_chunk_reusing(slot, backend, &sino, geom, chunk_geom, algorithm, params)
+}
+
+/// Reconstruct one **already-prepared** sinogram chunk, reusing a single backend
+/// reconstructor across chunks. Used directly by [`ReconSteps::run`] (which
+/// normalizes + transposes the whole dataset up front, then slices sinogram
+/// chunks) and as the host fallback inside [`chunk_to_volume`].
+///
+/// Builds the handle-reusing [`StreamingAnalytic`] on the first chunk (sized to
+/// that chunk's `nz`, the largest) when `slot` is still `None`, and reuses it
+/// afterwards; `Some(None)` means the backend declined for this algorithm so the
+/// stateless [`crate::recon::recon`] is used.
 fn recon_chunk_reusing(
     slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
     backend: &dyn crate::backend::Backend,
