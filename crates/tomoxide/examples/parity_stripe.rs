@@ -155,6 +155,14 @@ fn main() {
                 level: None,
             },
         ),
+        (
+            "voall",
+            StripeMethod::VoAll {
+                snr: 3.0,
+                la_size: 61,
+                sm_size: 21,
+            },
+        ),
     ];
 
     println!("parity_stripe: nproj={nproj} max_nz={max_nz} ncols={ncols}");

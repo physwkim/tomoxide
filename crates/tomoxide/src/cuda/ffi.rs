@@ -25,6 +25,8 @@ unsafe extern "C" {
     pub fn tomoxide_cuda_memcpy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
     /// `cudaMemcpy` device→host; returns 0 on success.
     pub fn tomoxide_cuda_memcpy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
+    /// Device-to-device copy. 0 on success.
+    pub fn tomoxide_cuda_memcpy_d2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
     /// `cudaMemset`; returns 0 on success.
     pub fn tomoxide_cuda_memset(p: *mut c_void, value: i32, bytes: usize) -> i32;
     /// `cudaDeviceSynchronize`; returns 0 on success.
@@ -262,6 +264,154 @@ unsafe extern "C" {
         nz: usize,
         my: usize,
         mx: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // --- Vo all-stripe (`remove_all_stripe`) building blocks, orchestrated
+    // from `CudaFbpStream::vo_on_device`. Operate on the f32 sinogram
+    // [nz, nproj, ncol] and per-column [nz, ncol] vectors; batched over nz. ---
+    /// uniform_filter1d along axis 0 (projection), mode='reflect'.
+    pub fn tomoxide_vo_uniform_axis0(
+        sino: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `listdiff[z,c] = sum_r |sino - smooth|`.
+    pub fn tomoxide_vo_absdiff_colsum(
+        sino: *const c_void,
+        smooth: *const c_void,
+        listdiff: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// 1-D median filter along the last axis of `[nz,R,nc]`, reflect, `size<=256`.
+    pub fn tomoxide_vo_median_axis1(
+        in_: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        r: usize,
+        nc: usize,
+        size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Elementwise `out = num/den` (or 1 where `den==0`).
+    pub fn tomoxide_vo_ratio(
+        num: *const c_void,
+        den: *const c_void,
+        out: *mut c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Sort each column of `sino[nz,nrow,nc]` → `sorted[z,rank,c]` (+ optional
+    /// `perm` rows). Composite (value,row) key = Rust stable order.
+    pub fn tomoxide_vo_colsort(
+        sino: *const c_void,
+        sorted: *mut c_void,
+        perm: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        ascending: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Sort each slice row of `in[nz,n]` → `sorted[z,rank]`.
+    pub fn tomoxide_vo_slicesort(
+        in_: *const c_void,
+        sorted: *mut c_void,
+        nz: usize,
+        n: usize,
+        ascending: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `_detect_stripe` raw mask from `listfact` and its descending sort.
+    pub fn tomoxide_vo_detect_rawmask(
+        listfact: *const c_void,
+        listsorted: *const c_void,
+        rawmask: *mut c_void,
+        nz: usize,
+        nc: usize,
+        snr: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `binary_dilation` (3-element SE); `border_zero != 0` zeroes 2 cols/side.
+    pub fn tomoxide_vo_dilate(
+        rawmask: *const c_void,
+        mask: *mut c_void,
+        nz: usize,
+        nc: usize,
+        border_zero: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Compact good (`mask<1`) columns per slice → `goodx[z,:]` + `goodcount[z]`.
+    pub fn tomoxide_vo_build_goodx(
+        mask: *const c_void,
+        goodx: *mut c_void,
+        goodcount: *mut c_void,
+        nz: usize,
+        nc: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Per-row linear fill of dead columns from bracketing good columns.
+    pub fn tomoxide_vo_interp_fill(
+        sino: *const c_void,
+        work: *mut c_void,
+        mask: *const c_void,
+        goodx: *const c_void,
+        goodcount: *const c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `_rs_large` per-column intensity factor (f64 + f32 copies).
+    pub fn tomoxide_vo_rs_large_listfact(
+        sinosort: *const c_void,
+        sinosmooth: *const c_void,
+        lf64: *mut c_void,
+        lf32: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        ndrop: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Normalise each column by `1/listfact` (f64 divide).
+    pub fn tomoxide_vo_normalize(
+        s: *const c_void,
+        lf64: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Scatter `sinosmooth` back through `perm` for masked columns (`out`
+    /// pre-seeded with the normalised working copy).
+    pub fn tomoxide_vo_scatter_masked(
+        perm: *const c_void,
+        sinosmooth: *const c_void,
+        mask: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Scatter `smoothed` back through `perm` for every column (`out` fully
+    /// overwritten) — the `_rs_sort` unsort.
+    pub fn tomoxide_vo_unsort_scatter(
+        perm: *const c_void,
+        smoothed: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        nrow: usize,
+        nc: usize,
         stream: *mut c_void,
     ) -> i32;
 

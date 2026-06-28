@@ -1016,10 +1016,18 @@ mod cuda_impl {
     /// no-op (always handled). Methods without a GPU port make the caller defer
     /// the whole chunk to the host. Kept in sync with [`CudaFbpStream::stripe_on_device`].
     fn gpu_supports_stripe(stripe: StripeMethod) -> bool {
-        matches!(
-            stripe,
-            StripeMethod::None | StripeMethod::Ti { nblock: 0, .. } | StripeMethod::Fw { .. }
-        )
+        match stripe {
+            StripeMethod::None | StripeMethod::Ti { nblock: 0, .. } | StripeMethod::Fw { .. } => {
+                true
+            }
+            // Vo all-stripe: the on-device median filters keep their window in a
+            // fixed 256-element thread-local buffer, so larger windows fall back
+            // to the host route.
+            StripeMethod::VoAll {
+                la_size, sm_size, ..
+            } => la_size <= 256 && sm_size <= 256,
+            _ => false,
+        }
     }
 
     /// Münch damping vector `D = ifftshift(damp)` (matches `stripe::damp_vector`),
@@ -1078,6 +1086,16 @@ mod cuda_impl {
                 // damping of the vertical band; orchestrated below.
                 StripeMethod::Fw { sigma, level } => {
                     self.fw_on_device(ptr, nz, sigma, level)?;
+                    Ok(true)
+                }
+                // Vo all-stripe (rs_dead → rs_sort). Window sizes are gated to
+                // <= 256 by `gpu_supports_stripe`.
+                StripeMethod::VoAll {
+                    snr,
+                    la_size,
+                    sm_size,
+                } => {
+                    self.vo_on_device(ptr, nz, snr, la_size, sm_size)?;
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -1284,6 +1302,346 @@ mod cuda_impl {
                     ffi::tomoxide_fw_final(sli.ptr, ptr, nz, nproj, ncol, sr, sc, xshift, null)
                 },
                 "fw_final",
+            )?;
+            Ok(())
+        }
+
+        /// Device-to-device copy of `bytes` from `src` into `dst`.
+        fn vo_d2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+            ck(
+                unsafe { ffi::tomoxide_cuda_memcpy_d2d(dst, src, bytes) },
+                "vo_d2d",
+            )
+        }
+
+        /// `_detect_stripe` + `binary_dilation` for a per-column `listfact`
+        /// `[nz, nc]`, writing the dilated mask. `border_zero` protects the two
+        /// outer columns each side (the `_rs_dead` rule); `_rs_large` passes
+        /// `false`.
+        fn vo_detect_mask(
+            &self,
+            listfact: &DevBuf,
+            mask: &DevBuf,
+            nz: usize,
+            nc: usize,
+            snr: f32,
+            border_zero: bool,
+        ) -> Result<()> {
+            let null = std::ptr::null_mut::<c_void>();
+            let cols = nz * nc;
+            let sorted = DevBuf::new(cols * std::mem::size_of::<f32>())?;
+            ck(
+                unsafe { ffi::tomoxide_vo_slicesort(listfact.ptr, sorted.ptr, nz, nc, 0, null) },
+                "vo_slicesort",
+            )?;
+            let rawmask = DevBuf::new(cols * std::mem::size_of::<f32>())?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_detect_rawmask(
+                        listfact.ptr,
+                        sorted.ptr,
+                        rawmask.ptr,
+                        nz,
+                        nc,
+                        snr,
+                        null,
+                    )
+                },
+                "vo_detect_rawmask",
+            )?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_dilate(
+                        rawmask.ptr,
+                        mask.ptr,
+                        nz,
+                        nc,
+                        if border_zero { 1 } else { 0 },
+                        null,
+                    )
+                },
+                "vo_dilate",
+            )?;
+            Ok(())
+        }
+
+        /// `_rs_large` (Vo algorithm 5) on `s [nz,nrow,nc]` with `norm=true`:
+        /// replace detected large-stripe columns with the rank-smoothed profile,
+        /// normalising by the per-column intensity factor first. Returns a fresh
+        /// device buffer.
+        fn vo_rs_large(
+            &self,
+            s: &DevBuf,
+            nz: usize,
+            snr: f32,
+            size: usize,
+            drop_ratio: f32,
+        ) -> Result<DevBuf> {
+            let null = std::ptr::null_mut::<c_void>();
+            let (nrow, nc) = (self.nproj, self.ncols);
+            let (f32sz, f64sz, i32sz) = (
+                std::mem::size_of::<f32>(),
+                std::mem::size_of::<f64>(),
+                std::mem::size_of::<i32>(),
+            );
+            let vol = nz * nrow * nc;
+            let cols = nz * nc;
+            let dr = drop_ratio.clamp(0.0, 0.8) as f64;
+            let ndrop = (0.5 * dr * nrow as f64) as usize;
+
+            // sinosort = sort each column ascending (perm unused here).
+            let sinosort = DevBuf::new(vol * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_colsort(s.ptr, sinosort.ptr, null, nz, nrow, nc, 1, null)
+                },
+                "vo_colsort(sinosort)",
+            )?;
+            // sinosmooth = per-row median along columns.
+            let sinosmooth = DevBuf::new(vol * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_median_axis1(
+                        sinosort.ptr,
+                        sinosmooth.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        size,
+                        null,
+                    )
+                },
+                "vo_median(sinosmooth)",
+            )?;
+            // Per-column intensity factor (f64 for normalise, f32 for detect).
+            let lf64 = DevBuf::new(cols * f64sz)?;
+            let lf32 = DevBuf::new(cols * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_rs_large_listfact(
+                        sinosort.ptr,
+                        sinosmooth.ptr,
+                        lf64.ptr,
+                        lf32.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        ndrop,
+                        null,
+                    )
+                },
+                "vo_rs_large_listfact",
+            )?;
+            drop(sinosort);
+            // Mask (no border protection in _rs_large).
+            let mask = DevBuf::new(cols * f32sz)?;
+            self.vo_detect_mask(&lf32, &mask, nz, nc, snr, false)?;
+            drop(lf32);
+            // Normalised working copy.
+            let work2 = DevBuf::new(vol * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_normalize(s.ptr, lf64.ptr, work2.ptr, nz, nrow, nc, null)
+                },
+                "vo_normalize",
+            )?;
+            drop(lf64);
+            // Sort the normalised copy for its permutation.
+            let perm2 = DevBuf::new(vol * i32sz)?;
+            let sortdummy = DevBuf::new(vol * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_colsort(
+                        work2.ptr,
+                        sortdummy.ptr,
+                        perm2.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        1,
+                        null,
+                    )
+                },
+                "vo_colsort(work2)",
+            )?;
+            drop(sortdummy);
+            // out = work2; overwrite masked columns with the smoothed profile.
+            let out = DevBuf::new(vol * f32sz)?;
+            Self::vo_d2d(out.ptr, work2.ptr, vol * f32sz)?;
+            drop(work2);
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_scatter_masked(
+                        perm2.ptr,
+                        sinosmooth.ptr,
+                        mask.ptr,
+                        out.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        null,
+                    )
+                },
+                "vo_scatter_masked",
+            )?;
+            Ok(out)
+        }
+
+        /// Vo all-stripe removal on the device f32 sinogram `ptr [nz,nproj,ncol]`,
+        /// in place: `_rs_dead` (uniform-smooth → per-column L1 diff → median →
+        /// detect+dilate → border-protect → bilinear dead-column fill →
+        /// `_rs_large`) followed by `_rs_sort` (column sort → cross-column median
+        /// → unsort). Mirrors `stripe::remove_all_stripe` for all `nz` at once;
+        /// correlation parity with the CPU golden.
+        fn vo_on_device(
+            &self,
+            ptr: *mut c_void,
+            nz: usize,
+            snr: f32,
+            la_size: usize,
+            sm_size: usize,
+        ) -> Result<()> {
+            let null = std::ptr::null_mut::<c_void>();
+            let (nrow, nc) = (self.nproj, self.ncols);
+            // Matches the CPU guard in `remove_all_stripe`.
+            if nrow < 2 || nz == 0 || nc < 4 || la_size == 0 || sm_size == 0 {
+                return Ok(());
+            }
+            let (f32sz, i32sz) = (std::mem::size_of::<f32>(), std::mem::size_of::<i32>());
+            let vol = nz * nrow * nc;
+            let cols = nz * nc;
+
+            // ---- _rs_dead ----
+            // sinosmooth = uniform_filter1d along the projection axis (size 10).
+            let smooth = DevBuf::new(vol * f32sz)?;
+            ck(
+                unsafe { ffi::tomoxide_vo_uniform_axis0(ptr, smooth.ptr, nz, nrow, nc, 10, null) },
+                "vo_uniform_axis0",
+            )?;
+            // listdiff[z,c] = sum_r |sino - smooth|.
+            let listdiff = DevBuf::new(cols * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_absdiff_colsum(
+                        ptr,
+                        smooth.ptr,
+                        listdiff.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        null,
+                    )
+                },
+                "vo_absdiff_colsum",
+            )?;
+            drop(smooth);
+            // listdiffbck = 1-D median of listdiff over columns (window la_size).
+            let listdiffbck = DevBuf::new(cols * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_median_axis1(
+                        listdiff.ptr,
+                        listdiffbck.ptr,
+                        nz,
+                        1,
+                        nc,
+                        la_size,
+                        null,
+                    )
+                },
+                "vo_median(listdiffbck)",
+            )?;
+            // listfact = listdiff / listdiffbck.
+            let listfact = DevBuf::new(cols * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_ratio(listdiff.ptr, listdiffbck.ptr, listfact.ptr, cols, null)
+                },
+                "vo_ratio(listfact)",
+            )?;
+            drop(listdiff);
+            drop(listdiffbck);
+            // Dead-column mask with border protection.
+            let mask = DevBuf::new(cols * f32sz)?;
+            self.vo_detect_mask(&listfact, &mask, nz, nc, snr, true)?;
+            drop(listfact);
+            // Good-column lists, then bilinear fill of the dead columns.
+            let goodx = DevBuf::new(cols * i32sz)?;
+            let goodcount = DevBuf::new(nz * i32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_build_goodx(mask.ptr, goodx.ptr, goodcount.ptr, nz, nc, null)
+                },
+                "vo_build_goodx",
+            )?;
+            let work = DevBuf::new(vol * f32sz)?;
+            Self::vo_d2d(work.ptr, ptr, vol * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_interp_fill(
+                        ptr,
+                        work.ptr,
+                        mask.ptr,
+                        goodx.ptr,
+                        goodcount.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        null,
+                    )
+                },
+                "vo_interp_fill",
+            )?;
+            drop(mask);
+            drop(goodx);
+            drop(goodcount);
+            // Residual large-stripe pass (VoAll always runs it, norm=True).
+            let dead_out = self.vo_rs_large(&work, nz, snr, la_size, 0.1)?;
+            drop(work);
+
+            // ---- _rs_sort (dim=1) ----
+            // Sort each column ascending, keeping the permutation.
+            let sortedv = DevBuf::new(vol * f32sz)?;
+            let perm = DevBuf::new(vol * i32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_colsort(
+                        dead_out.ptr,
+                        sortedv.ptr,
+                        perm.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        1,
+                        null,
+                    )
+                },
+                "vo_colsort(rs_sort)",
+            )?;
+            drop(dead_out);
+            // Smooth the sorted profiles across columns (window sm_size).
+            let smoothed = DevBuf::new(vol * f32sz)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_median_axis1(
+                        sortedv.ptr,
+                        smoothed.ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        sm_size,
+                        null,
+                    )
+                },
+                "vo_median(rs_sort)",
+            )?;
+            drop(sortedv);
+            // Unsort back into the original projection order, in place into `ptr`.
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_unsort_scatter(perm.ptr, smoothed.ptr, ptr, nz, nrow, nc, null)
+                },
+                "vo_unsort_scatter",
             )?;
             Ok(())
         }
@@ -3256,6 +3614,76 @@ mod cuda_impl {
                 "recon[5,3] {}",
                 out_h[5 * rc2 + 3]
             );
+        }
+
+        // The Vo per-column bitonic sort must reproduce Rust's stable ascending
+        // `sort_by` exactly — including tie-breaking by original row — so the
+        // unsort scatter lands every value back on the right projection. Uses a
+        // column with deliberate ties (clamped values) to exercise the composite
+        // (value, row) key.
+        #[test]
+        fn vo_colsort_matches_stable_sort() {
+            let _b = CudaBackend::new().expect("cuda backend");
+            ck(unsafe { ffi::tomoxide_cuda_set_device(0) }, "set_device").unwrap();
+            let null = std::ptr::null_mut::<c_void>();
+            let (nz, nrow, nc) = (2usize, 90usize, 7usize);
+            let mut host = vec![0.0f32; nz * nrow * nc];
+            for z in 0..nz {
+                for p in 0..nrow {
+                    for c in 0..nc {
+                        // Quantised to create many ties; pow2 padding (128) exercised.
+                        let raw = (p as f32 * 0.3 + c as f32 * 1.7 + z as f32).sin();
+                        host[(z * nrow + p) * nc + c] = (raw * 4.0).round() / 4.0;
+                    }
+                }
+            }
+            let dev = DevBuf::from_host_f32(&host).unwrap();
+            let f4 = std::mem::size_of::<f32>();
+            let i4 = std::mem::size_of::<i32>();
+            let sorted = DevBuf::zeroed(nz * nrow * nc * f4).unwrap();
+            let perm = DevBuf::zeroed(nz * nrow * nc * i4).unwrap();
+            ck(
+                unsafe {
+                    ffi::tomoxide_vo_colsort(dev.ptr, sorted.ptr, perm.ptr, nz, nrow, nc, 1, null)
+                },
+                "vo_colsort",
+            )
+            .unwrap();
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync").unwrap();
+            let mut sorted_h = vec![0.0f32; nz * nrow * nc];
+            sorted.to_host_f32(&mut sorted_h).unwrap();
+            let mut perm_h = vec![0i32; nz * nrow * nc];
+            {
+                let bytes = std::mem::size_of_val(perm_h.as_slice());
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_d2h(
+                            perm_h.as_mut_ptr() as *mut c_void,
+                            perm.ptr,
+                            bytes,
+                        )
+                    },
+                    "perm d2h",
+                )
+                .unwrap();
+            }
+            for z in 0..nz {
+                for c in 0..nc {
+                    let mut idx: Vec<usize> = (0..nrow).collect();
+                    idx.sort_by(|&a, &b| {
+                        host[(z * nrow + a) * nc + c].total_cmp(&host[(z * nrow + b) * nc + c])
+                    });
+                    for rank in 0..nrow {
+                        let o = (z * nrow + rank) * nc + c;
+                        assert_eq!(
+                            perm_h[o] as usize, idx[rank],
+                            "perm mismatch z={z} c={c} rank={rank}"
+                        );
+                        let want = host[(z * nrow + idx[rank]) * nc + c];
+                        assert_eq!(sorted_h[o], want, "value mismatch z={z} c={c} rank={rank}");
+                    }
+                }
+            }
         }
     }
 }
