@@ -127,6 +127,8 @@ mod cuda_impl {
     use ndarray::{Array3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::os::raw::c_void;
     use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -254,6 +256,33 @@ mod cuda_impl {
         fn drop(&mut self) {
             unsafe { ffi::tomoxide_cuda_free(self.ptr) };
         }
+    }
+
+    thread_local! {
+        /// Per-thread reusable device scratch for the composed FFT path, keyed by
+        /// exact byte size. `Fft::for_each_slice` runs the per-slice loop on
+        /// device-pinned worker threads, and each thread issues many same-shaped
+        /// `fft_1d`/`fft_2d` calls, so a `cudaMalloc`/`cudaFree` per call serialized
+        /// on the driver and dominated the per-slice cost. Thread-local ⇒ no
+        /// locking and each buffer lives on the device its worker is pinned to;
+        /// keyed by size ⇒ a constant-shape loop reuses one allocation for all
+        /// slices. Buffers are freed when the worker thread exits (process end).
+        static FFT_SCRATCH: RefCell<HashMap<usize, DevBuf>> = RefCell::new(HashMap::new());
+    }
+
+    /// Run `f` with a thread-local device scratch buffer of exactly `bytes`,
+    /// allocating it once per (thread, size) and reusing it thereafter. Replaces
+    /// the per-call `DevBuf::from_host_f32` allocate-free in the FFT wrappers.
+    fn with_fft_scratch<R>(bytes: usize, f: impl FnOnce(&DevBuf) -> Result<R>) -> Result<R> {
+        use std::collections::hash_map::Entry;
+        FFT_SCRATCH.with(|cell| {
+            let mut map = cell.borrow_mut();
+            let buf = match map.entry(bytes) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(DevBuf::new(bytes)?),
+            };
+            f(buf)
+        })
     }
 
     /// An owned CUDA stream. Work issued on it runs in order but overlaps work on
@@ -2297,13 +2326,14 @@ mod cuda_impl {
                 });
             }
             let flat = complex_as_f32_mut(buf);
-            let d = DevBuf::from_host_f32(flat)?;
-            ck(
-                unsafe { ffi::tomoxide_fft_1d(d.ptr, len, batch, inverse as i32) },
-                "fft_1d",
-            )?;
-            d.to_host_f32(flat)?;
-            Ok(())
+            with_fft_scratch(std::mem::size_of_val(flat), |d| {
+                d.copy_from_host_f32(flat)?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_1d(d.ptr, len, batch, inverse as i32) },
+                    "fft_1d",
+                )?;
+                d.to_host_f32(flat)
+            })
         }
 
         fn fft_2d(
@@ -2324,13 +2354,14 @@ mod cuda_impl {
                 });
             }
             let flat = complex_as_f32_mut(buf);
-            let d = DevBuf::from_host_f32(flat)?;
-            ck(
-                unsafe { ffi::tomoxide_fft_2d(d.ptr, rows, cols, batch, inverse as i32) },
-                "fft_2d",
-            )?;
-            d.to_host_f32(flat)?;
-            Ok(())
+            with_fft_scratch(std::mem::size_of_val(flat), |d| {
+                d.copy_from_host_f32(flat)?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_2d(d.ptr, rows, cols, batch, inverse as i32) },
+                    "fft_2d",
+                )?;
+                d.to_host_f32(flat)
+            })
         }
     }
 
