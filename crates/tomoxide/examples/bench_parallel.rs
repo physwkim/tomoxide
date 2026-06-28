@@ -14,7 +14,7 @@ use std::time::Instant;
 use ndarray::Array3;
 use tomoxide::recon::recon;
 use tomoxide::{
-    Algorithm, Angles, BackendKind, Engine, Geometry, Layout, PhaseMethod, ReconParams, Tomo,
+    Algorithm, Angles, BackendKind, Dtype, Engine, Geometry, Layout, PhaseMethod, ReconParams, Tomo,
 };
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -80,6 +80,12 @@ fn main() {
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "all".into());
     let want = |name: &str| only == "all" || only == name;
+    // Optional 7th arg: reconstruction precision (float32|float16). f16 applies
+    // to the fused CUDA Fbp/Linerec/Fourierrec paths only; other algos ignore it.
+    let dtype = match args.get(7).map(|s| s.to_lowercase()).as_deref() {
+        Some("float16") | Some("f16") | Some("half") => Dtype::F16,
+        _ => Dtype::F32,
+    };
 
     let kind = match backend_kind {
         "cuda" => BackendKind::Cuda,
@@ -91,8 +97,9 @@ fn main() {
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "all".into());
 
     println!(
-        "backend={}  nd={nd} nang={nang} nz={nz}  reps={reps}  RAYON_NUM_THREADS={threads}",
-        backend.name()
+        "backend={}  nd={nd} nang={nang} nz={nz}  reps={reps}  dtype={}  RAYON_NUM_THREADS={threads}",
+        backend.name(),
+        dtype.as_str()
     );
 
     // Equally spaced angles over [0, pi) — required for lprec's log-polar grid.
@@ -102,6 +109,7 @@ fn main() {
     let geom = Geometry::parallel(Angles(theta.clone()), nd, nz, 1.0);
     let params = ReconParams {
         num_gridx: Some(nd),
+        dtype,
         ..Default::default()
     };
 
