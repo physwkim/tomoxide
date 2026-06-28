@@ -382,15 +382,17 @@ fn chunk_geometry(geom: &Geometry, r0: usize, r1: usize) -> Geometry {
 /// `Some(Some(_))` = reuse.
 ///
 /// Two routes, identical output:
-/// - **Device-resident** (CUDA, `stripe == None`): the raw projection chunk goes
-///   straight to [`StreamingAnalytic::reconstruct_chunk_raw`], which does
-///   dark/flat correction, minus-log, and the projection→sinogram transpose on
-///   the device — one PCIe upload, one download, no host normalize round-trip or
-///   transpose copy. Skipped when stripe removal is requested (it runs on the
-///   host sinogram this route never materializes), or when the reconstructor
-///   declines (`Ok(None)`).
-/// - **Host** (CPU/wgpu, or stripe removal requested): normalize → transpose →
-///   stripe removal on the host, then `reconstruct_chunk` / stateless `recon`.
+/// - **Device-resident** (CUDA): the raw projection chunk goes straight to
+///   [`StreamingAnalytic::reconstruct_chunk_raw`], which does dark/flat
+///   correction, minus-log, the projection→sinogram transpose, and any
+///   GPU-ported `stripe` removal on the device — one PCIe upload, one download,
+///   no host normalize round-trip or transpose copy. The reconstructor decides
+///   whether it can run the requested `stripe` on the GPU; when it cannot (or
+///   has no device path at all) it returns `Ok(None)` and the whole chunk falls
+///   through to the host route.
+/// - **Host** (CPU/wgpu, or a stripe method with no GPU port): normalize →
+///   transpose → stripe removal on the host, then `reconstruct_chunk` /
+///   stateless `recon`.
 #[allow(clippy::too_many_arguments)]
 fn chunk_to_volume(
     slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
@@ -413,14 +415,19 @@ fn chunk_to_volume(
         };
         *slot = Some(built);
     }
-    // Device-resident fast path: only when no host sinogram stage is needed.
-    if prep.stripe == StripeMethod::None {
-        if let Some(Some(s)) = slot.as_mut() {
-            if let Some(vol) =
-                s.reconstruct_chunk_raw(&ds.data, ds.flat.as_ref(), ds.dark.as_ref(), chunk_geom)?
-            {
-                return Ok(vol);
-            }
+    // Device-resident fast path. The reconstructor applies any GPU-ported stripe
+    // method itself and returns `Ok(None)` when it cannot (no device path, or the
+    // stripe method has no GPU port), in which case the whole chunk falls through
+    // to the host route below.
+    if let Some(Some(s)) = slot.as_mut() {
+        if let Some(vol) = s.reconstruct_chunk_raw(
+            &ds.data,
+            ds.flat.as_ref(),
+            ds.dark.as_ref(),
+            chunk_geom,
+            prep.stripe,
+        )? {
+            return Ok(vol);
         }
     }
     // Host path: normalize → transpose (to C-contiguous sinogram so the

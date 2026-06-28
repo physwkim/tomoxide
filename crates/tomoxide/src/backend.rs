@@ -12,7 +12,7 @@ use crate::data::{Frames, Tomo, Volume};
 use crate::dtype::{Complex32, Dtype, Element};
 use crate::error::Result;
 use crate::geometry::Geometry;
-use crate::params::FilterName;
+use crate::params::{FilterName, StripeMethod};
 
 /// Which physical device a backend runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,17 +294,23 @@ pub trait StreamingAnalytic {
     /// chunk crosses PCIe exactly once up and the volume once down — no host
     /// normalize round-trip and no host transpose copy.
     ///
-    /// Returns `Ok(None)` when this reconstructor has no device-resident path
-    /// (the caller then falls back to host normalize + transpose +
-    /// [`reconstruct_chunk`]). Callers MUST NOT use this when stripe removal is
-    /// requested: that runs on the host sinogram, which this path never
-    /// materializes. `data` must be [`Layout::Projection`](crate::data::Layout).
+    /// `stripe` requests on-device stripe removal applied to the transposed f32
+    /// sinogram (before any f16 cast). The reconstructor returns `Ok(None)` —
+    /// deferring the *whole* chunk to the host path — both when it has no
+    /// device-resident path at all and when it has one but cannot run the
+    /// requested `stripe` method on the device. `StripeMethod::None` is always
+    /// handled (no-op). This keeps the device/host gating decision inside the
+    /// backend: the caller simply falls back to host normalize + transpose +
+    /// host `remove_stripe` + [`reconstruct_chunk`] whenever this returns `None`.
+    ///
+    /// `data` must be [`Layout::Projection`](crate::data::Layout).
     fn reconstruct_chunk_raw(
         &mut self,
         _data: &Tomo<f32>,
         _flat: Option<&Frames<f32>>,
         _dark: Option<&Frames<f32>>,
         _geom: &Geometry,
+        _stripe: StripeMethod,
     ) -> Result<Option<Volume<f32>>> {
         Ok(None)
     }

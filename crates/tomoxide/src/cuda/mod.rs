@@ -123,7 +123,7 @@ mod cuda_impl {
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
     use crate::geometry::{Beam, Geometry};
-    use crate::params::FilterName;
+    use crate::params::{FilterName, StripeMethod};
     use ndarray::{Array3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -665,6 +665,10 @@ mod cuda_impl {
         // on the f32 path, which needs no cast. Mirrors tomocupy's GPU-side astype.
         sino_f32: Option<DevBuf>,
         f_f32: Option<DevBuf>,
+        // On-device stripe scratch (`tomoxide_stripe_ti`): `max_nz * 7 * ncols`
+        // f64, allocated lazily on the first device-stripe chunk. None until a
+        // chunk actually requests a GPU-ported stripe method.
+        ti_scratch: Option<DevBuf>,
         filt: *mut c_void,
         lrec: *mut c_void,
     }
@@ -769,6 +773,7 @@ mod cuda_impl {
                 denom,
                 sino_f32,
                 f_f32,
+                ti_scratch: None,
                 filt,
                 lrec,
             })
@@ -850,10 +855,17 @@ mod cuda_impl {
             flat: Option<&Frames<f32>>,
             dark: Option<&Frames<f32>>,
             geom: &Geometry,
+            stripe: StripeMethod,
         ) -> Result<Option<Volume<f32>>> {
             // The device-resident path consumes the raw projection-layout chunk;
             // for any other layout defer to the host path (`Ok(None)`).
             if data.layout != Layout::Projection {
+                return Ok(None);
+            }
+            // Defer the whole chunk to the host when the requested stripe method
+            // has no on-device port — checked before any GPU work so we don't
+            // normalize on the device only to have the host redo it.
+            if !gpu_supports_stripe(stripe) {
                 return Ok(None);
             }
             let (nproj, nz, ncols) = data.array.dim();
@@ -924,8 +936,9 @@ mod cuda_impl {
             )?;
             // Transpose projection → sinogram on the device. The transpose writes
             // only the `nz` valid rows of the sinogram, so zero the tail first on a
-            // partial chunk (as `reconstruct_chunk` does). The f16 path transposes
-            // into the f32 staging buffer, then casts into the f16 `sino`.
+            // partial chunk (as `reconstruct_chunk` does). Both paths transpose
+            // into an f32 buffer (`sino` for f32, the `sino_f32` staging buffer for
+            // f16) so on-device stripe removal runs on f32; the f16 cast follows.
             let partial = nz < self.max_nz;
             if partial {
                 ck(
@@ -933,18 +946,27 @@ mod cuda_impl {
                     "memset sino",
                 )?;
             }
+            let f32_target = if self.f16 {
+                self.sino_f32.as_ref().expect("f16 path has sino_f32").ptr
+            } else {
+                self.sino.ptr
+            };
+            ck(
+                unsafe {
+                    ffi::tomoxide_transpose(self.proj.ptr, f32_target, nproj, nz, ncols, null)
+                },
+                "transpose",
+            )?;
+            // On-device stripe removal on the f32 sinogram (no-op for
+            // `StripeMethod::None`). `gpu_supports_stripe` was checked above, so a
+            // `false` here is a logic error rather than a silent host fallback.
+            let handled = self.stripe_on_device(f32_target, nz, stripe)?;
+            debug_assert!(handled, "gpu_supports_stripe accepted an unhandled method");
             if self.f16 {
-                let sino_f32 = self.sino_f32.as_ref().expect("f16 path has sino_f32");
-                ck(
-                    unsafe {
-                        ffi::tomoxide_transpose(self.proj.ptr, sino_f32.ptr, nproj, nz, ncols, null)
-                    },
-                    "transpose",
-                )?;
                 ck(
                     unsafe {
                         ffi::tomoxide_cast_f32_to_f16(
-                            sino_f32.ptr,
+                            f32_target,
                             self.sino.ptr,
                             nz * nproj * ncols,
                             null,
@@ -952,22 +974,61 @@ mod cuda_impl {
                     },
                     "cast f32->f16 sino",
                 )?;
-            } else {
-                ck(
-                    unsafe {
-                        ffi::tomoxide_transpose(
-                            self.proj.ptr,
-                            self.sino.ptr,
-                            nproj,
-                            nz,
-                            ncols,
-                            null,
-                        )
-                    },
-                    "transpose",
-                )?;
             }
             Ok(Some(self.finish_recon(nz, geom)?))
+        }
+    }
+
+    /// Whether the device-resident path can run `stripe` on the GPU. `None` is a
+    /// no-op (always handled). Methods without a GPU port make the caller defer
+    /// the whole chunk to the host. Kept in sync with [`CudaFbpStream::stripe_on_device`].
+    fn gpu_supports_stripe(stripe: StripeMethod) -> bool {
+        matches!(
+            stripe,
+            StripeMethod::None | StripeMethod::Ti { nblock: 0, .. }
+        )
+    }
+
+    impl CudaFbpStream {
+        /// Apply on-device stripe removal to the f32 sinogram at `ptr` (the valid
+        /// `[nz, nproj, ncols]` prefix), in place. Returns `Ok(true)` when the
+        /// method was handled on the device, `Ok(false)` when it has no GPU port
+        /// (kept consistent with [`gpu_supports_stripe`]).
+        fn stripe_on_device(
+            &mut self,
+            ptr: *mut c_void,
+            nz: usize,
+            stripe: StripeMethod,
+        ) -> Result<bool> {
+            let null = std::ptr::null_mut::<c_void>();
+            match stripe {
+                StripeMethod::None => Ok(true),
+                // Titarenko, whole-sinogram (nblock=0). nblock>0 uses `_ringb`,
+                // which is not ported — leave it to the host.
+                StripeMethod::Ti { nblock: 0, beta } => {
+                    if self.ti_scratch.is_none() {
+                        let bytes = self.max_nz * 7 * self.ncols * std::mem::size_of::<f64>();
+                        self.ti_scratch = Some(DevBuf::zeroed(bytes)?);
+                    }
+                    let scratch = self.ti_scratch.as_ref().expect("ti_scratch allocated");
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_stripe_ti(
+                                ptr,
+                                nz,
+                                self.nproj,
+                                self.ncols,
+                                beta,
+                                scratch.ptr,
+                                null,
+                            )
+                        },
+                        "stripe_ti",
+                    )?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
     }
 
@@ -2740,6 +2801,103 @@ mod cuda_impl {
                 Array3::from_shape_vec((nz, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda fourierrec shape: {e}")))?,
             ))
+        }
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    mod stripe_gpu_tests {
+        use super::*;
+        use crate::data::{Layout, Tomo};
+        use crate::params::StripeMethod;
+        use ndarray::Array3;
+
+        fn pearson(a: &[f32], b: &[f32]) -> f64 {
+            let n = a.len() as f64;
+            let (mut sa, mut sb) = (0.0, 0.0);
+            for i in 0..a.len() {
+                sa += a[i] as f64;
+                sb += b[i] as f64;
+            }
+            let (ma, mb) = (sa / n, sb / n);
+            let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
+            for i in 0..a.len() {
+                let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
+                cov += da * db;
+                va += da * da;
+                vb += db * db;
+            }
+            cov / (va.sqrt() * vb.sqrt())
+        }
+
+        // Synthetic sinogram [nz, nproj, ncol]: a smooth angle/column structure
+        // plus a per-column constant offset (the classic stripe → ring), so the
+        // Titarenko correction has something to remove.
+        fn synthetic(nz: usize, nproj: usize, ncol: usize) -> Vec<f32> {
+            let mut v = vec![0.0f32; nz * nproj * ncol];
+            for z in 0..nz {
+                for p in 0..nproj {
+                    for c in 0..ncol {
+                        let base = (p as f32 * 0.05).sin() + (c as f32 * 0.03).cos();
+                        let stripe = (((c * 7 + 13) % 17) as f32 / 17.0 - 0.5) * 0.4;
+                        v[(z * nproj + p) * ncol + c] = base + 1.0 + stripe + z as f32 * 0.01;
+                    }
+                }
+            }
+            v
+        }
+
+        // The GPU Titarenko kernel solves the same (HᵀH + αI)q = f systems as the
+        // CPU golden via CG; parallel f64 reductions differ in summation order, so
+        // it is held to correlation parity, not bit-exactness.
+        #[test]
+        fn stripe_ti_matches_cpu_golden() {
+            let (nz, nproj, ncol) = (4usize, 180usize, 192usize);
+            let host = synthetic(nz, nproj, ncol);
+
+            // CPU golden.
+            let mut cpu = Tomo::new(
+                Array3::from_shape_vec((nz, nproj, ncol), host.clone()).unwrap(),
+                Layout::Sinogram,
+            );
+            crate::prep::remove_stripe(
+                &mut cpu,
+                StripeMethod::Ti {
+                    nblock: 0,
+                    beta: 1.5,
+                },
+            )
+            .unwrap();
+            let cpu_v: Vec<f32> = cpu.array.iter().copied().collect();
+
+            // GPU: run the kernel on a device copy of the same sinogram.
+            let _b = CudaBackend::new().expect("cuda backend");
+            ck(unsafe { ffi::tomoxide_cuda_set_device(0) }, "set_device").unwrap();
+            let dev = DevBuf::from_host_f32(&host).unwrap();
+            let scratch = DevBuf::zeroed(nz * 7 * ncol * std::mem::size_of::<f64>()).unwrap();
+            let null = std::ptr::null_mut::<c_void>();
+            ck(
+                unsafe {
+                    ffi::tomoxide_stripe_ti(dev.ptr, nz, nproj, ncol, 1.5, scratch.ptr, null)
+                },
+                "stripe_ti",
+            )
+            .unwrap();
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync").unwrap();
+            let mut gpu_v = vec![0.0f32; nz * nproj * ncol];
+            dev.to_host_f32(&mut gpu_v).unwrap();
+
+            let r = pearson(&cpu_v, &gpu_v);
+            let max_abs: f32 = cpu_v
+                .iter()
+                .zip(&gpu_v)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            let nan = gpu_v.iter().filter(|v| !v.is_finite()).count();
+            println!("TI GPU vs CPU: pearson={r:.8} max_abs_diff={max_abs:.3e} nan={nan}");
+            assert_eq!(nan, 0, "GPU TI produced non-finite values");
+            // Same CG systems, same combine: matches the CPU golden to the f32
+            // reduction-order floor (parallel dot products reassociate the sums).
+            assert!(r > 0.99999, "TI GPU vs CPU correlation too low: {r}");
         }
     }
 }

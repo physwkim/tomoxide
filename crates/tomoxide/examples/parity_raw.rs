@@ -100,7 +100,13 @@ fn run_case(
     // Path B — device-resident raw path on the un-normalized projection chunk.
     let raw_tomo = Tomo::new(raw, Layout::Projection);
     let vol_raw = recon
-        .reconstruct_chunk_raw(&raw_tomo, flat.as_ref(), dark.as_ref(), geom)
+        .reconstruct_chunk_raw(
+            &raw_tomo,
+            flat.as_ref(),
+            dark.as_ref(),
+            geom,
+            tomoxide::params::StripeMethod::None,
+        )
         .expect("reconstruct_chunk_raw ok")
         .expect("cuda returns Some from reconstruct_chunk_raw");
 

@@ -144,6 +144,20 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Titarenko (`remove_stripe_ti`, nblock=0) on the f32 sinogram
+    /// `[nz, nproj, ncol]`, in place. `scratch` is `nz * 7 * ncol` doubles.
+    /// One block per slice runs the conjugate-gradient solve in f64; held to
+    /// correlation parity with the CPU golden, not bit-exactness. Returns 0 ok.
+    pub fn tomoxide_stripe_ti(
+        sino: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncol: usize,
+        beta: f32,
+        scratch: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // --- device-resident analytic pipeline helpers ---
     /// Edge-replicate pad `[nz,nproj,ncols]` → `[nz,nproj,ne]` (centred at `pad_side`).
     pub fn tomoxide_pad(
