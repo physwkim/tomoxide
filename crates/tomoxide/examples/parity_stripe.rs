@@ -140,13 +140,22 @@ fn main() {
         .collect();
     let geom = Geometry::parallel(Angles(theta.clone()), ncols, max_nz, 1.0);
 
-    let methods: &[(&str, StripeMethod)] = &[(
-        "ti",
-        StripeMethod::Ti {
-            nblock: 0,
-            beta: 1.5,
-        },
-    )];
+    let methods: &[(&str, StripeMethod)] = &[
+        (
+            "ti",
+            StripeMethod::Ti {
+                nblock: 0,
+                beta: 1.5,
+            },
+        ),
+        (
+            "fw",
+            StripeMethod::Fw {
+                sigma: 2.0,
+                level: None,
+            },
+        ),
+    ];
 
     println!("parity_stripe: nproj={nproj} max_nz={max_nz} ncols={ncols}");
     let mut all_ok = true;

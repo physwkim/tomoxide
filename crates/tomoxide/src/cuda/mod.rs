@@ -159,6 +159,22 @@ mod cuda_impl {
             Ok(buf)
         }
 
+        /// Upload host f64 `data` into a fresh device buffer (FW wavelet path is
+        /// f64; also used for the per-level damping vectors).
+        fn from_host_f64(data: &[f64]) -> Result<Self> {
+            let bytes = std::mem::size_of_val(data);
+            let buf = DevBuf::new(bytes)?;
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_h2d(buf.ptr, data.as_ptr() as *const c_void, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!(
+                    "cudaMemcpy H2D (f64) failed ({rc})"
+                )));
+            }
+            Ok(buf)
+        }
+
         fn zeroed(bytes: usize) -> Result<Self> {
             let buf = DevBuf::new(bytes)?;
             let rc = unsafe { ffi::tomoxide_cuda_memset(buf.ptr, 0, bytes) };
@@ -199,6 +215,23 @@ mod cuda_impl {
                 )));
             }
             Ok(buf)
+        }
+
+        /// Download `count` f64 elements into a fresh Vec (FW test helper).
+        #[cfg(test)]
+        fn to_host_f64(&self, count: usize) -> Result<Vec<f64>> {
+            let mut out = vec![0.0f64; count];
+            let bytes = std::mem::size_of_val(out.as_slice());
+            debug_assert!(bytes <= self.bytes);
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_d2h(out.as_mut_ptr() as *mut c_void, self.ptr, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!(
+                    "cudaMemcpy D2H (f64) failed ({rc})"
+                )));
+            }
+            Ok(out)
         }
 
         /// Upload host f32 `data` into this **already-allocated** buffer (no
@@ -985,8 +1018,22 @@ mod cuda_impl {
     fn gpu_supports_stripe(stripe: StripeMethod) -> bool {
         matches!(
             stripe,
-            StripeMethod::None | StripeMethod::Ti { nblock: 0, .. }
+            StripeMethod::None | StripeMethod::Ti { nblock: 0, .. } | StripeMethod::Fw { .. }
         )
+    }
+
+    /// Münch damping vector `D = ifftshift(damp)` (matches `stripe::damp_vector`),
+    /// computed in f32 like tomopy and returned as f64 for the device multiply.
+    fn fw_damp_vector(my: usize, sigma: f32) -> Vec<f64> {
+        let two_sig2 = 2.0f32 * sigma * sigma;
+        let damp: Vec<f32> = (0..my)
+            .map(|k| {
+                let y_hat = ((-(my as i64) + 2 * k as i64) as f32 + 1.0) / 2.0;
+                1.0f32 - (-(y_hat * y_hat) / two_sig2).exp()
+            })
+            .collect();
+        let half = my / 2;
+        (0..my).map(|i| damp[(i + half) % my] as f64).collect()
     }
 
     impl CudaFbpStream {
@@ -1027,8 +1074,218 @@ mod cuda_impl {
                     )?;
                     Ok(true)
                 }
+                // Fourier-Wavelet. Multi-level db5 DWT/IDWT with per-column FFT
+                // damping of the vertical band; orchestrated below.
+                StripeMethod::Fw { sigma, level } => {
+                    self.fw_on_device(ptr, nz, sigma, level)?;
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
+        }
+
+        /// Multi-level Fourier-Wavelet stripe removal on the device f32 sinogram
+        /// `ptr [nz, nproj, ncol]`, mirroring `stripe::fw_slice` /
+        /// `remove_stripe_fw` for all `nz` slices at once: db5 DWT/IDWT in f64
+        /// (each band rounded to f32 like tomopy's `pywt` float32 pass) with the
+        /// vertical-detail band damped column-wise via the f32 cuFFT shim. Held
+        /// to correlation parity with the CPU golden, not bit-exactness.
+        ///
+        /// Per-call device buffers are allocated fresh (the band shapes depend on
+        /// the chunk's `nz` through `level`); reuse/caching is a later
+        /// optimization, not a correctness concern.
+        fn fw_on_device(
+            &self,
+            ptr: *mut c_void,
+            nz: usize,
+            sigma: f32,
+            level: Option<usize>,
+        ) -> Result<()> {
+            let null = std::ptr::null_mut::<c_void>();
+            let (nproj, ncol) = (self.nproj, self.ncols);
+            if nproj == 0 || nz == 0 || ncol == 0 {
+                return Ok(());
+            }
+            // Auto-level matches the CPU golden: ceil(log2(max(nproj, nz, ncol))),
+            // where the chunk's `nz` plays tomopy's `nrows`.
+            let level = level.unwrap_or_else(|| {
+                let size = nproj.max(nz).max(ncol);
+                (size as f64).log2().ceil() as usize
+            });
+            if level == 0 {
+                return Ok(());
+            }
+            let nx = nproj + nproj / 8; // pad=True
+            let xshift = (nx - nproj) / 2;
+            let f64sz = std::mem::size_of::<f64>();
+
+            // approx = pad(sino) → f64 [nz, nx, ncol].
+            let mut approx = DevBuf::new(nz * nx * ncol * f64sz)?;
+            ck(
+                unsafe { ffi::tomoxide_fw_pad(ptr, approx.ptr, nz, nproj, ncol, nx, xshift, null) },
+                "fw_pad",
+            )?;
+
+            // Per-level detail bands (kept for the inverse pass) and their shapes.
+            let mut chs: Vec<DevBuf> = Vec::with_capacity(level);
+            let mut cvs: Vec<DevBuf> = Vec::with_capacity(level);
+            let mut cds: Vec<DevBuf> = Vec::with_capacity(level);
+            let mut dims: Vec<(usize, usize)> = Vec::with_capacity(level);
+
+            // Reusable interleaved-complex scratch for the damping FFT, sized for
+            // the largest band (level 0); smaller levels use a contiguous prefix.
+            let or0 = (nx + 9) / 2;
+            let oc0 = (ncol + 9) / 2;
+            let cplx = DevBuf::new(nz * or0 * oc0 * 2 * std::mem::size_of::<f32>())?;
+
+            // Forward: `level`-deep db5 decomposition (rows pass then cols pass),
+            // each band rounded to f32, vertical band damped.
+            let (mut r, mut c) = (nx, ncol);
+            for _ in 0..level {
+                let or = (r + 9) / 2;
+                let oc = (c + 9) / 2;
+                // Rows pass (last axis): approx[nz,r,c] → cols_a, cols_d [nz,r,oc].
+                let cols_a = DevBuf::new(nz * r * oc * f64sz)?;
+                let cols_d = DevBuf::new(nz * r * oc * f64sz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_dwt_rows(
+                            approx.ptr, cols_a.ptr, cols_d.ptr, nz, r, c, null,
+                        )
+                    },
+                    "fw_dwt_rows",
+                )?;
+                // Cols pass (middle axis): cols_a → ca,ch; cols_d → cv,cd [nz,or,oc].
+                let ca = DevBuf::new(nz * or * oc * f64sz)?;
+                let ch = DevBuf::new(nz * or * oc * f64sz)?;
+                let cv = DevBuf::new(nz * or * oc * f64sz)?;
+                let cd = DevBuf::new(nz * or * oc * f64sz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_dwt_cols(cols_a.ptr, ca.ptr, ch.ptr, nz, r, oc, null)
+                    },
+                    "fw_dwt_cols(approx)",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_dwt_cols(cols_d.ptr, cv.ptr, cd.ptr, nz, r, oc, null)
+                    },
+                    "fw_dwt_cols(detail)",
+                )?;
+                // Round every band to f32 (tomopy band quantization).
+                let n_band = nz * or * oc;
+                ck(
+                    unsafe { ffi::tomoxide_fw_round(ca.ptr, n_band, null) },
+                    "fw_round(ca)",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fw_round(ch.ptr, n_band, null) },
+                    "fw_round(ch)",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fw_round(cv.ptr, n_band, null) },
+                    "fw_round(cv)",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fw_round(cd.ptr, n_band, null) },
+                    "fw_round(cd)",
+                )?;
+                // Damp the vertical-detail band cv along axis 0 (my=or, mx=oc):
+                // real(ifft(fft(col) · D)), D = ifftshift(damp).
+                let d = DevBuf::from_host_f64(&fw_damp_vector(or, sigma))?;
+                ck(
+                    unsafe { ffi::tomoxide_fw_damp_gather(cv.ptr, cplx.ptr, nz, or, oc, null) },
+                    "fw_damp_gather",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_1d(cplx.ptr, or, nz * oc, 0) },
+                    "fw_damp_fft_fwd",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fw_damp_apply(cplx.ptr, d.ptr, nz, or, oc, null) },
+                    "fw_damp_apply",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_1d(cplx.ptr, or, nz * oc, 1) },
+                    "fw_damp_fft_inv",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fw_damp_scatter(cplx.ptr, cv.ptr, nz, or, oc, null) },
+                    "fw_damp_scatter",
+                )?;
+
+                chs.push(ch);
+                cvs.push(cv);
+                cds.push(cd);
+                dims.push((or, oc));
+                approx = ca; // running approximation for the next level
+                r = or;
+                c = oc;
+            }
+
+            // Inverse: crop the running approximation to each level's band shape,
+            // then idwt2 (cols pass then rows pass) with the damped details.
+            let mut sli = approx;
+            let (mut sr, mut sc) = (r, c);
+            for n in (0..level).rev() {
+                let (or, oc) = dims[n];
+                let cropped = DevBuf::new(nz * or * oc * f64sz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_crop(sli.ptr, cropped.ptr, nz, sr, sc, or, oc, null)
+                    },
+                    "fw_crop",
+                )?;
+                // idwt2 cols pass (middle axis): combine (ca,ch) and (cv,cd).
+                let rr = 2 * or + 2 - 10;
+                let cols_a = DevBuf::new(nz * rr * oc * f64sz)?;
+                let cols_d = DevBuf::new(nz * rr * oc * f64sz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_idwt_cols(
+                            cropped.ptr,
+                            chs[n].ptr,
+                            cols_a.ptr,
+                            nz,
+                            or,
+                            oc,
+                            null,
+                        )
+                    },
+                    "fw_idwt_cols(approx)",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_idwt_cols(
+                            cvs[n].ptr, cds[n].ptr, cols_d.ptr, nz, or, oc, null,
+                        )
+                    },
+                    "fw_idwt_cols(detail)",
+                )?;
+                // idwt2 rows pass (last axis): combine the two column results.
+                let rc_ = 2 * oc + 2 - 10;
+                let out = DevBuf::new(nz * rr * rc_ * f64sz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fw_idwt_rows(
+                            cols_a.ptr, cols_d.ptr, out.ptr, nz, rr, oc, null,
+                        )
+                    },
+                    "fw_idwt_rows",
+                )?;
+                sli = out;
+                sr = rr;
+                sc = rc_;
+            }
+
+            // Crop back to the sinogram region → write f32 into `ptr` in place.
+            ck(
+                unsafe {
+                    ffi::tomoxide_fw_final(sli.ptr, ptr, nz, nproj, ncol, sr, sc, xshift, null)
+                },
+                "fw_final",
+            )?;
+            Ok(())
         }
     }
 
@@ -2898,6 +3155,107 @@ mod cuda_impl {
             // Same CG systems, same combine: matches the CPU golden to the f32
             // reduction-order floor (parallel dot products reassociate the sums).
             assert!(r > 0.99999, "TI GPU vs CPU correlation too low: {r}");
+        }
+
+        // Validate the db5 DWT/IDWT kernels against the pywt oracle (the same
+        // [5,4] case as the CPU `wavelet::dwt2_idwt2_match_pywt` test).
+        #[test]
+        fn fw_wavelet_matches_pywt() {
+            let _b = CudaBackend::new().expect("cuda backend");
+            ck(unsafe { ffi::tomoxide_cuda_set_device(0) }, "set_device").unwrap();
+            let null = std::ptr::null_mut::<c_void>();
+            let f8 = std::mem::size_of::<f64>();
+            let (nz, r, c) = (1usize, 5usize, 4usize);
+            let (oc, or) = ((c + 9) / 2, (r + 9) / 2); // 6, 7
+            let a: Vec<f64> = (0..r * c).map(|i| (i + 1) as f64).collect();
+            let dev_a = DevBuf::from_host_f64(&a).unwrap();
+
+            // Forward dwt2: rows then cols.
+            let cols_a = DevBuf::zeroed(nz * r * oc * f8).unwrap();
+            let cols_d = DevBuf::zeroed(nz * r * oc * f8).unwrap();
+            ck(
+                unsafe {
+                    ffi::tomoxide_fw_dwt_rows(dev_a.ptr, cols_a.ptr, cols_d.ptr, nz, r, c, null)
+                },
+                "dwt_rows",
+            )
+            .unwrap();
+            let (ca, ch, cv, cd) = (
+                DevBuf::zeroed(nz * or * oc * f8).unwrap(),
+                DevBuf::zeroed(nz * or * oc * f8).unwrap(),
+                DevBuf::zeroed(nz * or * oc * f8).unwrap(),
+                DevBuf::zeroed(nz * or * oc * f8).unwrap(),
+            );
+            ck(
+                unsafe { ffi::tomoxide_fw_dwt_cols(cols_a.ptr, ca.ptr, ch.ptr, nz, r, oc, null) },
+                "dwt_cols a",
+            )
+            .unwrap();
+            ck(
+                unsafe { ffi::tomoxide_fw_dwt_cols(cols_d.ptr, cv.ptr, cd.ptr, nz, r, oc, null) },
+                "dwt_cols d",
+            )
+            .unwrap();
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync").unwrap();
+
+            let ca_h = ca.to_host_f64(nz * or * oc).unwrap();
+            let ch_h = ch.to_host_f64(nz * or * oc).unwrap();
+            let cv_h = cv.to_host_f64(nz * or * oc).unwrap();
+            let cd_h = cd.to_host_f64(nz * or * oc).unwrap();
+            assert!(
+                (ca_h[0] - 32.046313561434275).abs() < 1e-9,
+                "ca {}",
+                ca_h[0]
+            );
+            assert!((ch_h[0] - 0.426202580246038).abs() < 1e-9, "ch {}", ch_h[0]);
+            assert!(
+                (cv_h[0] - 0.1888883078383144).abs() < 1e-9,
+                "cv {}",
+                cv_h[0]
+            );
+            assert!(cd_h[0].abs() < 1e-9, "cd {}", cd_h[0]);
+
+            // Inverse idwt2: cols then rows. rR = 2*or+2-10 = 6, rC = 2*oc+2-10 = 4.
+            let rr = 2 * or + 2 - 10;
+            let colsa2 = DevBuf::zeroed(nz * rr * oc * f8).unwrap();
+            let colsd2 = DevBuf::zeroed(nz * rr * oc * f8).unwrap();
+            ck(
+                unsafe { ffi::tomoxide_fw_idwt_cols(ca.ptr, ch.ptr, colsa2.ptr, nz, or, oc, null) },
+                "idwt_cols a",
+            )
+            .unwrap();
+            ck(
+                unsafe { ffi::tomoxide_fw_idwt_cols(cv.ptr, cd.ptr, colsd2.ptr, nz, or, oc, null) },
+                "idwt_cols d",
+            )
+            .unwrap();
+            let rc2 = 2 * oc + 2 - 10;
+            let out = DevBuf::zeroed(nz * rr * rc2 * f8).unwrap();
+            ck(
+                unsafe {
+                    ffi::tomoxide_fw_idwt_rows(colsa2.ptr, colsd2.ptr, out.ptr, nz, rr, oc, null)
+                },
+                "idwt_rows",
+            )
+            .unwrap();
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync").unwrap();
+            let out_h = out.to_host_f64(nz * rr * rc2).unwrap();
+            assert_eq!((rr, rc2), (6, 4));
+            for row in 0..5 {
+                for col in 0..4 {
+                    let want = a[row * 4 + col];
+                    let got = out_h[row * rc2 + col];
+                    assert!(
+                        (got - want).abs() < 1e-8,
+                        "recon[{row},{col}] {got} vs {want}"
+                    );
+                }
+            }
+            assert!(
+                (out_h[5 * rc2 + 3] - 20.0).abs() < 1e-8,
+                "recon[5,3] {}",
+                out_h[5 * rc2 + 3]
+            );
         }
     }
 }

@@ -158,6 +158,113 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // --- Fourier-Wavelet (`remove_stripe_fw`) building blocks, orchestrated
+    // from `CudaFbpStream::stripe_on_device`. All f64 except the damping FFT
+    // (f32 cuFFT via `tomoxide_fft_1d`); batched over the leading `nz`. ---
+    /// Pad f32 sino `[nz,nproj,ncol]` → f64 approx `[nz,nx,ncol]` at row `xshift`.
+    pub fn tomoxide_fw_pad(
+        in_: *const c_void,
+        approx: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncol: usize,
+        nx: usize,
+        xshift: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Crop f64 `sli [nz,sliR,sliC]` rows `[xshift, xshift+nproj)` → f32 sino.
+    pub fn tomoxide_fw_final(
+        sli: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        nproj: usize,
+        ncol: usize,
+        sli_r: usize,
+        sli_c: usize,
+        xshift: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Crop the top-left `[oR,oC]` block of `[nz,inR,inC]` (f64).
+    pub fn tomoxide_fw_crop(
+        in_: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        in_r: usize,
+        in_c: usize,
+        o_r: usize,
+        o_c: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// In-place f32 round-trip of `n` f64 elements (tomopy band quantization).
+    pub fn tomoxide_fw_round(a: *mut c_void, n: usize, stream: *mut c_void) -> i32;
+    /// Forward db5 DWT along the last axis: `[nz,R,C]` → `lo,hi [nz,R,(C+9)/2]`.
+    pub fn tomoxide_fw_dwt_rows(
+        in_: *const c_void,
+        lo: *mut c_void,
+        hi: *mut c_void,
+        nz: usize,
+        r: usize,
+        c: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Forward db5 DWT along the middle axis: `[nz,R,C]` → `lo,hi [nz,(R+9)/2,C]`.
+    pub fn tomoxide_fw_dwt_cols(
+        in_: *const c_void,
+        lo: *mut c_void,
+        hi: *mut c_void,
+        nz: usize,
+        r: usize,
+        c: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Inverse db5 DWT along the middle axis: `lo,hi [nz,L0,C]` → `[nz,2L0+2-10,C]`.
+    pub fn tomoxide_fw_idwt_cols(
+        lo: *const c_void,
+        hi: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        l0: usize,
+        c: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Inverse db5 DWT along the last axis: `lo,hi [nz,R,L1]` → `[nz,R,2L1+2-10]`.
+    pub fn tomoxide_fw_idwt_rows(
+        lo: *const c_void,
+        hi: *const c_void,
+        out: *mut c_void,
+        nz: usize,
+        r: usize,
+        l1: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Gather cv `[nz,my,mx]` (f64) → interleaved f32 complex `[nz*mx][my]`.
+    pub fn tomoxide_fw_damp_gather(
+        cv: *const c_void,
+        cplx: *mut c_void,
+        nz: usize,
+        my: usize,
+        mx: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Multiply each length-`my` spectrum by the damping vector `d[my]`.
+    pub fn tomoxide_fw_damp_apply(
+        cplx: *mut c_void,
+        d: *const c_void,
+        nz: usize,
+        my: usize,
+        mx: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Scatter the real part of `[nz*mx][my]` complex back into cv `[nz,my,mx]`.
+    pub fn tomoxide_fw_damp_scatter(
+        cplx: *const c_void,
+        cv: *mut c_void,
+        nz: usize,
+        my: usize,
+        mx: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     // --- device-resident analytic pipeline helpers ---
     /// Edge-replicate pad `[nz,nproj,ncols]` → `[nz,nproj,ne]` (centred at `pad_side`).
     pub fn tomoxide_pad(
