@@ -2296,14 +2296,13 @@ mod cuda_impl {
                     found: buf.len().to_string(),
                 });
             }
-            let mut flat = complex_to_flat(buf);
-            let d = DevBuf::from_host_f32(&flat)?;
+            let flat = complex_as_f32_mut(buf);
+            let d = DevBuf::from_host_f32(flat)?;
             ck(
                 unsafe { ffi::tomoxide_fft_1d(d.ptr, len, batch, inverse as i32) },
                 "fft_1d",
             )?;
-            d.to_host_f32(&mut flat)?;
-            flat_to_complex(&flat, buf);
+            d.to_host_f32(flat)?;
             Ok(())
         }
 
@@ -2324,34 +2323,29 @@ mod cuda_impl {
                     found: buf.len().to_string(),
                 });
             }
-            let mut flat = complex_to_flat(buf);
-            let d = DevBuf::from_host_f32(&flat)?;
+            let flat = complex_as_f32_mut(buf);
+            let d = DevBuf::from_host_f32(flat)?;
             ck(
                 unsafe { ffi::tomoxide_fft_2d(d.ptr, rows, cols, batch, inverse as i32) },
                 "fft_2d",
             )?;
-            d.to_host_f32(&mut flat)?;
-            flat_to_complex(&flat, buf);
+            d.to_host_f32(flat)?;
             Ok(())
         }
     }
 
-    /// Interleave `[re, im, …]` from a complex slice for upload.
-    fn complex_to_flat(buf: &[crate::dtype::Complex32]) -> Vec<f32> {
-        let mut flat = vec![0.0f32; buf.len() * 2];
-        for (i, c) in buf.iter().enumerate() {
-            flat[2 * i] = c.re;
-            flat[2 * i + 1] = c.im;
-        }
-        flat
-    }
-
-    /// Write an interleaved `[re, im, …]` buffer back into a complex slice.
-    fn flat_to_complex(flat: &[f32], buf: &mut [crate::dtype::Complex32]) {
-        for (i, c) in buf.iter_mut().enumerate() {
-            c.re = flat[2 * i];
-            c.im = flat[2 * i + 1];
-        }
+    /// Reinterpret a `Complex32` slice as the equivalent interleaved
+    /// `[re, im, …]` f32 slice — zero-copy, both for upload and for receiving the
+    /// transform back in place.
+    ///
+    /// Sound because `Complex32 = num_complex::Complex<f32>` is `#[repr(C)]` with
+    /// fields `{ re: f32, im: f32 }`, so `N` complex values occupy exactly the
+    /// same bytes as `2N` contiguous f32 (matching cuFFT's `cufftComplex`). This
+    /// replaces the per-call interleave/deinterleave `Vec<f32>` allocate-and-copy
+    /// in `fft_1d`/`fft_2d` — the dominant host overhead of the composed path.
+    fn complex_as_f32_mut(buf: &mut [crate::dtype::Complex32]) -> &mut [f32] {
+        let len = buf.len() * 2;
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, len) }
     }
 
     impl Elementwise for CudaBackend {
