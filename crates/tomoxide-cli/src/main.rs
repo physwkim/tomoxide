@@ -65,13 +65,57 @@ enum Command {
     ReconSteps {
         /// Input DXchange HDF5 file.
         file: PathBuf,
+        /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …).
+        #[arg(long, default_value = "fbp")]
+        algorithm: String,
+        /// Rotation-axis column (omit to use the detector midline).
+        #[arg(long)]
+        center: Option<f32>,
         /// Reconstruction precision: float32 | float16 (CUDA only).
         #[arg(long, default_value = "float32")]
         dtype: String,
         /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
         #[arg(long, default_value = "tiff")]
         save_format: String,
+        /// Detector rows (slices) reconstructed/written per pipeline chunk
+        /// (tomocupy `--nsino-per-chunk`). Smaller = more read/compute/write
+        /// overlap; larger = fewer per-chunk launches.
+        #[arg(long, default_value_t = DEFAULT_PIPELINE_CHUNK)]
+        chunk: usize,
     },
+}
+
+/// Default z-rows per streaming pipeline chunk. Small enough that the
+/// read‖compute‖write conveyor overlaps well across a typical `nz` (≈128), large
+/// enough that per-chunk launch/setup overhead stays amortized. Mirrors
+/// tomocupy's `--nsino-per-chunk` default magnitude.
+const DEFAULT_PIPELINE_CHUNK: usize = 8;
+
+/// Whether `recon` should reconstruct through the overlapped streaming pipeline
+/// instead of the whole-volume path.
+///
+/// The pipeline overlaps disk read, GPU compute, and disk write and runs
+/// normalize/minus-log/transpose **on the device** (one PCIe round-trip), so for
+/// the per-slice-independent GPU analytic methods it is a strict win over the
+/// serial whole-volume path (which transposes the full projection array on the
+/// host before upload). It pays off only when the per-chunk GPU work dominates
+/// the per-chunk host setup:
+///
+/// - **Fbp / Linerec**: device-resident streaming reconstructor (GPU
+///   normalize/transpose + reused cuFFT/back-projection handles) — large win.
+/// - **Fourierrec**: per-chunk GPU reconstruct (host normalize/transpose, but
+///   cuFFT plans are thread-cached across chunks) — moderate win.
+///
+/// `Gridrec`/`Lprec` do a host gather/deapodize per reconstruct call, so
+/// chunking multiplies that host round-trip and makes the pipeline *slower* than
+/// whole-volume — they stay on the whole-volume path. CPU/wgpu backends have no
+/// device-resident path either, so they also stay whole-volume.
+fn pipelines_well(engine: &Engine, algo: Algorithm) -> bool {
+    engine.name() == "cuda"
+        && matches!(
+            algo,
+            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+        )
 }
 
 fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {
@@ -128,62 +172,116 @@ fn main() -> anyhow::Result<()> {
                 dtype.as_str(),
                 engine.name()
             );
-            let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
-            let geom = geometry_from_reader(reader.as_mut(), center)?;
-            let params = recon_params(&geom, dtype);
-            let ds = reader.read_all()?;
-            let vol = tomoxide::reconstruct(
-                ds,
-                &geom,
-                algo,
-                &params,
-                &tomoxide::PrepOptions::default(),
-                &engine,
-            )?;
             let out = recon_out_path(&file);
-            let mut writer = tomoxide::io::create_writer(&out, save_format)?;
-            let nz = vol.dims().0;
-            writer.reserve(nz)?;
-            writer.write_chunk(&vol, 0, nz)?;
-            println!("wrote {nz} reconstructed slices to {out}");
+            if pipelines_well(&engine, algo) {
+                // Overlapped streaming path: same output as the whole-volume path
+                // (cuFFT-floor identical, Pearson 1.0), lower peak memory, and it
+                // hides disk read/write behind GPU compute. See `pipelines_well`.
+                run_pipelined(
+                    &file,
+                    &out,
+                    algo,
+                    center,
+                    dtype,
+                    save_format,
+                    DEFAULT_PIPELINE_CHUNK,
+                    &engine,
+                )?;
+            } else {
+                // Whole-volume path (CPU/wgpu, or chunking-hostile GPU methods).
+                let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
+                let geom = geometry_from_reader(reader.as_mut(), center)?;
+                let params = recon_params(&geom, dtype);
+                let ds = reader.read_all()?;
+                let vol = tomoxide::reconstruct(
+                    ds,
+                    &geom,
+                    algo,
+                    &params,
+                    &tomoxide::PrepOptions::default(),
+                    &engine,
+                )?;
+                let mut writer = tomoxide::io::create_writer(&out, save_format)?;
+                let nz = vol.dims().0;
+                writer.reserve(nz)?;
+                writer.write_chunk(&vol, 0, nz)?;
+            }
+            println!("wrote reconstruction to {out}");
         }
         Command::ReconSteps {
             file,
+            algorithm,
+            center,
             dtype,
             save_format,
+            chunk,
         } => {
             let engine = Engine::new(backend_kind)?;
+            let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
             let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
             let save_format: tomoxide::io::SaveFormat =
                 save_format.parse().map_err(|e| anyhow!("{e}"))?;
             println!(
-                "recon_steps: file={} dtype={} backend={}",
+                "recon_steps: file={} algorithm={:?} center={:?} dtype={} chunk={} backend={}",
                 file.display(),
+                algo,
+                center,
                 dtype.as_str(),
+                chunk,
                 engine.name()
             );
-            let path = file.to_string_lossy().into_owned();
-            // Probe geometry from a short-lived reader open (metadata only); the
-            // pipeline builds its own reader on the reader thread.
-            let mut probe = tomoxide::io::open_dxchange(&path)?;
-            let geom = geometry_from_reader(probe.as_mut(), None)?;
-            drop(probe);
-            let params = recon_params(&geom, dtype);
             let out = recon_out_path(&file);
-            let read_path = path.clone();
-            let write_path = out.clone();
-            tomoxide::ReconSteps::new(64).run_streaming_pipelined(
-                move || tomoxide::io::open_dxchange(&read_path),
-                move || tomoxide::io::create_writer(&write_path, save_format),
-                &geom,
-                Algorithm::Fbp,
-                &params,
-                &tomoxide::PrepOptions::default(),
+            run_pipelined(
+                &file,
+                &out,
+                algo,
+                center,
+                dtype,
+                save_format,
+                chunk,
                 &engine,
             )?;
             println!("wrote streamed reconstruction to {out}");
         }
     }
+    Ok(())
+}
+
+/// Run the overlapped read‖compute‖write streaming pipeline for one file.
+///
+/// Probes geometry (metadata only) on the calling thread, then hands
+/// reader/writer **factories** to [`ReconSteps::run_streaming_pipelined`] — the
+/// `rust-hdf5` handles are `!Send`, so each I/O object is built on the thread
+/// that owns it. Shared by `recon` (auto-pipelined GPU path) and `recon_steps`.
+#[allow(clippy::too_many_arguments)]
+fn run_pipelined(
+    file: &Path,
+    out: &str,
+    algo: Algorithm,
+    center: Option<f32>,
+    dtype: Dtype,
+    save_format: tomoxide::io::SaveFormat,
+    chunk: usize,
+    engine: &Engine,
+) -> anyhow::Result<()> {
+    let path = file.to_string_lossy().into_owned();
+    // Probe geometry from a short-lived reader open (metadata only); the pipeline
+    // builds its own reader on the reader thread.
+    let mut probe = tomoxide::io::open_dxchange(&path)?;
+    let geom = geometry_from_reader(probe.as_mut(), center)?;
+    drop(probe);
+    let params = recon_params(&geom, dtype);
+    let read_path = path;
+    let write_path = out.to_string();
+    tomoxide::ReconSteps::new(chunk).run_streaming_pipelined(
+        move || tomoxide::io::open_dxchange(&read_path),
+        move || tomoxide::io::create_writer(&write_path, save_format),
+        &geom,
+        algo,
+        &params,
+        &tomoxide::PrepOptions::default(),
+        engine,
+    )?;
     Ok(())
 }
 
