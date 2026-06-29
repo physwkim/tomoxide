@@ -629,23 +629,25 @@ __global__ void vo_absdiff_colsum_ker(const float* sino, const float* smooth, fl
 // 1-D median filter along the last axis (columns) of [nz, R, nc], reflect,
 // window `size`. Used for listdiffbck (R=1), rs_large sinosmooth and rs_sort
 // smoothed (R=nrow). `size` must be <= 256.
+//
+// One thread per (z, r) row slides a sorted window across the nc columns: as the
+// centre advances by one, the value at the leaving raw position is removed and
+// the value at the entering raw position is inserted, both O(size). This visits
+// the same multiset per output as a per-element gather-and-sort, so the median
+// is identical — but at O(nc·size) per row instead of O(nc·size²).
 __global__ void vo_median_axis1_ker(const float* in, float* out, int nz, int R, int nc, int size) {
   long long t = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-  long long total = (long long) nz * R * nc;
+  long long total = (long long) nz * R;
   if (t >= total) return;
-  int c = (int) (t % nc);
-  long long zr = t / nc;
-  int r = (int) (zr % R);
-  int z = (int) (zr / R);
-  int half = size / 2;
+  int r = (int) (t % R);
+  int z = (int) (t / R);
   const float* row = in + ((long long) z * R + r) * nc;
+  float* orow = out + ((long long) z * R + r) * nc;
+  int half = size / 2;
   float w[256];
-  for (int k = 0; k < size; k++) {
-    int cc = vo_reflect((long long) c - half + k, nc);
-    w[k] = row[cc];
-  }
-  // insertion sort ascending (size is small).
-  for (int a = 1; a < size; a++) {
+  // Window centred on column 0.
+  for (int k = 0; k < size; k++) w[k] = row[vo_reflect((long long) -half + k, nc)];
+  for (int a = 1; a < size; a++) {  // insertion sort ascending (size is small)
     float key = w[a];
     int b = a - 1;
     while (b >= 0 && w[b] > key) {
@@ -654,7 +656,27 @@ __global__ void vo_median_axis1_ker(const float* in, float* out, int nz, int R, 
     }
     w[b + 1] = key;
   }
-  out[t] = w[size / 2];
+  orow[0] = w[size / 2];
+  for (int c = 1; c < nc; c++) {
+    // Advancing to c: drop the previous window's leftmost raw position, add the
+    // new rightmost. Reflection is applied per position; the multiset update is
+    // unaffected by it.
+    float vold = row[vo_reflect((long long) (c - 1) - half, nc)];
+    float vnew = row[vo_reflect((long long) (c - 1) - half + size, nc)];
+    // Remove one instance of vold (guaranteed present; clamp guards NaN inputs).
+    int idx = 0;
+    while (idx < size && w[idx] != vold) idx++;
+    if (idx >= size) idx = size - 1;
+    for (int b = idx; b < size - 1; b++) w[b] = w[b + 1];
+    // Insert vnew into the now size-1 sorted prefix.
+    int pos = size - 2;
+    while (pos >= 0 && w[pos] > vnew) {
+      w[pos + 1] = w[pos];
+      pos--;
+    }
+    w[pos + 1] = vnew;
+    orow[c] = w[size / 2];
+  }
 }
 
 // listfact = num/den (or 1 where den == 0), elementwise.
@@ -926,7 +948,7 @@ int tomoxide_vo_median_axis1(const void* in, void* out, size_t nz, size_t R, siz
                              void* stream) {
   if (size > 256) return -1;
   int block = 256;
-  long long total = (long long) nz * R * nc;
+  long long total = (long long) nz * R;  // one thread per (z,r) row (sliding window)
   vo_median_axis1_ker<<<fw_grid(total, block), block, 0, (cudaStream_t) stream>>>(
       (const float*) in, (float*) out, (int) nz, (int) R, (int) nc, (int) size);
   return (int) cudaGetLastError();
