@@ -105,16 +105,19 @@ const DEFAULT_PIPELINE_CHUNK: usize = 8;
 ///   normalize/transpose + reused cuFFT/back-projection handles) — large win.
 /// - **Fourierrec**: per-chunk GPU reconstruct (host normalize/transpose, but
 ///   cuFFT plans are thread-cached across chunks) — moderate win.
+/// - **Lprec**: device-resident streaming reconstructor (GPU spline prefilter +
+///   gather/FFT/scatter, log-polar grids uploaded once and reused) — the
+///   whole-volume path otherwise pays a full-volume host transpose.
 ///
-/// `Gridrec`/`Lprec` do a host gather/deapodize per reconstruct call, so
-/// chunking multiplies that host round-trip and makes the pipeline *slower* than
-/// whole-volume — they stay on the whole-volume path. CPU/wgpu backends have no
+/// `Gridrec` does a host gather/deapodize per reconstruct call, so chunking
+/// multiplies that host round-trip and makes the pipeline *slower* than
+/// whole-volume — it stays on the whole-volume path. CPU/wgpu backends have no
 /// device-resident path either, so they also stay whole-volume.
 fn pipelines_well(engine: &Engine, algo: Algorithm) -> bool {
     engine.name() == "cuda"
         && matches!(
             algo,
-            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec | Algorithm::Lprec
         )
 }
 

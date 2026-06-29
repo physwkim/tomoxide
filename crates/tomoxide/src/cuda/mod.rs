@@ -745,6 +745,16 @@ mod cuda_impl {
         gc: Option<DevBuf>,
         fc: Option<DevBuf>,
         frec: *mut c_void,
+        // Log-polar device-resident path (f32 only). When `lprec` is set the
+        // back-projection tail of `finish_recon` runs the [`LpRecDev`] runtime
+        // (spline prefilter → per-span gather/FFT/scatter) on the filtered `gf`
+        // instead of `cfunc_linerec`/`cfunc_fourierrec`, reusing the same raw-path
+        // normalize/transpose/stripe machinery and the shared `filt` handle. The
+        // grids are built once and held here (reused across chunks); `flc` is the
+        // `[max_nz, nrho, ntheta]` complex work buffer. Both unused (None) on the
+        // FBP/Linerec/Fourierrec paths. lprec/fourier/linerec are mutually exclusive.
+        lprec: Option<LpRecDev>,
+        flc: Option<DevBuf>,
     }
 
     /// Persistent device scratch for the Vo all-stripe pass, sized to the
@@ -825,6 +835,7 @@ mod cuda_impl {
         /// handles for a `max_nz`-slice chunk. `filter` is the ramp kernel
         /// (`make_fbp_filter`), `theta` the chunk-invariant angles. The current
         /// device must already be selected (the caller binds it).
+        #[allow(clippy::too_many_arguments)]
         fn new(
             filter: Vec<f32>,
             theta: &[f32],
@@ -833,6 +844,7 @@ mod cuda_impl {
             max_nz: usize,
             f16: bool,
             fourier: bool,
+            lprec: Option<LpRecDev>,
         ) -> Result<Self> {
             let nproj = theta.len();
             let pad = filter.len();
@@ -877,7 +889,16 @@ mod cuda_impl {
                     ffi::tomoxide_filter_new(nproj, max_nz, pad)
                 }
             };
-            let (lrec, frec, gc, fc) = if fourier {
+            // lprec uses only the shared `filt` handle plus the uploaded grids; it
+            // builds no back-projection tail handle. Its `[max_nz, nrho, ntheta]`
+            // complex work buffer is allocated here and reused across chunks.
+            let flc = match &lprec {
+                Some(lp) => Some(DevBuf::zeroed(lp.flc_bytes(max_nz))?),
+                None => None,
+            };
+            let (lrec, frec, gc, fc) = if lprec.is_some() {
+                (std::ptr::null_mut(), std::ptr::null_mut(), None, None)
+            } else if fourier {
                 // f32-only path (streaming() returns None for f16 Fourierrec).
                 let gc = DevBuf::zeroed(max_nz * nproj * ncols * fsz)?;
                 let fc = DevBuf::zeroed(max_nz * n * n * fsz)?;
@@ -895,8 +916,9 @@ mod cuda_impl {
                 };
                 (lrec, std::ptr::null_mut(), None, None)
             };
+            // lprec has no tail handle, so only `filt` must be non-null there.
             let tail = if fourier { frec } else { lrec };
-            if filt.is_null() || tail.is_null() {
+            if filt.is_null() || (lprec.is_none() && tail.is_null()) {
                 // Free whichever allocation succeeded so a partial failure leaks
                 // nothing (the Drop guard only runs on a fully-built value).
                 unsafe {
@@ -950,6 +972,8 @@ mod cuda_impl {
                 gc,
                 fc,
                 frec,
+                lprec,
+                flc,
             })
         }
     }
@@ -962,7 +986,10 @@ mod cuda_impl {
                 } else {
                     ffi::tomoxide_filter_free(self.filt);
                 }
-                if self.fourier {
+                if self.lprec.is_some() {
+                    // lprec builds no tail handle (only the shared `filt`); the
+                    // grids/flc are freed by their own DevBuf/LpRecDev drops.
+                } else if self.fourier {
                     // f32-only Fourierrec tail.
                     ffi::tomoxide_fourierrec_free(self.frec);
                 } else if self.f16 {
@@ -1874,6 +1901,57 @@ mod cuda_impl {
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
                 let mut host = vec![0.0f32; nz * n * n];
                 f_f32.to_host_f32(&mut host)?;
+                Ok(Volume::new(
+                    Array3::from_shape_vec((nz, n, n), host)
+                        .expect("nz*n*n volume length matches shape"),
+                ))
+            } else if self.lprec.is_some() {
+                // Device-resident log-polar (f32): same pad → filter → crop as the
+                // FBP tail produces the filtered sinogram in `gf`; the held
+                // `LpRecDev` runtime (grids built once, reused across chunks) then
+                // does spline prefilter → per-span gather/FFT/scatter into `f`.
+                ck(
+                    unsafe {
+                        ffi::tomoxide_pad(
+                            self.sino.ptr,
+                            self.gpad.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "pad",
+                )?;
+                unsafe { ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_crop(
+                            self.gpad.ptr,
+                            self.gf.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "crop",
+                )?;
+                // The scatter accumulates over spans, so zero the output first.
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(self.f.ptr, 0, self.f.bytes) },
+                    "memset f",
+                )?;
+                let lp = self.lprec.as_ref().expect("lprec path has grids");
+                let flc = self.flc.as_ref().expect("lprec path has flc");
+                lp.run(self.gf.ptr, flc.ptr, self.f.ptr, nz, nproj, n)?;
+                ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                let mut host = vec![0.0f32; nz * n * n];
+                self.f.to_host_f32(&mut host)?;
                 Ok(Volume::new(
                     Array3::from_shape_vec((nz, n, n), host)
                         .expect("nz*n*n volume length matches shape"),
@@ -2878,12 +2956,13 @@ mod cuda_impl {
             ))
         }
 
-        /// Reuse one set of `cfunc_filter`/`cfunc_linerec` handles across all
-        /// streaming chunks (see [`CudaFbpStream`]). Only the fused FBP/Linerec
-        /// back-projection path is handle-reusing here; `Fourierrec` (its packing +
-        /// `cfunc_fourierrec`), gridrec and lprec return `None` and the caller falls
-        /// back to per-chunk [`reconstruct`]. Binds the first selected device, as the
-        /// f16 one-shot path does, since the handles are device-resident.
+        /// Reuse one set of device handles + uploaded grids across all streaming
+        /// chunks (see [`CudaFbpStream`]). Handle-reusing for FBP/Linerec
+        /// (`cfunc_filter`/`cfunc_linerec`), Fourierrec (`cfunc_fourierrec`), and
+        /// lprec (the [`LpRecDev`] grids — built once here, not per chunk). Gridrec
+        /// returns `None` and the caller falls back to per-chunk [`reconstruct`].
+        /// Binds the first selected device, as the f16 one-shot path does, since
+        /// the handles are device-resident.
         fn streaming(
             &self,
             algorithm: crate::params::Algorithm,
@@ -2896,7 +2975,7 @@ mod cuda_impl {
             if geom.beam != Beam::Parallel
                 || !matches!(
                     algorithm,
-                    Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+                    Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec | Algorithm::Lprec
                 )
             {
                 return Ok(None);
@@ -2907,10 +2986,16 @@ mod cuda_impl {
             }
             let f16 = params.dtype == crate::dtype::Dtype::F16;
             let fourier = matches!(algorithm, Algorithm::Fourierrec);
+            let is_lprec = matches!(algorithm, Algorithm::Lprec);
             // Fourierrec packs slice pairs (s, s+max_nz/2) for the real-FFT path, so
             // it needs an even chunk and is f32-only here (mirrors the one-shot
             // `analytic_fourierrec` constraint). Anything else → per-chunk fallback.
             if fourier && (f16 || max_nz % 2 != 0) {
+                return Ok(None);
+            }
+            // lprec's gather/scatter + spline runtime is f32-only (no f16 port);
+            // f16 lprec falls back to the per-chunk host-interp path.
+            if is_lprec && f16 {
                 return Ok(None);
             }
             // `make_fbp_filter` pads to `(4·ncols).next_power_of_two()`, always a
@@ -2919,7 +3004,23 @@ mod cuda_impl {
             let filter = make_fbp_filter(params.filter_name, ncols)?;
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-            let recon = CudaFbpStream::new(filter, &geom.angles.0, ncols, n, max_nz, f16, fourier)?;
+            // Build + upload the lprec grids once for the whole stream (the chunk
+            // loop reuses them); other methods carry no grids.
+            let lprec = if is_lprec {
+                Some(LpRecDev::new(n, geom.angles.0.len(), self)?)
+            } else {
+                None
+            };
+            let recon = CudaFbpStream::new(
+                filter,
+                &geom.angles.0,
+                ncols,
+                n,
+                max_nz,
+                f16,
+                fourier,
+                lprec,
+            )?;
             Ok(Some(Box::new(recon)))
         }
     }
@@ -3657,6 +3758,199 @@ mod cuda_impl {
         }
     }
 
+    /// Device-resident log-polar geometry grids plus the per-chunk runtime,
+    /// shared by the whole-volume [`LpRecReconstruct`] path and the streaming
+    /// reconstructor ([`CudaFbpStream`]). Built once — host `build_grids` then a
+    /// single upload — and reused across every tile/chunk, so a streamed job pays
+    /// the (host) precompute and the grid upload exactly once.
+    struct LpRecDev {
+        ntheta: usize,
+        nrho: usize,
+        n_lp: usize,
+        n_w: usize,
+        n_c: usize,
+        /// Full Hermitian convolution kernel `[nrho, ntheta]` (folds the
+        /// deapodization + the tomocupy constant).
+        kfull: DevBuf,
+        /// Span-independent target index sets (i32).
+        lpids: DevBuf,
+        wids: DevBuf,
+        cids: DevBuf,
+        /// Per-span coordinate arrays, NSPAN spans concatenated contiguously
+        /// (span `k` lives at offset `k * npts`).
+        lp2p1: DevBuf,
+        lp2p2: DevBuf,
+        lp2p1w: DevBuf,
+        lp2p2w: DevBuf,
+        c2lp1: DevBuf,
+        c2lp2: DevBuf,
+    }
+
+    impl LpRecDev {
+        /// Precompute the log-polar grids on the host (`fft` backs the small
+        /// precompute transforms — the CUDA backend's own Fft is fine) and upload
+        /// them.
+        fn new(n: usize, nproj: usize, fft: &dyn crate::backend::Fft) -> Result<Self> {
+            use crate::recon::lprec::{build_grids, LP_NSPAN};
+            let grids = build_grids(n, nproj, fft)?;
+            let kfull_f32: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    grids.kfull.as_ptr() as *const f32,
+                    grids.kfull.len() * 2,
+                )
+            };
+            let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+            let concat = |spans: &[Vec<f32>; LP_NSPAN]| -> Vec<f32> {
+                let mut v = Vec::with_capacity(spans.iter().map(Vec::len).sum());
+                for sp in spans {
+                    v.extend_from_slice(sp);
+                }
+                v
+            };
+            Ok(LpRecDev {
+                ntheta: grids.ntheta,
+                nrho: grids.nrho,
+                n_lp: grids.lpids.len(),
+                n_w: grids.wids.len(),
+                n_c: grids.cids.len(),
+                kfull: DevBuf::from_host_f32(kfull_f32)?,
+                lpids: DevBuf::from_host_i32(&to_i32(&grids.lpids))?,
+                wids: DevBuf::from_host_i32(&to_i32(&grids.wids))?,
+                cids: DevBuf::from_host_i32(&to_i32(&grids.cids))?,
+                lp2p1: DevBuf::from_host_f32(&concat(&grids.lp2p1))?,
+                lp2p2: DevBuf::from_host_f32(&concat(&grids.lp2p2))?,
+                lp2p1w: DevBuf::from_host_f32(&concat(&grids.lp2p1w))?,
+                lp2p2w: DevBuf::from_host_f32(&concat(&grids.lp2p2w))?,
+                c2lp1: DevBuf::from_host_f32(&concat(&grids.c2lp1))?,
+                c2lp2: DevBuf::from_host_f32(&concat(&grids.c2lp2))?,
+            })
+        }
+
+        /// Bytes of the `[cz, nrho, ntheta]` complex work buffer for `cz` slices.
+        fn flc_bytes(&self, cz: usize) -> usize {
+            cz * self.nrho * self.ntheta * 2 * std::mem::size_of::<f32>()
+        }
+
+        /// Per-chunk runtime (port of `recon/lprec.rs::process_row`): `g` is the
+        /// **filtered** sinogram `[cz, nproj, n]`, consumed in place as the
+        /// spline-coefficient buffer; `flc` a `[cz, nrho, ntheta]` complex scratch
+        /// (clobbered); `f` the `[cz, n, n]` output, which the caller must zero
+        /// first (the scatter accumulates over the NSPAN spans).
+        fn run(
+            &self,
+            g: *mut c_void,
+            flc: *mut c_void,
+            f: *mut c_void,
+            cz: usize,
+            nproj: usize,
+            n: usize,
+        ) -> Result<()> {
+            use crate::recon::lprec::LP_NSPAN;
+            let null = std::ptr::null_mut::<c_void>();
+            let (nrho, ntheta) = (self.nrho, self.ntheta);
+            let off = |buf: &DevBuf, elems: usize| -> *const c_void {
+                unsafe { (buf.ptr as *const f32).add(elems) as *const c_void }
+            };
+            ck(
+                unsafe {
+                    ffi::tomoxide_lprec_prefilter_rows(g, cz as i32, nproj as i32, n as i32, null)
+                },
+                "lprec prefilter rows",
+            )?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_lprec_prefilter_cols(g, cz as i32, nproj as i32, n as i32, null)
+                },
+                "lprec prefilter cols",
+            )?;
+            let flc_bytes = self.flc_bytes(cz);
+            for k in 0..LP_NSPAN {
+                ck(
+                    unsafe { ffi::tomoxide_cuda_memset(flc, 0, flc_bytes) },
+                    "memset flc",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lprec_gather(
+                            g,
+                            flc,
+                            self.lpids.ptr,
+                            off(&self.lp2p2, k * self.n_lp),
+                            off(&self.lp2p1, k * self.n_lp),
+                            self.n_lp as i32,
+                            cz as i32,
+                            nproj as i32,
+                            n as i32,
+                            nrho as i32,
+                            ntheta as i32,
+                            null,
+                        )
+                    },
+                    "lprec gather main",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lprec_gather(
+                            g,
+                            flc,
+                            self.wids.ptr,
+                            off(&self.lp2p2w, k * self.n_w),
+                            off(&self.lp2p1w, k * self.n_w),
+                            self.n_w as i32,
+                            cz as i32,
+                            nproj as i32,
+                            n as i32,
+                            nrho as i32,
+                            ntheta as i32,
+                            null,
+                        )
+                    },
+                    "lprec gather wrap",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_2d(flc, nrho, ntheta, cz, 0) },
+                    "lprec fft fwd",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lprec_cmul(
+                            flc,
+                            self.kfull.ptr,
+                            cz as i32,
+                            nrho as i32,
+                            ntheta as i32,
+                            null,
+                        )
+                    },
+                    "lprec cmul",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_2d(flc, nrho, ntheta, cz, 1) },
+                    "lprec fft inv",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lprec_scatter(
+                            flc,
+                            f,
+                            self.cids.ptr,
+                            off(&self.c2lp1, k * self.n_c),
+                            off(&self.c2lp2, k * self.n_c),
+                            self.n_c as i32,
+                            cz as i32,
+                            n as i32,
+                            nrho as i32,
+                            ntheta as i32,
+                            null,
+                        )
+                    },
+                    "lprec scatter",
+                )?;
+            }
+            Ok(())
+        }
+    }
+
     impl LpRecReconstruct for CudaBackend {
         /// Device-resident log-polar reconstruction — the GPU port of
         /// [`crate::recon::lprec`]'s per-slice runtime. The geometry grids are
@@ -3672,7 +3966,6 @@ mod cuda_impl {
             geom: &Geometry,
             n: usize,
         ) -> Result<Volume<f32>> {
-            use crate::recon::lprec::{build_grids, LP_NSPAN};
             if geom.beam != Beam::Parallel {
                 return Err(Error::InvalidParam(
                     "cuda lprec supports parallel beam only".into(),
@@ -3712,40 +4005,10 @@ mod cuda_impl {
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
 
-            // Precompute the geometry grids on the host (the CUDA Fft backs the
-            // small precompute transforms) and upload them once. `kfull` already
-            // folds the deapodization + the tomocupy constant.
+            // Precompute + upload the geometry grids once (shared device runtime).
             let fft: &dyn crate::backend::Fft = self;
-            let grids = build_grids(n, nproj, fft)?;
-            let (ntheta, nrho) = (grids.ntheta, grids.nrho);
-
-            let kfull_f32: &[f32] = unsafe {
-                std::slice::from_raw_parts(
-                    grids.kfull.as_ptr() as *const f32,
-                    grids.kfull.len() * 2,
-                )
-            };
-            let kfull_dev = DevBuf::from_host_f32(kfull_f32)?;
-            let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
-            let lpids_dev = DevBuf::from_host_i32(&to_i32(&grids.lpids))?;
-            let wids_dev = DevBuf::from_host_i32(&to_i32(&grids.wids))?;
-            let cids_dev = DevBuf::from_host_i32(&to_i32(&grids.cids))?;
-            // Concatenate the NSPAN per-span coordinate arrays contiguously; the
-            // kernels index span `k` at offset `k * npts`.
-            let concat = |spans: &[Vec<f32>; LP_NSPAN]| -> Vec<f32> {
-                let mut v = Vec::with_capacity(spans.iter().map(Vec::len).sum());
-                for sp in spans {
-                    v.extend_from_slice(sp);
-                }
-                v
-            };
-            let lp2p1_dev = DevBuf::from_host_f32(&concat(&grids.lp2p1))?;
-            let lp2p2_dev = DevBuf::from_host_f32(&concat(&grids.lp2p2))?;
-            let lp2p1w_dev = DevBuf::from_host_f32(&concat(&grids.lp2p1w))?;
-            let lp2p2w_dev = DevBuf::from_host_f32(&concat(&grids.lp2p2w))?;
-            let c2lp1_dev = DevBuf::from_host_f32(&concat(&grids.c2lp1))?;
-            let c2lp2_dev = DevBuf::from_host_f32(&concat(&grids.c2lp2))?;
-            let (n_lp, n_w, n_c) = (grids.lpids.len(), grids.wids.len(), grids.cids.len());
+            let lp = LpRecDev::new(n, nproj, fft)?;
+            let (nrho, ntheta) = (lp.nrho, lp.ntheta);
 
             // z-tile so the [tile, nrho, ntheta] complex work buffer (plus the g
             // and f tiles) fits. A third of free memory leaves headroom for the
@@ -3754,133 +4017,14 @@ mod cuda_impl {
             let per_slice = nrho * ntheta * 2 * fsz + nproj * ncols * fsz + n * n * fsz;
             let tile = (device_free_bytes() / 3 / per_slice.max(1)).clamp(1, nz);
 
-            let null = std::ptr::null_mut::<c_void>();
-            let off = |buf: &DevBuf, elems: usize| -> *const c_void {
-                unsafe { (buf.ptr as *const f32).add(elems) as *const c_void }
-            };
             let mut vol = vec![0.0f32; nz * n * n];
             let mut z = 0;
             while z < nz {
                 let cz = tile.min(nz - z);
                 let g = DevBuf::from_host_f32(&raw[z * nproj * ncols..(z + cz) * nproj * ncols])?;
-                let flc = DevBuf::zeroed(cz * nrho * ntheta * 2 * fsz)?;
-                let f = DevBuf::zeroed(cz * n * n * fsz)?;
-
-                // Cubic-B-spline prefilter: detector axis, then angle axis (in place).
-                ck(
-                    unsafe {
-                        ffi::tomoxide_lprec_prefilter_rows(
-                            g.ptr,
-                            cz as i32,
-                            nproj as i32,
-                            n as i32,
-                            null,
-                        )
-                    },
-                    "lprec prefilter rows",
-                )?;
-                ck(
-                    unsafe {
-                        ffi::tomoxide_lprec_prefilter_cols(
-                            g.ptr,
-                            cz as i32,
-                            nproj as i32,
-                            n as i32,
-                            null,
-                        )
-                    },
-                    "lprec prefilter cols",
-                )?;
-
-                for k in 0..LP_NSPAN {
-                    ck(
-                        unsafe { ffi::tomoxide_cuda_memset(flc.ptr, 0, flc.bytes) },
-                        "memset flc",
-                    )?;
-                    // Gather polar → log-polar: main set (lp2p2 = detector coord,
-                    // lp2p1 = angle coord) then the wrapping set.
-                    ck(
-                        unsafe {
-                            ffi::tomoxide_lprec_gather(
-                                g.ptr,
-                                flc.ptr,
-                                lpids_dev.ptr,
-                                off(&lp2p2_dev, k * n_lp),
-                                off(&lp2p1_dev, k * n_lp),
-                                n_lp as i32,
-                                cz as i32,
-                                nproj as i32,
-                                n as i32,
-                                nrho as i32,
-                                ntheta as i32,
-                                null,
-                            )
-                        },
-                        "lprec gather main",
-                    )?;
-                    ck(
-                        unsafe {
-                            ffi::tomoxide_lprec_gather(
-                                g.ptr,
-                                flc.ptr,
-                                wids_dev.ptr,
-                                off(&lp2p2w_dev, k * n_w),
-                                off(&lp2p1w_dev, k * n_w),
-                                n_w as i32,
-                                cz as i32,
-                                nproj as i32,
-                                n as i32,
-                                nrho as i32,
-                                ntheta as i32,
-                                null,
-                            )
-                        },
-                        "lprec gather wrap",
-                    )?;
-                    // 2-D FFT convolution (cuFFT applies 1/(nrho·ntheta) on the
-                    // inverse; the residual ×2 is folded into the scatter).
-                    ck(
-                        unsafe { ffi::tomoxide_fft_2d(flc.ptr, nrho, ntheta, cz, 0) },
-                        "lprec fft fwd",
-                    )?;
-                    ck(
-                        unsafe {
-                            ffi::tomoxide_lprec_cmul(
-                                flc.ptr,
-                                kfull_dev.ptr,
-                                cz as i32,
-                                nrho as i32,
-                                ntheta as i32,
-                                null,
-                            )
-                        },
-                        "lprec cmul",
-                    )?;
-                    ck(
-                        unsafe { ffi::tomoxide_fft_2d(flc.ptr, nrho, ntheta, cz, 1) },
-                        "lprec fft inv",
-                    )?;
-                    // Scatter log-polar → Cartesian disk (c2lp1 = theta coord,
-                    // c2lp2 = rho coord), accumulating across spans into f.
-                    ck(
-                        unsafe {
-                            ffi::tomoxide_lprec_scatter(
-                                flc.ptr,
-                                f.ptr,
-                                cids_dev.ptr,
-                                off(&c2lp1_dev, k * n_c),
-                                off(&c2lp2_dev, k * n_c),
-                                n_c as i32,
-                                cz as i32,
-                                n as i32,
-                                nrho as i32,
-                                ntheta as i32,
-                                null,
-                            )
-                        },
-                        "lprec scatter",
-                    )?;
-                }
+                let flc = DevBuf::zeroed(lp.flc_bytes(cz))?;
+                let f = DevBuf::zeroed(cz * n * n * fsz)?; // scatter accumulates → zeroed
+                lp.run(g.ptr, flc.ptr, f.ptr, cz, nproj, n)?;
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "lprec sync")?;
                 f.to_host_f32(&mut vol[z * n * n..(z + cz) * n * n])?;
                 z += cz;
