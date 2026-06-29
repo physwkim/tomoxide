@@ -710,6 +710,18 @@ mod cuda_impl {
         vo_scratch: Option<VoScratch>,
         filt: *mut c_void,
         lrec: *mut c_void,
+        // Fourierrec device-resident path (f32 only). When `fourier` is set the
+        // back-projection tail of `finish_recon` is pack → `cfunc_fourierrec` →
+        // unpack instead of `cfunc_linerec`, reusing the same raw-path normalize/
+        // transpose/stripe machinery and the shared `filt` handle. `gc` holds the
+        // packed complex sinogram `[max_nz/2, nproj, ncols]` and `fc` the complex
+        // reconstruction `[max_nz/2, n, n]`; `frec` is the `cfunc_fourierrec`
+        // handle (built for `max_nz/2` pairs). All three are unused (None/null) on
+        // the FBP/Linerec path, which keeps `lrec`.
+        fourier: bool,
+        gc: Option<DevBuf>,
+        fc: Option<DevBuf>,
+        frec: *mut c_void,
     }
 
     /// Persistent device scratch for the Vo all-stripe pass, sized to the
@@ -797,6 +809,7 @@ mod cuda_impl {
             n: usize,
             max_nz: usize,
             f16: bool,
+            fourier: bool,
         ) -> Result<Self> {
             let nproj = theta.len();
             let pad = filter.len();
@@ -829,20 +842,38 @@ mod cuda_impl {
             } else {
                 (None, None)
             };
-            let (filt, lrec) = unsafe {
+            // The FBP filter handle is shared by both back-projection tails. The
+            // tail handle is `cfunc_linerec` (FBP/Linerec) or `cfunc_fourierrec`
+            // (Fourierrec, f32 only — built for `max_nz/2` packed pairs). The
+            // Fourierrec packed/complex scratch (`gc`/`fc`) is allocated only on
+            // that path.
+            let filt = unsafe {
                 if f16 {
-                    (
-                        ffi::tomoxide_filter_fp16_new(nproj, max_nz, pad),
-                        ffi::tomoxide_linerec_fp16_new(nproj, max_nz, n, nproj, max_nz),
-                    )
+                    ffi::tomoxide_filter_fp16_new(nproj, max_nz, pad)
                 } else {
-                    (
-                        ffi::tomoxide_filter_new(nproj, max_nz, pad),
-                        ffi::tomoxide_linerec_new(nproj, max_nz, n, nproj, max_nz),
-                    )
+                    ffi::tomoxide_filter_new(nproj, max_nz, pad)
                 }
             };
-            if filt.is_null() || lrec.is_null() {
+            let (lrec, frec, gc, fc) = if fourier {
+                // f32-only path (streaming() returns None for f16 Fourierrec).
+                let gc = DevBuf::zeroed(max_nz * nproj * ncols * fsz)?;
+                let fc = DevBuf::zeroed(max_nz * n * n * fsz)?;
+                let frec = unsafe {
+                    ffi::tomoxide_fourierrec_new(nproj, max_nz / 2, n, theta_dev.ptr as *const f32)
+                };
+                (std::ptr::null_mut(), frec, Some(gc), Some(fc))
+            } else {
+                let lrec = unsafe {
+                    if f16 {
+                        ffi::tomoxide_linerec_fp16_new(nproj, max_nz, n, nproj, max_nz)
+                    } else {
+                        ffi::tomoxide_linerec_new(nproj, max_nz, n, nproj, max_nz)
+                    }
+                };
+                (lrec, std::ptr::null_mut(), None, None)
+            };
+            let tail = if fourier { frec } else { lrec };
+            if filt.is_null() || tail.is_null() {
                 // Free whichever allocation succeeded so a partial failure leaks
                 // nothing (the Drop guard only runs on a fully-built value).
                 unsafe {
@@ -859,6 +890,9 @@ mod cuda_impl {
                         } else {
                             ffi::tomoxide_linerec_free(lrec)
                         }
+                    }
+                    if !frec.is_null() {
+                        ffi::tomoxide_fourierrec_free(frec)
                     }
                 }
                 return Err(Error::Backend(
@@ -889,6 +923,10 @@ mod cuda_impl {
                 vo_scratch: None,
                 filt,
                 lrec,
+                fourier,
+                gc,
+                fc,
+                frec,
             })
         }
     }
@@ -898,9 +936,15 @@ mod cuda_impl {
             unsafe {
                 if self.f16 {
                     ffi::tomoxide_filter_fp16_free(self.filt);
-                    ffi::tomoxide_linerec_fp16_free(self.lrec);
                 } else {
                     ffi::tomoxide_filter_free(self.filt);
+                }
+                if self.fourier {
+                    // f32-only Fourierrec tail.
+                    ffi::tomoxide_fourierrec_free(self.frec);
+                } else if self.f16 {
+                    ffi::tomoxide_linerec_fp16_free(self.lrec);
+                } else {
                     ffi::tomoxide_linerec_free(self.lrec);
                 }
             }
@@ -1807,6 +1851,60 @@ mod cuda_impl {
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
                 let mut host = vec![0.0f32; nz * n * n];
                 f_f32.to_host_f32(&mut host)?;
+                Ok(Volume::new(
+                    Array3::from_shape_vec((nz, n, n), host)
+                        .expect("nz*n*n volume length matches shape"),
+                ))
+            } else if self.fourier {
+                // Device-resident Fourierrec (f32): same pad → filter → crop as the
+                // FBP tail, then pack pairs → `cfunc_fourierrec` → unpack, mirroring
+                // `analytic_fourierrec` but at the handle's fixed `max_nz` batch
+                // (the `max_nz/2`-pair handle reuses the cuFFT plans across chunks).
+                let gc = self.gc.as_ref().expect("fourier path has gc");
+                let fc = self.fc.as_ref().expect("fourier path has fc");
+                ck(
+                    unsafe {
+                        ffi::tomoxide_pad(
+                            self.sino.ptr,
+                            self.gpad.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "pad",
+                )?;
+                unsafe { ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_crop(
+                            self.gpad.ptr,
+                            self.gf.ptr,
+                            m,
+                            nproj,
+                            ncols,
+                            pad,
+                            ps,
+                            null,
+                        )
+                    },
+                    "crop",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_pack_pairs(self.gf.ptr, gc.ptr, m, nproj, ncols, null) },
+                    "pack",
+                )?;
+                unsafe { ffi::tomoxide_fourierrec_backproject(self.frec, fc.ptr, gc.ptr, null) };
+                ck(
+                    unsafe { ffi::tomoxide_unpack_pairs(fc.ptr, self.f.ptr, m, n, null) },
+                    "unpack",
+                )?;
+                ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                let mut host = vec![0.0f32; nz * n * n];
+                self.f.to_host_f32(&mut host)?;
                 Ok(Volume::new(
                     Array3::from_shape_vec((nz, n, n), host)
                         .expect("nz*n*n volume length matches shape"),
@@ -2773,7 +2871,10 @@ mod cuda_impl {
         ) -> Result<Option<Box<dyn StreamingAnalytic>>> {
             use crate::params::Algorithm;
             if geom.beam != Beam::Parallel
-                || !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec)
+                || !matches!(
+                    algorithm,
+                    Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+                )
             {
                 return Ok(None);
             }
@@ -2782,13 +2883,20 @@ mod cuda_impl {
                 return Ok(None); // square-grid only, like `reconstruct`
             }
             let f16 = params.dtype == crate::dtype::Dtype::F16;
+            let fourier = matches!(algorithm, Algorithm::Fourierrec);
+            // Fourierrec packs slice pairs (s, s+max_nz/2) for the real-FFT path, so
+            // it needs an even chunk and is f32-only here (mirrors the one-shot
+            // `analytic_fourierrec` constraint). Anything else → per-chunk fallback.
+            if fourier && (f16 || max_nz % 2 != 0) {
+                return Ok(None);
+            }
             // `make_fbp_filter` pads to `(4·ncols).next_power_of_two()`, always a
             // power of two, so the f16 half-cuFFT width constraint holds by
             // construction (mirrors the assert in `reconstruct`).
             let filter = make_fbp_filter(params.filter_name, ncols)?;
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-            let recon = CudaFbpStream::new(filter, &geom.angles.0, ncols, n, max_nz, f16)?;
+            let recon = CudaFbpStream::new(filter, &geom.angles.0, ncols, n, max_nz, f16, fourier)?;
             Ok(Some(Box::new(recon)))
         }
     }
