@@ -62,14 +62,17 @@ build selects the CPU backend so the whole workspace builds on this Mac.
 Not every algorithm is faster on the GPU — there are two reconstruction paths
 and they scale very differently:
 
-- **Fused analytic path — `Fbp`, `Linerec`, `Fourierrec`.** Filtering and
-  back-projection stay resident on the device (one upload, one download), so
-  the GPU wins decisively and scales across multiple GPUs.
-- **Composed FFT path — `lprec`, `gridrec`.** Only the per-slice FFT is
-  offloaded (cuFFT); the log-polar / Fourier-grid build, the gather/scatter and
-  the Cartesian resampling all run on the host. These are **host-gather bound**:
-  on a strong multi-core CPU the GPU's FFT offload does not pay for the host
-  gather plus the upload/download round-trip.
+- **Fused / device-resident path — `Fbp`, `Linerec`, `Fourierrec`, `lprec`.**
+  Filtering, back-projection and — for `lprec` — the log-polar spline prefilter,
+  gather/FFT/scatter all stay resident on the device (one upload, one download),
+  so the GPU wins decisively. On CUDA the `recon`/`recon_steps` path streams
+  these per chunk with the cuFFT plans and log-polar grids reused across chunks;
+  `Fbp`/`Linerec` additionally scale across multiple GPUs.
+- **Composed FFT path — `gridrec`.** Only the per-slice FFT is offloaded
+  (cuFFT); the Fourier-grid build, the gather/scatter and the Cartesian
+  resampling all run on the host. This is **host-gather bound**: on a strong
+  multi-core CPU the GPU's FFT offload does not pay for the host gather plus the
+  upload/download round-trip.
 
 ### Measured scaling by image size
 
@@ -111,8 +114,11 @@ trails the CPU only at 2048²:
 | 1024² | 5.642 | 4.778 | **4.391** |
 | 2048² | 22.71 | 28.25 | **16.03** |
 
-`lprec` (composed) and `Paganin` (per-projection FFT) — CPU wins at small sizes;
-multi-GPU overtakes at large sizes:
+`lprec` and `Paganin` (per-projection FFT) — CPU wins at small sizes; multi-GPU
+overtakes at large sizes. (The `lprec` GPU columns below are recon-only
+whole-volume `bench_parallel` numbers that predate the device-resident log-polar
+rewrite; the end-to-end CUDA `recon` path is now much faster — see the
+head-to-head tables. A recon-only refresh of these cells is pending.):
 
 | image | lprec CPU | lprec 1-GPU | lprec 4-GPU | Paganin CPU | Paganin 1-GPU | Paganin 4-GPU |
 |---|---|---|---|---|---|---|
@@ -164,11 +170,14 @@ cargo run --release --features cuda --example bench_parallel -- cuda 1024 1024 1
 Full-pipeline wall time — HDF5 read → normalize → reconstruct → TIFF write — for
 the three algorithms both tools implement (`linerec`, `fourierrec`, `lprec`), on
 the same synthetic DXchange file in `/dev/shm` (RAM I/O, so the comparison is
-compute- not disk-bound), `nz=128`, dynamic (unlocked boost) GPU clocks, min of 2
-runs after a warmup. Both tools ran under the same clock regime, so the relative
-comparison is fair; absolute times carry boost-clock variance. Times in seconds;
-**bold** is the faster tool in each GPU-count
-pair. tomoxide multi-GPU is one process splitting `z` across 4 devices; tomocupy
+compute- not disk-bound), `nz=128`, dynamic (unlocked boost) GPU clocks. Both
+tools ran under the same clock regime, so the relative comparison is fair;
+absolute times carry boost-clock variance. Times in seconds; **bold** is the
+faster tool. The `fourierrec` and `lprec` tables were re-measured after the
+device-resident streaming rewrite (1-GPU, best of 3 runs, sizes through 4096²);
+the `linerec` table below still carries the earlier 2-run, 4-column (1-/4-GPU)
+data and predates the Phase 1 auto-pipeline — it is pending a refresh.
+tomoxide multi-GPU is one process splitting `z` across 4 devices; tomocupy
 1.0.4 is single-GPU per process, so its "4-GPU" is 4 concurrent processes each
 pinned to one device over a quarter of the `z` rows (`--start-row/--end-row`,
 wall = slowest shard).
@@ -183,25 +192,29 @@ wall = slowest shard).
 | 1024² | **2.24** | 2.28 | **2.73** | 3.12 |
 | 2048² | 11.52 | **6.27** | 7.66 | **5.32** |
 
-`fourierrec` (fp32):
+`fourierrec` (fp32, 1-GPU; refreshed after the device-resident streaming rewrite,
+best of 3 runs; 4-GPU cells pending re-measurement):
 
-| image | tomoxide 1-GPU | tomocupy 1-GPU | tomoxide 4-GPU | tomocupy 4-GPU |
-|---|---|---|---|---|
-| 128²  | **0.51** | 1.27 | **0.65** | 1.67 |
-| 256²  | **0.68** | 1.16 | **0.72** | 2.05 |
-| 512²  | **1.23** | 2.07 | **1.28** | 2.26 |
-| 1024² | **2.61** | 2.93 | **2.42** | 2.87 |
-| 2048² | 8.86 | **4.69** | 8.72 | **4.82** |
+| image | tomoxide 1-GPU | tomocupy 1-GPU |
+|---|---|---|
+| 128²  | **0.31** | 1.63 |
+| 256²  | **0.36** | 1.63 |
+| 512²  | **0.43** | 1.54 |
+| 1024² | **1.30** | 3.27 |
+| 2048² | **3.14** | 4.61 |
+| 4096² | **11.30** | 12.53 |
 
-`lprec` (fp32):
+`lprec` (fp32, 1-GPU; refreshed after the device-resident log-polar rewrite, best
+of 3 runs; 4-GPU cells pending re-measurement):
 
-| image | tomoxide 1-GPU | tomocupy 1-GPU | tomoxide 4-GPU | tomocupy 4-GPU |
-|---|---|---|---|---|
-| 128²  | **0.95** | 1.35 | **1.13** | 1.92 |
-| 256²  | **1.65** | 1.94 | **1.74** | 2.59 |
-| 512²  | 3.19 | **2.30** | **2.94** | 3.01 |
-| 1024² | 7.74 | **2.85** | 5.63 | **2.96** |
-| 2048² | 22.75 | **4.88** | 20.95 | **4.98** |
+| image | tomoxide 1-GPU | tomocupy 1-GPU |
+|---|---|---|
+| 128²  | **0.34** | 1.75 |
+| 256²  | **0.36** | 1.91 |
+| 512²  | **0.54** | 1.84 |
+| 1024² | **1.37** | 2.83 |
+| 2048² | **4.55** | 5.27 |
+| 4096² | 15.67 | **11.32** |
 
 fp16 (`linerec`, `fourierrec`; tomoxide fp16 covers only the analytic paths):
 
@@ -215,21 +228,27 @@ fp16 (`linerec`, `fourierrec`; tomoxide fp16 covers only the analytic paths):
 
 What this means:
 
-- **tomoxide wins end-to-end at small/medium sizes** (≤1024² for the analytic
-  paths, ≤256² for `lprec`). The compiled binary starts in ~0.3 s; tomocupy pays
-  ~1.3–1.7 s of Python + CuPy/context init per invocation, which dominates the
-  wall until the reconstruction itself is large.
-- **tomocupy wins at 2048²** for every algorithm (linerec ~1.8×, fourierrec
-  ~1.9×, `lprec` ~4.6×). Once compute dominates startup, its streaming pipeline
-  beats tomoxide's whole-volume `recon`, which holds the full sinogram + volume
-  and, for `lprec`, runs a host-gather-bound composed path.
-- **`lprec` is tomocupy's strongest case** — its GPU log-polar implementation
-  pulls ahead from 512² up; tomoxide's `lprec` (composed FFT + host gather) is
-  the slowest GPU path here.
-- **Multi-GPU.** tomoxide's z-split helps only at 2048² (e.g. linerec 11.5→7.7 s).
-  tomocupy's 4-process shard rarely beats its own single GPU below 2048² — four
-  cold Python/CuPy inits plus each shard re-reading its slab outweigh the split —
-  and helps only modestly at 2048².
+- **tomoxide wins end-to-end across the sweep for `fourierrec` and `lprec`.**
+  After the device-resident streaming rewrite, `recon` on CUDA streams these
+  per chunk (GPU normalize/transpose, cuFFT plans + log-polar grids reused), so
+  tomoxide leads `fourierrec` at every size up to 4096² and `lprec` up to 2048².
+  Two compounding wins: the compiled binary starts in ~0.3 s vs tomocupy's
+  ~1.3–1.7 s Python + CuPy/context init, and the per-chunk GPU path keeps the
+  device busy without a full-volume host transpose.
+- **tomocupy retakes `lprec` only at 4096²** (~1.4×: 11.3 s vs 15.7 s). The
+  crossover used to sit at ~512²; the device-resident log-polar path pushed it
+  out past 2048². `fourierrec` shows no crossover through 4096². (The `linerec`
+  table above predates the Phase 1 auto-pipeline and is pending a refresh — do
+  not read its 2048² row as current.)
+- **`lprec` is no longer host-gather bound on CUDA.** Its log-polar spline
+  prefilter + gather/FFT/scatter now run device-resident (ported from the
+  parity-verified Rust math), so the old "tomocupy's strongest case / tomoxide's
+  slowest GPU path" no longer holds — at 2048² tomoxide is ~1.16× faster.
+- **Multi-GPU.** tomoxide's z-split helps only at large sizes (e.g. linerec
+  2048² 11.5→7.7 s). tomocupy's 4-process shard rarely beats its own single GPU
+  below 2048² — four cold Python/CuPy inits plus each shard re-reading its slab
+  outweigh the split. The `fourierrec`/`lprec` 4-GPU cells are pending
+  re-measurement after the streaming rewrite.
 
 Caveat: this is **wall-to-wall** time. tomocupy's own internal "Reconstruction
 time" (compute only, excluding Python import) is far smaller (e.g. fourierrec
