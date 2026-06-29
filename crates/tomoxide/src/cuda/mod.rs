@@ -702,8 +702,87 @@ mod cuda_impl {
         // f64, allocated lazily on the first device-stripe chunk. None until a
         // chunk actually requests a GPU-ported stripe method.
         ti_scratch: Option<DevBuf>,
+        // Vo all-stripe scratch (`vo_on_device`): all the per-chunk working
+        // buffers, sized to `max_nz` and reused across chunks. Allocated lazily
+        // on the first VoAll chunk (a stream not using VoAll never pays the
+        // ~5.5 GB it holds at large dims). See [`VoScratch`] for the buffer
+        // roles and the lifetime-disjoint aliasing that keeps the set small.
+        vo_scratch: Option<VoScratch>,
         filt: *mut c_void,
         lrec: *mut c_void,
+    }
+
+    /// Persistent device scratch for the Vo all-stripe pass, sized to the
+    /// handle's fixed `max_nz` batch and reused across chunks (a smaller chunk
+    /// uses the `nz`-prefix). Allocating once and reusing removes ~24 per-chunk
+    /// `cudaMalloc`/`cudaFree` pairs — the large frees synchronise the device, so
+    /// this is wall-clock, not just bookkeeping.
+    ///
+    /// The large `[max_nz,nproj,ncols]` buffers dominate the footprint, so roles
+    /// with disjoint lifetimes share one buffer. The sharing is intra-function
+    /// only (each function writes solely its own buffers); the one cross-function
+    /// reuse is `big_a`, which `vo_rs_large` reads as its read-only input `s` and
+    /// never writes, so the caller can reuse it afterwards. Large f32 roles:
+    ///   big_a:     rs_dead `smooth` → `work` (input to rs_large) → rs_sort `sortedv`
+    ///   big_b:     rs_sort `smoothed`
+    ///   rl_out:    rs_large normalised `out` (returned as `dead_out`)
+    ///   rl_sort:   rs_large `sinosort` → `sortdummy`
+    ///   rl_smooth: rs_large `sinosmooth`
+    /// Large i32: `perm` (rs_sort) and `perm2` (rs_large) kept separate. The
+    /// `[max_nz,ncols]`/`[max_nz]` buffers are ~0.5 MB each, so each small role
+    /// gets its own buffer (no aliasing); `detsort`/`detraw` are shared by the
+    /// two `vo_detect_mask` calls, which never overlap.
+    struct VoScratch {
+        big_a: DevBuf,
+        big_b: DevBuf,
+        rl_out: DevBuf,
+        rl_sort: DevBuf,
+        rl_smooth: DevBuf,
+        perm: DevBuf,
+        perm2: DevBuf,
+        listdiff: DevBuf,
+        listdiffbck: DevBuf,
+        listfact: DevBuf,
+        mask_dead: DevBuf,
+        lf64: DevBuf,
+        lf32: DevBuf,
+        mask_large: DevBuf,
+        detsort: DevBuf,
+        detraw: DevBuf,
+        goodx: DevBuf,
+        goodcount: DevBuf,
+    }
+
+    impl VoScratch {
+        fn new(max_nz: usize, nproj: usize, ncols: usize) -> Result<Self> {
+            let (f32sz, f64sz, i32sz) = (
+                std::mem::size_of::<f32>(),
+                std::mem::size_of::<f64>(),
+                std::mem::size_of::<i32>(),
+            );
+            let vol = max_nz * nproj * ncols;
+            let cols = max_nz * ncols;
+            Ok(VoScratch {
+                big_a: DevBuf::new(vol * f32sz)?,
+                big_b: DevBuf::new(vol * f32sz)?,
+                rl_out: DevBuf::new(vol * f32sz)?,
+                rl_sort: DevBuf::new(vol * f32sz)?,
+                rl_smooth: DevBuf::new(vol * f32sz)?,
+                perm: DevBuf::new(vol * i32sz)?,
+                perm2: DevBuf::new(vol * i32sz)?,
+                listdiff: DevBuf::new(cols * f32sz)?,
+                listdiffbck: DevBuf::new(cols * f32sz)?,
+                listfact: DevBuf::new(cols * f32sz)?,
+                mask_dead: DevBuf::new(cols * f32sz)?,
+                lf64: DevBuf::new(cols * f64sz)?,
+                lf32: DevBuf::new(cols * f32sz)?,
+                mask_large: DevBuf::new(cols * f32sz)?,
+                detsort: DevBuf::new(cols * f32sz)?,
+                detraw: DevBuf::new(cols * f32sz)?,
+                goodx: DevBuf::new(cols * i32sz)?,
+                goodcount: DevBuf::new(max_nz * i32sz)?,
+            })
+        }
     }
 
     impl CudaFbpStream {
@@ -807,6 +886,7 @@ mod cuda_impl {
                 sino_f32,
                 f_f32,
                 ti_scratch: None,
+                vo_scratch: None,
                 filt,
                 lrec,
             })
@@ -1095,7 +1175,12 @@ mod cuda_impl {
                     la_size,
                     sm_size,
                 } => {
-                    self.vo_on_device(ptr, nz, snr, la_size, sm_size)?;
+                    if self.vo_scratch.is_none() {
+                        self.vo_scratch =
+                            Some(VoScratch::new(self.max_nz, self.nproj, self.ncols)?);
+                    }
+                    let sc = self.vo_scratch.as_ref().expect("vo_scratch allocated");
+                    self.vo_on_device(ptr, nz, snr, la_size, sm_size, sc)?;
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -1315,18 +1400,17 @@ mod cuda_impl {
             listfact: &DevBuf,
             mask: &DevBuf,
             nz: usize,
-            nc: usize,
             snr: f32,
             border_zero: bool,
+            sc: &VoScratch,
         ) -> Result<()> {
             let null = std::ptr::null_mut::<c_void>();
-            let cols = nz * nc;
-            let sorted = DevBuf::new(cols * std::mem::size_of::<f32>())?;
+            let nc = self.ncols;
+            let (sorted, rawmask) = (&sc.detsort, &sc.detraw);
             ck(
                 unsafe { ffi::tomoxide_vo_slicesort(listfact.ptr, sorted.ptr, nz, nc, 0, null) },
                 "vo_slicesort",
             )?;
-            let rawmask = DevBuf::new(cols * std::mem::size_of::<f32>())?;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_detect_rawmask(
@@ -1359,8 +1443,9 @@ mod cuda_impl {
 
         /// `_rs_large` (Vo algorithm 5) on `s [nz,nrow,nc]` with `norm=true`:
         /// replace detected large-stripe columns with the rank-smoothed profile,
-        /// normalising by the per-column intensity factor first. Returns a fresh
-        /// device buffer.
+        /// normalising by the per-column intensity factor first. Writes the result
+        /// into `sc.rl_out` (the caller's `dead_out`). `s` may alias `sc.big_a`;
+        /// it is only read (never written) here, so the caller may reuse it after.
         fn vo_rs_large(
             &self,
             s: &DevBuf,
@@ -1368,21 +1453,15 @@ mod cuda_impl {
             snr: f32,
             size: usize,
             drop_ratio: f32,
-        ) -> Result<DevBuf> {
+            sc: &VoScratch,
+        ) -> Result<()> {
             let null = std::ptr::null_mut::<c_void>();
             let (nrow, nc) = (self.nproj, self.ncols);
-            let (f32sz, f64sz, i32sz) = (
-                std::mem::size_of::<f32>(),
-                std::mem::size_of::<f64>(),
-                std::mem::size_of::<i32>(),
-            );
-            let vol = nz * nrow * nc;
-            let cols = nz * nc;
             let dr = drop_ratio.clamp(0.0, 0.8) as f64;
             let ndrop = (0.5 * dr * nrow as f64) as usize;
 
             // sinosort = sort each column ascending (perm unused here).
-            let sinosort = DevBuf::new(vol * f32sz)?;
+            let sinosort = &sc.rl_sort;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_colsort(s.ptr, sinosort.ptr, null, nz, nrow, nc, 1, null)
@@ -1390,7 +1469,7 @@ mod cuda_impl {
                 "vo_colsort(sinosort)",
             )?;
             // sinosmooth = per-row median along columns.
-            let sinosmooth = DevBuf::new(vol * f32sz)?;
+            let sinosmooth = &sc.rl_smooth;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_median_axis1(
@@ -1406,15 +1485,13 @@ mod cuda_impl {
                 "vo_median(sinosmooth)",
             )?;
             // Per-column intensity factor (f64 for normalise, f32 for detect).
-            let lf64 = DevBuf::new(cols * f64sz)?;
-            let lf32 = DevBuf::new(cols * f32sz)?;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_rs_large_listfact(
                         sinosort.ptr,
                         sinosmooth.ptr,
-                        lf64.ptr,
-                        lf32.ptr,
+                        sc.lf64.ptr,
+                        sc.lf32.ptr,
                         nz,
                         nrow,
                         nc,
@@ -1424,29 +1501,27 @@ mod cuda_impl {
                 },
                 "vo_rs_large_listfact",
             )?;
-            drop(sinosort);
-            // Mask (no border protection in _rs_large).
-            let mask = DevBuf::new(cols * f32sz)?;
-            self.vo_detect_mask(&lf32, &mask, nz, nc, snr, false)?;
-            drop(lf32);
-            // Normalised result, written straight into `out`. colsort reads it
+            // Mask (no border protection in _rs_large). `sinosort`/`rl_sort` is
+            // now free; it is reused as `sortdummy` below.
+            self.vo_detect_mask(&sc.lf32, &sc.mask_large, nz, snr, false, sc)?;
+            // Normalised result, written straight into `rl_out`. colsort reads it
             // (without modifying it) for the permutation, then scatter_masked
             // overwrites only the masked columns in place — no seeding copy.
-            let out = DevBuf::new(vol * f32sz)?;
+            let out = &sc.rl_out;
             ck(
-                unsafe { ffi::tomoxide_vo_normalize(s.ptr, lf64.ptr, out.ptr, nz, nrow, nc, null) },
+                unsafe {
+                    ffi::tomoxide_vo_normalize(s.ptr, sc.lf64.ptr, out.ptr, nz, nrow, nc, null)
+                },
                 "vo_normalize",
             )?;
-            drop(lf64);
-            // Sort the normalised copy for its permutation (sorted values unused).
-            let perm2 = DevBuf::new(vol * i32sz)?;
-            let sortdummy = DevBuf::new(vol * f32sz)?;
+            // Sort the normalised copy for its permutation (sorted values unused,
+            // dumped into `rl_sort` which `sinosort` has finished with).
             ck(
                 unsafe {
                     ffi::tomoxide_vo_colsort(
                         out.ptr,
-                        sortdummy.ptr,
-                        perm2.ptr,
+                        sc.rl_sort.ptr,
+                        sc.perm2.ptr,
                         nz,
                         nrow,
                         nc,
@@ -1456,14 +1531,13 @@ mod cuda_impl {
                 },
                 "vo_colsort(out)",
             )?;
-            drop(sortdummy);
             // Overwrite masked columns of `out` with the smoothed profile.
             ck(
                 unsafe {
                     ffi::tomoxide_vo_scatter_masked(
-                        perm2.ptr,
+                        sc.perm2.ptr,
                         sinosmooth.ptr,
-                        mask.ptr,
+                        sc.mask_large.ptr,
                         out.ptr,
                         nz,
                         nrow,
@@ -1473,7 +1547,7 @@ mod cuda_impl {
                 },
                 "vo_scatter_masked",
             )?;
-            Ok(out)
+            Ok(())
         }
 
         /// Vo all-stripe removal on the device f32 sinogram `ptr [nz,nproj,ncol]`,
@@ -1489,6 +1563,7 @@ mod cuda_impl {
             snr: f32,
             la_size: usize,
             sm_size: usize,
+            sc: &VoScratch,
         ) -> Result<()> {
             let null = std::ptr::null_mut::<c_void>();
             let (nrow, nc) = (self.nproj, self.ncols);
@@ -1496,25 +1571,21 @@ mod cuda_impl {
             if nrow < 2 || nz == 0 || nc < 4 || la_size == 0 || sm_size == 0 {
                 return Ok(());
             }
-            let (f32sz, i32sz) = (std::mem::size_of::<f32>(), std::mem::size_of::<i32>());
-            let vol = nz * nrow * nc;
-            let cols = nz * nc;
 
             // ---- _rs_dead ----
             // sinosmooth = uniform_filter1d along the projection axis (size 10).
-            let smooth = DevBuf::new(vol * f32sz)?;
+            let smooth = &sc.big_a;
             ck(
                 unsafe { ffi::tomoxide_vo_uniform_axis0(ptr, smooth.ptr, nz, nrow, nc, 10, null) },
                 "vo_uniform_axis0",
             )?;
             // listdiff[z,c] = sum_r |sino - smooth|.
-            let listdiff = DevBuf::new(cols * f32sz)?;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_absdiff_colsum(
                         ptr,
                         smooth.ptr,
-                        listdiff.ptr,
+                        sc.listdiff.ptr,
                         nz,
                         nrow,
                         nc,
@@ -1523,14 +1594,13 @@ mod cuda_impl {
                 },
                 "vo_absdiff_colsum",
             )?;
-            drop(smooth);
+            // `smooth`/`big_a` is now free; it is reused as `work` then `sortedv`.
             // listdiffbck = 1-D median of listdiff over columns (window la_size).
-            let listdiffbck = DevBuf::new(cols * f32sz)?;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_median_axis1(
-                        listdiff.ptr,
-                        listdiffbck.ptr,
+                        sc.listdiff.ptr,
+                        sc.listdiffbck.ptr,
                         nz,
                         1,
                         nc,
@@ -1541,39 +1611,46 @@ mod cuda_impl {
                 "vo_median(listdiffbck)",
             )?;
             // listfact = listdiff / listdiffbck.
-            let listfact = DevBuf::new(cols * f32sz)?;
+            let cols = nz * nc;
             ck(
                 unsafe {
-                    ffi::tomoxide_vo_ratio(listdiff.ptr, listdiffbck.ptr, listfact.ptr, cols, null)
+                    ffi::tomoxide_vo_ratio(
+                        sc.listdiff.ptr,
+                        sc.listdiffbck.ptr,
+                        sc.listfact.ptr,
+                        cols,
+                        null,
+                    )
                 },
                 "vo_ratio(listfact)",
             )?;
-            drop(listdiff);
-            drop(listdiffbck);
             // Dead-column mask with border protection.
-            let mask = DevBuf::new(cols * f32sz)?;
-            self.vo_detect_mask(&listfact, &mask, nz, nc, snr, true)?;
-            drop(listfact);
+            self.vo_detect_mask(&sc.listfact, &sc.mask_dead, nz, snr, true, sc)?;
             // Good-column lists, then bilinear fill of the dead columns.
-            let goodx = DevBuf::new(cols * i32sz)?;
-            let goodcount = DevBuf::new(nz * i32sz)?;
             ck(
                 unsafe {
-                    ffi::tomoxide_vo_build_goodx(mask.ptr, goodx.ptr, goodcount.ptr, nz, nc, null)
+                    ffi::tomoxide_vo_build_goodx(
+                        sc.mask_dead.ptr,
+                        sc.goodx.ptr,
+                        sc.goodcount.ptr,
+                        nz,
+                        nc,
+                        null,
+                    )
                 },
                 "vo_build_goodx",
             )?;
-            // `work` is written in full by interp_fill (good columns copied from
-            // `ptr`, dead columns interpolated) — no seeding copy.
-            let work = DevBuf::new(vol * f32sz)?;
+            // `work` (reusing `big_a`) is written in full by interp_fill (good
+            // columns copied from `ptr`, dead columns interpolated) — no seed copy.
+            let work = &sc.big_a;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_interp_fill(
                         ptr,
                         work.ptr,
-                        mask.ptr,
-                        goodx.ptr,
-                        goodcount.ptr,
+                        sc.mask_dead.ptr,
+                        sc.goodx.ptr,
+                        sc.goodcount.ptr,
                         nz,
                         nrow,
                         nc,
@@ -1582,23 +1659,21 @@ mod cuda_impl {
                 },
                 "vo_interp_fill",
             )?;
-            drop(mask);
-            drop(goodx);
-            drop(goodcount);
-            // Residual large-stripe pass (VoAll always runs it, norm=True).
-            let dead_out = self.vo_rs_large(&work, nz, snr, la_size, 0.1)?;
-            drop(work);
+            // Residual large-stripe pass (VoAll always runs it, norm=True). Reads
+            // `work` only; result lands in `sc.rl_out`.
+            self.vo_rs_large(work, nz, snr, la_size, 0.1, sc)?;
+            let dead_out = &sc.rl_out;
 
             // ---- _rs_sort (dim=1) ----
-            // Sort each column ascending, keeping the permutation.
-            let sortedv = DevBuf::new(vol * f32sz)?;
-            let perm = DevBuf::new(vol * i32sz)?;
+            // Sort each column ascending, keeping the permutation. `work`/`big_a`
+            // is free now (rs_large only read it), so reuse it for `sortedv`.
+            let sortedv = &sc.big_a;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_colsort(
                         dead_out.ptr,
                         sortedv.ptr,
-                        perm.ptr,
+                        sc.perm.ptr,
                         nz,
                         nrow,
                         nc,
@@ -1608,9 +1683,8 @@ mod cuda_impl {
                 },
                 "vo_colsort(rs_sort)",
             )?;
-            drop(dead_out);
             // Smooth the sorted profiles across columns (window sm_size).
-            let smoothed = DevBuf::new(vol * f32sz)?;
+            let smoothed = &sc.big_b;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_median_axis1(
@@ -1625,11 +1699,18 @@ mod cuda_impl {
                 },
                 "vo_median(rs_sort)",
             )?;
-            drop(sortedv);
             // Unsort back into the original projection order, in place into `ptr`.
             ck(
                 unsafe {
-                    ffi::tomoxide_vo_unsort_scatter(perm.ptr, smoothed.ptr, ptr, nz, nrow, nc, null)
+                    ffi::tomoxide_vo_unsort_scatter(
+                        sc.perm.ptr,
+                        smoothed.ptr,
+                        ptr,
+                        nz,
+                        nrow,
+                        nc,
+                        null,
+                    )
                 },
                 "vo_unsort_scatter",
             )?;
