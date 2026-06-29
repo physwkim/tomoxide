@@ -130,7 +130,7 @@ mod cuda_impl {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::os::raw::c_void;
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock};
 
     /// RAII wrapper over a `cudaMalloc` allocation (freed on drop).
     struct DevBuf {
@@ -2951,6 +2951,25 @@ mod cuda_impl {
         }
     }
 
+    /// Total memory (bytes) on the **current** device. Caller must have already
+    /// `cudaSetDevice`'d the device it means to query. Falls back to a
+    /// conservative 8 GiB if the query fails.
+    ///
+    /// Used to size the per-slice worker pool: unlike free memory, total is a
+    /// stable property of the GPU and does not shrink as thread-local cuFFT plan
+    /// caches fill up, so the in-flight cap it yields is the same on every
+    /// reconstruction (free memory would collapse the cap once plans are cached).
+    fn device_total_bytes() -> usize {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let rc = unsafe { ffi::tomoxide_cuda_mem_info(&mut free, &mut total) };
+        if rc == 0 && total > 0 {
+            total
+        } else {
+            8 * 1024 * 1024 * 1024
+        }
+    }
+
     /// Largest z-tile for the fused Fbp/Linerec path on the current device.
     /// Bounded by BOTH (a) the 32-bit index ceiling on the padded buffer
     /// `tile·nproj·pad`, and (b) ~80% of free device memory against the
@@ -3087,48 +3106,56 @@ mod cuda_impl {
         })
     }
 
-    /// Minimal counting semaphore (std-only) used to bound how many per-slice
-    /// reconstructions hold device buffers at once. A worker blocks in
-    /// [`acquire`](Semaphore::acquire) until a permit is free; the returned guard
-    /// returns the permit on drop.
-    struct Semaphore {
-        permits: Mutex<usize>,
-        cv: Condvar,
+    /// A device-pinned rayon pool sized to exactly `nthreads`, built once per
+    /// `(device, nthreads)` and cached for the process lifetime.
+    ///
+    /// The per-slice loop runs here instead of on the full host-core pool so that
+    /// the number of *distinct* worker threads equals the in-flight cap. That
+    /// matters because each worker lazily creates a **thread-local cuFFT plan**
+    /// (see `cuda/fft.cu`) that is never destroyed: if the loop fanned across all
+    /// 96 host cores, up to 96 oversampled `(2n)²` plan workspaces would
+    /// accumulate and exhaust VRAM at large `n` (one GPU OOMs, or the next
+    /// reconstruction sees no free memory and collapses to a serial cap). Pinning
+    /// the loop to `nthreads = max_inflight` makes plan-count == concurrency ==
+    /// cap by construction — one number governs both. Pools are leaked (process
+    /// lifetime, like `device_pools`) so plans persist and are reused; only a
+    /// handful of distinct `(device, nthreads)` keys arise per run.
+    fn slice_pool(device: i32, nthreads: usize) -> &'static ThreadPool {
+        static REG: OnceLock<Mutex<HashMap<(i32, usize), &'static ThreadPool>>> = OnceLock::new();
+        let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut m = reg.lock().unwrap();
+        if let Some(p) = m.get(&(device, nthreads)) {
+            return p;
+        }
+        let pool: &'static ThreadPool = Box::leak(Box::new(
+            ThreadPoolBuilder::new()
+                .num_threads(nthreads.max(1))
+                .start_handler(move |_| {
+                    unsafe { ffi::tomoxide_cuda_set_device(device) };
+                })
+                .build()
+                .expect("build cuda slice pool"),
+        ));
+        m.insert((device, nthreads), pool);
+        pool
     }
 
-    struct SemGuard<'a>(&'a Semaphore);
-
-    impl Semaphore {
-        fn new(permits: usize) -> Self {
-            Self {
-                permits: Mutex::new(permits),
-                cv: Condvar::new(),
-            }
-        }
-        fn acquire(&self) -> SemGuard<'_> {
-            let mut p = self.permits.lock().unwrap();
-            while *p == 0 {
-                p = self.cv.wait(p).unwrap();
-            }
-            *p -= 1;
-            SemGuard(self)
-        }
-    }
-
-    impl Drop for SemGuard<'_> {
-        fn drop(&mut self) {
-            *self.0.permits.lock().unwrap() += 1;
-            self.0.cv.notify_one();
-        }
-    }
-
-    /// How many per-slice reconstructions may run concurrently on one device.
-    /// The composed path allocates an oversampled `(2n)²` complex grid (plus
-    /// cuFFT workspace) per in-flight slice; fanning all host cores at large `n`
-    /// over-subscribes 32 GB and OOMs. Cap concurrency at ~70% of free device
-    /// memory over a conservative per-slice footprint, clamped to the pool size.
+    /// How many per-slice reconstructions may run concurrently on one device —
+    /// which is also the worker-thread count handed to [`slice_pool`], so it
+    /// bounds VRAM by construction (one thread ⇒ one in-flight slice ⇒ one
+    /// persistent cuFFT plan).
+    ///
+    /// Each worker holds, for the lifetime of the process, an oversampled `(2n)²`
+    /// cuFFT plan workspace, plus — while a slice is in flight — its `(2n)²`
+    /// complex grid and padded staging buffers. The persistent plan dominates at
+    /// large `n`, so the budget is taken against **total** device memory (a stable
+    /// figure) rather than free memory: free memory shrinks as plans are cached,
+    /// which would make the cap collapse on the second reconstruction. Cap at
+    /// ~70% of total over a per-slice footprint of 6× the `(2n)²` grid (grid +
+    /// plan workspace + staging), clamped to the host-core budget. Smaller `n`
+    /// clamps to the pool size (plans are tiny, full host parallelism is kept).
     /// `TOMOXIDE_CUDA_MAX_INFLIGHT` overrides the computed value.
-    fn max_inflight(n: usize, free_bytes: usize, pool_threads: usize) -> usize {
+    fn max_inflight(n: usize, total_bytes: usize, pool_threads: usize) -> usize {
         if let Ok(s) = std::env::var("TOMOXIDE_CUDA_MAX_INFLIGHT") {
             if let Ok(v) = s.trim().parse::<usize>() {
                 if v >= 1 {
@@ -3136,16 +3163,19 @@ mod cuda_impl {
                 }
             }
         }
-        // ~3× the (2n)² complex grid covers grid + plan workspace + staging.
-        let per_slice = 3 * (2 * n) * (2 * n) * std::mem::size_of::<crate::dtype::Complex32>();
-        let by_mem = (free_bytes / 100 * 70) / per_slice.max(1);
+        // 6× the (2n)² complex grid covers the persistent plan workspace + the
+        // in-flight grid + padded staging; calibrated so large-n fits VRAM with
+        // headroom (e.g. n=2048 → ~27 of 32 GB) while small-n stays pool-bound.
+        let per_slice = 6 * (2 * n) * (2 * n) * std::mem::size_of::<crate::dtype::Complex32>();
+        let by_mem = (total_bytes / 100 * 70) / per_slice.max(1);
         by_mem.clamp(1, pool_threads.max(1))
     }
 
     impl crate::backend::Fft for CudaBackend {
         /// Fan the per-slice loop across the selected GPUs (and host cores).
         /// Slices are partitioned into one contiguous chunk per device; each
-        /// chunk runs on that device's pinned pool, all devices concurrently.
+        /// chunk runs on that device's [`slice_pool`] — a pinned pool sized to the
+        /// device's in-flight cap — all devices concurrently.
         ///
         /// Bit-identical regardless of device count: each slice's cuFFT uses a
         /// fixed per-slice batch (independent of how slices are spread), and the
@@ -3166,19 +3196,20 @@ mod cuda_impl {
             let slabs: Vec<ArrayViewMut2<f32>> = out.axis_iter_mut(Axis(0)).collect();
             let nz = slabs.len();
 
-            // Single device: one pinned pool, rayon across its host cores, with
-            // in-flight slices capped to fit device memory (see `max_inflight`).
+            // Single device: run on a pinned pool sized to `max_inflight`, so the
+            // in-flight slice count == worker count == persistent cuFFT plan count
+            // (see `slice_pool` / `max_inflight`). Total VRAM (queried on a pinned
+            // worker) gives a stable cap that does not collapse once plans cache.
             if d <= 1 {
                 let threads = dp.pools[0].current_num_threads();
-                return dp.pools[0].install(move || {
-                    let sem = Semaphore::new(max_inflight(n, device_free_bytes(), threads));
+                let total = dp.pools[0].install(device_total_bytes);
+                let inflight = max_inflight(n, total, threads);
+                let pool = slice_pool(dp.devices[0], inflight);
+                return pool.install(move || {
                     slabs
                         .into_par_iter()
                         .enumerate()
-                        .try_for_each(|(row, slab)| {
-                            let _permit = sem.acquire();
-                            f(row, slab)
-                        })
+                        .try_for_each(|(row, slab)| f(row, slab))
                 });
             }
 
@@ -3200,16 +3231,21 @@ mod cuda_impl {
                 let handles: Vec<_> = chunks
                     .into_iter()
                     .zip(dp.pools.iter())
-                    .map(|((off, chunk), pool)| {
+                    .zip(dp.devices.iter())
+                    .map(|(((off, chunk), pool), &dev)| {
                         scope.spawn(move || -> Result<()> {
+                            // Size this device's per-slice pool to its in-flight
+                            // cap (total VRAM queried on a worker pinned to `dev`),
+                            // matching the single-GPU path so plan-count == cap.
                             let threads = pool.current_num_threads();
-                            pool.install(|| {
-                                let sem =
-                                    Semaphore::new(max_inflight(n, device_free_bytes(), threads));
-                                chunk.into_par_iter().enumerate().try_for_each(|(i, slab)| {
-                                    let _permit = sem.acquire();
-                                    f(off + i, slab)
-                                })
+                            let total = pool.install(device_total_bytes);
+                            let inflight = max_inflight(n, total, threads);
+                            let spool = slice_pool(dev, inflight);
+                            spool.install(|| {
+                                chunk
+                                    .into_par_iter()
+                                    .enumerate()
+                                    .try_for_each(|(i, slab)| f(off + i, slab))
                             })
                         })
                     })
