@@ -832,6 +832,15 @@ mod cuda_impl {
         // FBP/Linerec/Fourierrec paths. lprec/fourier/linerec are mutually exclusive.
         lprec: Option<LpRecDev>,
         flc: Option<DevBuf>,
+        // Recycled host volume buffers handed back by the writer thread (see
+        // `give_reuse_buffer` / `download_volume`). The pinned `out_pinned` is
+        // reused across chunks, so the D2H'd volume must be copied into an owned
+        // `Send` buffer for the writer. Allocating that buffer fresh each chunk
+        // pays ~190 ms of page-faults on a 536 MB `[8, n, n]` chunk; reusing a
+        // warm buffer from the writer drops the copy to ~34 ms. Symmetric to the
+        // reader's pinned input pool. Empty until the writer returns the first
+        // spent volume (the first few chunks still allocate fresh).
+        reuse_pool: Vec<Vec<f32>>,
         // Pinned `[max_nz, n, n]` f32 host staging for the volume download. A D2H
         // into pageable memory is driver-staged at ~⅓ the PCIe rate and is
         // synchronous; downloading into this page-locked buffer (then moving it
@@ -1061,6 +1070,7 @@ mod cuda_impl {
                 lprec,
                 flc,
                 out_pinned,
+                reuse_pool: Vec::new(),
             })
         }
     }
@@ -1275,6 +1285,15 @@ mod cuda_impl {
                 )?;
             }
             Ok(Some(self.finish_recon(nz, geom)?))
+        }
+
+        fn give_reuse_buffer(&mut self, buf: Vec<f32>) {
+            // The number of volume buffers in circulation is bounded by the
+            // pipeline's channel depths, so the pool stays small; cap it anyway so
+            // a buffer can never accumulate without limit.
+            if self.reuse_pool.len() < 4 {
+                self.reuse_pool.push(buf);
+            }
         }
     }
 
@@ -1910,19 +1929,26 @@ mod cuda_impl {
     /// The destination being page-locked is what matters: a D2H into pageable
     /// host memory is driver-staged at ~⅓ the PCIe rate (and is synchronous, so
     /// it cannot overlap kernels), whereas the pinned copy runs at full
-    /// bandwidth. The subsequent `to_vec` hands the writer its own `Send` buffer
-    /// so the pinned staging can be reused by the next chunk, and replaces the
-    /// old `vec![0.0; nz*n*n]` that zeroed the buffer only to immediately
-    /// overwrite every element.
+    /// bandwidth. The volume must then move into an owned `Send` buffer so the
+    /// pinned staging can be reused by the next chunk. A fresh allocation for
+    /// that buffer pays ~190 ms of first-touch page-faults on a 536 MB chunk, so
+    /// `pool` supplies a warm buffer recycled from the writer (see
+    /// `give_reuse_buffer`); the copy into it is ~34 ms. The pool is empty for
+    /// the first few chunks (nothing returned yet), which fall back to a fresh
+    /// allocation.
     fn download_volume(
         src: &DevBuf,
         pin: &mut PinnedBuf<f32>,
+        pool: &mut Vec<Vec<f32>>,
         nz: usize,
         n: usize,
     ) -> Result<Volume<f32>> {
         let count = nz * n * n;
         src.to_host_f32(&mut pin.as_mut_slice()[..count])?;
-        let host = pin.as_slice()[..count].to_vec();
+        // Reuse a warm buffer from the writer if one is available, else allocate.
+        let mut host = pool.pop().unwrap_or_default();
+        host.resize(count, 0.0);
+        host.copy_from_slice(&pin.as_slice()[..count]);
         Ok(Volume::new(
             Array3::from_shape_vec((nz, n, n), host).expect("nz*n*n volume length matches shape"),
         ))
@@ -2015,7 +2041,7 @@ mod cuda_impl {
                     "cast f16->f32 vol",
                 )?;
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                download_volume(f_f32, &mut self.out_pinned, nz, n)
+                download_volume(f_f32, &mut self.out_pinned, &mut self.reuse_pool, nz, n)
             } else if self.lprec.is_some() {
                 // Device-resident log-polar (f32): same pad → filter → crop as the
                 // FBP tail produces the filtered sinogram in `gf`; the held
@@ -2061,7 +2087,7 @@ mod cuda_impl {
                 let flc = self.flc.as_ref().expect("lprec path has flc");
                 lp.run(self.gf.ptr, flc.ptr, self.f.ptr, nz, nproj, n)?;
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                download_volume(&self.f, &mut self.out_pinned, nz, n)
+                download_volume(&self.f, &mut self.out_pinned, &mut self.reuse_pool, nz, n)
             } else if self.fourier {
                 // Device-resident Fourierrec (f32): same pad → filter → crop as the
                 // FBP tail, then pack pairs → `cfunc_fourierrec` → unpack, mirroring
@@ -2110,7 +2136,7 @@ mod cuda_impl {
                     "unpack",
                 )?;
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                download_volume(&self.f, &mut self.out_pinned, nz, n)
+                download_volume(&self.f, &mut self.out_pinned, &mut self.reuse_pool, nz, n)
             } else {
                 ck(
                     unsafe {
@@ -2159,7 +2185,7 @@ mod cuda_impl {
                     );
                 }
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-                download_volume(&self.f, &mut self.out_pinned, nz, n)
+                download_volume(&self.f, &mut self.out_pinned, &mut self.reuse_pool, nz, n)
             }
         }
     }

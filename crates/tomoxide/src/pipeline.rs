@@ -270,6 +270,14 @@ impl ReconSteps {
         let (free_tx, free_rx) =
             std::sync::mpsc::sync_channel::<Box<dyn crate::backend::HostBuffer>>(POOL);
         let free_tx_reader = free_tx.clone();
+        // Output-volume recycle channel: the writer hands each spent volume's
+        // backing `Vec<f32>` back to the compute thread, which feeds it to the
+        // reconstructor (`give_reuse_buffer`) so the device→host download copies
+        // into a warm allocation instead of a fresh 536 MB one (~190 ms of
+        // first-touch page-faults per chunk avoided). Unbounded so the writer
+        // never blocks returning a buffer; circulation is bounded by the volume
+        // channel depth, so it cannot grow without limit.
+        let (out_free_tx, out_free_rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
         std::thread::scope(|s| {
             // Reader thread: build its own reader, stream each chunk's rows.
@@ -348,6 +356,11 @@ impl ReconSteps {
                 }
                 while let Ok((r0, r1, vol)) = write_rx.recv() {
                     writer.write_chunk(&vol, r0, r1)?;
+                    // Return the spent volume's backing buffer to the compute
+                    // thread for reuse (ignore a send error: a finished compute
+                    // thread just lets the buffer drop). `into_raw_vec_and_offset`
+                    // is a move, not a copy — the volume is standard C-layout here.
+                    let _ = out_free_tx.send(vol.array.into_raw_vec_and_offset().0);
                 }
                 Ok(())
             });
@@ -356,7 +369,15 @@ impl ReconSteps {
             // drops at the end of the loop, terminating the writer thread, and
             // `free_tx` so spent pinned buffers return to the reader's pool.
             let compute = compute_chunks(
-                read_rx, write_tx, free_tx, backend, geom, algorithm, params, prep,
+                read_rx,
+                write_tx,
+                free_tx,
+                out_free_rx,
+                backend,
+                geom,
+                algorithm,
+                params,
+                prep,
             );
 
             // Join I/O threads, then surface the first error in causal order:
@@ -397,6 +418,7 @@ fn compute_chunks(
     read_rx: std::sync::mpsc::Receiver<(usize, usize, ChunkMsg)>,
     write_tx: std::sync::mpsc::SyncSender<(usize, usize, Volume<f32>)>,
     free_tx: std::sync::mpsc::SyncSender<Box<dyn crate::backend::HostBuffer>>,
+    out_free: std::sync::mpsc::Receiver<Vec<f32>>,
     backend: &dyn crate::backend::Backend,
     geom: &Geometry,
     algorithm: Algorithm,
@@ -406,8 +428,16 @@ fn compute_chunks(
     // Reuse one backend reconstructor across all chunks (see
     // `recon_chunk_reusing`): a many-chunk job pays the cuFFT-plan / f16-texture
     // setup once, not per chunk.
-    let mut recon = None;
+    let mut recon: Option<Option<Box<dyn crate::backend::StreamingAnalytic>>> = None;
     while let Ok((r0, r1, msg)) = read_rx.recv() {
+        // Feed any volume buffers the writer has returned back to the
+        // reconstructor so this chunk's device→host download reuses a warm
+        // allocation (no-op for backends that build the volume on the host).
+        while let Ok(buf) = out_free.try_recv() {
+            if let Some(Some(r)) = recon.as_mut() {
+                r.give_reuse_buffer(buf);
+            }
+        }
         let chunk_geom = chunk_geometry(geom, r0, r1);
         let vol = match msg {
             ChunkMsg::Raw {

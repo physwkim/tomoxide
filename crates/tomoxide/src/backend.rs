@@ -383,6 +383,15 @@ pub trait StreamingAnalytic {
     ) -> Result<Option<Volume<f32>>> {
         Ok(None)
     }
+
+    /// Hand a spent host volume buffer back to the reconstructor for reuse on a
+    /// later chunk. The streaming pipeline calls this with the `Vec` backing each
+    /// volume after the writer is done with it, so a reconstructor that copies
+    /// device output into an owned `Send` buffer (the CUDA path) can recycle a
+    /// warm allocation instead of paying ~190 ms of first-touch page-faults per
+    /// 536 MB chunk. The default ignores the buffer (backends that build the
+    /// volume on the host have nothing to recycle).
+    fn give_reuse_buffer(&mut self, _buf: Vec<f32>) {}
 }
 
 /// Direct Fourier-gridding reconstruction (sinogram → volume) for a backend
