@@ -157,6 +157,84 @@ TOMOXIDE_CUDA_DEVICES=0 cargo run --release --features cuda --example bench_para
 cargo run --release --features cuda --example bench_parallel -- cuda 1024 1024 128 1
 ```
 
+### Head-to-head vs tomocupy (end-to-end wall)
+
+Full-pipeline wall time — HDF5 read → normalize → reconstruct → TIFF write — for
+the three algorithms both tools implement (`linerec`, `fourierrec`, `lprec`), on
+the same synthetic DXchange file in `/dev/shm` (RAM I/O, so the comparison is
+compute- not disk-bound), `nz=128`, GPU clocks locked at 2100 MHz, min of 2 runs
+after a warmup. Times in seconds; **bold** is the faster tool in each GPU-count
+pair. tomoxide multi-GPU is one process splitting `z` across 4 devices; tomocupy
+1.0.4 is single-GPU per process, so its "4-GPU" is 4 concurrent processes each
+pinned to one device over a quarter of the `z` rows (`--start-row/--end-row`,
+wall = slowest shard).
+
+`linerec` (fp32):
+
+| image | tomoxide 1-GPU | tomocupy 1-GPU | tomoxide 4-GPU | tomocupy 4-GPU |
+|---|---|---|---|---|
+| 128²  | **0.52** | 1.14 | **0.96** | 1.83 |
+| 256²  | **0.69** | 1.69 | **1.16** | 2.47 |
+| 512²  | **1.18** | 2.10 | **1.66** | 2.24 |
+| 1024² | **2.24** | 2.28 | **2.73** | 3.12 |
+| 2048² | 11.52 | **6.27** | 7.66 | **5.32** |
+
+`fourierrec` (fp32):
+
+| image | tomoxide 1-GPU | tomocupy 1-GPU | tomoxide 4-GPU | tomocupy 4-GPU |
+|---|---|---|---|---|
+| 128²  | **0.51** | 1.27 | **0.65** | 1.67 |
+| 256²  | **0.68** | 1.16 | **0.72** | 2.05 |
+| 512²  | **1.23** | 2.07 | **1.28** | 2.26 |
+| 1024² | **2.61** | 2.93 | **2.42** | 2.87 |
+| 2048² | 8.86 | **4.69** | 8.72 | **4.82** |
+
+`lprec` (fp32):
+
+| image | tomoxide 1-GPU | tomocupy 1-GPU | tomoxide 4-GPU | tomocupy 4-GPU |
+|---|---|---|---|---|
+| 128²  | **0.95** | 1.35 | **1.13** | 1.92 |
+| 256²  | **1.65** | 1.94 | **1.74** | 2.59 |
+| 512²  | 3.19 | **2.30** | **2.94** | 3.01 |
+| 1024² | 7.74 | **2.85** | 5.63 | **2.96** |
+| 2048² | 22.75 | **4.88** | 20.95 | **4.98** |
+
+fp16 (`linerec`, `fourierrec`; tomoxide fp16 covers only the analytic paths):
+
+| image | linerec tox/tc 1-GPU | linerec tox/tc 4-GPU | fourierrec tox/tc 1-GPU | fourierrec tox/tc 4-GPU |
+|---|---|---|---|---|
+| 128²  | **0.44**/1.57 | **0.60**/1.92 | **0.54**/1.27 | **0.60**/2.34 |
+| 256²  | **0.66**/1.66 | **0.74**/2.28 | **0.67**/1.66 | **0.73**/2.34 |
+| 512²  | **1.14**/2.08 | **1.20**/2.79 | **1.25**/2.12 | **1.24**/2.68 |
+| 1024² | **2.96**/3.16 | 2.94/**2.94** | **2.96**/3.17 | **3.02**/3.22 |
+| 2048² | 11.25/**5.95** | 11.25/**4.27** | 7.44/**5.39** | 9.38/**4.48** |
+
+What this means:
+
+- **tomoxide wins end-to-end at small/medium sizes** (≤1024² for the analytic
+  paths, ≤256² for `lprec`). The compiled binary starts in ~0.3 s; tomocupy pays
+  ~1.3–1.7 s of Python + CuPy/context init per invocation, which dominates the
+  wall until the reconstruction itself is large.
+- **tomocupy wins at 2048²** for every algorithm (linerec ~1.8×, fourierrec
+  ~1.9×, `lprec` ~4.6×). Once compute dominates startup, its streaming pipeline
+  beats tomoxide's whole-volume `recon`, which holds the full sinogram + volume
+  and, for `lprec`, runs a host-gather-bound composed path.
+- **`lprec` is tomocupy's strongest case** — its GPU log-polar implementation
+  pulls ahead from 512² up; tomoxide's `lprec` (composed FFT + host gather) is
+  the slowest GPU path here.
+- **Multi-GPU.** tomoxide's z-split helps only at 2048² (e.g. linerec 11.5→7.7 s).
+  tomocupy's 4-process shard rarely beats its own single GPU below 2048² — four
+  cold Python/CuPy inits plus each shard re-reading its slab outweigh the split —
+  and helps only modestly at 2048².
+
+Caveat: this is **wall-to-wall** time. tomocupy's own internal "Reconstruction
+time" (compute only, excluding Python import) is far smaller (e.g. fourierrec
+256² ≈ 0.39 s), so the small/medium wins are tomoxide avoiding interpreter
+startup, not a faster core loop; for very large or batched streaming jobs
+tomocupy's pipeline dominates. Reproduce by generating a DXchange file with the
+`make_synthetic_dxchange` example and timing `tomoxide recon` against
+`tomocupy recon` on it.
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline.
