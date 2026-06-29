@@ -810,14 +810,15 @@ mod cuda_impl {
         vo_scratch: Option<VoScratch>,
         filt: *mut c_void,
         lrec: *mut c_void,
-        // Fourierrec device-resident path (f32 only). When `fourier` is set the
+        // Fourierrec device-resident path (f32 and f16). When `fourier` is set the
         // back-projection tail of `finish_recon` is pack → `cfunc_fourierrec` →
         // unpack instead of `cfunc_linerec`, reusing the same raw-path normalize/
         // transpose/stripe machinery and the shared `filt` handle. `gc` holds the
         // packed complex sinogram `[max_nz/2, nproj, ncols]` and `fc` the complex
-        // reconstruction `[max_nz/2, n, n]`; `frec` is the `cfunc_fourierrec`
-        // handle (built for `max_nz/2` pairs). All three are unused (None/null) on
-        // the FBP/Linerec path, which keeps `lrec`.
+        // reconstruction `[max_nz/2, n, n]` (f16- or f32-wide per `f16`); `frec` is
+        // the `cfunc_fourierrec` handle (built for `max_nz/2` pairs, f16 or f32
+        // variant). All three are unused (None/null) on the FBP/Linerec path, which
+        // keeps `lrec`.
         fourier: bool,
         gc: Option<DevBuf>,
         fc: Option<DevBuf>,
@@ -972,7 +973,7 @@ mod cuda_impl {
             };
             // The FBP filter handle is shared by both back-projection tails. The
             // tail handle is `cfunc_linerec` (FBP/Linerec) or `cfunc_fourierrec`
-            // (Fourierrec, f32 only — built for `max_nz/2` packed pairs). The
+            // (Fourierrec, f16 or f32 — built for `max_nz/2` packed pairs). The
             // Fourierrec packed/complex scratch (`gc`/`fc`) is allocated only on
             // that path.
             let filt = unsafe {
@@ -994,11 +995,27 @@ mod cuda_impl {
             let (lrec, frec, gc, fc) = if lprec.is_some() {
                 (std::ptr::null_mut(), std::ptr::null_mut(), None, None)
             } else if fourier {
-                // f32-only path (streaming() returns None for f16 Fourierrec).
-                let gc = DevBuf::zeroed(max_nz * nproj * ncols * fsz)?;
-                let fc = DevBuf::zeroed(max_nz * n * n * fsz)?;
+                // Packed/complex scratch sized to the element width (f16 or f32) and
+                // the matching `max_nz/2`-pair handle. The f16 tail mirrors
+                // `analytic_fourierrec_f16`.
+                let gc = DevBuf::zeroed(max_nz * nproj * ncols * esz)?;
+                let fc = DevBuf::zeroed(max_nz * n * n * esz)?;
                 let frec = unsafe {
-                    ffi::tomoxide_fourierrec_new(nproj, max_nz / 2, n, theta_dev.ptr as *const f32)
+                    if f16 {
+                        ffi::tomoxide_fourierrec_fp16_new(
+                            nproj,
+                            max_nz / 2,
+                            n,
+                            theta_dev.ptr as *const f32,
+                        )
+                    } else {
+                        ffi::tomoxide_fourierrec_new(
+                            nproj,
+                            max_nz / 2,
+                            n,
+                            theta_dev.ptr as *const f32,
+                        )
+                    }
                 };
                 (std::ptr::null_mut(), frec, Some(gc), Some(fc))
             } else {
@@ -1032,7 +1049,11 @@ mod cuda_impl {
                         }
                     }
                     if !frec.is_null() {
-                        ffi::tomoxide_fourierrec_free(frec)
+                        if f16 {
+                            ffi::tomoxide_fourierrec_fp16_free(frec)
+                        } else {
+                            ffi::tomoxide_fourierrec_free(frec)
+                        }
                     }
                 }
                 return Err(Error::Backend(
@@ -1087,8 +1108,11 @@ mod cuda_impl {
                     // lprec builds no tail handle (only the shared `filt`); the
                     // grids/flc are freed by their own DevBuf/LpRecDev drops.
                 } else if self.fourier {
-                    // f32-only Fourierrec tail.
-                    ffi::tomoxide_fourierrec_free(self.frec);
+                    if self.f16 {
+                        ffi::tomoxide_fourierrec_fp16_free(self.frec);
+                    } else {
+                        ffi::tomoxide_fourierrec_free(self.frec);
+                    }
                 } else if self.f16 {
                     ffi::tomoxide_linerec_fp16_free(self.lrec);
                 } else {
@@ -2017,20 +2041,48 @@ mod cuda_impl {
                     },
                     "crop_fp16",
                 )?;
-                ck(
-                    unsafe { ffi::tomoxide_cuda_memset(self.f.ptr, 0, self.f.bytes) },
-                    "memset f f16",
-                )?;
-                unsafe {
-                    ffi::tomoxide_linerec_fp16_backproject(
-                        self.lrec,
-                        self.f.ptr,
-                        self.gf.ptr,
-                        self.theta.ptr as *const f32,
-                        std::f32::consts::FRAC_PI_2,
-                        0,
-                        null,
-                    );
+                if self.fourier {
+                    // f16 Fourierrec tail: pack pairs → `cfunc_fourierrec` (f16) →
+                    // unpack, mirroring the f32 fourier branch and
+                    // `analytic_fourierrec_f16` at the handle's `max_nz/2`-pair batch.
+                    let gc = self.gc.as_ref().expect("fourier path has gc");
+                    let fc = self.fc.as_ref().expect("fourier path has fc");
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_pack_pairs_fp16(
+                                self.gf.ptr,
+                                gc.ptr,
+                                m,
+                                nproj,
+                                ncols,
+                                null,
+                            )
+                        },
+                        "pack_fp16",
+                    )?;
+                    unsafe {
+                        ffi::tomoxide_fourierrec_fp16_backproject(self.frec, fc.ptr, gc.ptr, null)
+                    };
+                    ck(
+                        unsafe { ffi::tomoxide_unpack_pairs_fp16(fc.ptr, self.f.ptr, m, n, null) },
+                        "unpack_fp16",
+                    )?;
+                } else {
+                    ck(
+                        unsafe { ffi::tomoxide_cuda_memset(self.f.ptr, 0, self.f.bytes) },
+                        "memset f f16",
+                    )?;
+                    unsafe {
+                        ffi::tomoxide_linerec_fp16_backproject(
+                            self.lrec,
+                            self.f.ptr,
+                            self.gf.ptr,
+                            self.theta.ptr as *const f32,
+                            std::f32::consts::FRAC_PI_2,
+                            0,
+                            null,
+                        );
+                    }
                 }
                 // Cast the f16 volume to f32 on the GPU, then D2H f32 (no host widen).
                 let f_f32 = self.f_f32.as_ref().expect("f16 path has f_f32");
@@ -3110,9 +3162,9 @@ mod cuda_impl {
             let fourier = matches!(algorithm, Algorithm::Fourierrec);
             let is_lprec = matches!(algorithm, Algorithm::Lprec);
             // Fourierrec packs slice pairs (s, s+max_nz/2) for the real-FFT path, so
-            // it needs an even chunk and is f32-only here (mirrors the one-shot
-            // `analytic_fourierrec` constraint). Anything else → per-chunk fallback.
-            if fourier && (f16 || max_nz % 2 != 0) {
+            // it needs an even chunk (f32 and f16 both have a device-resident tail;
+            // see `finish_recon`'s fourier branch). An odd chunk → per-chunk fallback.
+            if fourier && max_nz % 2 != 0 {
                 return Ok(None);
             }
             // lprec's gather/scatter + spline runtime is f32-only (no f16 port);

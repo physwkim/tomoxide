@@ -51,6 +51,19 @@ fn pearson(a: &ndarray::Array2<f32>, b: &ndarray::Array2<f32>) -> f32 {
 
 #[test]
 fn cuda_fourierrec_pipelined_matches_whole_volume() {
+    check_pipelined_matches_whole_volume(Dtype::F32, 0.999);
+}
+
+/// f16 Fourierrec also has a device-resident streaming tail (pack → `cfunc_
+/// fourierrec` (f16) → unpack); it must match the whole-volume f16 Fourierrec.
+/// Half precision + the `atomicAdd` gather floor make the agreement coarser than
+/// f32, so the per-slice correlation bar is relaxed.
+#[test]
+fn cuda_fourierrec_f16_pipelined_matches_whole_volume() {
+    check_pipelined_matches_whole_volume(Dtype::F16, 0.99);
+}
+
+fn check_pipelined_matches_whole_volume(dtype: Dtype, min_r: f32) {
     if CudaBackend::new().is_err() {
         eprintln!("skipping CUDA test: no usable CUDA device");
         return;
@@ -69,7 +82,7 @@ fn cuda_fourierrec_pipelined_matches_whole_volume() {
     let geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
     let params = ReconParams {
         num_gridx: Some(nx),
-        dtype: Dtype::F32,
+        dtype,
         ..Default::default()
     };
     let prep = PrepOptions::default();
@@ -105,8 +118,8 @@ fn cuda_fourierrec_pipelined_matches_whole_volume() {
         let b = piped.index_axis(Axis(0), z).to_owned();
         let r = pearson(&a, &b);
         assert!(
-            r > 0.999,
-            "pipelined fourierrec slice {z} disagrees with whole-volume: r = {r:.6}"
+            r > min_r,
+            "pipelined fourierrec slice {z} disagrees with whole-volume: r = {r:.6} (min {min_r})"
         );
     }
     eprintln!("device-resident fourierrec pipeline matches whole-volume across all {nz} slices");
