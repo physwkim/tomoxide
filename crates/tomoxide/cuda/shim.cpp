@@ -51,9 +51,6 @@ int tomoxide_cuda_memcpy_h2d(void* dst, const void* src, size_t bytes) {
 int tomoxide_cuda_memcpy_d2h(void* dst, const void* src, size_t bytes) {
   return (int) cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
 }
-int tomoxide_cuda_memcpy_d2d(void* dst, const void* src, size_t bytes) {
-  return (int) cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
-}
 int tomoxide_cuda_memset(void* p, int value, size_t bytes) {
   return (int) cudaMemset(p, value, bytes);
 }

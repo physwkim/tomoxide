@@ -813,9 +813,10 @@ __global__ void vo_build_goodx_ker(const float* mask, int* goodx, int* goodcount
   goodcount[z] = cnt;
 }
 
-// Bilinear (per-row linear) fill of dead columns from the bracketing good
-// columns. `work` is pre-seeded with a copy of `sino`; good columns are left
-// unchanged. One thread per (z,c).
+// Per-row linear fill of dead columns from the bracketing good columns, writing
+// the full `[nz,nrow,nc]` working copy: good columns (and every column when no
+// fill is possible) are copied straight from `sino`, dead columns are
+// interpolated. One thread per (z,c) — no separate seeding copy needed.
 __global__ void vo_interp_fill_ker(const float* sino, float* work, const float* mask,
                                    const int* goodx, const int* goodcount, int nz, int nrow,
                                    int nc) {
@@ -824,9 +825,14 @@ __global__ void vo_interp_fill_ker(const float* sino, float* work, const float* 
   if (t >= total) return;
   int c = (int) (t % nc);
   int z = (int) (t / nc);
-  if (mask[(long long) z * nc + c] <= 0.0f) return;  // good column
+  const float* sc = sino + (long long) z * nrow * nc + c;
+  float* wc = work + (long long) z * nrow * nc + c;
   int cnt = goodcount[z];
-  if (cnt < 2) return;  // CPU: no fill when goodx.len() < 2
+  // Good column, or no fill possible (CPU leaves work == clone(sino)): copy.
+  if (mask[(long long) z * nc + c] <= 0.0f || cnt < 2) {
+    for (int r = 0; r < nrow; r++) wc[(long long) r * nc] = sc[(long long) r * nc];
+    return;
+  }
   const int* gx = goodx + (long long) z * nc;
   int i0 = 0;
   for (int k = 0; k < cnt - 1; k++) {
@@ -839,7 +845,6 @@ __global__ void vo_interp_fill_ker(const float* sino, float* work, const float* 
   double tt = (c1 != c0) ? ((double) c - (double) c0) / ((double) c1 - (double) c0) : 0.0;
   const float* col0 = sino + (long long) z * nrow * nc + c0;
   const float* col1 = sino + (long long) z * nrow * nc + c1;
-  float* wc = work + (long long) z * nrow * nc + c;
   for (int r = 0; r < nrow; r++) {
     double v0 = col0[(long long) r * nc];
     double v1 = col1[(long long) r * nc];

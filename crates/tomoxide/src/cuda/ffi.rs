@@ -25,8 +25,6 @@ unsafe extern "C" {
     pub fn tomoxide_cuda_memcpy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
     /// `cudaMemcpy` device→host; returns 0 on success.
     pub fn tomoxide_cuda_memcpy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
-    /// Device-to-device copy. 0 on success.
-    pub fn tomoxide_cuda_memcpy_d2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
     /// `cudaMemset`; returns 0 on success.
     pub fn tomoxide_cuda_memset(p: *mut c_void, value: i32, bytes: usize) -> i32;
     /// `cudaDeviceSynchronize`; returns 0 on success.

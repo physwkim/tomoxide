@@ -1306,14 +1306,6 @@ mod cuda_impl {
             Ok(())
         }
 
-        /// Device-to-device copy of `bytes` from `src` into `dst`.
-        fn vo_d2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
-            ck(
-                unsafe { ffi::tomoxide_cuda_memcpy_d2d(dst, src, bytes) },
-                "vo_d2d",
-            )
-        }
-
         /// `_detect_stripe` + `binary_dilation` for a per-column `listfact`
         /// `[nz, nc]`, writing the dilated mask. `border_zero` protects the two
         /// outer columns each side (the `_rs_dead` rule); `_rs_large` passes
@@ -1437,22 +1429,22 @@ mod cuda_impl {
             let mask = DevBuf::new(cols * f32sz)?;
             self.vo_detect_mask(&lf32, &mask, nz, nc, snr, false)?;
             drop(lf32);
-            // Normalised working copy.
-            let work2 = DevBuf::new(vol * f32sz)?;
+            // Normalised result, written straight into `out`. colsort reads it
+            // (without modifying it) for the permutation, then scatter_masked
+            // overwrites only the masked columns in place — no seeding copy.
+            let out = DevBuf::new(vol * f32sz)?;
             ck(
-                unsafe {
-                    ffi::tomoxide_vo_normalize(s.ptr, lf64.ptr, work2.ptr, nz, nrow, nc, null)
-                },
+                unsafe { ffi::tomoxide_vo_normalize(s.ptr, lf64.ptr, out.ptr, nz, nrow, nc, null) },
                 "vo_normalize",
             )?;
             drop(lf64);
-            // Sort the normalised copy for its permutation.
+            // Sort the normalised copy for its permutation (sorted values unused).
             let perm2 = DevBuf::new(vol * i32sz)?;
             let sortdummy = DevBuf::new(vol * f32sz)?;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_colsort(
-                        work2.ptr,
+                        out.ptr,
                         sortdummy.ptr,
                         perm2.ptr,
                         nz,
@@ -1462,13 +1454,10 @@ mod cuda_impl {
                         null,
                     )
                 },
-                "vo_colsort(work2)",
+                "vo_colsort(out)",
             )?;
             drop(sortdummy);
-            // out = work2; overwrite masked columns with the smoothed profile.
-            let out = DevBuf::new(vol * f32sz)?;
-            Self::vo_d2d(out.ptr, work2.ptr, vol * f32sz)?;
-            drop(work2);
+            // Overwrite masked columns of `out` with the smoothed profile.
             ck(
                 unsafe {
                     ffi::tomoxide_vo_scatter_masked(
@@ -1574,8 +1563,9 @@ mod cuda_impl {
                 },
                 "vo_build_goodx",
             )?;
+            // `work` is written in full by interp_fill (good columns copied from
+            // `ptr`, dead columns interpolated) — no seeding copy.
             let work = DevBuf::new(vol * f32sz)?;
-            Self::vo_d2d(work.ptr, ptr, vol * f32sz)?;
             ck(
                 unsafe {
                     ffi::tomoxide_vo_interp_fill(
