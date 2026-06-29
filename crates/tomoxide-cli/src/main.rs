@@ -103,8 +103,8 @@ const DEFAULT_PIPELINE_CHUNK: usize = 8;
 ///
 /// - **Fbp / Linerec**: device-resident streaming reconstructor (GPU
 ///   normalize/transpose + reused cuFFT/back-projection handles) — large win.
-/// - **Fourierrec**: per-chunk GPU reconstruct (host normalize/transpose, but
-///   cuFFT plans are thread-cached across chunks) — moderate win.
+/// - **Fourierrec**: device-resident streaming reconstructor (GPU pack-pairs →
+///   `cfunc_fourierrec` → unpack, cuFFT plans reused across chunks) — large win.
 /// - **Lprec**: device-resident streaming reconstructor (GPU spline prefilter +
 ///   gather/FFT/scatter, log-polar grids uploaded once and reused) — the
 ///   whole-volume path otherwise pays a full-volume host transpose.
