@@ -60,6 +60,33 @@ impl CudaBackend {
     }
 }
 
+/// Name of the active CUDA device (e.g. `"NVIDIA RTX 5000 Ada Generation"`),
+/// or `None` without the `cuda` feature or when the query fails. Used to key the
+/// chunk-tuning cache so a chunk tuned on one GPU is not reused on another model.
+pub fn device_name() -> Option<String> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe {
+            ffi::tomoxide_cuda_device_name(buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len())
+        };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+}
+
 impl Backend for CudaBackend {
     fn name(&self) -> &'static str {
         "cuda"

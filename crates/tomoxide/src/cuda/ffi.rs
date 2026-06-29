@@ -17,6 +17,9 @@ unsafe extern "C" {
     pub fn tomoxide_cuda_device_count() -> i32;
     /// Bind the calling host thread to a device (multi-GPU pools); 0 on success.
     pub fn tomoxide_cuda_set_device(dev: i32) -> i32;
+    /// Name of the current device, written NUL-terminated into `buf` (capacity
+    /// `len` bytes); 0 on success, non-zero `cudaError_t` otherwise.
+    pub fn tomoxide_cuda_device_name(buf: *mut std::os::raw::c_char, len: usize) -> i32;
     /// `cudaMalloc` — returns a device pointer or null on failure.
     pub fn tomoxide_cuda_malloc(bytes: usize) -> *mut c_void;
     /// `cudaFree`.

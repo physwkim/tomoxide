@@ -37,6 +37,22 @@ int tomoxide_cuda_device_count() {
 }
 // Bind the calling host thread to a device (for multi-GPU pools). 0 on success.
 int tomoxide_cuda_set_device(int dev) { return (int) cudaSetDevice(dev); }
+// Name of the current device, copied (NUL-terminated) into `buf` of capacity
+// `len`. 0 on success; non-zero cudaError_t otherwise. Used to key the chunk
+// cache so a tuning measured on one GPU is not reused on a different model.
+int tomoxide_cuda_device_name(char* buf, size_t len) {
+  if (!buf || len == 0) return (int) cudaErrorInvalidValue;
+  int dev = 0;
+  cudaError_t e = cudaGetDevice(&dev);
+  if (e != cudaSuccess) return (int) e;
+  cudaDeviceProp prop;
+  e = cudaGetDeviceProperties(&prop, dev);
+  if (e != cudaSuccess) return (int) e;
+  size_t i = 0;
+  for (; i + 1 < len && prop.name[i] != '\0'; ++i) buf[i] = prop.name[i];
+  buf[i] = '\0';
+  return 0;
+}
 // Returns a device pointer (as void*) or null on failure.
 void* tomoxide_cuda_malloc(size_t bytes) {
   void* p = nullptr;
