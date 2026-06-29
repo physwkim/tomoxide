@@ -75,10 +75,10 @@ and they scale very differently:
 
 Reconstruction time per backend on this machine (96-core CPU, 4× RTX 5000 Ada),
 sweeping the in-plane image size at fixed depth `nz=128`. GPU columns are the
-median of 5 runs (3 at 2048²) after a warmup, with graphics clocks locked at
-2100 MHz (`nvidia-smi -lgc 2100`) for reproducibility; CPU columns are
-clock-independent and carried over. Times in seconds; **bold** is the fastest
-backend for that row.
+median of 5 runs (3 at 2048²) after a warmup, with the GPU clocks left dynamic
+(unlocked boost — idle 210 MHz, boosting toward 3105 MHz under load), so the GPU
+times carry run-to-run variance; CPU columns are clock-independent and carried
+over. Times in seconds; **bold** is the fastest backend for that row.
 
 `Fbp` (fused) — GPU wins, and the gap widens with size:
 
@@ -146,10 +146,12 @@ What this means in practice:
 
 The exact numbers are hardware-specific — a weaker CPU or a single faster GPU
 shifts each crossover — but the structural reasons (fused vs host-gather bound;
-per-call overhead) hold regardless. GPU columns are at a fixed 2100 MHz clock for
-reproducibility; with unlocked boost clocks the GPU is somewhat faster. Small
-times and the run-to-run-nondeterministic `Fourierrec` carry ± noise. Reproduce
-with the `bench_parallel` example (CPU / single-GPU / all-GPU):
+per-call overhead) hold regardless. GPU columns were measured with dynamic
+(unlocked boost) clocks, so they reflect real-world boost performance but carry
+run-to-run variance; small times and the run-to-run-nondeterministic `Fourierrec`
+carry the most ± noise. Locking the clock (`nvidia-smi -lgc <MHz>`) trades some
+speed for reproducibility. Reproduce with the `bench_parallel` example (CPU /
+single-GPU / all-GPU):
 
 ```sh
 cargo run --release --features cuda --example bench_parallel -- cpu 1024 1024 128 1
@@ -162,8 +164,10 @@ cargo run --release --features cuda --example bench_parallel -- cuda 1024 1024 1
 Full-pipeline wall time — HDF5 read → normalize → reconstruct → TIFF write — for
 the three algorithms both tools implement (`linerec`, `fourierrec`, `lprec`), on
 the same synthetic DXchange file in `/dev/shm` (RAM I/O, so the comparison is
-compute- not disk-bound), `nz=128`, GPU clocks locked at 2100 MHz, min of 2 runs
-after a warmup. Times in seconds; **bold** is the faster tool in each GPU-count
+compute- not disk-bound), `nz=128`, dynamic (unlocked boost) GPU clocks, min of 2
+runs after a warmup. Both tools ran under the same clock regime, so the relative
+comparison is fair; absolute times carry boost-clock variance. Times in seconds;
+**bold** is the faster tool in each GPU-count
 pair. tomoxide multi-GPU is one process splitting `z` across 4 devices; tomocupy
 1.0.4 is single-GPU per process, so its "4-GPU" is 4 concurrent processes each
 pinned to one device over a quarter of the `z` rows (`--start-row/--end-row`,
