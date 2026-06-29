@@ -3,10 +3,18 @@
 #include<stdio.h>
 cfunc_filter::cfunc_filter(size_t nproj, size_t nz, size_t n)
     : nproj(nproj), nz(nz), n(n) {
-    
+
     //fft filter R<->C
-    cufftCreate(&plan_filter_fwd);
-    cufftCreate(&plan_filter_inv);
+    // cuFFT auto-allocates the plan work area at cufftXtMakePlanMany time, so
+    // checking every cuFFT/cudaMalloc return here is what turns an out-of-memory
+    // chunk into a clean failure: any failure leaves valid_ == false and the
+    // factory returns null, instead of leaving an unallocated work area that
+    // cufftXtExec later dereferences (SIGSEGV inside libcufft).
+    if (cufftCreate(&plan_filter_fwd) != CUFFT_SUCCESS) return;
+    fwd_ok = true;
+    if (cufftCreate(&plan_filter_inv) != CUFFT_SUCCESS) return;
+    inv_ok = true;
+
     long long ffts[1] = {};
     long long inembed[1] = {};
     long long onembed[1] = {};
@@ -19,18 +27,22 @@ cfunc_filter::cfunc_filter(size_t nproj, size_t nz, size_t n)
     inembed[0] = n;onembed[0] = n/2+1;
 
 
-    cudaMalloc((void **)&ge,
-            (n/2+1) * nproj * nz * sizeof(real2));
-    cufftXtMakePlanMany(plan_filter_fwd, 
-        1, ffts, 
-        inembed, 1, idist, CUDA_R, 
-        onembed, 1, odist, CUDA_C, 
-        nproj*nz, &workSize, CUDA_C);      
-    cufftXtMakePlanMany(plan_filter_inv, 
-        1, ffts, 
-        onembed, 1, odist, CUDA_C, 
-        inembed, 1, idist, CUDA_R, 
-        nproj*nz, &workSize, CUDA_C);        
+    if (cudaMalloc((void **)&ge,
+            (n/2+1) * nproj * nz * sizeof(real2)) != cudaSuccess) {
+        ge = nullptr;
+        return;
+    }
+    if (cufftXtMakePlanMany(plan_filter_fwd,
+        1, ffts,
+        inembed, 1, idist, CUDA_R,
+        onembed, 1, odist, CUDA_C,
+        nproj*nz, &workSize, CUDA_C) != CUFFT_SUCCESS) return;
+    if (cufftXtMakePlanMany(plan_filter_inv,
+        1, ffts,
+        onembed, 1, odist, CUDA_C,
+        inembed, 1, idist, CUDA_R,
+        nproj*nz, &workSize, CUDA_C) != CUFFT_SUCCESS) return;
+    valid_ = true;
     }
 
 
@@ -39,10 +51,10 @@ cfunc_filter::~cfunc_filter() { free(); }
 
 void cfunc_filter::free() {
   if (!is_free) {
-    cufftDestroy(plan_filter_fwd);
-    cufftDestroy(plan_filter_inv);
-    cudaFree(ge);
-    is_free = true;   
+    if (fwd_ok) cufftDestroy(plan_filter_fwd);
+    if (inv_ok) cufftDestroy(plan_filter_inv);
+    if (ge) cudaFree(ge);
+    is_free = true;
   }
 }
 

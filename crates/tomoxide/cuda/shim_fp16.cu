@@ -105,7 +105,9 @@ extern "C" {
 
 // ---- FBP filter (fp16) ----
 void* tomoxide_filter_fp16_new(size_t nproj, size_t nz, size_t n) {
-  return new fp16::cfunc_filter(nproj, nz, n);
+  auto* h = new fp16::cfunc_filter(nproj, nz, n);
+  if (!h->valid()) { delete h; return nullptr; }  // OOM -> clean null (see cfunc_filter.cu)
+  return h;
 }
 void tomoxide_filter_fp16_apply(void* h, void* g, const void* w, void* stream) {
   static_cast<fp16::cfunc_filter*>(h)->filter(as_size(g), as_size(w), as_size(stream));
@@ -125,7 +127,9 @@ void tomoxide_linerec_fp16_free(void* h) { delete static_cast<fp16::cfunc_linere
 
 // ---- fourierrec (fp16) ----
 void* tomoxide_fourierrec_fp16_new(size_t nproj, size_t nz, size_t n, const float* theta) {
-  return new fp16::cfunc_fourierrec(nproj, nz, n, as_size(theta));
+  auto* h = new fp16::cfunc_fourierrec(nproj, nz, n, as_size(theta));
+  if (!h->valid()) { delete h; return nullptr; }  // OOM -> clean null (see cfunc_fourierrec.cu)
+  return h;
 }
 void tomoxide_fourierrec_fp16_backproject(void* h, void* f, const void* g, void* stream) {
   static_cast<fp16::cfunc_fourierrec*>(h)->backprojection(as_size(f), as_size(g), as_size(stream));

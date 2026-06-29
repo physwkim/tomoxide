@@ -4,38 +4,53 @@
 cfunc_fourierrec::cfunc_fourierrec(size_t nproj, size_t nz, size_t n, size_t theta_)
     : nproj(nproj), nz(nz), n(n) {
     float eps = 1e-3;
-    mu = -log(eps) / (2 * n * n);        
-    m = ceil(2 * n * 1 / PI * sqrt(-mu * log(eps) + (mu * n) * (mu * n) / 4));    
-    cudaMalloc((void **)&fde,
-            (2 * n + 2 * m) * (2 * n + 2 * m) * nz * sizeof(real2));
-    cudaMalloc((void **)&x, n * nproj * sizeof(float));
-    cudaMalloc((void **)&y, n * nproj * sizeof(float));
-    
+    mu = -log(eps) / (2 * n * n);
+    m = ceil(2 * n * 1 / PI * sqrt(-mu * log(eps) + (mu * n) * (mu * n) / 4));
+    theta = (float*)theta_;
+    // Check every cuFFT/cudaMalloc return: cuFFT auto-allocates the plan work
+    // area at cufftXtMakePlanMany time, so any out-of-memory failure here leaves
+    // valid_ == false and the factory returns null, instead of leaving an
+    // unallocated work area that cufftXtExec later dereferences (SIGSEGV).
+    if (cudaMalloc((void **)&fde,
+            (2 * n + 2 * m) * (2 * n + 2 * m) * nz * sizeof(real2)) != cudaSuccess) {
+        fde = nullptr;
+        return;
+    }
+    if (cudaMalloc((void **)&x, n * nproj * sizeof(float)) != cudaSuccess) {
+        x = nullptr;
+        return;
+    }
+    if (cudaMalloc((void **)&y, n * nproj * sizeof(float)) != cudaSuccess) {
+        y = nullptr;
+        return;
+    }
+
     long long ffts[] = {2*n,2*n};
 	  long long idist = (2 * n + 2 * m) * (2 * n + 2 * m);long long odist = (2 * n + 2 * m) * (2 * n + 2 * m);
     long long inembed[] = {2 * n + 2 * m, 2 * n + 2 * m};long long onembed[] = {2 * n + 2 * m, 2 * n + 2 * m};
     size_t workSize = 0;
 
-    cufftCreate(&plan2d);
-    cufftXtMakePlanMany(plan2d, 
-        2, ffts, 
-        inembed, 1, idist, CUDA_C, 
-        onembed, 1, odist, CUDA_C, 
-        nz, &workSize, CUDA_C);    
+    if (cufftCreate(&plan2d) != CUFFT_SUCCESS) return;
+    plan2d_ok = true;
+    if (cufftXtMakePlanMany(plan2d,
+        2, ffts,
+        inembed, 1, idist, CUDA_C,
+        onembed, 1, odist, CUDA_C,
+        nz, &workSize, CUDA_C) != CUFFT_SUCCESS) return;
     // fft 1d
-    cufftCreate(&plan1d);
+    if (cufftCreate(&plan1d) != CUFFT_SUCCESS) return;
+    plan1d_ok = true;
     ffts[0] = n;
     idist = n;
     odist = n;
     inembed[0] = n;
     onembed[0] = n;
-    cufftXtMakePlanMany(plan1d, 
-        1, ffts, 
-        inembed, 1, idist, CUDA_C, 
-        onembed, 1, odist, CUDA_C, 
-        nproj*nz, &workSize, CUDA_C);                      
-    
-    theta = (float*)theta_;
+    if (cufftXtMakePlanMany(plan1d,
+        1, ffts,
+        inembed, 1, idist, CUDA_C,
+        onembed, 1, odist, CUDA_C,
+        nproj*nz, &workSize, CUDA_C) != CUFFT_SUCCESS) return;
+    valid_ = true;
 
     // Pre-compute grid dimensions (constant for lifetime of object)
     dim3 dimBlock(32, 32, 1);
@@ -55,12 +70,12 @@ cfunc_fourierrec::~cfunc_fourierrec() { free(); }
 
 void cfunc_fourierrec::free() {
   if (!is_free) {
-    cudaFree(fde);
-    cudaFree(x);
-    cudaFree(y);
-    cufftDestroy(plan2d);
-    cufftDestroy(plan1d);
-    is_free = true;   
+    if (fde) cudaFree(fde);
+    if (x) cudaFree(x);
+    if (y) cudaFree(y);
+    if (plan2d_ok) cufftDestroy(plan2d);
+    if (plan1d_ok) cufftDestroy(plan1d);
+    is_free = true;
   }
 }
 
