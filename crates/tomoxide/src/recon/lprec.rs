@@ -255,28 +255,34 @@ fn fzeta_loop_weights_adj(
 
 /// Precomputed log-polar reconstruction grids (geometry only — angle-independent
 /// of slice, so built once per `(n, nproj)`).
-struct LpGrids {
-    n: usize,
-    nproj: usize,
-    ntheta: usize,
-    nrho: usize,
+///
+/// `pub(crate)` so the CUDA backend's device-resident lprec path can reuse the
+/// same precompute (uploading these grids) instead of duplicating it.
+pub(crate) struct LpGrids {
+    pub(crate) n: usize,
+    pub(crate) nproj: usize,
+    pub(crate) ntheta: usize,
+    pub(crate) nrho: usize,
     /// Full Hermitian convolution kernel `[nrho, ntheta]` for C2C FFT.
-    kfull: Vec<Complex32>,
+    pub(crate) kfull: Vec<Complex32>,
     /// Per-span polar→log-polar coords + targets (main set).
-    lp2p1: [Vec<f32>; NSPAN],
-    lp2p2: [Vec<f32>; NSPAN],
-    lpids: Vec<usize>,
+    pub(crate) lp2p1: [Vec<f32>; NSPAN],
+    pub(crate) lp2p2: [Vec<f32>; NSPAN],
+    pub(crate) lpids: Vec<usize>,
     /// Per-span polar→log-polar coords + targets (wrapping set).
-    lp2p1w: [Vec<f32>; NSPAN],
-    lp2p2w: [Vec<f32>; NSPAN],
-    wids: Vec<usize>,
+    pub(crate) lp2p1w: [Vec<f32>; NSPAN],
+    pub(crate) lp2p2w: [Vec<f32>; NSPAN],
+    pub(crate) wids: Vec<usize>,
     /// Per-span log-polar→Cartesian coords + disk targets.
-    c2lp1: [Vec<f32>; NSPAN],
-    c2lp2: [Vec<f32>; NSPAN],
-    cids: Vec<usize>,
+    pub(crate) c2lp1: [Vec<f32>; NSPAN],
+    pub(crate) c2lp2: [Vec<f32>; NSPAN],
+    pub(crate) cids: Vec<usize>,
 }
 
-fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGrids> {
+/// Number of overlapping angular spans, exposed for the CUDA path's per-span loop.
+pub(crate) const LP_NSPAN: usize = NSPAN;
+
+pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGrids> {
     let ntheta = 1usize << ((nproj as f32).log2().round() as u32);
     let nrho = 2 * (1usize << ((n as f32).log2().round() as u32));
     let beta = PI / NSPAN as f32;

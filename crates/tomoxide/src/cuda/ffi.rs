@@ -454,6 +454,72 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // --- Log-polar (lprec) runtime kernels (cuda/lprec.cu) ---
+    // Device-resident port of `recon/lprec.rs::process_row`. Buffers are batched
+    // over `nz` slices: `g` [nz,nproj,n] real (also the in-place spline-coeff
+    // buffer), `flc` [nz,nrho,ntheta] complex (float2), `f` [nz,n,n] real. The
+    // geometry grids (`kfull`, per-span coords, target index sets) are uploaded
+    // from the host `build_grids` output.
+    /// Cubic-B-spline prefilter along the detector axis (one line per angle).
+    pub fn tomoxide_lprec_prefilter_rows(
+        g: *mut c_void,
+        nz: i32,
+        nproj: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Cubic-B-spline prefilter along the angle axis (one strided column per detector).
+    pub fn tomoxide_lprec_prefilter_cols(
+        g: *mut c_void,
+        nz: i32,
+        nproj: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Gather polar → log-polar: cubic interp of `g` accumulated into `flc.real`
+    /// at `targets`. `xs` = detector coord (width n), `ys` = angle coord (height nproj).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tomoxide_lprec_gather(
+        g: *const c_void,
+        flc: *mut c_void,
+        targets: *const c_void,
+        xs: *const c_void,
+        ys: *const c_void,
+        npts: i32,
+        nz: i32,
+        nproj: i32,
+        n: i32,
+        nrho: i32,
+        ntheta: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Broadcast complex multiply `flc[s,i] *= kfull[i]` over the `[nrho,ntheta]` grid.
+    pub fn tomoxide_lprec_cmul(
+        flc: *mut c_void,
+        kfull: *const c_void,
+        nz: i32,
+        nrho: i32,
+        ntheta: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Scatter log-polar → Cartesian disk: cubic interp of `flc.real` (×2) summed
+    /// into `f` at `targets`. `xs` = theta coord (width ntheta), `ys` = rho coord
+    /// (height nrho).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tomoxide_lprec_scatter(
+        flc: *const c_void,
+        f: *mut c_void,
+        targets: *const c_void,
+        xs: *const c_void,
+        ys: *const c_void,
+        npts: i32,
+        nz: i32,
+        n: i32,
+        nrho: i32,
+        ntheta: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     // --- FP16 (half-precision) variants (cuda/shim_fp16.cu) ---
     // Same semantics as the f32 entry points above, but the device buffers hold
     // `half` (`real = half`) — 2 bytes/element — and the filter runs a

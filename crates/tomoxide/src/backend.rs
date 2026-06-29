@@ -81,6 +81,14 @@ pub trait Backend: Send + Sync {
     fn analytic_reconstruct(&self) -> Option<&dyn AnalyticReconstruct> {
         None
     }
+    /// Monolithic log-polar (lprec) reconstruction with the gather/scatter +
+    /// spline prefilter resident on the device (CUDA `cuda/lprec.cu`), for
+    /// backends that would otherwise run lprec's cubic interpolation on the host
+    /// through the generic [`Fft`] capability. When absent, lprec composes from
+    /// [`Fft`] (CPU/wgpu).
+    fn lprec_reconstruct(&self) -> Option<&dyn LpRecReconstruct> {
+        None
+    }
     /// Forward projection (Radon).
     fn projector(&self) -> Option<&dyn ForwardProject> {
         None
@@ -323,6 +331,13 @@ pub trait StreamingAnalytic {
 pub trait FourierReconstruct {
     /// Reconstruct an `[nz, n, n]` volume from a filtered sinogram
     /// `[nz, nproj, ncols]`.
+    fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>>;
+}
+
+/// Monolithic log-polar (lprec) reconstruction from a **filtered** sinogram.
+pub trait LpRecReconstruct {
+    /// Reconstruct an `[nz, n, n]` volume from a filtered sinogram
+    /// `[nz, nproj, ncols]` via the log-polar method.
     fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>>;
 }
 

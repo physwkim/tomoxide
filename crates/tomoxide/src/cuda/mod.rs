@@ -98,6 +98,13 @@ impl Backend for CudaBackend {
         Some(self)
     }
 
+    /// Device-resident log-polar reconstruction (`cuda/lprec.cu`): the
+    /// gather/scatter + spline prefilter run on the GPU instead of the host.
+    #[cfg(feature = "cuda")]
+    fn lprec_reconstruct(&self) -> Option<&dyn crate::backend::LpRecReconstruct> {
+        Some(self)
+    }
+
     /// Dark/flat correction + minus-log on the GPU.
     #[cfg(feature = "cuda")]
     fn elementwise(&self) -> Option<&dyn crate::backend::Elementwise> {
@@ -118,7 +125,7 @@ mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
         make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
-        StreamingAnalytic,
+        LpRecReconstruct, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -170,6 +177,22 @@ mod cuda_impl {
             if rc != 0 {
                 return Err(Error::Backend(format!(
                     "cudaMemcpy H2D (f64) failed ({rc})"
+                )));
+            }
+            Ok(buf)
+        }
+
+        /// Upload host i32 `data` into a fresh device buffer (lprec target index
+        /// sets: `lpids`/`wids`/`cids`).
+        fn from_host_i32(data: &[i32]) -> Result<Self> {
+            let bytes = std::mem::size_of_val(data);
+            let buf = DevBuf::new(bytes)?;
+            let rc = unsafe {
+                ffi::tomoxide_cuda_memcpy_h2d(buf.ptr, data.as_ptr() as *const c_void, bytes)
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!(
+                    "cudaMemcpy H2D (i32) failed ({rc})"
                 )));
             }
             Ok(buf)
@@ -3630,6 +3653,242 @@ mod cuda_impl {
             Ok(Volume::new(
                 Array3::from_shape_vec((nz, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda fourierrec shape: {e}")))?,
+            ))
+        }
+    }
+
+    impl LpRecReconstruct for CudaBackend {
+        /// Device-resident log-polar reconstruction — the GPU port of
+        /// [`crate::recon::lprec`]'s per-slice runtime. The geometry grids are
+        /// precomputed on the host by `build_grids` (the same precompute the CPU
+        /// path uses) and uploaded once; the cubic-B-spline prefilter, the
+        /// polar↔log-polar gather/scatter, and the per-span FFT convolution all
+        /// run on the device (`cuda/lprec.cu`), replacing the host interpolation
+        /// that dominated the composed `Fft`-only path. The slice batch is
+        /// z-tiled to bound the large `[tile, nrho, ntheta]` complex work buffer.
+        fn reconstruct(
+            &self,
+            filtered: &Tomo<f32>,
+            geom: &Geometry,
+            n: usize,
+        ) -> Result<Volume<f32>> {
+            use crate::recon::lprec::{build_grids, LP_NSPAN};
+            if geom.beam != Beam::Parallel {
+                return Err(Error::InvalidParam(
+                    "cuda lprec supports parallel beam only".into(),
+                ));
+            }
+            let s = filtered.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
+            let (nz, nproj, ncols) = s.array.dim();
+            if ncols != n {
+                return Err(Error::InvalidParam(format!(
+                    "cuda lprec needs a square grid = detector width {ncols}; got {n}"
+                )));
+            }
+            if nproj < 2 {
+                return Err(Error::InvalidParam("cuda lprec needs >= 2 angles".into()));
+            }
+            let angles = &geom.angles.0;
+            if angles.len() != nproj {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("{nproj} angles"),
+                    found: angles.len().to_string(),
+                });
+            }
+            // Equally-spaced [0, π) guard (matches the CPU lprec precondition the
+            // log-polar span tiling assumes).
+            let dth = (angles[1] - angles[0]).abs();
+            let nproj_test = (std::f32::consts::PI / dth).round() as usize;
+            if nproj_test != nproj {
+                return Err(Error::InvalidParam(
+                    "cuda lprec requires equally spaced angles spanning [0, π)".into(),
+                ));
+            }
+            let raw = s
+                .array
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+            let devices = selected_devices();
+            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+
+            // Precompute the geometry grids on the host (the CUDA Fft backs the
+            // small precompute transforms) and upload them once. `kfull` already
+            // folds the deapodization + the tomocupy constant.
+            let fft: &dyn crate::backend::Fft = self;
+            let grids = build_grids(n, nproj, fft)?;
+            let (ntheta, nrho) = (grids.ntheta, grids.nrho);
+
+            let kfull_f32: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    grids.kfull.as_ptr() as *const f32,
+                    grids.kfull.len() * 2,
+                )
+            };
+            let kfull_dev = DevBuf::from_host_f32(kfull_f32)?;
+            let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+            let lpids_dev = DevBuf::from_host_i32(&to_i32(&grids.lpids))?;
+            let wids_dev = DevBuf::from_host_i32(&to_i32(&grids.wids))?;
+            let cids_dev = DevBuf::from_host_i32(&to_i32(&grids.cids))?;
+            // Concatenate the NSPAN per-span coordinate arrays contiguously; the
+            // kernels index span `k` at offset `k * npts`.
+            let concat = |spans: &[Vec<f32>; LP_NSPAN]| -> Vec<f32> {
+                let mut v = Vec::with_capacity(spans.iter().map(Vec::len).sum());
+                for sp in spans {
+                    v.extend_from_slice(sp);
+                }
+                v
+            };
+            let lp2p1_dev = DevBuf::from_host_f32(&concat(&grids.lp2p1))?;
+            let lp2p2_dev = DevBuf::from_host_f32(&concat(&grids.lp2p2))?;
+            let lp2p1w_dev = DevBuf::from_host_f32(&concat(&grids.lp2p1w))?;
+            let lp2p2w_dev = DevBuf::from_host_f32(&concat(&grids.lp2p2w))?;
+            let c2lp1_dev = DevBuf::from_host_f32(&concat(&grids.c2lp1))?;
+            let c2lp2_dev = DevBuf::from_host_f32(&concat(&grids.c2lp2))?;
+            let (n_lp, n_w, n_c) = (grids.lpids.len(), grids.wids.len(), grids.cids.len());
+
+            // z-tile so the [tile, nrho, ntheta] complex work buffer (plus the g
+            // and f tiles) fits. A third of free memory leaves headroom for the
+            // cuFFT plan and the resident grid uploads.
+            let fsz = std::mem::size_of::<f32>();
+            let per_slice = nrho * ntheta * 2 * fsz + nproj * ncols * fsz + n * n * fsz;
+            let tile = (device_free_bytes() / 3 / per_slice.max(1)).clamp(1, nz);
+
+            let null = std::ptr::null_mut::<c_void>();
+            let off = |buf: &DevBuf, elems: usize| -> *const c_void {
+                unsafe { (buf.ptr as *const f32).add(elems) as *const c_void }
+            };
+            let mut vol = vec![0.0f32; nz * n * n];
+            let mut z = 0;
+            while z < nz {
+                let cz = tile.min(nz - z);
+                let g = DevBuf::from_host_f32(&raw[z * nproj * ncols..(z + cz) * nproj * ncols])?;
+                let flc = DevBuf::zeroed(cz * nrho * ntheta * 2 * fsz)?;
+                let f = DevBuf::zeroed(cz * n * n * fsz)?;
+
+                // Cubic-B-spline prefilter: detector axis, then angle axis (in place).
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lprec_prefilter_rows(
+                            g.ptr,
+                            cz as i32,
+                            nproj as i32,
+                            n as i32,
+                            null,
+                        )
+                    },
+                    "lprec prefilter rows",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lprec_prefilter_cols(
+                            g.ptr,
+                            cz as i32,
+                            nproj as i32,
+                            n as i32,
+                            null,
+                        )
+                    },
+                    "lprec prefilter cols",
+                )?;
+
+                for k in 0..LP_NSPAN {
+                    ck(
+                        unsafe { ffi::tomoxide_cuda_memset(flc.ptr, 0, flc.bytes) },
+                        "memset flc",
+                    )?;
+                    // Gather polar → log-polar: main set (lp2p2 = detector coord,
+                    // lp2p1 = angle coord) then the wrapping set.
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lprec_gather(
+                                g.ptr,
+                                flc.ptr,
+                                lpids_dev.ptr,
+                                off(&lp2p2_dev, k * n_lp),
+                                off(&lp2p1_dev, k * n_lp),
+                                n_lp as i32,
+                                cz as i32,
+                                nproj as i32,
+                                n as i32,
+                                nrho as i32,
+                                ntheta as i32,
+                                null,
+                            )
+                        },
+                        "lprec gather main",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lprec_gather(
+                                g.ptr,
+                                flc.ptr,
+                                wids_dev.ptr,
+                                off(&lp2p2w_dev, k * n_w),
+                                off(&lp2p1w_dev, k * n_w),
+                                n_w as i32,
+                                cz as i32,
+                                nproj as i32,
+                                n as i32,
+                                nrho as i32,
+                                ntheta as i32,
+                                null,
+                            )
+                        },
+                        "lprec gather wrap",
+                    )?;
+                    // 2-D FFT convolution (cuFFT applies 1/(nrho·ntheta) on the
+                    // inverse; the residual ×2 is folded into the scatter).
+                    ck(
+                        unsafe { ffi::tomoxide_fft_2d(flc.ptr, nrho, ntheta, cz, 0) },
+                        "lprec fft fwd",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lprec_cmul(
+                                flc.ptr,
+                                kfull_dev.ptr,
+                                cz as i32,
+                                nrho as i32,
+                                ntheta as i32,
+                                null,
+                            )
+                        },
+                        "lprec cmul",
+                    )?;
+                    ck(
+                        unsafe { ffi::tomoxide_fft_2d(flc.ptr, nrho, ntheta, cz, 1) },
+                        "lprec fft inv",
+                    )?;
+                    // Scatter log-polar → Cartesian disk (c2lp1 = theta coord,
+                    // c2lp2 = rho coord), accumulating across spans into f.
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lprec_scatter(
+                                flc.ptr,
+                                f.ptr,
+                                cids_dev.ptr,
+                                off(&c2lp1_dev, k * n_c),
+                                off(&c2lp2_dev, k * n_c),
+                                n_c as i32,
+                                cz as i32,
+                                n as i32,
+                                nrho as i32,
+                                ntheta as i32,
+                                null,
+                            )
+                        },
+                        "lprec scatter",
+                    )?;
+                }
+                ck(unsafe { ffi::tomoxide_cuda_sync() }, "lprec sync")?;
+                f.to_host_f32(&mut vol[z * n * n..(z + cz) * n * n])?;
+                z += cz;
+            }
+
+            Ok(Volume::new(
+                Array3::from_shape_vec((nz, n, n), vol)
+                    .map_err(|e| Error::InvalidParam(format!("cuda lprec shape: {e}")))?,
             ))
         }
     }

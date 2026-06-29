@@ -18,7 +18,7 @@ pub mod center;
 mod fourierrec;
 mod gridrec;
 pub mod lamino;
-mod lprec;
+pub(crate) mod lprec;
 pub mod ring;
 pub mod vector;
 
@@ -115,6 +115,12 @@ fn analytic(
     // FFT convolution, then resamples to the Cartesian grid (needs only the Fft
     // capability). Faithful port of tomocupy `lprec`.
     if algorithm == Algorithm::Lprec {
+        // A backend with a device-resident lprec (CUDA cuda/lprec.cu) runs the
+        // gather/scatter + spline prefilter on the GPU; otherwise it composes
+        // from the generic Fft capability (CPU/wgpu) with host interpolation.
+        if let Some(lr) = backend.lprec_reconstruct() {
+            return lr.reconstruct(&filtered, geom, n);
+        }
         let fft = backend.fft().ok_or_else(|| missing("Fft", backend))?;
         return Ok(Volume::new(lprec::lprec(&filtered, geom, n, fft)?));
     }
