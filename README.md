@@ -225,7 +225,7 @@ fp16 (`linerec`, `fourierrec`; tomoxide fp16 covers only the analytic paths):
 | 256²  | **0.57**/1.64 | **0.62**/2.39 | **0.90**/1.72 | **0.85**/2.41 |
 | 512²  | **0.65**/2.02 | **0.71**/2.60 | **1.29**/2.09 | **1.30**/2.59 |
 | 1024² | **1.13**/3.12 | **1.14**/3.22 | **3.20**/3.27 | **3.11**/3.23 |
-| 2048² | **3.49**/6.01 | **3.46**/4.75 | 9.83/**5.41** | 10.16/**5.18** |
+| 2048² | **3.49**/6.01 | **3.46**/4.75 | **2.70**/5.41 | **2.65**/5.18 |
 
 What this means:
 
@@ -253,11 +253,12 @@ What this means:
   effectively single-device here). tomocupy's 4-process shard re-reads its slab
   per process but spreads the I/O across processes, so it pulls ahead at 4096²
   on `linerec`/`lprec`.
-- **fp16.** tomoxide wins both algorithms through 1024² on 1- and 4-GPU, and
-  `linerec` fp16 stays ahead at 2048². `fourierrec` fp16 is the exception (9.8 s
-  vs tomocupy 5.4 s at 2048²): its half-precision path falls back to the
-  per-chunk reconstructor instead of the device-resident streaming handle, so it
-  runs slower than its own fp32 (2.6 s) — a known open item.
+- **fp16.** tomoxide wins both algorithms at every size on 1- and 4-GPU through
+  2048². `fourierrec` fp16 used to be the exception (9.8 s at 2048², slower than
+  its own fp32) because its half-precision path fell back to the per-chunk
+  reconstructor; it now shares the device-resident streaming handle (pack →
+  `cfunc_fourierrec` (f16) → unpack reusing one handle set), dropping the 2048²
+  1-GPU wall to 2.70 s and beating tomocupy 5.41 s.
 
 Caveat: this is **wall-to-wall** time. tomocupy's own internal "Reconstruction
 time" (compute only, excluding Python import) is far smaller (e.g. fourierrec
