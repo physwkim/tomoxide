@@ -45,17 +45,19 @@ static int run_scale(void* data, long long nfloat, float f) {
 
 namespace {
 
+// `type`: 0 = C2C, 1 = R2C (in-place, padded), 2 = C2R (in-place, padded).
 struct PlanKey {
-  int rank, n0, n1, batch;
+  int rank, n0, n1, batch, type;
   bool operator==(const PlanKey& o) const {
-    return rank == o.rank && n0 == o.n0 && n1 == o.n1 && batch == o.batch;
+    return rank == o.rank && n0 == o.n0 && n1 == o.n1 && batch == o.batch &&
+           type == o.type;
   }
 };
 
 struct PlanKeyHash {
   size_t operator()(const PlanKey& k) const {
-    size_t h = 1469598103934665603ull;  // FNV-1a over the four fields
-    int vs[4] = {k.rank, k.n0, k.n1, k.batch};
+    size_t h = 1469598103934665603ull;  // FNV-1a over the five fields
+    int vs[5] = {k.rank, k.n0, k.n1, k.batch, k.type};
     for (int v : vs) {
       h ^= (size_t) (uint32_t) v;
       h *= 1099511628211ull;
@@ -77,7 +79,27 @@ int get_plan(const PlanKey& key, cufftHandle* out) {
   }
   cufftHandle plan;
   cufftResult r;
-  if (key.rank == 1) {
+  if (key.type == 1 || key.type == 2) {
+    // In-place real transform of `batch` images [nrho=n0, ntheta=n1]. The real
+    // data lives in a row-padded buffer [nrho, ntheta+2] so it overlays the
+    // half-complex spectrum [nrho, ntheta/2+1] (cuFFT's in-place R2C/C2R
+    // layout). idist (reals) == odist (complex) * 2, so both views are
+    // contiguous over the batch.
+    int dims[2] = {key.n0, key.n1};
+    int nc = key.n1 / 2 + 1;        // complex half-width
+    int npad = 2 * nc;             // padded real width
+    int rembed[2] = {key.n0, npad};
+    int cembed[2] = {key.n0, nc};
+    int rdist = key.n0 * npad;     // reals per image
+    int cdist = key.n0 * nc;       // complex per image
+    if (key.type == 1) {
+      r = cufftPlanMany(&plan, 2, dims, rembed, 1, rdist, cembed, 1, cdist,
+                        CUFFT_R2C, key.batch);
+    } else {
+      r = cufftPlanMany(&plan, 2, dims, cembed, 1, cdist, rembed, 1, rdist,
+                        CUFFT_C2R, key.batch);
+    }
+  } else if (key.rank == 1) {
     int dims[1] = {key.n0};
     r = cufftPlanMany(&plan, 1, dims, nullptr, 1, key.n0, nullptr, 1, key.n0, CUFFT_C2C, key.batch);
   } else {
@@ -99,7 +121,7 @@ extern "C" {
 // In-place batched 1-D C2C FFT of `batch` transforms of length `n`.
 // Returns 0 on success.
 int tomoxide_fft_1d(void* data, size_t n, size_t batch, int inverse) {
-  PlanKey key{1, (int) n, 0, (int) batch};
+  PlanKey key{1, (int) n, 0, (int) batch, 0};
   cufftHandle plan;
   if (get_plan(key, &plan) != 0) return -1;
   if (cufftExecC2C(plan, (cufftComplex*) data, (cufftComplex*) data,
@@ -114,7 +136,7 @@ int tomoxide_fft_1d(void* data, size_t n, size_t batch, int inverse) {
 
 // In-place batched 2-D C2C FFT of `batch` images of size `rows × cols`.
 int tomoxide_fft_2d(void* data, size_t rows, size_t cols, size_t batch, int inverse) {
-  PlanKey key{2, (int) rows, (int) cols, (int) batch};
+  PlanKey key{2, (int) rows, (int) cols, (int) batch, 0};
   cufftHandle plan;
   if (get_plan(key, &plan) != 0) return -1;
   if (cufftExecC2C(plan, (cufftComplex*) data, (cufftComplex*) data,
@@ -124,6 +146,37 @@ int tomoxide_fft_2d(void* data, size_t rows, size_t cols, size_t batch, int inve
     long long cnt = 2ll * (long long) rows * (long long) cols * (long long) batch;
     run_scale(data, cnt, 1.0f / (float) (rows * cols));
   }
+  return (int) cudaStreamSynchronize(cudaStreamPerThread);
+}
+
+// In-place batched 2-D **R2C** FFT (forward) of `batch` real images
+// [rows × cols], laid out row-padded to [rows × (cols+2 rounded)] so the real
+// input overlays the half-complex output [rows × (cols/2+1)]. `data` is the
+// padded real buffer; on return it holds the half-complex spectrum. Forward is
+// unnormalized (the C2R inverse carries the 1/(rows*cols) scale), matching the
+// C2C convention. Returns 0 on success.
+int tomoxide_fft_2d_r2c(void* data, size_t rows, size_t cols, size_t batch) {
+  PlanKey key{2, (int) rows, (int) cols, (int) batch, 1};
+  cufftHandle plan;
+  if (get_plan(key, &plan) != 0) return -1;
+  if (cufftExecR2C(plan, (cufftReal*) data, (cufftComplex*) data) != CUFFT_SUCCESS)
+    return -2;
+  return (int) cudaStreamSynchronize(cudaStreamPerThread);
+}
+
+// In-place batched 2-D **C2R** FFT (inverse) of `batch` half-complex spectra
+// [rows × (cols/2+1)] back to row-padded real images [rows × cols]. Normalized
+// by 1/(rows*cols) to match `ifft(fft(x)) == x` (cuFFT leaves it unnormalized),
+// scaling only the `rows*(cols+2 rounded)` real floats per image in place.
+int tomoxide_fft_2d_c2r(void* data, size_t rows, size_t cols, size_t batch) {
+  PlanKey key{2, (int) rows, (int) cols, (int) batch, 2};
+  cufftHandle plan;
+  if (get_plan(key, &plan) != 0) return -1;
+  if (cufftExecC2R(plan, (cufftComplex*) data, (cufftReal*) data) != CUFFT_SUCCESS)
+    return -2;
+  long long npad = 2ll * ((long long) cols / 2 + 1);  // padded real width
+  long long cnt = (long long) rows * npad * (long long) batch;
+  run_scale(data, cnt, 1.0f / (float) (rows * cols));
   return (int) cudaStreamSynchronize(cudaStreamPerThread);
 }
 

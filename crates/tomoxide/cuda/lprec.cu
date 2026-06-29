@@ -12,7 +12,12 @@
 // Buffer layouts (row-major, batched over `nz` slices):
 //   g   [nz, nproj, n]            real, the filtered sinogram chunk (also the
 //                                 in-place spline-coefficient buffer)
-//   flc [nz, nrho, ntheta]        complex (float2), log-polar work buffer
+//   flc [nz, nrho, ntheta_pad]    in-place R2C buffer: row-padded real
+//                                 (ntheta_pad = 2*(ntheta/2+1)) overlaying the
+//                                 half-complex spectrum [nz, nrho, ntheta/2+1].
+//                                 The log-polar function is real, so the forward
+//                                 R2C / inverse C2R run at ~half the cost and
+//                                 memory of a full C2C transform.
 //   f   [nz, n, n]                real, the Cartesian output chunk
 // Index sets (`lpids`/`wids` over flc grid, `cids` over the f grid) are span-
 // independent; only the float coordinate arrays differ per span.
@@ -39,10 +44,14 @@ __device__ __forceinline__ int lprec_wrap(int i, int n) {
     return ((i % n) + n) % n;
 }
 
-// 4x4 cubic-B-spline interpolation of a real coeff grid (width x height,
-// row-major) at (x, y), wrap addressing on both axes. Mirrors `cubic_interp2d`.
+// 4x4 cubic-B-spline interpolation of a real coeff grid at (x, y), wrap
+// addressing over the logical `width x height` grid. `stride` is the physical
+// row stride in elements (≥ width): it differs from `width` when the grid is
+// row-padded (the in-place R2C/C2R real buffer is padded to `2*(width/2+1)`),
+// so wrap uses `width` for the column index but addressing uses `stride`.
+// Mirrors `cubic_interp2d`.
 __device__ float lprec_cubic_interp2d(const float *coeffs, int width, int height,
-                                      float x, float y) {
+                                      int stride, float x, float y) {
     float ixf = floorf(x);
     float iyf = floorf(y);
     float wx[4], wy[4];
@@ -53,35 +62,11 @@ __device__ float lprec_cubic_interp2d(const float *coeffs, int width, int height
     float sum = 0.0f;
     for (int j = 0; j < 4; ++j) {
         int py = lprec_wrap(iy - 1 + j, height);
-        long row = (long)py * width;
+        long row = (long)py * stride;
         float acc = 0.0f;
         for (int i = 0; i < 4; ++i) {
             int px = lprec_wrap(ix - 1 + i, width);
             acc += wx[i] * coeffs[row + px];
-        }
-        sum += wy[j] * acc;
-    }
-    return sum;
-}
-
-// Same interpolation reading the real part of a complex (float2) grid.
-__device__ float lprec_cubic_interp2d_re(const float2 *coeffs, int width,
-                                         int height, float x, float y) {
-    float ixf = floorf(x);
-    float iyf = floorf(y);
-    float wx[4], wy[4];
-    lprec_bspline_weights(x - ixf, wx);
-    lprec_bspline_weights(y - iyf, wy);
-    int ix = (int)ixf;
-    int iy = (int)iyf;
-    float sum = 0.0f;
-    for (int j = 0; j < 4; ++j) {
-        int py = lprec_wrap(iy - 1 + j, height);
-        long row = (long)py * width;
-        float acc = 0.0f;
-        for (int i = 0; i < 4; ++i) {
-            int px = lprec_wrap(ix - 1 + i, width);
-            acc += wx[i] * coeffs[row + px].x;
         }
         sum += wy[j] * acc;
     }
@@ -144,12 +129,16 @@ __global__ void lprec_prefilter_cols_ker(float *g, int nz, int nproj, int n) {
     lprec_convert_coeffs(g + s * (long)nproj * n + d, nproj, n);
 }
 
-// Gather: polar -> log-polar cubic interpolation, accumulated into flc.real.
-// `xs` is the detector coord (width n), `ys` the angle coord (height nproj).
-// atomicAdd because the wrapping set can land on the same target as the main set.
-__global__ void lprec_gather_ker(const float *g, float2 *flc, const int *targets,
+// Gather: polar -> log-polar cubic interpolation, accumulated into the padded
+// real work buffer. `xs` is the detector coord (width n), `ys` the angle coord
+// (height nproj); atomicAdd because the wrapping set can land on the same target
+// as the main set. `flc` is the in-place R2C real buffer, row-padded to
+// `ntheta_pad = 2*(ntheta/2+1)` per row (per-slice stride `nrho*ntheta_pad`);
+// `targets` are the padded within-slice indices (`row*ntheta_pad + col`).
+__global__ void lprec_gather_ker(const float *g, float *flc, const int *targets,
                                  const float *xs, const float *ys, int npts,
-                                 int nz, int nproj, int n, int nrho, int ntheta) {
+                                 int nz, int nproj, int n, int nrho,
+                                 int ntheta_pad) {
     long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
     long total = (long)nz * npts;
     if (t >= total) {
@@ -158,12 +147,13 @@ __global__ void lprec_gather_ker(const float *g, float2 *flc, const int *targets
     long s = t / npts;
     int idx = (int)(t % npts);
     const float *gs = g + s * (long)nproj * n;
-    float val = lprec_cubic_interp2d(gs, n, nproj, xs[idx], ys[idx]);
-    long base = s * (long)nrho * ntheta + targets[idx];
-    atomicAdd(&flc[base].x, val);
+    float val = lprec_cubic_interp2d(gs, n, nproj, n, xs[idx], ys[idx]);
+    long base = s * (long)nrho * ntheta_pad + targets[idx];
+    atomicAdd(&flc[base], val);
 }
 
-// Broadcast complex multiply: flc[s, i] *= kfull[i] over the [nrho, ntheta] grid.
+// Broadcast complex multiply on the half-complex spectrum: flc[s, i] *= kfull[i]
+// over the [nrho, ntheta_c] grid (ntheta_c = ntheta/2+1, the R2C half-width).
 __global__ void lprec_cmul_ker(float2 *flc, const float2 *kfull, int nz, long ng) {
     long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
     long total = (long)nz * ng;
@@ -177,13 +167,15 @@ __global__ void lprec_cmul_ker(float2 *flc, const float2 *kfull, int nz, long ng
 }
 
 // Scatter: log-polar -> Cartesian disk cubic interpolation, accumulated into f
-// (x2 folds tomocupy's 2/(nrho*ntheta) scale; the inverse FFT already applied
-// 1/(nrho*ntheta)). `xs` is the theta coord (width ntheta), `ys` the rho coord
-// (height nrho). cids targets are distinct within a span, so a plain += is race
-// free within one launch; spans accumulate across successive launches.
-__global__ void lprec_scatter_ker(const float2 *flc, float *f, const int *targets,
+// (x2 folds tomocupy's 2/(nrho*ntheta) scale; the inverse C2R already applied
+// 1/(nrho*ntheta)). `xs` is the theta coord (logical width ntheta), `ys` the rho
+// coord (height nrho); `flc` is the padded real buffer (row stride ntheta_pad).
+// cids targets are distinct within a span, so a plain += is race free within one
+// launch; spans accumulate across successive launches.
+__global__ void lprec_scatter_ker(const float *flc, float *f, const int *targets,
                                   const float *xs, const float *ys, int npts,
-                                  int nz, int n, int nrho, int ntheta) {
+                                  int nz, int n, int nrho, int ntheta,
+                                  int ntheta_pad) {
     long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
     long total = (long)nz * npts;
     if (t >= total) {
@@ -191,8 +183,9 @@ __global__ void lprec_scatter_ker(const float2 *flc, float *f, const int *target
     }
     long s = t / npts;
     int idx = (int)(t % npts);
-    const float2 *fs = flc + s * (long)nrho * ntheta;
-    float val = 2.0f * lprec_cubic_interp2d_re(fs, ntheta, nrho, xs[idx], ys[idx]);
+    const float *fs = flc + s * (long)nrho * ntheta_pad;
+    float val =
+        2.0f * lprec_cubic_interp2d(fs, ntheta, nrho, ntheta_pad, xs[idx], ys[idx]);
     f[s * (long)n * n + targets[idx]] += val;
 }
 
@@ -216,21 +209,22 @@ int tomoxide_lprec_prefilter_cols(void *g, int nz, int nproj, int n, void *strea
 
 int tomoxide_lprec_gather(const void *g, void *flc, const void *targets,
                           const void *xs, const void *ys, int npts, int nz,
-                          int nproj, int n, int nrho, int ntheta, void *stream) {
+                          int nproj, int n, int nrho, int ntheta_pad,
+                          void *stream) {
     long total = (long)nz * npts;
     if (total == 0) {
         return cudaSuccess;
     }
     int grid = (int)((total + LPREC_BLK - 1) / LPREC_BLK);
     lprec_gather_ker<<<grid, LPREC_BLK, 0, (cudaStream_t)stream>>>(
-        (const float *)g, (float2 *)flc, (const int *)targets, (const float *)xs,
-        (const float *)ys, npts, nz, nproj, n, nrho, ntheta);
+        (const float *)g, (float *)flc, (const int *)targets, (const float *)xs,
+        (const float *)ys, npts, nz, nproj, n, nrho, ntheta_pad);
     return cudaGetLastError();
 }
 
 int tomoxide_lprec_cmul(void *flc, const void *kfull, int nz, int nrho,
-                        int ntheta, void *stream) {
-    long ng = (long)nrho * ntheta;
+                        int ntheta_c, void *stream) {
+    long ng = (long)nrho * ntheta_c;
     long total = (long)nz * ng;
     int grid = (int)((total + LPREC_BLK - 1) / LPREC_BLK);
     lprec_cmul_ker<<<grid, LPREC_BLK, 0, (cudaStream_t)stream>>>(
@@ -240,15 +234,16 @@ int tomoxide_lprec_cmul(void *flc, const void *kfull, int nz, int nrho,
 
 int tomoxide_lprec_scatter(const void *flc, void *f, const void *targets,
                            const void *xs, const void *ys, int npts, int nz,
-                           int n, int nrho, int ntheta, void *stream) {
+                           int n, int nrho, int ntheta, int ntheta_pad,
+                           void *stream) {
     long total = (long)nz * npts;
     if (total == 0) {
         return cudaSuccess;
     }
     int grid = (int)((total + LPREC_BLK - 1) / LPREC_BLK);
     lprec_scatter_ker<<<grid, LPREC_BLK, 0, (cudaStream_t)stream>>>(
-        (const float2 *)flc, (float *)f, (const int *)targets, (const float *)xs,
-        (const float *)ys, npts, nz, n, nrho, ntheta);
+        (const float *)flc, (float *)f, (const int *)targets, (const float *)xs,
+        (const float *)ys, npts, nz, n, nrho, ntheta, ntheta_pad);
     return cudaGetLastError();
 }
 

@@ -476,8 +476,11 @@ unsafe extern "C" {
         n: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// Gather polar → log-polar: cubic interp of `g` accumulated into `flc.real`
-    /// at `targets`. `xs` = detector coord (width n), `ys` = angle coord (height nproj).
+    /// Gather polar → log-polar: cubic interp of `g` accumulated into the padded
+    /// real work buffer `flc` at `targets`. `xs` = detector coord (width n),
+    /// `ys` = angle coord (height nproj). `ntheta_pad = 2*(ntheta/2+1)` is the
+    /// padded row width (per-slice stride `nrho*ntheta_pad`); `targets` are the
+    /// padded within-slice indices.
     #[allow(clippy::too_many_arguments)]
     pub fn tomoxide_lprec_gather(
         g: *const c_void,
@@ -490,21 +493,23 @@ unsafe extern "C" {
         nproj: i32,
         n: i32,
         nrho: i32,
-        ntheta: i32,
+        ntheta_pad: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// Broadcast complex multiply `flc[s,i] *= kfull[i]` over the `[nrho,ntheta]` grid.
+    /// Broadcast complex multiply `flc[s,i] *= kfull[i]` over the half-complex
+    /// `[nrho, ntheta_c]` grid (`ntheta_c = ntheta/2+1`).
     pub fn tomoxide_lprec_cmul(
         flc: *mut c_void,
         kfull: *const c_void,
         nz: i32,
         nrho: i32,
-        ntheta: i32,
+        ntheta_c: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// Scatter log-polar → Cartesian disk: cubic interp of `flc.real` (×2) summed
-    /// into `f` at `targets`. `xs` = theta coord (width ntheta), `ys` = rho coord
-    /// (height nrho).
+    /// Scatter log-polar → Cartesian disk: cubic interp of the padded real `flc`
+    /// (×2) summed into `f` at `targets`. `xs` = theta coord (logical width
+    /// ntheta), `ys` = rho coord (height nrho); `ntheta_pad` is the padded row
+    /// stride.
     #[allow(clippy::too_many_arguments)]
     pub fn tomoxide_lprec_scatter(
         flc: *const c_void,
@@ -517,6 +522,7 @@ unsafe extern "C" {
         n: i32,
         nrho: i32,
         ntheta: i32,
+        ntheta_pad: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -629,4 +635,13 @@ unsafe extern "C" {
         batch: usize,
         inverse: i32,
     ) -> i32;
+    /// In-place batched 2-D **R2C** FFT (forward, unnormalized). `data` is a
+    /// row-padded real buffer `[rows, 2*(cols/2+1)]` per image (so it overlays
+    /// the half-complex output `[rows, cols/2+1]`); on return it holds the
+    /// spectrum. Returns 0 on success.
+    pub fn tomoxide_fft_2d_r2c(data: *mut c_void, rows: usize, cols: usize, batch: usize) -> i32;
+    /// In-place batched 2-D **C2R** FFT (inverse, normalized by `1/(rows*cols)`).
+    /// Consumes the half-complex spectrum `[rows, cols/2+1]` and writes the
+    /// row-padded real image `[rows, 2*(cols/2+1)]` per image in place.
+    pub fn tomoxide_fft_2d_c2r(data: *mut c_void, rows: usize, cols: usize, batch: usize) -> i32;
 }

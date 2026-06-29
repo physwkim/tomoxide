@@ -3813,7 +3813,31 @@ mod cuda_impl {
                     grids.kfull.len() * 2,
                 )
             };
+            // The log-polar function is real, so the per-span convolution runs as
+            // an in-place R2C → cmul → C2R. The spectrum is the half-complex
+            // `[nrho, ntheta_c]` (ntheta_c = ntheta/2+1, the conjugate-symmetric
+            // half), so `kfull` — the FFT of a real kernel, hence Hermitian — is
+            // cropped to its first `ntheta_c` columns per row to match.
+            let (nrho, ntheta) = (grids.nrho, grids.ntheta);
+            let ntheta_c = ntheta / 2 + 1;
+            let ntheta_pad = 2 * ntheta_c;
+            let mut kfull_half = Vec::with_capacity(nrho * ntheta_c * 2);
+            for row in 0..nrho {
+                let base = row * ntheta * 2;
+                for col in 0..ntheta_c {
+                    kfull_half.push(kfull_f32[base + col * 2]);
+                    kfull_half.push(kfull_f32[base + col * 2 + 1]);
+                }
+            }
             let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+            // Gather targets index the `[nrho, ntheta]` grid row-major; remap them
+            // to the padded real layout (row stride ntheta_pad) used in place by
+            // the R2C buffer. cids (Cartesian-output indices) are unaffected.
+            let to_padded_i32 = |v: &[usize]| -> Vec<i32> {
+                v.iter()
+                    .map(|&t| ((t / ntheta) * ntheta_pad + (t % ntheta)) as i32)
+                    .collect()
+            };
             let concat = |spans: &[Vec<f32>; LP_NSPAN]| -> Vec<f32> {
                 let mut v = Vec::with_capacity(spans.iter().map(Vec::len).sum());
                 for sp in spans {
@@ -3827,9 +3851,9 @@ mod cuda_impl {
                 n_lp: grids.lpids.len(),
                 n_w: grids.wids.len(),
                 n_c: grids.cids.len(),
-                kfull: DevBuf::from_host_f32(kfull_f32)?,
-                lpids: DevBuf::from_host_i32(&to_i32(&grids.lpids))?,
-                wids: DevBuf::from_host_i32(&to_i32(&grids.wids))?,
+                kfull: DevBuf::from_host_f32(&kfull_half)?,
+                lpids: DevBuf::from_host_i32(&to_padded_i32(&grids.lpids))?,
+                wids: DevBuf::from_host_i32(&to_padded_i32(&grids.wids))?,
                 cids: DevBuf::from_host_i32(&to_i32(&grids.cids))?,
                 lp2p1: DevBuf::from_host_f32(&concat(&grids.lp2p1))?,
                 lp2p2: DevBuf::from_host_f32(&concat(&grids.lp2p2))?,
@@ -3840,9 +3864,22 @@ mod cuda_impl {
             })
         }
 
-        /// Bytes of the `[cz, nrho, ntheta]` complex work buffer for `cz` slices.
+        /// Complex half-width of the R2C spectrum (`ntheta/2 + 1`).
+        fn ntheta_c(&self) -> usize {
+            self.ntheta / 2 + 1
+        }
+
+        /// Padded real row width of the in-place R2C buffer (`2*(ntheta/2+1)`).
+        fn ntheta_pad(&self) -> usize {
+            2 * self.ntheta_c()
+        }
+
+        /// Bytes of the in-place R2C work buffer for `cz` slices: the padded real
+        /// `[cz, nrho, ntheta_pad]` overlays the half-complex `[cz, nrho,
+        /// ntheta_c]`, i.e. `cz*nrho*ntheta_c` complex — roughly half the old
+        /// `[cz, nrho, ntheta]` full-complex buffer.
         fn flc_bytes(&self, cz: usize) -> usize {
-            cz * self.nrho * self.ntheta * 2 * std::mem::size_of::<f32>()
+            cz * self.nrho * self.ntheta_c() * 2 * std::mem::size_of::<f32>()
         }
 
         /// Per-chunk runtime (port of `recon/lprec.rs::process_row`): `g` is the
@@ -3862,6 +3899,7 @@ mod cuda_impl {
             use crate::recon::lprec::LP_NSPAN;
             let null = std::ptr::null_mut::<c_void>();
             let (nrho, ntheta) = (self.nrho, self.ntheta);
+            let (ntheta_c, ntheta_pad) = (self.ntheta_c(), self.ntheta_pad());
             let off = |buf: &DevBuf, elems: usize| -> *const c_void {
                 unsafe { (buf.ptr as *const f32).add(elems) as *const c_void }
             };
@@ -3896,7 +3934,7 @@ mod cuda_impl {
                             nproj as i32,
                             n as i32,
                             nrho as i32,
-                            ntheta as i32,
+                            ntheta_pad as i32,
                             null,
                         )
                     },
@@ -3915,15 +3953,15 @@ mod cuda_impl {
                             nproj as i32,
                             n as i32,
                             nrho as i32,
-                            ntheta as i32,
+                            ntheta_pad as i32,
                             null,
                         )
                     },
                     "lprec gather wrap",
                 )?;
                 ck(
-                    unsafe { ffi::tomoxide_fft_2d(flc, nrho, ntheta, cz, 0) },
-                    "lprec fft fwd",
+                    unsafe { ffi::tomoxide_fft_2d_r2c(flc, nrho, ntheta, cz) },
+                    "lprec fft fwd (r2c)",
                 )?;
                 ck(
                     unsafe {
@@ -3932,15 +3970,15 @@ mod cuda_impl {
                             self.kfull.ptr,
                             cz as i32,
                             nrho as i32,
-                            ntheta as i32,
+                            ntheta_c as i32,
                             null,
                         )
                     },
                     "lprec cmul",
                 )?;
                 ck(
-                    unsafe { ffi::tomoxide_fft_2d(flc, nrho, ntheta, cz, 1) },
-                    "lprec fft inv",
+                    unsafe { ffi::tomoxide_fft_2d_c2r(flc, nrho, ntheta, cz) },
+                    "lprec fft inv (c2r)",
                 )?;
                 ck(
                     unsafe {
@@ -3955,6 +3993,7 @@ mod cuda_impl {
                             n as i32,
                             nrho as i32,
                             ntheta as i32,
+                            ntheta_pad as i32,
                             null,
                         )
                     },
