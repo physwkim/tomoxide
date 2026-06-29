@@ -41,7 +41,7 @@ log.workspace = true
 # one read) — a `[:, r0:r1, :]` z-chunk is `nproj` reads, not `nproj*(r1-r0)`;
 # ~1.6s/job faster streaming on the 1024-proj bench (was the recon_steps
 # read-bound bottleneck).
-rust-hdf5 = "0.2.27"
+rust-hdf5 = "0.2.28"
 tiff = "0.11"
 # optional GPU (wgpu / Metal) — only with `gpu-wgpu`
 wgpu = { workspace = true, optional = true }

@@ -80,18 +80,21 @@ fn main() {
     ];
 
     println!("prof_stripe: nproj={nproj} nz={nz} ncols={ncols} iters={iters}");
+    let dims = raw.array.dim();
+    let raw_std = raw.array.as_standard_layout();
+    let raw_slice = raw_std.as_slice().expect("contiguous raw chunk");
     for &(name, stripe) in methods {
         // Warmup (plan/handle caches, first-touch allocations).
         for _ in 0..2 {
             recon
-                .reconstruct_chunk_raw(&raw, None, None, &geom, stripe)
+                .reconstruct_chunk_raw(raw_slice, dims, None, None, &geom, stripe)
                 .expect("raw ok")
                 .expect("device handled");
         }
         let t0 = Instant::now();
         for _ in 0..iters {
             recon
-                .reconstruct_chunk_raw(&raw, None, None, &geom, stripe)
+                .reconstruct_chunk_raw(raw_slice, dims, None, None, &geom, stripe)
                 .expect("raw ok")
                 .expect("device handled");
         }

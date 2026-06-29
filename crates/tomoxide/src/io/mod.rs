@@ -50,6 +50,37 @@ pub trait DatasetReader {
             "read_chunk: out-of-core reads not supported by this reader".into(),
         ))
     }
+
+    /// Read a detector-row chunk's projections **directly into** `data_out` — the
+    /// caller's (page-locked) host buffer — returning the chunk's flat/dark frames
+    /// and `theta` as [`ChunkAux`]. This is the out-of-core entry point for
+    /// backends that upload raw chunks ([`Backend::wants_raw_chunks`](crate::backend::Backend::wants_raw_chunks)):
+    /// the projection hyperslab lands straight in the pinned staging buffer with
+    /// no intervening owned allocation or copy. `data_out.len()` must equal
+    /// `nproj * (row1 - row0) * nx`. The default is unsupported.
+    fn read_chunk_into(
+        &mut self,
+        _row0: usize,
+        _row1: usize,
+        _data_out: &mut [f32],
+    ) -> Result<ChunkAux> {
+        Err(Error::Io(
+            "read_chunk_into: out-of-core reads not supported by this reader".into(),
+        ))
+    }
+}
+
+/// Side data accompanying a raw projection chunk read via
+/// [`DatasetReader::read_chunk_into`]: the chunk's flat/dark frames (sliced to
+/// the same detector rows) and the full projection angles. The projections
+/// themselves are read straight into the caller's buffer, not carried here.
+pub struct ChunkAux {
+    /// Flat (white/open-beam) frames for this chunk's rows, if present.
+    pub flat: Option<Frames<f32>>,
+    /// Dark frames for this chunk's rows, if present.
+    pub dark: Option<Frames<f32>>,
+    /// Projection angles in radians, length = number of angles.
+    pub theta: Vec<f32>,
 }
 
 /// A reconstruction writer (port of tomocupy `dataio/writer.py:73`).
@@ -249,6 +280,63 @@ impl DatasetReader for H5DxchangeReader {
             dark,
             theta,
         })
+    }
+
+    fn read_chunk_into(
+        &mut self,
+        row0: usize,
+        row1: usize,
+        data_out: &mut [f32],
+    ) -> Result<ChunkAux> {
+        let [nproj, nz, nx] = self.data_shape()?;
+        if row0 > row1 || row1 > nz {
+            return Err(Error::InvalidParam(format!(
+                "read_chunk_into rows [{row0}, {row1}) out of range for nz={nz}"
+            )));
+        }
+        let rows = row1 - row0;
+        let expected = nproj * rows * nx;
+        if data_out.len() != expected {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{expected} elems ([{nproj}, {rows}, {nx}])"),
+                found: format!("{} elems", data_out.len()),
+            });
+        }
+
+        // Projections straight into the caller's (pinned) buffer — no owned
+        // allocation, no copy. The hyperslab is `[:, row0:row1, :]` of [nproj, nz, nx].
+        read_f32_slice_into(
+            &self.required(dxchange::DATA)?,
+            &[0, row0, 0],
+            &[nproj, rows, nx],
+            data_out,
+        )?;
+
+        // Flat/dark are tiny (one frame each here) — the owned-array slab is fine.
+        let slab = |ds: &H5Dataset, n: usize| -> Result<Array3<f32>> {
+            let v = read_f32_slice(ds, &[0, row0, 0], &[n, rows, nx])?;
+            Array3::from_shape_vec((n, rows, nx), v).map_err(|e| Error::ShapeMismatch {
+                expected: format!("[{n}, {rows}, {nx}]"),
+                found: e.to_string(),
+            })
+        };
+        let flat = match self.optional(dxchange::DATA_WHITE)? {
+            Some(ds) => {
+                let nf = ds.shape().first().copied().unwrap_or(0);
+                Some(Frames::new(slab(&ds, nf)?))
+            }
+            None => None,
+        };
+        let dark = match self.optional(dxchange::DATA_DARK)? {
+            Some(ds) => {
+                let nd = ds.shape().first().copied().unwrap_or(0);
+                Some(Frames::new(slab(&ds, nd)?))
+            }
+            None => None,
+        };
+        let theta = self.read_theta()?;
+
+        Ok(ChunkAux { flat, dark, theta })
     }
 }
 
@@ -526,6 +614,49 @@ fn read_f32_slice(ds: &H5Dataset, starts: &[usize], counts: &[usize]) -> Result<
         }
     };
     Ok(v)
+}
+
+/// Read a hyperslab **directly into** `out` (a caller-owned, possibly pinned,
+/// buffer), avoiding [`read_f32_slice`]'s internal allocation + copy. The fast
+/// path is an f32-on-disk dataset: `rust-hdf5`'s `read_slice_into` decodes the
+/// hyperslab straight into `out` (no `Vec`, no `memcpy`). Non-f32 on-disk dtypes
+/// have no zero-copy route here (they need a numeric cast), so they fall back to
+/// [`read_f32_slice`] + a copy into `out` — correct, just not allocation-free.
+/// `out.len()` must equal `counts.iter().product()`.
+fn read_f32_slice_into(
+    ds: &H5Dataset,
+    starts: &[usize],
+    counts: &[usize],
+    out: &mut [f32],
+) -> Result<()> {
+    let expected: usize = counts.iter().product();
+    if out.len() != expected {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{expected} elems"),
+            found: format!("{} elems", out.len()),
+        });
+    }
+    let dt = ds
+        .datatype()
+        .map_err(|e| Error::Io(format!("datatype: {e}")))?;
+    match dt {
+        DatatypeMessage::FloatingPoint {
+            size: 4,
+            byte_order,
+            ..
+        } => {
+            ensure_le(byte_order)?;
+            ds.read_slice_into::<f32>(out, starts, counts)
+                .map_err(|e| Error::Io(format!("read: {e}")))?;
+            Ok(())
+        }
+        _ => {
+            // Non-f32 on disk: cast through the allocating path, then copy in.
+            let v = read_f32_slice(ds, starts, counts)?;
+            out.copy_from_slice(&v);
+            Ok(())
+        }
+    }
 }
 
 /// Guard against silently mis-reading a big-endian dataset: `read_raw`

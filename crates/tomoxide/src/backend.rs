@@ -42,6 +42,42 @@ pub trait DeviceBuffer<T: Element> {
     fn copy_to_host(&self, dst: &mut [T]) -> Result<()>;
 }
 
+/// A page-locked-capable host buffer of `f32` that the out-of-core reader fills
+/// (directly, via `rust-hdf5`'s `read_slice_into`) and a backend uploads.
+///
+/// The CUDA backend returns one backed by `cudaHostAlloc` (pinned) memory so the
+/// subsequent H2D is a pure DMA with no driver staging copy — eliminating the
+/// per-chunk host-bandwidth cost that otherwise competes with the reader. Other
+/// backends fall back to a plain `Vec`. `Send` so the filled buffer can cross the
+/// pipeline's reader→compute channel; the bytes are plain host memory, safe to
+/// read and free from any thread.
+pub trait HostBuffer: Send {
+    /// The whole buffer, for the reader to fill.
+    fn as_mut_slice(&mut self) -> &mut [f32];
+    /// The filled buffer, for the H2D upload (or a host-path view).
+    fn as_slice(&self) -> &[f32];
+}
+
+/// Plain heap-`Vec` [`HostBuffer`] — the default for backends without pinned
+/// memory (CPU/wgpu) and the CUDA fallback when `cudaHostAlloc` fails.
+pub(crate) struct VecHostBuffer(Vec<f32>);
+
+impl VecHostBuffer {
+    /// A zeroed buffer of `len` `f32`.
+    pub(crate) fn new(len: usize) -> Self {
+        VecHostBuffer(vec![0.0f32; len])
+    }
+}
+
+impl HostBuffer for VecHostBuffer {
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.0
+    }
+    fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
+}
+
 /// A backend: a device plus the set of numerical capabilities it provides.
 ///
 /// Capability accessors return `Some(self-as-trait)` when supported. Callers
@@ -104,6 +140,26 @@ pub trait Backend: Send + Sync {
     /// Rank filters (median, outlier removal).
     fn rank_filter(&self) -> Option<&dyn RankFilter> {
         None
+    }
+
+    /// Allocate a host staging buffer of `len` `f32` for an out-of-core read
+    /// chunk's projections. The CUDA backend overrides this to return page-locked
+    /// (pinned) memory so the chunk's H2D is a direct DMA; the default is a plain
+    /// `Vec`. Infallible — a backend that cannot pin (allocation failure) falls
+    /// back to a `Vec` so reading always proceeds.
+    fn alloc_host_buffer(&self, len: usize) -> Box<dyn HostBuffer> {
+        Box::new(VecHostBuffer::new(len))
+    }
+
+    /// Whether the streaming pipeline should hand this backend **raw** projection
+    /// chunks read straight into an [`alloc_host_buffer`](Backend::alloc_host_buffer)
+    /// staging buffer (for [`reconstruct_chunk_raw`](StreamingAnalytic::reconstruct_chunk_raw)'s
+    /// device-resident upload), instead of a host-assembled [`Tomo`]. True only
+    /// for backends with a device-resident raw path that benefits from pinned
+    /// reads (CUDA); the default `false` keeps CPU/wgpu on the owned-array path
+    /// (no per-chunk copy into a staging buffer).
+    fn wants_raw_chunks(&self) -> bool {
+        false
     }
 }
 
@@ -311,10 +367,15 @@ pub trait StreamingAnalytic {
     /// backend: the caller simply falls back to host normalize + transpose +
     /// host `remove_stripe` + [`reconstruct_chunk`] whenever this returns `None`.
     ///
-    /// `data` must be [`Layout::Projection`](crate::data::Layout).
+    /// `data` is the contiguous, C-order raw projection chunk in
+    /// [`Layout::Projection`](crate::data::Layout) — `[nproj, nz, ncols]` with
+    /// `dims == (nproj, nz, ncols)`. Taking a slice (not a [`Tomo`]) lets the
+    /// caller hand the pinned read buffer straight through with no intervening
+    /// owned `ndarray` allocation (`ndarray` cannot own page-locked memory).
     fn reconstruct_chunk_raw(
         &mut self,
-        _data: &Tomo<f32>,
+        _data: &[f32],
+        _dims: (usize, usize, usize),
         _flat: Option<&Frames<f32>>,
         _dark: Option<&Frames<f32>>,
         _geom: &Geometry,

@@ -145,6 +145,26 @@ impl Backend for CudaBackend {
     fn fft(&self) -> Option<&dyn crate::backend::Fft> {
         Some(self)
     }
+
+    /// Pinned (`cudaHostAlloc`) staging buffer so the streaming reader can read a
+    /// chunk's projections straight into page-locked memory and the H2D is a
+    /// direct DMA — no driver staging copy competing with the reader for host
+    /// bandwidth. Falls back to a `Vec` if pinning fails.
+    #[cfg(feature = "cuda")]
+    fn alloc_host_buffer(&self, len: usize) -> Box<dyn crate::backend::HostBuffer> {
+        match cuda_impl::PinnedHostBuffer::new(len) {
+            Ok(b) => Box::new(b),
+            Err(_) => Box::new(crate::backend::VecHostBuffer::new(len)),
+        }
+    }
+
+    /// CUDA has the device-resident raw path
+    /// ([`reconstruct_chunk_raw`](crate::backend::StreamingAnalytic::reconstruct_chunk_raw)),
+    /// so the pipeline reads chunks straight into the pinned staging buffer above.
+    #[cfg(feature = "cuda")]
+    fn wants_raw_chunks(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -436,6 +456,36 @@ mod cuda_impl {
     impl<T> Drop for PinnedBuf<T> {
         fn drop(&mut self) {
             unsafe { ffi::tomoxide_cuda_host_free(self.ptr) };
+        }
+    }
+
+    /// A pinned (`cudaHostAlloc`) [`HostBuffer`] of `f32` for the streaming
+    /// reader to fill via `read_slice_into`, so a chunk's H2D is a direct DMA. The
+    /// page-locked bytes are plain host memory — safe to fill on the reader thread
+    /// and upload/free on the compute thread — so it is `Send` (the raw pointer in
+    /// `PinnedBuf` only blocks the auto-derive).
+    pub(super) struct PinnedHostBuffer(PinnedBuf<f32>);
+
+    impl PinnedHostBuffer {
+        /// Allocate `len` pinned `f32`. Errors propagate so the caller can fall
+        /// back to a plain `Vec` buffer.
+        pub(super) fn new(len: usize) -> Result<Self> {
+            Ok(PinnedHostBuffer(PinnedBuf::<f32>::new(len)?))
+        }
+    }
+
+    // SAFETY: the wrapped pointer addresses page-locked host memory with no
+    // thread affinity; `cudaHostAlloc`/`cudaFreeHost` and plain loads/stores are
+    // valid from any thread, and the buffer is moved (not shared) across the
+    // reader→compute channel.
+    unsafe impl Send for PinnedHostBuffer {}
+
+    impl crate::backend::HostBuffer for PinnedHostBuffer {
+        fn as_mut_slice(&mut self) -> &mut [f32] {
+            self.0.as_mut_slice()
+        }
+        fn as_slice(&self) -> &[f32] {
+            self.0.as_slice()
         }
     }
 
@@ -1095,24 +1145,25 @@ mod cuda_impl {
 
         fn reconstruct_chunk_raw(
             &mut self,
-            data: &Tomo<f32>,
+            data: &[f32],
+            dims: (usize, usize, usize),
             flat: Option<&Frames<f32>>,
             dark: Option<&Frames<f32>>,
             geom: &Geometry,
             stripe: StripeMethod,
         ) -> Result<Option<Volume<f32>>> {
-            // The device-resident path consumes the raw projection-layout chunk;
-            // for any other layout defer to the host path (`Ok(None)`).
-            if data.layout != Layout::Projection {
-                return Ok(None);
-            }
+            // `data` is the caller's contiguous, C-order projection-layout chunk
+            // `[nproj, nz, ncols]` (read straight into a pinned staging buffer);
+            // no layout check is needed — the streaming pipeline only ever feeds
+            // projection-order chunks here.
+            //
             // Defer the whole chunk to the host when the requested stripe method
             // has no on-device port — checked before any GPU work so we don't
             // normalize on the device only to have the host redo it.
             if !gpu_supports_stripe(stripe) {
                 return Ok(None);
             }
-            let (nproj, nz, ncols) = data.array.dim();
+            let (nproj, nz, ncols) = dims;
             if nproj != self.nproj || ncols != self.ncols {
                 return Err(Error::ShapeMismatch {
                     expected: format!("nproj={} ncols={}", self.nproj, self.ncols),
@@ -1125,14 +1176,18 @@ mod cuda_impl {
                     self.max_nz
                 )));
             }
-            let std = data.array.as_standard_layout();
-            let raw = std
-                .as_slice()
-                .ok_or_else(|| Error::InvalidParam("non-contiguous projection chunk".into()))?;
+            if data.len() != nproj * nz * ncols {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("{} elems ([{nproj}, {nz}, {ncols}])", nproj * nz * ncols),
+                    found: format!("{} elems", data.len()),
+                });
+            }
             let null = std::ptr::null_mut::<c_void>();
             // One H2D: the raw projection chunk as the contiguous [nproj, nz, ncols]
-            // prefix of the max-sized f32 `proj` buffer.
-            self.proj.copy_from_host_f32(raw)?;
+            // prefix of the max-sized f32 `proj` buffer. When `data` is pinned
+            // (the streaming reader's staging buffer) this is a direct DMA with no
+            // driver staging copy.
+            self.proj.copy_from_host_f32(data)?;
             // Dark/flat correction on the device, mirroring `CudaBackend::darkflat`
             // (host-averaged `dark2d`, clamped `denom`, device broadcast) so the
             // output is bit-identical to the host normalize path. Skipped when

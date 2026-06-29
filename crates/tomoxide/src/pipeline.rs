@@ -6,10 +6,11 @@
 //! and write **by sinogram chunks**, so the volume is streamed to the writer a
 //! chunk at a time instead of being held whole (see `docs/ARCHITECTURE.md` §5).
 
-use crate::data::{Dataset, Layout, Tomo, Volume};
+use crate::data::{Dataset, Frames, Layout, Tomo, Volume};
 use crate::error::Result;
 use crate::geometry::Geometry;
 use crate::params::{Algorithm, PhaseMethod, ReconParams, StripeMethod};
+use ndarray::Array3;
 
 use crate::engine::Engine;
 
@@ -252,33 +253,85 @@ impl ReconSteps {
 
         // read thread → compute (this thread) → write thread, each bounded.
         let (read_tx, read_rx) =
-            std::sync::mpsc::sync_channel::<(usize, usize, Dataset<f32>)>(PIPELINE_DEPTH);
+            std::sync::mpsc::sync_channel::<(usize, usize, ChunkMsg)>(PIPELINE_DEPTH);
         let (write_tx, write_rx) =
             std::sync::mpsc::sync_channel::<(usize, usize, Volume<f32>)>(PIPELINE_DEPTH);
         // One-shot: the reader thread (which owns `read_sizes`) hands the total
         // slice count to the writer thread so it can `reserve` before chunk 0
         // (H5/Zarr pre-size their container; TIFF's no-op ignores it).
         let (nz_tx, nz_rx) = std::sync::mpsc::sync_channel::<usize>(1);
+        // Pinned-buffer recycle channel (raw mode only): the reader fills a
+        // staging buffer pulled from here and the compute thread returns it after
+        // upload, so the `POOL` page-locked buffers are allocated ONCE — a fresh
+        // `cudaHostAlloc` per chunk would cost more than the staging copy it saves.
+        // `POOL = PIPELINE_DEPTH + 1` keeps the reader a full depth ahead while one
+        // buffer is in flight on the compute thread.
+        const POOL: usize = PIPELINE_DEPTH + 1;
+        let (free_tx, free_rx) =
+            std::sync::mpsc::sync_channel::<Box<dyn crate::backend::HostBuffer>>(POOL);
+        let free_tx_reader = free_tx.clone();
 
         std::thread::scope(|s| {
             // Reader thread: build its own reader, stream each chunk's rows.
             let reader_handle = s.spawn(move || -> Result<()> {
                 let mut reader = make_reader()?;
-                let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+                let (nproj, nz, nx, _nflat, _ndark) = reader.read_sizes()?;
                 // Hand the writer the total slice count for `reserve` (ignore a
                 // send error: a dropped receiver means the writer/compute side
                 // already aborted, which the join below surfaces).
                 let _ = nz_tx.send(nz);
-                let mut r0 = 0;
-                while r0 < nz {
-                    let r1 = (r0 + chunk).min(nz);
-                    let ds = reader.read_chunk(r0, r1)?;
-                    // A send error means compute hung up (errored/aborted); stop
-                    // reading — the compute side already owns the real error.
-                    if read_tx.send((r0, r1, ds)).is_err() {
-                        break;
+                // CUDA's device-resident raw path wants chunks read straight into a
+                // pinned staging buffer (direct-DMA H2D, no driver staging copy);
+                // CPU/wgpu take the owned-`Dataset` path.
+                let raw_mode = backend.wants_raw_chunks();
+                if raw_mode {
+                    // Prime the pool with `POOL` buffers sized to the largest chunk,
+                    // allocated once and recycled for the whole run.
+                    let max_len = nproj * chunk.min(nz) * nx;
+                    for _ in 0..POOL {
+                        if free_tx_reader
+                            .send(backend.alloc_host_buffer(max_len))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
-                    r0 = r1;
+                    let mut r0 = 0;
+                    while r0 < nz {
+                        let r1 = (r0 + chunk).min(nz);
+                        let rows = r1 - r0;
+                        let need = nproj * rows * nx;
+                        // Recycle a pinned buffer (blocks until compute returns one).
+                        let mut buf = match free_rx.recv() {
+                            Ok(b) => b,
+                            Err(_) => break, // compute hung up
+                        };
+                        let aux =
+                            reader.read_chunk_into(r0, r1, &mut buf.as_mut_slice()[..need])?;
+                        let msg = ChunkMsg::Raw {
+                            data: buf,
+                            dims: (nproj, rows, nx),
+                            flat: aux.flat,
+                            dark: aux.dark,
+                            theta: aux.theta,
+                        };
+                        if read_tx.send((r0, r1, msg)).is_err() {
+                            break;
+                        }
+                        r0 = r1;
+                    }
+                } else {
+                    let mut r0 = 0;
+                    while r0 < nz {
+                        let r1 = (r0 + chunk).min(nz);
+                        let ds = reader.read_chunk(r0, r1)?;
+                        // A send error means compute hung up (errored/aborted); stop
+                        // reading — the compute side already owns the real error.
+                        if read_tx.send((r0, r1, ChunkMsg::Host(ds))).is_err() {
+                            break;
+                        }
+                        r0 = r1;
+                    }
                 }
                 Ok(())
                 // read_tx drops here → compute's recv loop ends.
@@ -300,8 +353,11 @@ impl ReconSteps {
             });
 
             // Compute on this thread (the backend lives here). Owns write_tx so it
-            // drops at the end of the loop, terminating the writer thread.
-            let compute = compute_chunks(read_rx, write_tx, backend, geom, algorithm, params, prep);
+            // drops at the end of the loop, terminating the writer thread, and
+            // `free_tx` so spent pinned buffers return to the reader's pool.
+            let compute = compute_chunks(
+                read_rx, write_tx, free_tx, backend, geom, algorithm, params, prep,
+            );
 
             // Join I/O threads, then surface the first error in causal order:
             // a reader error truncates the stream (compute ends Ok) so it must be
@@ -317,10 +373,30 @@ impl ReconSteps {
 /// run the per-chunk numeric pipeline (identical to `run_streaming`), and push the
 /// reconstructed volume to the writer. Takes `write_tx` by value so it is dropped
 /// when the stream ends, signalling the writer thread to finish.
+/// One read chunk crossing reader→compute. Either **raw** projections read
+/// straight into a host staging buffer (pinned for CUDA, for the device-resident
+/// upload in [`reconstruct_chunk_raw`](crate::backend::StreamingAnalytic::reconstruct_chunk_raw)),
+/// or a fully host-assembled [`Dataset`] (CPU/wgpu). The reader picks per
+/// [`Backend::wants_raw_chunks`](crate::backend::Backend::wants_raw_chunks).
+enum ChunkMsg {
+    /// Raw projection chunk `[nproj, rows, nx]` in a staging buffer, plus the
+    /// chunk's flat/dark frames and angles.
+    Raw {
+        data: Box<dyn crate::backend::HostBuffer>,
+        dims: (usize, usize, usize),
+        flat: Option<Frames<f32>>,
+        dark: Option<Frames<f32>>,
+        theta: Vec<f32>,
+    },
+    /// Fully host-assembled dataset (the original owned-array path).
+    Host(Dataset<f32>),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_chunks(
-    read_rx: std::sync::mpsc::Receiver<(usize, usize, Dataset<f32>)>,
+    read_rx: std::sync::mpsc::Receiver<(usize, usize, ChunkMsg)>,
     write_tx: std::sync::mpsc::SyncSender<(usize, usize, Volume<f32>)>,
+    free_tx: std::sync::mpsc::SyncSender<Box<dyn crate::backend::HostBuffer>>,
     backend: &dyn crate::backend::Backend,
     geom: &Geometry,
     algorithm: Algorithm,
@@ -331,18 +407,47 @@ fn compute_chunks(
     // `recon_chunk_reusing`): a many-chunk job pays the cuFFT-plan / f16-texture
     // setup once, not per chunk.
     let mut recon = None;
-    while let Ok((r0, r1, ds)) = read_rx.recv() {
+    while let Ok((r0, r1, msg)) = read_rx.recv() {
         let chunk_geom = chunk_geometry(geom, r0, r1);
-        let vol = chunk_to_volume(
-            &mut recon,
-            backend,
-            ds,
-            geom,
-            &chunk_geom,
-            algorithm,
-            params,
-            prep,
-        )?;
+        let vol = match msg {
+            ChunkMsg::Raw {
+                data,
+                dims,
+                flat,
+                dark,
+                theta,
+            } => {
+                let vol = raw_chunk_to_volume(
+                    &mut recon,
+                    backend,
+                    data.as_ref(),
+                    dims,
+                    flat,
+                    dark,
+                    theta,
+                    geom,
+                    &chunk_geom,
+                    algorithm,
+                    params,
+                    prep,
+                )?;
+                // Return the pinned buffer to the reader's pool for reuse (the H2D
+                // inside `reconstruct_chunk_raw` is synchronous, so it is already
+                // free). Ignore a send error: a finished reader just drops it.
+                let _ = free_tx.send(data);
+                vol
+            }
+            ChunkMsg::Host(ds) => chunk_to_volume(
+                &mut recon,
+                backend,
+                ds,
+                geom,
+                &chunk_geom,
+                algorithm,
+                params,
+                prep,
+            )?,
+        };
         // A send error means the writer hung up (errored); stop — the writer
         // thread owns the real error, surfaced after join.
         if write_tx.send((r0, r1, vol)).is_err() {
@@ -397,7 +502,7 @@ fn chunk_geometry(geom: &Geometry, r0: usize, r1: usize) -> Geometry {
 fn chunk_to_volume(
     slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
     backend: &dyn crate::backend::Backend,
-    mut ds: Dataset<f32>,
+    ds: Dataset<f32>,
     geom: &Geometry,
     chunk_geom: &Geometry,
     algorithm: Algorithm,
@@ -406,22 +511,28 @@ fn chunk_to_volume(
 ) -> Result<Volume<f32>> {
     // Build the reusable reconstructor on the first chunk, sized to that chunk's
     // (largest) projection dims.
-    if slot.is_none() {
-        let built = match backend.analytic_reconstruct() {
-            Some(ar) => {
-                ar.streaming(algorithm, params, geom, ds.data.n_cols(), ds.data.n_rows())?
-            }
-            None => None,
-        };
-        *slot = Some(built);
-    }
+    ensure_slot(
+        slot,
+        backend,
+        algorithm,
+        params,
+        geom,
+        ds.data.n_cols(),
+        ds.data.n_rows(),
+    )?;
     // Device-resident fast path. The reconstructor applies any GPU-ported stripe
     // method itself and returns `Ok(None)` when it cannot (no device path, or the
     // stripe method has no GPU port), in which case the whole chunk falls through
     // to the host route below.
     if let Some(Some(s)) = slot.as_mut() {
+        let std = ds.data.array.as_standard_layout();
+        let raw = std.as_slice().ok_or_else(|| {
+            crate::error::Error::InvalidParam("non-contiguous projection chunk".into())
+        })?;
+        let dims = ds.data.array.dim();
         if let Some(vol) = s.reconstruct_chunk_raw(
-            &ds.data,
+            raw,
+            dims,
             ds.flat.as_ref(),
             ds.dark.as_ref(),
             chunk_geom,
@@ -430,10 +541,103 @@ fn chunk_to_volume(
             return Ok(vol);
         }
     }
-    // Host path: normalize → transpose (to C-contiguous sinogram so the
-    // back-projector can take a flat slice) → stripe removal → reconstruct from
-    // the prepared sinogram (`slot` is already built above; `recon_chunk_reusing`
-    // just dispatches).
+    host_path(slot, backend, ds, geom, chunk_geom, algorithm, params, prep)
+}
+
+/// Reconstruct one **raw** projection chunk delivered in a host staging buffer
+/// (pinned for CUDA): the device-resident path uploads the staging slice straight
+/// (a direct DMA when pinned), with no owned `ndarray` materialization. Only the
+/// rare host fallback (a stripe method with no GPU port) copies the projections
+/// into an owned array. Mirrors [`chunk_to_volume`]'s two routes.
+#[allow(clippy::too_many_arguments)]
+fn raw_chunk_to_volume(
+    slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
+    backend: &dyn crate::backend::Backend,
+    data: &dyn crate::backend::HostBuffer,
+    dims: (usize, usize, usize),
+    flat: Option<Frames<f32>>,
+    dark: Option<Frames<f32>>,
+    theta: Vec<f32>,
+    geom: &Geometry,
+    chunk_geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+) -> Result<Volume<f32>> {
+    let (nproj, rows, nx) = dims;
+    // The staging buffer is sized to the largest chunk; this (possibly smaller,
+    // trailing) chunk occupies only its `need`-element prefix.
+    let need = nproj * rows * nx;
+    let raw = &data.as_slice()[..need];
+    // Reconstructor sized to this (largest, first) chunk: ncols = nx, nz = rows.
+    ensure_slot(slot, backend, algorithm, params, geom, nx, rows)?;
+    if let Some(Some(s)) = slot.as_mut() {
+        if let Some(vol) = s.reconstruct_chunk_raw(
+            raw,
+            dims,
+            flat.as_ref(),
+            dark.as_ref(),
+            chunk_geom,
+            prep.stripe,
+        )? {
+            return Ok(vol);
+        }
+    }
+    // Host fallback: materialize the staging projections into an owned array once,
+    // then run the identical host route as `chunk_to_volume`.
+    let array = Array3::from_shape_vec((nproj, rows, nx), raw.to_vec()).map_err(|e| {
+        crate::error::Error::ShapeMismatch {
+            expected: format!("[{nproj}, {rows}, {nx}]"),
+            found: e.to_string(),
+        }
+    })?;
+    let ds = Dataset {
+        data: Tomo::new(array, Layout::Projection),
+        flat,
+        dark,
+        theta,
+    };
+    host_path(slot, backend, ds, geom, chunk_geom, algorithm, params, prep)
+}
+
+/// Build the reusable streaming reconstructor into `slot` on the first chunk
+/// (sized to `ncols`/`nz`), reused for every later chunk. `Some(None)` records
+/// that the backend declined for this algorithm (host fallback).
+fn ensure_slot(
+    slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
+    backend: &dyn crate::backend::Backend,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    geom: &Geometry,
+    ncols: usize,
+    nz: usize,
+) -> Result<()> {
+    if slot.is_none() {
+        let built = match backend.analytic_reconstruct() {
+            Some(ar) => ar.streaming(algorithm, params, geom, ncols, nz)?,
+            None => None,
+        };
+        *slot = Some(built);
+    }
+    Ok(())
+}
+
+/// Host reconstruction route shared by [`chunk_to_volume`] and
+/// [`raw_chunk_to_volume`]: normalize → transpose (to a C-contiguous sinogram so
+/// the back-projector can take a flat slice) → stripe removal → reconstruct from
+/// the prepared sinogram (`slot` is already built; `recon_chunk_reusing` just
+/// dispatches).
+#[allow(clippy::too_many_arguments)]
+fn host_path(
+    slot: &mut Option<Option<Box<dyn crate::backend::StreamingAnalytic>>>,
+    backend: &dyn crate::backend::Backend,
+    mut ds: Dataset<f32>,
+    geom: &Geometry,
+    chunk_geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+) -> Result<Volume<f32>> {
     crate::prep::normalize_dataset(&mut ds, backend)?;
     let mut sino = ds.data.to_layout(Layout::Sinogram);
     sino.array = sino.array.as_standard_layout().to_owned();

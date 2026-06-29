@@ -117,9 +117,11 @@ fn run_case(
         .expect("reconstruct_chunk");
 
     // Path B — device-resident raw path with on-device stripe removal.
-    let raw_tomo = Tomo::new(raw, Layout::Projection);
+    let dims = raw.dim();
+    let raw_std = raw.as_standard_layout();
+    let raw_slice = raw_std.as_slice().expect("contiguous raw chunk");
     let vol_dev = recon
-        .reconstruct_chunk_raw(&raw_tomo, flat.as_ref(), dark.as_ref(), geom, stripe)
+        .reconstruct_chunk_raw(raw_slice, dims, flat.as_ref(), dark.as_ref(), geom, stripe)
         .expect("reconstruct_chunk_raw ok")
         .expect("cuda returns Some for a GPU-ported stripe method");
 
