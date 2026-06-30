@@ -10,8 +10,8 @@ use ndarray::{Array3, ArrayViewMut2, Axis};
 
 use crate::data::{Frames, Tomo, Volume};
 use crate::dtype::{Complex32, Dtype, Element};
-use crate::error::Result;
-use crate::geometry::Geometry;
+use crate::error::{Error, Result};
+use crate::geometry::{Beam, Geometry};
 use crate::params::{FilterName, StripeMethod};
 
 /// Which physical device a backend runs on.
@@ -643,6 +643,61 @@ pub trait RayProject {
     /// `geom` center at row 0), matching tomopy's row-action `art` (which takes
     /// `center[0]` for all slices); per-slice center variation is not modeled.
     fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>>;
+}
+
+/// Parallel-beam row-action rows for an `n × n` grid — the shared,
+/// backend-independent geometry behind every [`RayProject`] implementation.
+///
+/// Transposes the pixel-driven splat of the forward projector into per-detector
+/// rows: each pixel `(iy, ix)` projects to
+/// `t = (ix − n/2)·cosθ + (iy − n/2)·sinθ + center` and splits linearly between
+/// detector columns `⌊t⌋` and `⌊t⌋+1`, so `rows[p][⌊t⌋]` gains weight `1 − frac`
+/// and `rows[p][⌊t⌋+1]` gains `frac`. These are exactly the rows of the same
+/// operator `R` the simultaneous methods use. A single `center` (row 0) is used
+/// for all slices, matching tomopy `art`.
+///
+/// The computation is pure host geometry (no device kernel — the row-action
+/// solvers ART/BART are sequential Kaczmarz updates), so CPU and CUDA share this
+/// one definition and produce byte-identical rows.
+pub(crate) fn parallel_ray_rows(geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>> {
+    if geom.beam != Beam::Parallel {
+        return Err(Error::InvalidParam(
+            "row-action projection currently supports parallel beam only".into(),
+        ));
+    }
+    let nang = geom.angles.0.len();
+    let ncols = geom.detector.width;
+    if nang == 0 || ncols == 0 {
+        return Err(Error::InvalidParam(
+            "geometry has no angles or zero detector width".into(),
+        ));
+    }
+    let center = geom.center.at(0);
+    let c0 = n as f32 / 2.0; // cx == cy == n/2
+    let mut rows: Vec<Vec<RayRow>> = (0..nang).map(|_| vec![RayRow::default(); ncols]).collect();
+    for (ia, &a) in geom.angles.0.iter().enumerate() {
+        let (sn, cs) = a.sin_cos();
+        let arows = &mut rows[ia];
+        for iy in 0..n {
+            let gy = iy as f32 - c0;
+            for ix in 0..n {
+                let gx = ix as f32 - c0;
+                let t = gx * cs + gy * sn + center;
+                let t0 = t.floor();
+                let i0 = t0 as isize;
+                if i0 >= 0 && (i0 as usize) + 1 < ncols {
+                    let frac = t - t0;
+                    let pix = (iy * n + ix) as u32;
+                    let d0 = i0 as usize;
+                    arows[d0].pixels.push(pix);
+                    arows[d0].weights.push(1.0 - frac);
+                    arows[d0 + 1].pixels.push(pix);
+                    arows[d0 + 1].weights.push(frac);
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// Elementwise preprocessing kernels.

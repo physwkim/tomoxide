@@ -305,3 +305,50 @@ fn cuda_iterative_suite_runs() {
         eprintln!("{algo:?}: ran on CUDA, interior var = {var:.3e}");
     }
 }
+
+/// The row-action methods ART/BART (tomopy-only) now run on CUDA too: the
+/// `RayProject` rows are geometry-only and the Kaczmarz iteration is pure host
+/// work, so `CudaBackend` reuses the shared host geometry and produces a result
+/// **bit-identical** to the CPU backend (same rows, same iteration, same data).
+#[test]
+fn cuda_art_bart_match_cpu_bit_for_bit() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (48usize, 60usize, 2usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(stack(&phantom, nz));
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    for algo in [Algorithm::Art, Algorithm::Bart] {
+        let params = ReconParams {
+            num_iter: 3,
+            num_gridx: Some(n),
+            num_block: 3, // exercised by BART's ordered subsets
+            ..Default::default()
+        };
+        let rc = recon::recon(&sino, &geom, algo, &params, &cpu)
+            .unwrap_or_else(|e| panic!("{algo:?} failed on CPU: {e}"));
+        let rg = recon::recon(&sino, &geom, algo, &params, &cuda)
+            .unwrap_or_else(|e| panic!("{algo:?} failed on CUDA: {e}"));
+
+        let max_abs = rc
+            .array
+            .iter()
+            .zip(rg.array.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("{algo:?}: CUDA vs CPU max|Δ| = {max_abs:.3e}");
+        assert_eq!(
+            max_abs, 0.0,
+            "{algo:?}: CUDA row-action recon differs from CPU (max|Δ| = {max_abs:.3e}); \
+             the rows must be byte-identical"
+        );
+    }
+}

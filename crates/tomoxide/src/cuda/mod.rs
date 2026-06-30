@@ -136,6 +136,16 @@ impl Backend for CudaBackend {
         Some(self)
     }
 
+    /// Row-action (ART/BART) projection rows. These solvers are sequential
+    /// Kaczmarz updates with no GPU kernel in this design, and the rows are
+    /// geometry-only, so CUDA reuses the shared host geometry — `recon(Art|Bart,
+    /// …, cuda)` runs the same computation, and yields the same result, as the
+    /// CPU backend.
+    #[cfg(feature = "cuda")]
+    fn ray_projector(&self) -> Option<&dyn crate::backend::RayProject> {
+        Some(self)
+    }
+
     /// Fourier-gridding reconstruction on the GPU (`cfunc_fourierrec`).
     #[cfg(feature = "cuda")]
     fn fourier_reconstruct(&self) -> Option<&dyn crate::backend::FourierReconstruct> {
@@ -195,8 +205,9 @@ impl Backend for CudaBackend {
 mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
-        make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, ForwardProject,
-        FourierReconstruct, LpRecReconstruct, RampShape, StreamingAnalytic,
+        make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter, FilteredBackproject,
+        ForwardProject, FourierReconstruct, LpRecReconstruct, RampShape, RayProject, RayRow,
+        StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -676,6 +687,16 @@ mod cuda_impl {
                 .map_err(|e| Error::InvalidParam(format!("cuda sinogram shape: {e}")))?;
             *out = Tomo::new(array, Layout::Sinogram);
             Ok(())
+        }
+    }
+
+    impl RayProject for CudaBackend {
+        /// Row-action (ART/BART) rows. The row-action solvers are sequential
+        /// Kaczmarz updates (no GPU kernel in this design) and the rows are
+        /// geometry-only, so CUDA reuses the shared host geometry
+        /// [`parallel_ray_rows`] — byte-identical to the CPU backend's rows.
+        fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>> {
+            parallel_ray_rows(geom, n)
         }
     }
 
