@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-30
+
+A filter correctness / convention release. The CUDA backend now matches
+tomocupy's analytic reconstruction in **absolute amplitude** (0.2.0's CUDA
+analytic output was 2× too large), the **default FBP filter switches to
+`parzen`** to match tomocupy, and the CUDA filter ramp is ported to tomocupy's
+exact degree-12 quadrature *shape* (not just its scale). Also adds GPU
+laminography.
+
+> **Behaviour changes — read before upgrading.** Both the default-filter switch
+> and the CUDA amplitude halving change reconstruction *values* relative to
+> 0.2.0. See **Changed** below for how to restore the old behaviour.
+
+### Added
+
+- **GPU laminography.** `recon --lamino_angle` runs the analytic linerec path
+  with a tilted rotation axis on CUDA (port of tomocupy's scalar-`phi` linerec),
+  verified against tomocupy on real leaf data (Pearson 0.99997).
+- **tomocupy `_wint` quadrature ramp** (`backend::wint_ramp`) — a faithful port
+  of tomocupy's degree-12 Newton–Cotes interpolatory quadrature (inverse
+  Vandermonde weights over overlapping order-point windows + the 40-sample
+  endpoint correction), so the CUDA analytic filter reproduces tomocupy's ramp
+  *shape* bit-for-bit, closing a ~1% straight-line-ramp gap near DC/Nyquist.
+- **`backend::RampShape`** — selects the base ramp per backend (`Linear` =
+  tomopy for CPU/wgpu, `Wint` = tomocupy for CUDA).
+
+### Changed
+
+- **Default FBP filter is now `parzen`** (was `ramp`), matching tomocupy's
+  default. Reconstructions that used the default filter will be smoother than
+  under 0.2.0; set `filter_name = FilterName::Ramp` (library) to restore the
+  sharp ramp.
+- **CUDA analytic output amplitude halved to match tomocupy.** `build_filter_w`
+  used `1.0/pad`, making every CUDA analytic method
+  (fbp / linerec / fourierrec / lprec / laminography, f32 + fp16) exactly 2×
+  tomocupy. It now uses `0.5/pad`: CUDA matches **tomocupy** in absolute
+  amplitude while the CPU/wgpu path still matches **tomopy**. The documented
+  CUDA↔CPU convention scales become `2/π` (fbp/linerec), `≈2·n²` (fourierrec),
+  `½` (lprec); gridrec stays `1`.
+- **Per-backend filter ramp shape.** The base ramp is no longer shared between
+  backends: CPU/wgpu build tomopy's linear ramp, CUDA builds tomocupy's `_wint`
+  quadrature ramp. Apodization, padding, the `≥0` clamp, DC doubling and the
+  symmetric FFT layout remain shared in `make_fbp_filter`; all tomocupy-specific
+  filter behaviour (the `½` gain and the `_wint` shape) now lives on the CUDA
+  side.
+- **API:** `backend::make_fbp_filter` gained a `RampShape` argument.
+
+### Fixed
+
+- `docs/ARCHITECTURE.md` §4.1: lprec's CUDA/CPU amplitude-scale row corrected
+  `1` → `½` (stale since the `½` normalization landed; the parity test already
+  undoes the `½`).
+
 ## [0.2.0] - 2026-06-30
 
 This release turns the CUDA backend into a full streaming, multi-GPU
@@ -95,5 +148,6 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
+[0.3.0]: https://github.com/physwkim/tomoxide/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/physwkim/tomoxide/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/physwkim/tomoxide/releases/tag/v0.1.0
