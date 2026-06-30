@@ -188,7 +188,7 @@ mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
         make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
-        LpRecReconstruct, StreamingAnalytic,
+        LpRecReconstruct, RampShape, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -3116,7 +3116,7 @@ mod cuda_impl {
                 .as_slice()
                 .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
-            let filter = make_fbp_filter(params.filter_name, ncols)?;
+            let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
             let pad = filter.len();
             let pad_side = pad / 2 - ncols / 2;
             let w = build_filter_w(&filter, geom, nz, ncols, pad);
@@ -3328,7 +3328,7 @@ mod cuda_impl {
             // `make_fbp_filter` pads to `(4·ncols).next_power_of_two()`, always a
             // power of two, so the f16 half-cuFFT width constraint holds by
             // construction (mirrors the assert in `reconstruct`).
-            let filter = make_fbp_filter(params.filter_name, ncols)?;
+            let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
             // Build + upload the lprec grids once for the whole stream (the chunk
@@ -3353,10 +3353,12 @@ mod cuda_impl {
     }
 
     impl FbpFilter for CudaBackend {
-        /// Shared FBP filter definition (same ramp the CPU/wgpu backends build),
-        /// so the GPU filter applies an identical kernel.
+        /// FBP filter via the shared [`make_fbp_filter`] with
+        /// [`RampShape::Wint`] — the CUDA backend ports tomocupy, so it builds
+        /// tomocupy's `_wint` quadrature ramp (the CPU/wgpu backends build
+        /// tomopy's linear ramp). Apodization/padding/layout are shared.
         fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
-            make_fbp_filter(name, n)
+            make_fbp_filter(name, n, RampShape::Wint)
         }
 
         /// FBP filtering on the GPU via tomocupy's `cfunc_filter` (cuFFT R2C →

@@ -236,17 +236,28 @@ the CPU/wgpu output:
 | `lprec`               | same orientation as CPU                | `1` |
 | `gridrec`             | same orientation as CPU                | `1` |
 
-The CUDA analytic filter normalization carries tomocupy's net FBP gain, so the
-CUDA analytic output matches **tomocupy** in absolute amplitude, while the
-CPU/wgpu path matches **tomopy**; the `cuda / cpu` ratios above are the
-consequence of those two reference conventions differing.
+The CUDA and CPU/wgpu analytic paths differ by two deliberate, documented
+reference conventions, both because the CPU/wgpu backends port **tomopy** and the
+CUDA backend ports **tomocupy**:
 
-The reconstruction is otherwise **numerically identical** to the CPU reference:
-after undoing the flip (and amplitude-normalizing), CUDA matches CPU to the
-f32/cuFFT floor (Pearson 1.0). This is a fixed handedness/scale convention, not a
-numerical error — so it is intentional and preserved, but consumers comparing
-CUDA output against CPU/wgpu (or against absolute physical units) must account
-for it. The cross-backend regression test
+1. **Filter amplitude** — the CUDA analytic filter carries tomocupy's net FBP
+   gain (the CUDA-only `½` in `build_filter_w`), half tomopy's. This drives the
+   `cuda / cpu` ratios in the table above, so CUDA matches tomocupy in absolute
+   amplitude and CPU/wgpu matches tomopy.
+2. **Ramp shape** — the base ramp itself differs: CPU/wgpu build tomopy's plain
+   linear ramp (`2·k/pad`), CUDA builds tomocupy's degree-12 `_wint` quadrature
+   ramp. The two diverge ≈0.6% near DC/Nyquist. This is selected per backend via
+   `backend::RampShape` (`Linear` for CPU/wgpu, `Wint` for CUDA) in the single
+   shared `make_fbp_filter`; everything else (windowing, padding, ≥0 clamp, DC
+   doubling, symmetric FFT layout) stays identical across backends.
+
+After undoing the flip and amplitude scale, CUDA matches CPU very closely but
+**not** to the bare f32 floor: the `_wint`-vs-linear ramp leaves a deterministic
+≈0.6% residual (e.g. lprec cuda×2 ↔ cpu max-rel 5.6e-3). Pearson correlation
+stays ≈1.0 because the shape difference is small and smooth. These are fixed
+handedness/scale/shape conventions, not numerical errors — intentional and
+preserved — but consumers comparing CUDA output against CPU/wgpu (or against
+absolute physical units) must account for them. The cross-backend regression test
 `tests/cuda_cpu_convention_parity.rs` pins both the orientation (per the table)
 and structural agreement, so any *other* CUDA divergence is caught and any change
 to this convention is surfaced deliberately.

@@ -11,7 +11,7 @@
 
 use crate::backend::{
     Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
-    ForwardProject, RankFilter, RayProject, RayRow,
+    ForwardProject, RampShape, RankFilter, RayProject, RayRow,
 };
 use crate::data::{Frames, Layout, Tomo, Volume};
 use crate::dtype::{Complex32, Dtype, Element};
@@ -172,11 +172,12 @@ impl FbpFilter for CpuBackend {
     /// Build the full frequency-domain apodized ramp filter for a projection of
     /// width `n`.
     ///
-    /// Delegates to [`crate::backend::make_fbp_filter`] — the kernel is
-    /// device-independent host arithmetic shared with every other backend, so
-    /// CPU and GPU build the identical filter from one definition.
+    /// Delegates to [`crate::backend::make_fbp_filter`] with
+    /// [`RampShape::Linear`] — the CPU backend ports tomopy, whose ramp is the
+    /// plain straight line (the CUDA backend ports tomocupy and uses the `_wint`
+    /// quadrature ramp instead). Apodization/padding/layout are shared.
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
-        crate::backend::make_fbp_filter(name, n)
+        crate::backend::make_fbp_filter(name, n, RampShape::Linear)
     }
 
     /// Apply `filter` to every projection of `sino` in place, folding in the

@@ -104,14 +104,26 @@ fn cuda_lprec_matches_cpu() {
     };
     let rc = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cpu).unwrap();
     let mut rg = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cuda).unwrap();
-    // The CUDA analytic filter carries tomocupy's net gain, half the CPU/tomopy
-    // path's, so CUDA lprec == ½·CPU lprec by convention (lprec keeps the CPU
-    // orientation — no flip). Undo the ½ before the shape comparison. See
-    // `cuda/mod.rs::build_filter_w` and `docs/ARCHITECTURE.md` §4.1.
+    // CUDA and CPU lprec differ by two documented conventions, both undone/
+    // tolerated here:
+    //   1. Gain — the CUDA analytic filter carries tomocupy's net FBP gain, half
+    //      the CPU/tomopy path's, so CUDA lprec == ½·CPU lprec (lprec keeps the
+    //      CPU orientation — no flip). Undone by the ×2 below.
+    //   2. Ramp shape — the CPU backend ports tomopy (plain linear ramp) and the
+    //      CUDA backend ports tomocupy (the degree-12 `_wint` quadrature ramp);
+    //      they diverge ~0.6% near DC/Nyquist. This is the deliberate per-backend
+    //      split (see `backend::RampShape`, `cuda/mod.rs::build_filter_w`,
+    //      `docs/ARCHITECTURE.md` §4.1), not a bug, so the bar accommodates it.
+    // The bar still sits far below the gross-bug signatures this test exists to
+    // catch (the pre-fix theta-order bug gave rel ≈ 1.0, the vertical-flip bug
+    // ≈ 0.58); the legitimate gain+shape residual is a deterministic 5.6e-3.
     rg.array.mapv_inplace(|v| v * 2.0);
     let d = max_rel(rc.array.as_slice().unwrap(), rg.array.as_slice().unwrap());
     eprintln!("lprec cuda×2 ↔ cpu max rel = {d:e}");
-    assert!(d < 2e-3, "lprec GPU≠½·CPU: rel {d}");
+    assert!(
+        d < 1.5e-2,
+        "lprec GPU≠½·CPU (beyond the wint/linear ramp gap): rel {d}"
+    );
 }
 
 #[test]

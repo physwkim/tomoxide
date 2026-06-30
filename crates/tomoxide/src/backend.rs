@@ -371,13 +371,34 @@ fn wint_ramp(order: usize, t: &[f64]) -> Vec<f64> {
     w
 }
 
+/// Which base ramp shape [`make_fbp_filter`] builds — the one knob on which the
+/// CPU/wgpu and CUDA backends deliberately diverge, so each matches its own
+/// reference library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RampShape {
+    /// tomopy's classic straight-line ramp `r = 2·fk/pad`. The CPU and wgpu
+    /// backends port tomopy, so they build this shape.
+    Linear,
+    /// tomocupy's degree-12 `_wint` quadrature ramp ([`wint_ramp`]). The CUDA
+    /// backend ports tomocupy, so it builds this shape; combined with the
+    /// `0.5/pad` gain in `build_filter_w` it reproduces tomocupy's net FBP
+    /// filter bit-for-bit.
+    Wint,
+}
+
 /// Build the full frequency-domain apodized ramp filter for a projection of
 /// width `n`.
 ///
-/// Backend-agnostic: the kernel is pure host arithmetic identical on every
-/// device, so all [`FbpFilter`] implementations build it through this one
-/// function — only [`FbpFilter::apply`] differs by backend. Keeping a single
-/// definition here means CPU and GPU cannot drift to different filter shapes.
+/// Backend-agnostic apodization and layout: the windowing, padding, clamp and
+/// symmetric FFT layout are pure host arithmetic identical on every device, so
+/// all [`FbpFilter`] implementations build the filter through this one function
+/// — only [`FbpFilter::apply`] differs by backend. The single exception is the
+/// base ramp *shape* ([`RampShape`]): the CPU/wgpu backends pass
+/// [`RampShape::Linear`] (tomopy), the CUDA backend [`RampShape::Wint`]
+/// (tomocupy), because the two reference libraries genuinely differ on the ramp
+/// and each tomoxide backend ports a different one. Keeping the apodization,
+/// padding and layout in a single definition means the backends cannot drift on
+/// anything *except* that one deliberate, documented ramp-shape axis.
 ///
 /// The returned kernel has length `pad = (4·n).next_power_of_two()` — the
 /// projection is edge-replicate-padded to `pad` and centred before
@@ -390,13 +411,15 @@ fn wint_ramp(order: usize, t: &[f64]) -> Vec<f64> {
 /// float16 pow2-rounding for the rest, keeping the wgpu radix-2 FFT usable at
 /// any width).
 ///
-/// The base ramp magnitude is `2·pad·wint(t)` ([`wint_ramp`], tomocupy's
-/// degree-12 quadrature ramp), running `0` at DC to `1` at Nyquist; `name`
-/// apodizes it. tomocupy's post-processing is mirrored: the windowed ramp is
-/// clamped to `≥0` and the DC bin is doubled. For a grid too short for the
-/// order-12 rule the plain linear ramp `2·k/pad` is used. The window set
+/// The base ramp magnitude runs `0` at DC to `1` at Nyquist and `name`
+/// apodizes it. [`RampShape::Linear`] is the plain `2·k/pad` line (tomopy);
+/// [`RampShape::Wint`] is `2·pad·wint(t)` ([`wint_ramp`], tomocupy's degree-12
+/// quadrature ramp). Either way tomocupy's post-processing is mirrored: the
+/// windowed ramp is clamped to `≥0` and the DC bin is doubled. A grid too short
+/// for the order-12 rule falls back to the linear ramp even when `Wint` is
+/// requested (tomocupy's `_wint` is itself undefined there). The window set
 /// matches tomopy/tomocupy.
-pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
+pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<Vec<f32>> {
     if n == 0 {
         return Err(crate::error::Error::InvalidParam(
             "filter length must be > 0".into(),
@@ -413,12 +436,12 @@ pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
     // below it). Real recons (`nhalf ≫ 23`) always take this path; only tiny
     // test/edge grids fall back to the plain linear ramp.
     const WINT_MIN: usize = 2 * ORDER - 1;
-    // Half-spectrum base ramp magnitude `2·pad·wint(t)` (≈ `2·t`, the tomocupy
-    // quadrature ramp), or the plain linear ramp when the grid is too short for
-    // the order-12 rule. `None` carries no ramp, so skip the build.
+    // Half-spectrum base ramp: tomocupy's `2·pad·wint(t)` quadrature ramp (≈
+    // `2·t`) for `Wint`, else the plain linear ramp — also the fallback when the
+    // grid is too short for the order-12 rule. `None` carries no ramp, so skip.
     let ramp_half: Vec<f32> = if name == FilterName::None {
         Vec::new()
-    } else if nhalf >= WINT_MIN {
+    } else if shape == RampShape::Wint && nhalf >= WINT_MIN {
         let t: Vec<f64> = (0..nhalf).map(|k| k as f64 / pad as f64).collect();
         wint_ramp(ORDER, &t)
             .iter()

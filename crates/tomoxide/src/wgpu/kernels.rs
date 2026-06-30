@@ -6,7 +6,8 @@
 //! tolerance, not Δ=0 — see the `gpu_tests` in [`crate`].
 
 use crate::backend::{
-    make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject, RankFilter,
+    make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject, RampShape,
+    RankFilter,
 };
 use crate::data::{Frames, Layout, Tomo, Volume};
 use crate::dtype::Complex32;
@@ -665,11 +666,12 @@ impl Fft for WgpuBackend {
 }
 
 impl FbpFilter for WgpuBackend {
-    /// Build the FBP apodized ramp filter on the host. The kernel is
-    /// device-independent, so this delegates to the shared
-    /// [`make_fbp_filter`] — CPU and GPU build the identical filter.
+    /// Build the FBP apodized ramp filter on the host via the shared
+    /// [`make_fbp_filter`] with [`RampShape::Linear`] — wgpu is a portable
+    /// fallback that mirrors the CPU (tomopy) ramp, not the CUDA (tomocupy)
+    /// `_wint` ramp.
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
-        make_fbp_filter(name, n)
+        make_fbp_filter(name, n, RampShape::Linear)
     }
 
     /// Apply `filter` to every projection of `sino` on the GPU. Each detector
