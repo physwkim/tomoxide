@@ -67,6 +67,16 @@ enum Command {
         /// present, else the safe default; an explicit value always overrides.
         #[arg(long)]
         chunk: Option<usize>,
+        /// First detector row (slice) to reconstruct, inclusive. Together with
+        /// `--end-row` restricts output to a contiguous z-shard. Omit for the
+        /// whole volume. Set internally by the multi-GPU orchestrator (one
+        /// process per GPU), but usable directly to reconstruct a sub-range.
+        #[arg(long)]
+        start_row: Option<usize>,
+        /// One past the last detector row (slice) to reconstruct, exclusive. See
+        /// `--start-row`. Omit for the whole volume.
+        #[arg(long)]
+        end_row: Option<usize>,
     },
     /// Chunked / streaming reconstruction (out-of-core).
     ReconSteps {
@@ -114,6 +124,14 @@ enum Command {
 /// enough that per-chunk launch/setup overhead stays amortized. Mirrors
 /// tomocupy's `--nsino-per-chunk` default magnitude.
 const DEFAULT_PIPELINE_CHUNK: usize = 8;
+
+/// Minimum reconstructed width (`nx`) at which `recon` fans the CUDA TIFF job into
+/// one z-shard process per GPU. Below this the per-process CUDA-init + startup
+/// overhead of the extra shards outweighs the parallelism, so multi-GPU runs stay
+/// on the single-GPU streaming pipeline. Empirical crossover on RTX 5000 Ada
+/// (nz≈128): at nx≥2048 the 4-GPU wall drops below single-GPU for all analytic
+/// methods; at nx≤1024 sharding regressed by ~0.5 s.
+const MULTI_GPU_MIN_NX: usize = 2048;
 
 /// Whether `recon` should reconstruct through the overlapped streaming pipeline
 /// instead of the whole-volume path.
@@ -186,10 +204,13 @@ fn main() -> anyhow::Result<()> {
             dtype,
             save_format,
             chunk,
+            start_row,
+            end_row,
         } => {
             let engine = Engine::new(backend_kind)?;
             let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
             let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
+            let save_format_str = save_format.clone();
             let save_format: tomoxide::io::SaveFormat =
                 save_format.parse().map_err(|e| anyhow!("{e}"))?;
             println!(
@@ -210,19 +231,59 @@ fn main() -> anyhow::Result<()> {
                 drop(probe);
                 let (chunk, source) = resolve_chunk(chunk, &file, &algorithm, dtype, nx, nproj, nz);
                 println!("  chunk: {chunk} ({source})");
-                // Overlapped streaming path: same output as the whole-volume path
-                // (cuFFT-floor identical, Pearson 1.0), lower peak memory, and it
-                // hides disk read/write behind GPU compute. See `pipelines_well`.
-                run_pipelined(
-                    &file,
-                    &out,
-                    algo,
-                    center,
-                    dtype,
-                    save_format,
-                    chunk,
-                    &engine,
-                )?;
+                // Multi-GPU fan-out: when this is the top-level invocation (no
+                // explicit row range), the backend is CUDA, the output is TIFF
+                // (per-slice files, so disjoint shards never collide), and more
+                // than one device is selected, reconstruct one contiguous z-shard
+                // per GPU in its own process (`CUDA_VISIBLE_DEVICES`). Each child
+                // reads only its slab and writes at the global slice offset, so the
+                // device compute *and* the HDF5 read / TIFF write parallelize —
+                // mirroring tomocupy's multi-process shard. Otherwise run a single
+                // pipeline over the requested range.
+                // Below the crossover, one extra CUDA context + binary startup per
+                // shard process (~0.5 s each, paid in parallel but contended) costs
+                // more than splitting the small per-slice work saves — sharding a
+                // 1024²-or-smaller volume runs *slower* than a single GPU. The
+                // dominant per-slice cost grows with nx², so gate on nx: at nx≥2048
+                // the compute/I/O the shards parallelize clearly outweighs the
+                // startup, and the 4-GPU wall drops well below single-GPU (and below
+                // tomocupy). Smaller volumes stay on the single-GPU streaming path.
+                let devices = tomoxide::cuda::selected_devices();
+                let top_level = start_row.is_none() && end_row.is_none();
+                let shardable = engine.name() == "cuda"
+                    && matches!(save_format, tomoxide::io::SaveFormat::Tiff)
+                    && top_level
+                    && devices.len() > 1
+                    && nz > devices.len()
+                    && nx >= MULTI_GPU_MIN_NX;
+                if shardable {
+                    run_sharded_subprocesses(
+                        &file,
+                        &algorithm,
+                        center,
+                        dtype,
+                        &save_format_str,
+                        chunk,
+                        nz,
+                        &devices,
+                    )?;
+                } else {
+                    // Overlapped streaming path: same output as the whole-volume
+                    // path (cuFFT-floor identical, Pearson 1.0), lower peak memory,
+                    // and it hides disk read/write behind GPU compute.
+                    run_pipelined(
+                        &file,
+                        &out,
+                        algo,
+                        center,
+                        dtype,
+                        save_format,
+                        chunk,
+                        start_row,
+                        end_row,
+                        &engine,
+                    )?;
+                }
             } else {
                 // Whole-volume path (CPU/wgpu, or chunking-hostile GPU methods).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
@@ -275,6 +336,8 @@ fn main() -> anyhow::Result<()> {
                 dtype,
                 save_format,
                 chunk,
+                None,
+                None,
                 &engine,
             )?;
             println!("wrote streamed reconstruction to {out}");
@@ -318,6 +381,8 @@ fn run_pipelined(
     dtype: Dtype,
     save_format: tomoxide::io::SaveFormat,
     chunk: usize,
+    start_row: Option<usize>,
+    end_row: Option<usize>,
     engine: &Engine,
 ) -> anyhow::Result<()> {
     let path = file.to_string_lossy().into_owned();
@@ -329,7 +394,13 @@ fn run_pipelined(
     let params = recon_params(&geom, dtype);
     let read_path = path;
     let write_path = out.to_string();
-    tomoxide::ReconSteps::new(chunk).run_streaming_pipelined(
+    // Reconstruct only `[start_row, end_row)` (a z-shard); both omitted ⇒ the
+    // whole volume (`usize::MAX` is clamped to nz by the reader).
+    let z_start = start_row.unwrap_or(0);
+    let z_end = end_row.unwrap_or(usize::MAX);
+    tomoxide::ReconSteps::new(chunk).run_streaming_pipelined_range(
+        z_start,
+        z_end,
         move || tomoxide::io::open_dxchange(&read_path),
         move || tomoxide::io::create_writer(&write_path, save_format),
         &geom,
@@ -338,6 +409,94 @@ fn run_pipelined(
         &tomoxide::PrepOptions::default(),
         engine,
     )?;
+    Ok(())
+}
+
+/// Fan a CUDA TIFF reconstruction across the selected GPUs by spawning one child
+/// `recon` process per device, each pinned to its GPU via `CUDA_VISIBLE_DEVICES`
+/// and restricted to a contiguous z-shard with `--start-row`/`--end-row`. The
+/// children write per-slice TIFFs at their global slice offset into the shared
+/// output directory, so the result is identical to a single-process run — but the
+/// HDF5 read, GPU compute, and TIFF write all parallelize across processes
+/// (mirroring tomocupy's multi-process shard). Spawned children see exactly one
+/// GPU, so they take the single-pipeline branch and do not recurse.
+///
+/// Each child re-executes this same binary. The parent passes the already-resolved
+/// `chunk` (so children skip cache lookups and all use the same value) and the
+/// same `center`/`dtype`/`save_format`. The call fails if any child fails.
+#[allow(clippy::too_many_arguments)]
+fn run_sharded_subprocesses(
+    file: &Path,
+    algorithm: &str,
+    center: Option<f32>,
+    dtype: Dtype,
+    save_format: &str,
+    chunk: usize,
+    nz: usize,
+    devices: &[i32],
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let n = devices.len();
+    // Contiguous shards differing by at most one row, covering [0, nz).
+    let base = nz / n;
+    let rem = nz % n;
+    println!("  multi-GPU: {n} shards across devices {devices:?}");
+    let mut children = Vec::with_capacity(n);
+    let mut z0 = 0usize;
+    for (i, &dev) in devices.iter().enumerate() {
+        let rows = base + if i < rem { 1 } else { 0 };
+        let z1 = z0 + rows;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--backend")
+            .arg("cuda")
+            .arg("recon")
+            .arg(file)
+            .arg("--algorithm")
+            .arg(algorithm)
+            .arg("--dtype")
+            .arg(dtype.as_str())
+            .arg("--save_format")
+            .arg(save_format)
+            .arg("--chunk")
+            .arg(chunk.to_string())
+            .arg("--start_row")
+            .arg(z0.to_string())
+            .arg("--end_row")
+            .arg(z1.to_string());
+        if let Some(c) = center {
+            cmd.arg("--center").arg(c.to_string());
+        }
+        // Pin the child to one physical GPU; clear any inherited multi-device
+        // selection so the child's `selected_devices()` is exactly `[0]`.
+        cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string())
+            .env("TOMOXIDE_CUDA_DEVICES", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawning shard {i} on device {dev}"))?;
+        children.push((i, dev, z0, z1, child));
+        z0 = z1;
+    }
+    // Wait for all shards; collect every failure rather than bailing on the first.
+    let mut failures = Vec::new();
+    for (i, dev, s, e, child) in children {
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("waiting for shard {i} on device {dev}"))?;
+        if !output.status.success() {
+            let reason = subprocess_failure_reason(&output);
+            failures.push(format!(
+                "shard {i} (device {dev}, rows [{s}, {e})): {reason}"
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "multi-GPU recon failed:\n  {}",
+            failures.join("\n  ")
+        ));
+    }
     Ok(())
 }
 
@@ -428,7 +587,11 @@ fn measure_chunk_subprocess(
     if let Some(c) = center {
         cmd.arg("--center").arg(c.to_string());
     }
-    cmd.stdout(std::process::Stdio::null())
+    // Tuning measures a single-GPU pipeline (the cache is keyed by one device
+    // name): pin the candidate to one GPU so it does not fan into the multi-GPU
+    // shard path, which would conflate per-shard chunk timing.
+    cmd.env("TOMOXIDE_CUDA_DEVICES", "0")
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     let t = Instant::now();
     let output = cmd

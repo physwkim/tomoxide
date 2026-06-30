@@ -63,6 +63,22 @@ impl CudaBackend {
 /// Name of the active CUDA device (e.g. `"NVIDIA RTX 5000 Ada Generation"`),
 /// or `None` without the `cuda` feature or when the query fails. Used to key the
 /// chunk-tuning cache so a chunk tuned on one GPU is not reused on another model.
+/// CUDA device indices a CUDA reconstruction will use, in order. Mirrors the
+/// internal selection: `TOMOXIDE_CUDA_DEVICES` (comma-separated indices) when set
+/// and non-empty, else all visible devices; an empty/invalid override falls back
+/// to `[0]`. Returns `[]` without the `cuda` feature. The multi-GPU `recon`
+/// orchestrator fans one z-shard process per returned index.
+pub fn selected_devices() -> Vec<i32> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::selected_devices()
+    }
+}
+
 pub fn device_name() -> Option<String> {
     #[cfg(not(feature = "cuda"))]
     {
@@ -3309,7 +3325,7 @@ mod cuda_impl {
     /// comma-separated index list — e.g. `0` pins a single GPU, `0,2` uses two.
     /// Out-of-range / unparsable entries are dropped; an empty result falls back
     /// to device 0.
-    fn selected_devices() -> Vec<i32> {
+    pub(super) fn selected_devices() -> Vec<i32> {
         let count = unsafe { ffi::tomoxide_cuda_device_count() }.max(0);
         if let Ok(s) = std::env::var("TOMOXIDE_CUDA_DEVICES") {
             if !s.trim().is_empty() {

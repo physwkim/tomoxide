@@ -241,6 +241,50 @@ impl ReconSteps {
         RF: FnOnce() -> Result<Box<dyn crate::io::DatasetReader>> + Send,
         WF: FnOnce() -> Result<Box<dyn crate::io::VolumeWriter>> + Send,
     {
+        // Full-volume case = the whole z-range; the reader clamps `usize::MAX` to nz.
+        self.run_streaming_pipelined_range(
+            0,
+            usize::MAX,
+            make_reader,
+            make_writer,
+            geom,
+            algorithm,
+            params,
+            prep,
+            engine,
+        )
+    }
+
+    /// Like [`run_streaming_pipelined`](Self::run_streaming_pipelined) but
+    /// reconstructs and writes only the **contiguous z-shard** `[z_start, z_end)`
+    /// (clamped to the dataset's slice count). Each shard reads only its own rows
+    /// and writes them at their *global* slice offset, so several shards — one per
+    /// GPU, each in its own process via `CUDA_VISIBLE_DEVICES` — fan a single
+    /// reconstruction across devices without coordinating: the per-slice analytic
+    /// methods have no cross-row coupling and the TIFF writer keys each slice by
+    /// its global index, so disjoint shards never collide.
+    ///
+    /// `reserve(total_nz)` still receives the *full* slice count (the writer sizes
+    /// its container to the whole volume); only the read/reconstruct/write loop is
+    /// bounded to the shard. Single-container writers (H5/Zarr) must therefore not
+    /// be sharded across processes — the caller restricts sharding to TIFF output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_streaming_pipelined_range<RF, WF>(
+        &self,
+        z_start: usize,
+        z_end: usize,
+        make_reader: RF,
+        make_writer: WF,
+        geom: &Geometry,
+        algorithm: Algorithm,
+        params: &ReconParams,
+        prep: &PrepOptions,
+        engine: &Engine,
+    ) -> Result<()>
+    where
+        RF: FnOnce() -> Result<Box<dyn crate::io::DatasetReader>> + Send,
+        WF: FnOnce() -> Result<Box<dyn crate::io::VolumeWriter>> + Send,
+    {
         if prep.phase != PhaseMethod::None {
             return Err(crate::error::Error::InvalidParam(
                 "ReconSteps::run_streaming_pipelined does not support phase retrieval \
@@ -284,9 +328,15 @@ impl ReconSteps {
             let reader_handle = s.spawn(move || -> Result<()> {
                 let mut reader = make_reader()?;
                 let (nproj, nz, nx, _nflat, _ndark) = reader.read_sizes()?;
+                // This shard's row range, clamped to the dataset (full volume when
+                // z_end == usize::MAX). z0 >= z1 means an empty shard: still hand the
+                // writer the full count so it can reserve, then read nothing.
+                let z0 = z_start.min(nz);
+                let z1 = z_end.min(nz);
                 // Hand the writer the total slice count for `reserve` (ignore a
                 // send error: a dropped receiver means the writer/compute side
-                // already aborted, which the join below surfaces).
+                // already aborted, which the join below surfaces). This is the full
+                // `nz`, not the shard extent — the writer sizes the whole volume.
                 let _ = nz_tx.send(nz);
                 // CUDA's device-resident raw path wants chunks read straight into a
                 // pinned staging buffer (direct-DMA H2D, no driver staging copy);
@@ -295,7 +345,7 @@ impl ReconSteps {
                 if raw_mode {
                     // Prime the pool with `POOL` buffers sized to the largest chunk,
                     // allocated once and recycled for the whole run.
-                    let max_len = nproj * chunk.min(nz) * nx;
+                    let max_len = nproj * chunk.min(nz.max(1)) * nx;
                     for _ in 0..POOL {
                         if free_tx_reader
                             .send(backend.alloc_host_buffer(max_len))
@@ -304,9 +354,9 @@ impl ReconSteps {
                             return Ok(());
                         }
                     }
-                    let mut r0 = 0;
-                    while r0 < nz {
-                        let r1 = (r0 + chunk).min(nz);
+                    let mut r0 = z0;
+                    while r0 < z1 {
+                        let r1 = (r0 + chunk).min(z1);
                         let rows = r1 - r0;
                         let need = nproj * rows * nx;
                         // Recycle a pinned buffer (blocks until compute returns one).
@@ -329,9 +379,9 @@ impl ReconSteps {
                         r0 = r1;
                     }
                 } else {
-                    let mut r0 = 0;
-                    while r0 < nz {
-                        let r1 = (r0 + chunk).min(nz);
+                    let mut r0 = z0;
+                    while r0 < z1 {
+                        let r1 = (r0 + chunk).min(z1);
                         let ds = reader.read_chunk(r0, r1)?;
                         // A send error means compute hung up (errored/aborted); stop
                         // reading — the compute side already owns the real error.

@@ -177,6 +177,81 @@ fn run_streaming_pipelined_matches_run_streaming() {
 }
 
 #[test]
+fn run_streaming_pipelined_range_shards_match_whole() {
+    use std::sync::{Arc, Mutex};
+    use tomoxide::Algorithm;
+    let path = format!("{FIXTURES}/streaming_dxchange.h5");
+    let engine = Engine::new(BackendKind::Cpu).unwrap();
+
+    let mut probe = io::open_dxchange(&path).unwrap();
+    let (_nproj, nz, nx, _nf, _nd) = probe.read_sizes().unwrap();
+    let theta = probe.read_theta().unwrap();
+    drop(probe);
+    let geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
+    let params = ReconParams {
+        num_gridx: Some(nx),
+        ..Default::default()
+    };
+    let prep = PrepOptions::default();
+
+    // Whole-volume pipelined reference.
+    let whole = Arc::new(Mutex::new(Array3::<f32>::zeros((nz, nx, nx))));
+    {
+        let read_path = path.clone();
+        let w = Arc::clone(&whole);
+        ReconSteps::new(4)
+            .run_streaming_pipelined(
+                move || io::open_dxchange(&read_path),
+                move || Ok(Box::new(SharedCollectWriter { vol: w }) as Box<dyn VolumeWriter>),
+                &geom,
+                Algorithm::Fbp,
+                &params,
+                &prep,
+                &engine,
+            )
+            .unwrap();
+    }
+
+    // Two contiguous z-shards covering [0, nz): [0, k) and [k, nz). Each shard
+    // reads only its rows and writes at the *global* offset, so concatenating
+    // them into one shared volume must reproduce the whole-volume output exactly —
+    // this is the invariant the multi-GPU subprocess orchestrator relies on. An
+    // out-of-bounds end (`usize::MAX`) must clamp to nz.
+    let sharded = Arc::new(Mutex::new(Array3::<f32>::zeros((nz, nx, nx))));
+    let k = 4; // nz = 6 → shards [0,4) and [4,6); second shard is partial
+    for (z0, z1) in [(0usize, k), (k, usize::MAX)] {
+        let read_path = path.clone();
+        let w = Arc::clone(&sharded);
+        ReconSteps::new(4)
+            .run_streaming_pipelined_range(
+                z0,
+                z1,
+                move || io::open_dxchange(&read_path),
+                move || Ok(Box::new(SharedCollectWriter { vol: w }) as Box<dyn VolumeWriter>),
+                &geom,
+                Algorithm::Fbp,
+                &params,
+                &prep,
+                &engine,
+            )
+            .unwrap();
+    }
+
+    let whole = whole.lock().unwrap();
+    let sharded = sharded.lock().unwrap();
+    assert_eq!(whole.dim(), sharded.dim());
+    let max_d = whole
+        .iter()
+        .zip(sharded.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert_eq!(
+        max_d, 0.0,
+        "z-shard composition differs from whole-volume: max |Δ| = {max_d}"
+    );
+}
+
+#[test]
 fn run_streaming_rejects_phase() {
     use tomoxide::{Algorithm, PhaseMethod};
     let path = format!("{FIXTURES}/streaming_dxchange.h5");
