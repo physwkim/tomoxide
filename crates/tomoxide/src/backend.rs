@@ -242,6 +242,135 @@ pub trait FbpFilter {
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()>;
 }
 
+/// Invert a square `n×n` f64 matrix by Gauss–Jordan elimination with partial
+/// pivoting. Used only to build the small (12×12) inverse-Vandermonde matrix
+/// inside [`wint_ramp`]; not a general-purpose linear-algebra routine. The
+/// caller guarantees the matrix is invertible (a Vandermonde of distinct
+/// nodes), so the pivot is always nonzero.
+fn invert_matrix(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = a.len();
+    // Augmented [A | I].
+    let mut m: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let mut row = a[i].clone();
+            row.extend((0..n).map(|j| if i == j { 1.0 } else { 0.0 }));
+            row
+        })
+        .collect();
+    for col in 0..n {
+        // Partial pivot: largest magnitude at/below the diagonal in this column.
+        let mut piv = col;
+        for r in (col + 1)..n {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        m.swap(col, piv);
+        let inv_d = 1.0 / m[col][col];
+        for v in m[col].iter_mut() {
+            *v *= inv_d;
+        }
+        let pivot_row = m[col].clone();
+        for (r, row) in m.iter_mut().enumerate() {
+            if r != col {
+                let factor = row[col];
+                if factor != 0.0 {
+                    for (slot, &pv) in row.iter_mut().zip(pivot_row.iter()) {
+                        *slot -= factor * pv;
+                    }
+                }
+            }
+        }
+    }
+    m.into_iter().map(|row| row[n..].to_vec()).collect()
+}
+
+/// Quadrature ramp weights — a port of tomocupy
+/// `fbp_filter.FBPFilter._wint` (`order = 12`). Returns one weight per
+/// frequency sample `t[k]` (`t[k] = k/pad`, `k = 0..pad/2`).
+///
+/// The weight approximates the ideal ramp `t/pad` but with the degree-`order`
+/// Newton–Cotes integration shape: a high-order interpolatory quadrature on the
+/// nodes `s = linspace(1e-40, 1, order)` (built via the inverse Vandermonde
+/// `iv` and the per-monomial interval integrals `u`), accumulated over
+/// overlapping `order`-point windows of `t` with the overlap-compensation
+/// weights `p`, plus tomocupy's 40-sample linear endpoint correction. Versus a
+/// plain linear ramp this deviates ≈1% near DC/Nyquist; matching it is what
+/// closes the residual scale between tomoxide's analytic CUDA output and
+/// tomocupy beyond the leading filter normalization. `iv`, `u`, `W1`, `W2`, `p`
+/// depend only on `order`; only the window loop reads `t`.
+fn wint_ramp(order: usize, t: &[f64]) -> Vec<f64> {
+    let n = order;
+    let big_n = t.len();
+    debug_assert!(big_n >= n, "wint_ramp needs at least `order` samples");
+    // Nodes and `V[i][j] = s[j]^i = exp(i·ln s[j])` (matches tomocupy's
+    // `exp(outer(arange(n), log(s)))`, including the `s[0]=1e-40` underflow).
+    let s: Vec<f64> = (0..n)
+        .map(|i| 1e-40 + (1.0 - 1e-40) * i as f64 / (n as f64 - 1.0))
+        .collect();
+    let logs: Vec<f64> = s.iter().map(|&x| x.ln()).collect();
+    let v: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|j| (i as f64 * logs[j]).exp()).collect())
+        .collect();
+    let iv = invert_matrix(&v);
+    // `u[i][j] = ∫_{s[j]}^{s[j+1]} x^i dx`, i.e. `s^{i+1}/(i+1)` differenced over
+    // `j`, for `i = 0..=n` (n+1 rows) and `j = 0..n-1` (n-1 cols).
+    let anti = |i: usize, j: usize| ((i as f64 + 1.0) * logs[j]).exp() / (i as f64 + 1.0);
+    let u: Vec<Vec<f64>> = (0..=n)
+        .map(|i| (0..n - 1).map(|j| anti(i, j + 1) - anti(i, j)).collect())
+        .collect();
+    // `W1 = iv · u[1..=n]` (the `x·pₙ(x)` term), `W2 = iv · u[0..n]` (the
+    // `const·pₙ(x)` term), both `n × (n-1)`.
+    let mut w1 = vec![vec![0.0f64; n - 1]; n];
+    let mut w2 = vec![vec![0.0f64; n - 1]; n];
+    for r in 0..n {
+        for c in 0..n - 1 {
+            let (mut a1, mut a2) = (0.0, 0.0);
+            for k in 0..n {
+                a1 += iv[r][k] * u[k + 1][c];
+                a2 += iv[r][k] * u[k][c];
+            }
+            w1[r][c] = a1;
+            w2[r][c] = a2;
+        }
+    }
+    // Overlap compensation `p` (length `big_n-1`): `1/1 .. 1/(n-1)` rising, a
+    // flat `1/(n-1)` middle, then `1/(n-1) .. 1/1` falling.
+    let mut p = Vec::with_capacity(big_n - 1);
+    for i in 1..n {
+        p.push(1.0 / i as f64);
+    }
+    let mid = big_n as isize - 2 * (n as isize - 1) - 1;
+    for _ in 0..mid.max(0) {
+        p.push(1.0 / (n as f64 - 1.0));
+    }
+    for i in (1..n).rev() {
+        p.push(1.0 / i as f64);
+    }
+    // Windowed quadrature accumulation. Window `j` maps `[t[j], t[j+n-1]]` onto
+    // the node domain: `∫ (t[j] + Δ·x)·pₙ = Δ²·W1 + Δ·t[j]·W2`, `Δ = t[j+n-1]-t[j]`.
+    let mut w = vec![0.0f64; big_n];
+    for j in 0..=(big_n - n) {
+        let dt = t[j + n - 1] - t[j];
+        for k in 0..n - 1 {
+            let pjk = p[j + k];
+            for row in 0..n {
+                w[j + row] += pjk * (dt * dt * w1[row][k] + dt * t[j] * w2[row][k]);
+            }
+        }
+    }
+    // tomocupy endpoint fix: replace the last 40 samples with a line through the
+    // anchor `w[big_n-40]` (`wn[-40:] = w[-40]/(N-40)·arange(N-40, N)`).
+    if big_n >= 40 {
+        let anchor = big_n - 40;
+        let base = w[anchor] / anchor as f64;
+        for (kk, slot) in w.iter_mut().enumerate().skip(anchor) {
+            *slot = base * kk as f64;
+        }
+    }
+    w
+}
+
 /// Build the full frequency-domain apodized ramp filter for a projection of
 /// width `n`.
 ///
@@ -259,9 +388,14 @@ pub trait FbpFilter {
 /// float32 path; the `next_power_of_two` rounding here is exact for every
 /// power-of-two width — the whole golden set — and matches tomocupy's own
 /// float16 pow2-rounding for the rest, keeping the wgpu radix-2 FFT usable at
-/// any width). The ramp magnitude `r` runs `0` at DC to `1` at Nyquist;
-/// `name` apodizes it. The window set matches tomopy/tomocupy; exact `_wint`
-/// quadrature weighting is reconciled when tomopy golden data is available.
+/// any width).
+///
+/// The base ramp magnitude is `2·pad·wint(t)` ([`wint_ramp`], tomocupy's
+/// degree-12 quadrature ramp), running `0` at DC to `1` at Nyquist; `name`
+/// apodizes it. tomocupy's post-processing is mirrored: the windowed ramp is
+/// clamped to `≥0` and the DC bin is doubled. For a grid too short for the
+/// order-12 rule the plain linear ramp `2·k/pad` is used. The window set
+/// matches tomopy/tomocupy.
 pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
     if n == 0 {
         return Err(crate::error::Error::InvalidParam(
@@ -270,14 +404,41 @@ pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
     }
     let pad = (4 * n).next_power_of_two();
     let pi = std::f32::consts::PI;
+    let nhalf = pad / 2 + 1;
+    const ORDER: usize = 12;
+    // The order-12 overlap quadrature needs at least `2·(ORDER−1)+1` samples for
+    // a non-degenerate window structure (its flat middle block has length
+    // `nhalf − 2·(ORDER−1) − 1`, which must be ≥ 0); this is exactly the regime
+    // where tomocupy's `_wint` is defined (it raises on a negative dimension
+    // below it). Real recons (`nhalf ≫ 23`) always take this path; only tiny
+    // test/edge grids fall back to the plain linear ramp.
+    const WINT_MIN: usize = 2 * ORDER - 1;
+    // Half-spectrum base ramp magnitude `2·pad·wint(t)` (≈ `2·t`, the tomocupy
+    // quadrature ramp), or the plain linear ramp when the grid is too short for
+    // the order-12 rule. `None` carries no ramp, so skip the build.
+    let ramp_half: Vec<f32> = if name == FilterName::None {
+        Vec::new()
+    } else if nhalf >= WINT_MIN {
+        let t: Vec<f64> = (0..nhalf).map(|k| k as f64 / pad as f64).collect();
+        wint_ramp(ORDER, &t)
+            .iter()
+            .map(|&wk| (2.0 * pad as f64 * wk) as f32)
+            .collect()
+    } else {
+        (0..nhalf).map(|k| 2.0 * k as f32 / pad as f32).collect()
+    };
     let mut f = vec![0.0f32; pad];
     for (k, slot) in f.iter_mut().enumerate() {
         // |fftfreq| bin index, then r = normalized frequency in [0, 1].
         let fk = if k <= pad / 2 { k } else { pad - k };
         let r = 2.0 * fk as f32 / pad as f32;
-        let ramp = r;
-        *slot = match name {
-            FilterName::None => 1.0, // identity: no apodization, no ramp
+        if name == FilterName::None {
+            *slot = 1.0; // identity: no apodization, no ramp
+            continue;
+        }
+        let ramp = ramp_half[fk];
+        let mut v = match name {
+            FilterName::None => unreachable!(),
             FilterName::Ramp => ramp,
             FilterName::Shepp => {
                 let x = pi * r / 2.0;
@@ -296,6 +457,14 @@ pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
             FilterName::Hann => ramp * 0.5 * (1.0 + (pi * r).cos()),
             FilterName::Parzen => ramp * (1.0 - r).powi(3),
         };
+        // tomocupy clamps the windowed ramp to ≥0 and doubles the DC bin.
+        if v < 0.0 {
+            v = 0.0;
+        }
+        if k == 0 {
+            v *= 2.0;
+        }
+        *slot = v;
     }
     Ok(f)
 }
@@ -468,4 +637,54 @@ pub trait RankFilter {
     /// Replace outliers exceeding `diff` from the local 3-D-cube median
     /// (dezinger; tomopy `remove_outlier3d`).
     fn remove_outlier3d(&self, data: &mut Tomo<f32>, diff: f32, size: usize) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `wint_ramp(12, ·)` reproduces tomocupy `FBPFilter._wint(12, ·)`.
+    ///
+    /// Golden values dumped from tomocupy (cupy float64) for `ne = 512`,
+    /// `t = arange(0, ne/2+1)/ne`. Indices 0..=13 probe the sensitive low-`k`
+    /// quadrature start, 64/128/200 the linear bulk, 216 the last quadrature
+    /// sample, and 217/256 the 40-sample linear endpoint correction.
+    #[test]
+    fn wint_ramp_matches_tomocupy_golden() {
+        let ne = 512usize;
+        let t: Vec<f64> = (0..ne / 2 + 1).map(|k| k as f64 / ne as f64).collect();
+        let w = wint_ramp(12, &t);
+        let golden: &[(usize, f64)] = &[
+            (0, 2.453569604067e-07),
+            (1, 4.042956064990e-06),
+            (2, 7.660118337826e-06),
+            (3, 9.761576171718e-06),
+            (4, 2.031827452663e-05),
+            (5, 1.049037500880e-05),
+            (6, 3.259454732421e-05),
+            (7, 1.901878617086e-05),
+            (8, 3.484518329315e-05),
+            (9, 3.256638900053e-05),
+            (10, 3.873577972859e-05),
+            (11, 4.168480391830e-05),
+            (12, 4.608636383489e-05),
+            (13, 4.912083786810e-05),
+            (64, 2.441406251635e-04),
+            (128, 4.882812503246e-04),
+            (200, 7.629394536308e-04),
+            (216, 8.239746099211e-04),
+            (217, 8.277893071893e-04),
+            (256, 9.765625006472e-04),
+        ];
+        for &(i, g) in golden {
+            let rel = (w[i] - g).abs() / g.abs();
+            assert!(
+                rel < 1e-5,
+                "wint[{i}] = {:.12e}, golden {:.12e}, rel {:.2e}",
+                w[i],
+                g,
+                rel
+            );
+        }
+    }
 }
