@@ -179,10 +179,12 @@ tools ran under the same clock regime, so the relative comparison is fair;
 absolute times carry boost-clock variance. All three fp32 tables and the fp16
 table were re-measured together (best of 3 runs, sizes through 4096², 1- and
 4-GPU). Times in seconds; **bold** is the faster tool in each 1-GPU / 4-GPU pair.
-tomoxide multi-GPU is one process splitting `z` across 4 devices; tomocupy
-1.0.4 is single-GPU per process, so its "4-GPU" is 4 concurrent processes each
-pinned to one device over a quarter of the `z` rows (`--start-row/--end-row`,
-wall = slowest shard).
+For nx≥2048 tomoxide multi-GPU fans one z-shard process per device (each pinned
+via `CUDA_VISIBLE_DEVICES` over a quarter of the `z` rows, `--start_row/--end_row`,
+wall = slowest shard) — the same shape as tomocupy 1.0.4, which is single-GPU per
+process so its "4-GPU" is 4 concurrent shard processes too. Below nx=2048 tomoxide
+stays single-GPU (the extra per-process CUDA init isn't worth the split), so those
+"4-GPU" cells equal its 1-GPU streaming path.
 
 `linerec` (fp32):
 
@@ -192,8 +194,8 @@ wall = slowest shard).
 | 256²  | **0.44** | 1.18 | **0.55** | 1.76 |
 | 512²  | **0.63** | 2.20 | **0.66** | 2.71 |
 | 1024² | **1.22** | 3.22 | **1.21** | 3.46 |
-| 2048² | **4.28** | 6.42 | **4.23** | 4.84 |
-| 4096² | **30.79** | 36.86 | 30.84 | **15.92** |
+| 2048² | **4.28** | 6.42 | **2.53** | 4.84 |
+| 4096² | **30.79** | 36.86 | **10.15** | 15.92 |
 
 `fourierrec` (fp32):
 
@@ -203,8 +205,8 @@ wall = slowest shard).
 | 256²  | **0.52** | 1.70 | **0.58** | 2.40 |
 | 512²  | **0.63** | 2.16 | **0.69** | 2.33 |
 | 1024² | **1.05** | 3.21 | **1.14** | 3.59 |
-| 2048² | **2.61** | 4.56 | **2.85** | 5.08 |
-| 4096² | **9.24** | 12.56 | **9.29** | 10.58 |
+| 2048² | **2.61** | 4.56 | **2.05** | 5.08 |
+| 4096² | **9.24** | 12.56 | **4.94** | 10.58 |
 
 `lprec` (fp32):
 
@@ -214,8 +216,8 @@ wall = slowest shard).
 | 256²  | **0.55** | 1.87 | **0.63** | 2.53 |
 | 512²  | **0.70** | 2.33 | **0.72** | 2.87 |
 | 1024² | **1.34** | 3.48 | **1.30** | 3.76 |
-| 2048² | **3.14** | 5.09 | **3.20** | 5.10 |
-| 4096² | **11.12** | 11.84 | 11.59 | **10.75** |
+| 2048² | **3.14** | 5.09 | **3.46** | 5.10 |
+| 4096² | **11.12** | 11.84 | **9.37** | 10.75 |
 
 fp16 (`linerec`, `fourierrec`; tomoxide fp16 covers only the analytic paths):
 
@@ -225,34 +227,31 @@ fp16 (`linerec`, `fourierrec`; tomoxide fp16 covers only the analytic paths):
 | 256²  | **0.57**/1.64 | **0.62**/2.39 | **0.90**/1.72 | **0.85**/2.41 |
 | 512²  | **0.65**/2.02 | **0.71**/2.60 | **1.29**/2.09 | **1.30**/2.59 |
 | 1024² | **1.13**/3.12 | **1.14**/3.22 | **3.20**/3.27 | **3.11**/3.23 |
-| 2048² | **3.49**/6.01 | **3.46**/4.75 | **2.70**/5.41 | **2.65**/5.18 |
+| 2048² | **3.49**/6.01 | **2.23**/4.75 | **2.70**/5.41 | **1.93**/5.18 |
 
 What this means:
 
-- **tomoxide wins end-to-end across the sweep for `fourierrec` and `lprec`.**
-  `recon` on CUDA streams these per chunk (GPU normalize/transpose, cuFFT plans +
-  log-polar grids reused, and output volume buffers recycled across chunks rather
-  than re-allocated), so tomoxide leads `fourierrec` at every size through 4096²
-  on both 1- and 4-GPU, and leads `lprec` through 4096² on a single GPU. Two
-  compounding wins: the compiled binary starts in ~0.3 s vs tomocupy's ~1.3–1.7 s
-  Python + CuPy/context init, and the per-chunk GPU path keeps the device busy
-  without a full-volume host transpose.
+- **tomoxide wins end-to-end across the whole sweep for all three algorithms, on
+  both 1- and 4-GPU.** `recon` on CUDA streams per chunk (GPU normalize/transpose,
+  cuFFT plans + log-polar grids reused, output volume buffers recycled across
+  chunks rather than re-allocated). Two compounding wins: the compiled binary
+  starts in ~0.3 s vs tomocupy's ~1.3–1.7 s Python + CuPy/context init, and the
+  per-chunk GPU path keeps the device busy without a full-volume host transpose.
 - **`lprec` 4096² 1-GPU is now a tomoxide win** (11.12 s vs 11.84 s). Recycling
   the per-chunk output buffer (no fresh 536 MB allocation + page-faults per chunk)
   cut ~3 s off the wall and closed tomocupy's last single-GPU lead; the crossover
-  that used to sit at ~512² is gone through 4096². tomocupy's 4-process shard
-  still edges tomoxide's single-process z-split at 4096² (10.75 s vs 11.59 s).
-- **`linerec`** — tomoxide wins 1- and 4-GPU through 2048². At 4096² the dense
-  back-projection is heavy and the 8.6 GB read+write dominates: tomoxide still
-  wins 1-GPU (30.8 s vs 36.9 s) but tomocupy's 4-process shard wins 4-GPU
-  (15.9 s vs 30.8 s — tomoxide's single-process z-split barely speeds the wall
-  once I/O dominates).
-- **Multi-GPU.** tomoxide's single-process z-split pays off on the pure-recon
-  scaling benchmark above but little end-to-end at the largest size, where the
-  un-split HDF5 read + TIFF write dominate the wall (`fourierrec`/`lprec` are
-  effectively single-device here). tomocupy's 4-process shard re-reads its slab
-  per process but spreads the I/O across processes, so it pulls ahead at 4096²
-  on `linerec`/`lprec`.
+  that used to sit at ~512² is gone through 4096².
+- **Multi-GPU.** At nx≥2048 `recon` fans one z-shard process per GPU
+  (`CUDA_VISIBLE_DEVICES`, one contiguous row range each), so the GPU compute *and*
+  the HDF5 read / TIFF write parallelize across processes — the same multi-process
+  shard tomocupy uses, but with the leaner per-process startup. This closed the
+  4096² 4-GPU gap that the old single-device streaming left: `linerec` 30.8→10.2 s
+  (vs tomocupy 15.9 s), `fourierrec` 9.3→4.9 s (vs 10.6 s), `lprec` 11.6→9.4 s
+  (vs 10.8 s) — all now tomoxide wins, bit-identical to the single-GPU output
+  (`fourierrec` Pearson 1.0, atomicAdd floor). Below nx=2048 the extra CUDA-init
+  per shard process outweighs the split, so multi-GPU stays on the single-GPU
+  streaming path (still ahead of tomocupy, whose 4-process Python startup is
+  heavier).
 - **fp16.** tomoxide wins both algorithms at every size on 1- and 4-GPU through
   2048². `fourierrec` fp16 used to be the exception (9.8 s at 2048², slower than
   its own fp32) because its half-precision path fell back to the per-chunk
