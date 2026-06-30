@@ -588,10 +588,18 @@ mod cuda_impl {
         }
     }
 
-    /// Complex FBP weight `w[z, k] = ramp[k]·exp(-2πi·k·δ_z/pad)/pad`, for
+    /// Complex FBP weight `w[z, k] = ½·ramp[k]·exp(-2πi·k·δ_z/pad)/pad`, for
     /// `k in 0..ne/2+1`, `δ_z = ncols/2 − center(z)` (half spectrum ⇒ `f_k = k ≥
     /// 0`), interleaved re/im — folds the ramp, signed-frequency centre-shift
-    /// phase, and `1/ne` cuFFT-inverse normalization (matches the CPU filter).
+    /// phase, and the `½/ne` cuFFT-inverse normalization.
+    ///
+    /// The `½` matches tomocupy's net FBP filter gain: with the back-projection
+    /// `4/nproj` byte-identical to tomocupy, tomoxide's CUDA analytic output was
+    /// measured at exactly 2.000× tomocupy across all slices (scale-invariant
+    /// Pearson parity hid it). The factor lives only here, so this single site
+    /// corrects every CUDA analytic method (fbp/linerec/fourierrec/lamino, f32 +
+    /// f16, one-shot + streaming). The residual sub-0.1% is the deferred
+    /// `make_fbp_filter` `_wint` quadrature shape, not scale.
     fn build_filter_w(
         filter: &[f32],
         geom: &Geometry,
@@ -601,7 +609,7 @@ mod cuda_impl {
     ) -> Vec<f32> {
         let nfreq = pad / 2 + 1;
         let half = ncols as f32 / 2.0;
-        let inv_pad = 1.0f32 / pad as f32;
+        let inv_pad = 0.5f32 / pad as f32;
         let mut w = vec![0.0f32; nz * nfreq * 2];
         for z in 0..nz {
             let delta = half - geom.center.at(z);

@@ -59,7 +59,8 @@ fn pearson_disk(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) ->
 
 /// Best-fit scale `a` minimizing `||cuda − a·cpu||` over the disk (for logging the
 /// per-algorithm convention scale; not asserted, since it differs per algorithm:
-/// 4/π for fbp/linerec, ≈4·n² for fourierrec, 1 for lprec).
+/// 2/π for fbp/linerec, ≈2·n² for fourierrec, 1 for lprec — the CUDA analytic
+/// filter carries tomocupy's net gain, half tomopy's).
 fn fit_scale(cuda: &Array2<f32>, cpu: &Array2<f32>, n: usize, radius_frac: f32) -> f64 {
     let c = (n as f32 - 1.0) / 2.0;
     let r2 = (radius_frac * (n as f32 / 2.0)).powi(2);

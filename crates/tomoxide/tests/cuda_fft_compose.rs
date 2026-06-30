@@ -103,10 +103,15 @@ fn cuda_lprec_matches_cpu() {
         ..Default::default()
     };
     let rc = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cpu).unwrap();
-    let rg = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cuda).unwrap();
+    let mut rg = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cuda).unwrap();
+    // The CUDA analytic filter carries tomocupy's net gain, half the CPU/tomopy
+    // path's, so CUDA lprec == ½·CPU lprec by convention (lprec keeps the CPU
+    // orientation — no flip). Undo the ½ before the shape comparison. See
+    // `cuda/mod.rs::build_filter_w` and `docs/ARCHITECTURE.md` §4.1.
+    rg.array.mapv_inplace(|v| v * 2.0);
     let d = max_rel(rc.array.as_slice().unwrap(), rg.array.as_slice().unwrap());
-    eprintln!("lprec cuda↔cpu max rel = {d:e}");
-    assert!(d < 2e-3, "lprec GPU≠CPU: rel {d}");
+    eprintln!("lprec cuda×2 ↔ cpu max rel = {d:e}");
+    assert!(d < 2e-3, "lprec GPU≠½·CPU: rel {d}");
 }
 
 #[test]

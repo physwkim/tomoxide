@@ -231,10 +231,15 @@ the CPU/wgpu output:
 
 | algorithm | image orientation | amplitude scale (cuda / cpu) |
 |-----------|-------------------|------------------------------|
-| `fbp`, `linerec`      | **vertically flipped** (rows reversed) | `4/π ≈ 1.273` (`4/nproj` vs tomopy `π/nproj`) |
-| `fourierrec`          | **vertically flipped**                 | `≈ 4·n²` (USFFT normalization) |
+| `fbp`, `linerec`      | **vertically flipped** (rows reversed) | `2/π ≈ 0.637` (`4/nproj` back-projection vs tomopy `π/nproj`, and the CUDA-only `½` filter normalization that matches tomocupy) |
+| `fourierrec`          | **vertically flipped**                 | `≈ 2·n²` (USFFT normalization × the `½` filter normalization) |
 | `lprec`               | same orientation as CPU                | `1` |
 | `gridrec`             | same orientation as CPU                | `1` |
+
+The CUDA analytic filter normalization carries tomocupy's net FBP gain, so the
+CUDA analytic output matches **tomocupy** in absolute amplitude, while the
+CPU/wgpu path matches **tomopy**; the `cuda / cpu` ratios above are the
+consequence of those two reference conventions differing.
 
 The reconstruction is otherwise **numerically identical** to the CPU reference:
 after undoing the flip (and amplitude-normalizing), CUDA matches CPU to the
