@@ -67,12 +67,17 @@ impl WgpuBackend {
             })
             .await
             .ok_or_else(|| Error::BackendUnavailable("no wgpu adapter available".into()))?;
+        // `Limits::default()` is the conservative downlevel/WebGL profile
+        // (256 MiB max buffer, 128 MiB max storage binding). A whole-volume
+        // reconstruction's filter/FFT buffers blow past that (e.g. a 512²
+        // nz=128 FBP needs a ~1 GiB spectrum buffer), so request the adapter's
+        // reported maxima — the real hardware capability — instead.
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("tomoxide-wgpu"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
