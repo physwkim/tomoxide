@@ -168,6 +168,10 @@ pub struct ReconParams {
     /// power-of-two padded width). Ignored by backends/algorithms that do not
     /// implement it.
     pub dtype: crate::dtype::Dtype,
+    /// Laminography reconstruction height (number of output z-slices). `None`
+    /// uses tomocupy's auto height `ceil(nz / cos(lamino_angle) / 2) * 2`. Only
+    /// consumed when the geometry's beam is [`crate::geometry::Beam::Laminography`].
+    pub lamino_rh: Option<usize>,
 }
 
 impl Default for ReconParams {
@@ -183,6 +187,7 @@ impl Default for ReconParams {
             num_block: 0,
             ind_block: Vec::new(),
             dtype: crate::dtype::Dtype::F32,
+            lamino_rh: None,
         }
     }
 }

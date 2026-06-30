@@ -77,6 +77,16 @@ enum Command {
         /// `--start-row`. Omit for the whole volume.
         #[arg(long)]
         end_row: Option<usize>,
+        /// Laminography tilt angle in DEGREES (tomocupy `--lamino-angle`). When
+        /// set, the rotation axis is tilted by this angle and the whole-stack
+        /// laminography back-projection is used (CUDA fbp/linerec, f32 only).
+        /// Omit for ordinary parallel-beam tomography.
+        #[arg(long)]
+        lamino_angle: Option<f32>,
+        /// Laminography reconstruction height (output z-slices). Omit for
+        /// tomocupy's auto height `ceil(nz / cos(lamino_angle) / 2) * 2`.
+        #[arg(long)]
+        lamino_rh: Option<usize>,
     },
     /// Chunked / streaming reconstruction (out-of-core).
     ReconSteps {
@@ -206,6 +216,8 @@ fn main() -> anyhow::Result<()> {
             chunk,
             start_row,
             end_row,
+            lamino_angle,
+            lamino_rh,
         } => {
             let engine = Engine::new(backend_kind)?;
             let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
@@ -222,7 +234,10 @@ fn main() -> anyhow::Result<()> {
                 engine.name()
             );
             let out = recon_out_path(&file);
-            if pipelines_well(&engine, algo) {
+            // Laminography is whole-stack only (the tilt couples all detector rows
+            // into every output voxel), so it cannot use the per-slice pipelined /
+            // multi-GPU shard path — force the whole-volume route below.
+            if pipelines_well(&engine, algo) && lamino_angle.is_none() {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
                 // else the safe default.
@@ -285,10 +300,19 @@ fn main() -> anyhow::Result<()> {
                     )?;
                 }
             } else {
-                // Whole-volume path (CPU/wgpu, or chunking-hostile GPU methods).
+                // Whole-volume path (CPU/wgpu, chunking-hostile GPU methods, or
+                // laminography).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
-                let geom = geometry_from_reader(reader.as_mut(), center)?;
-                let params = recon_params(&geom, dtype);
+                let mut geom = geometry_from_reader(reader.as_mut(), center)?;
+                let mut params = recon_params(&geom, dtype);
+                if let Some(deg) = lamino_angle {
+                    use std::f32::consts::PI;
+                    geom.beam = tomoxide::Beam::Laminography {
+                        phi: PI / 2.0 + deg * PI / 180.0,
+                    };
+                    params.lamino_rh = lamino_rh;
+                    println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
+                }
                 let ds = reader.read_all()?;
                 let vol = tomoxide::reconstruct(
                     ds,

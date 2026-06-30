@@ -694,6 +694,97 @@ mod cuda_impl {
         Ok(host)
     }
 
+    /// Laminography back-projection (`cfunc_linerec` with a tilted rotation axis)
+    /// for one output-z chunk, entirely on the **current** device. Mirrors
+    /// [`analytic_fbp_chunk`]'s pad → cuFFT filter → crop, but the back-projection
+    /// (a) feeds the scalar tilt `phi = π/2 + lamino_angle` instead of `π/2`,
+    /// (b) reconstructs `rh` output slices (not the `nz` detector rows — every
+    /// output voxel samples a detector row that depends on `(x,y,z)` once the axis
+    /// is tilted, so a parallel-beam per-slice mapping no longer holds), and
+    /// (c) passes the chunk's global z-start `sz` so the kernel's
+    /// `z = (tz + sz) − nz/2` lands on the right detector plane. The full
+    /// projection stack (`nz` rows) is filtered once and back-projected into every
+    /// output slice. Returns the chunk volume `[rh, n, n]` (with the kernel's
+    /// `(n−1−ty)` y-flip and `4/nproj` scale already applied, matching tomocupy).
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_lamino_chunk(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+        phi: f32,
+        rh: usize,
+        sz: i32,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let sino_dev = DevBuf::from_host_f32(raw)?;
+        let w_dev = DevBuf::from_host_f32(w)?;
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_pad(
+                    sino_dev.ptr,
+                    gpad.ptr,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    null,
+                )
+            },
+            "pad",
+        )?;
+        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
+        if fh.is_null() {
+            return Err(Error::Backend("cfunc_filter allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
+        unsafe { ffi::tomoxide_filter_free(fh) };
+        let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
+        ck(
+            unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
+            "crop",
+        )?;
+        // Output is `rh` slices, not `nz`; ncz = rh, ncproj = nproj (whole stack).
+        let f = DevBuf::zeroed(rh * n * n * fsz)?;
+        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, rh) };
+        if h.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+        unsafe {
+            ffi::tomoxide_linerec_backproject(
+                h,
+                f.ptr,
+                gf.ptr,
+                theta_dev.ptr as *const f32,
+                phi,
+                sz,
+                null,
+            );
+        }
+        unsafe { ffi::tomoxide_linerec_free(h) };
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        let mut host = vec![0.0f32; rh * n * n];
+        f.to_host_f32(&mut host)?;
+        Ok(host)
+    }
+
+    /// Auto reconstruction height for laminography (tomocupy `reader.py`
+    /// `rh0 = ceil(nz / cos(lamino_angle) / 2) * 2`), with `nz` the detector-row
+    /// count after any cropping. Even by construction.
+    fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
+        let c = (lamino_angle_deg * std::f32::consts::PI / 180.0).cos();
+        (((nz as f32 / c) / 2.0).ceil() as usize) * 2
+    }
+
     /// Half-precision (`Dtype::F16`) FBP/Linerec on the **current** device, whole
     /// stack in one chunk. Mirrors [`analytic_fbp_chunk`] but the sinogram, filter
     /// weights, padded/filtered buffers and volume are `f16` (2 bytes/element) and
@@ -2988,9 +3079,13 @@ mod cuda_impl {
             use crate::backend::make_fbp_filter;
             use crate::params::Algorithm;
 
-            if geom.beam != Beam::Parallel {
+            // Parallel beam and laminography (tilted axis) are both handled here;
+            // cone beam is not. Laminography routes to a dedicated whole-stack
+            // single-GPU path below (its output z-extent and detector-row coupling
+            // break the per-slice chunking the parallel path uses).
+            if !matches!(geom.beam, Beam::Parallel | Beam::Laminography { .. }) {
                 return Err(Error::InvalidParam(
-                    "cuda analytic reconstruct supports parallel beam only".into(),
+                    "cuda analytic reconstruct supports parallel beam and laminography only".into(),
                 ));
             }
             let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
@@ -3018,6 +3113,40 @@ mod cuda_impl {
             let pad_side = pad / 2 - ncols / 2;
             let w = build_filter_w(&filter, geom, nz, ncols, pad);
             let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
+
+            // Laminography (tilted rotation axis): whole projection stack, single
+            // GPU, single output-z chunk. The tilt couples every detector row into
+            // every output voxel, so the parallel-beam per-slice/multi-GPU split
+            // does not apply; `rh` (recon height) differs from the detector-row
+            // count `nz`. Only Fbp/Linerec (the direct back-projector) and f32 are
+            // supported for now — fourierrec-lamino and f16 are not wired.
+            if let Beam::Laminography { phi } = geom.beam {
+                if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
+                    return Err(Error::InvalidParam(format!(
+                        "cuda laminography supports Fbp/Linerec only; got {algorithm:?}"
+                    )));
+                }
+                if params.dtype == crate::dtype::Dtype::F16 {
+                    return Err(Error::InvalidParam(
+                        "cuda laminography f16 path is not implemented; use the default f32 dtype"
+                            .into(),
+                    ));
+                }
+                let lamino_angle_deg =
+                    (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+                let rh = params
+                    .lamino_rh
+                    .unwrap_or_else(|| lamino_recon_height(nz, lamino_angle_deg));
+                let devices = selected_devices();
+                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                let vol = analytic_lamino_chunk(
+                    raw, &w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh, 0,
+                )?;
+                return Ok(Volume::new(
+                    Array3::from_shape_vec((rh, n, n), vol)
+                        .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
+                ));
+            }
 
             // Half-precision path (tomocupy `--dtype float16`): single GPU, whole
             // stack in one chunk. The half cuFFT filter needs a power-of-two
