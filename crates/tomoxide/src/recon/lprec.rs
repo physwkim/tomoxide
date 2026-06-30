@@ -279,7 +279,10 @@ pub(crate) struct LpGrids {
     pub(crate) cids: Vec<usize>,
 }
 
-/// Number of overlapping angular spans, exposed for the CUDA path's per-span loop.
+/// Number of overlapping angular spans, exposed for the CUDA path's per-span
+/// loop. Only the CUDA backend consumes it, so it is dead code without that
+/// feature.
+#[cfg(feature = "cuda")]
 pub(crate) const LP_NSPAN: usize = NSPAN;
 
 pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGrids> {
