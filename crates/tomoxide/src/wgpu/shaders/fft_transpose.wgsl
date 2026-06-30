@@ -15,8 +15,9 @@ struct TParams {
 @group(0) @binding(2) var<uniform>             tparams : TParams;
 
 @compute @workgroup_size(WG)
-fn transpose(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let tid = gid.x;
+fn transpose(@builtin(global_invocation_id) gid : vec3<u32>,
+             @builtin(num_workgroups) nwg : vec3<u32>) {
+    let tid = gid.y * nwg.x * WG + gid.x;
     let total = arrayLength(&tsrc);
     if (tid >= total) { return; }
 

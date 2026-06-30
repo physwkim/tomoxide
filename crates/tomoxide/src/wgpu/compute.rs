@@ -58,6 +58,16 @@ impl WgpuBackend {
     /// injected into the shader source from [`WORKGROUP`]; every 1-D kernel
     /// declares `@workgroup_size(WG)` rather than a literal, so the size has a
     /// single source of truth here.
+    ///
+    /// WebGPU caps each dispatch dimension at 65535 workgroups, which a 1-D
+    /// dispatch blows past once `n_threads` exceeds `65535 * WORKGROUP` (≈16.8 M —
+    /// reached by a 512² back-projection's `nz·n·n` threads). So the workgroup
+    /// count is folded into a 2-D `(wx, wy)` grid with `wx ≤ 65535`, and every
+    /// kernel recovers its flat thread index as
+    /// `gid.y * num_workgroups.x * WG + gid.x` — a formula that also yields plain
+    /// `gid.x` in the common `wy == 1` case, so the same kernel source works for
+    /// both. Tail workgroups (the grid rounds up) are handled by each kernel's
+    /// existing `idx >= len` bounds check.
     pub(crate) fn dispatch1d(
         &self,
         wgsl: &str,
@@ -105,7 +115,16 @@ impl WgpuBackend {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(n_threads.div_ceil(WORKGROUP), 1, 1);
+            // Fold the workgroup count into a 2-D grid so neither dimension
+            // exceeds WebGPU's 65535 per-dimension cap (see method doc).
+            let wg = n_threads.div_ceil(WORKGROUP);
+            const MAX_DIM: u32 = 65535;
+            let (wx, wy) = if wg <= MAX_DIM {
+                (wg, 1)
+            } else {
+                (MAX_DIM, wg.div_ceil(MAX_DIM))
+            };
+            pass.dispatch_workgroups(wx, wy, 1);
         }
         self.queue.submit(Some(enc.finish()));
     }

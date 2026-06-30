@@ -28,8 +28,9 @@ struct Params {
 @group(0) @binding(4) var<uniform>             params : Params;
 
 @compute @workgroup_size(WG)
-fn project(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let lane = gid.x; // flat over (nz * nproj)
+fn project(@builtin(global_invocation_id) gid : vec3<u32>,
+           @builtin(num_workgroups) nwg : vec3<u32>) {
+    let lane = gid.y * nwg.x * WG + gid.x; // flat over (nz * nproj)
     let nz = arrayLength(&center);
     if (lane >= nz * params.nproj) { return; }
 

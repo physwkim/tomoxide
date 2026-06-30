@@ -7,8 +7,9 @@
 @group(0) @binding(0) var<storage, read_write> ml_data : array<f32>;
 
 @compute @workgroup_size(WG)
-fn minus_log(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let i = gid.x;
+fn minus_log(@builtin(global_invocation_id) gid : vec3<u32>,
+             @builtin(num_workgroups) nwg : vec3<u32>) {
+    let i = gid.y * nwg.x * WG + gid.x;
     if (i >= arrayLength(&ml_data)) { return; }
     let out = -log(max(ml_data[i], 1e-6));
     // abs(out) < f32::MAX is false for both NaN and ±inf (any NaN compare is
@@ -33,8 +34,9 @@ struct DfParams {
 @group(0) @binding(3) var<uniform>             df_params : DfParams;
 
 @compute @workgroup_size(WG)
-fn darkflat(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let i = gid.x;
+fn darkflat(@builtin(global_invocation_id) gid : vec3<u32>,
+            @builtin(num_workgroups) nwg : vec3<u32>) {
+    let i = gid.y * nwg.x * WG + gid.x;
     if (i >= df_params.n_elems) { return; }
     let rc = i % df_params.plane_size;
     df_data[i] = (df_data[i] - df_dark[rc]) / df_denom[rc];

@@ -21,8 +21,9 @@ struct Params {
 @group(0) @binding(3) var<storage, read>       deltas : array<f32>;  // [batch] per-lane shift
 
 @compute @workgroup_size(WG)
-fn apply_filter(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let idx = gid.x;
+fn apply_filter(@builtin(global_invocation_id) gid : vec3<u32>,
+                @builtin(num_workgroups) nwg : vec3<u32>) {
+    let idx = gid.y * nwg.x * WG + gid.x;
     if (idx >= arrayLength(&g)) {
         return;
     }

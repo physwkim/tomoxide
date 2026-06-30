@@ -26,8 +26,9 @@ struct Params {
 @group(0) @binding(4) var<uniform>             params : Params;
 
 @compute @workgroup_size(WG)
-fn backproject(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let flat = gid.x;
+fn backproject(@builtin(global_invocation_id) gid : vec3<u32>,
+               @builtin(num_workgroups) nwg : vec3<u32>) {
+    let flat = gid.y * nwg.x * WG + gid.x;
     let plane = params.ny * params.nx;
     let nz = arrayLength(&center);
     if (flat >= nz * plane) { return; }

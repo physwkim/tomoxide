@@ -31,8 +31,9 @@ struct Params {
 @group(0) @binding(2) var<uniform>             params : Params;
 
 @compute @workgroup_size(WG)
-fn medfilt3d(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let flat = gid.x;
+fn medfilt3d(@builtin(global_invocation_id) gid : vec3<u32>,
+             @builtin(num_workgroups) nwg : vec3<u32>) {
+    let flat = gid.y * nwg.x * WG + gid.x;
     let n = params.dz * params.dy * params.dx;
     if (flat >= n) { return; }
 

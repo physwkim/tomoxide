@@ -20,8 +20,9 @@ struct FftParams {
 @group(0) @binding(1) var<uniform>             params : FftParams;
 
 @compute @workgroup_size(WG)
-fn bitrev(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let tid = gid.x;
+fn bitrev(@builtin(global_invocation_id) gid : vec3<u32>,
+          @builtin(num_workgroups) nwg : vec3<u32>) {
+    let tid = gid.y * nwg.x * WG + gid.x;
     let total = arrayLength(&data);
     if (tid >= total) { return; }
     let lane = tid / params.n;
@@ -44,8 +45,9 @@ fn bitrev(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 
 @compute @workgroup_size(WG)
-fn butterfly(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let tid = gid.x;
+fn butterfly(@builtin(global_invocation_id) gid : vec3<u32>,
+             @builtin(num_workgroups) nwg : vec3<u32>) {
+    let tid = gid.y * nwg.x * WG + gid.x;
     let total = arrayLength(&data) / 2u; // batch * (n/2) butterflies
     if (tid >= total) { return; }
 
