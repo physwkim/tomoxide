@@ -233,8 +233,8 @@ the CPU/wgpu output:
 |-----------|-------------------|------------------------------|
 | `fbp`, `linerec`      | **vertically flipped** (rows reversed) | `2/π ≈ 0.637` (`4/nproj` back-projection vs tomopy `π/nproj`, and the CUDA-only `½` filter normalization that matches tomocupy) |
 | `fourierrec`          | **vertically flipped**                 | `≈ 2·n²` (USFFT normalization × the `½` filter normalization) |
-| `lprec`               | same orientation as CPU                | `1` |
-| `gridrec`             | same orientation as CPU                | `1` |
+| `lprec`               | same orientation as CPU                | `½ ≈ 0.5` (the CUDA-only `½` filter normalization; lprec's log-polar back-projection carries no extra scale vs the CPU port, so the filter ½ is the whole ratio) |
+| `gridrec`             | same orientation as CPU                | `1` (gridrec builds its own ramp, never `build_filter_w`, so no `½`) |
 
 The CUDA and CPU/wgpu analytic paths differ by two deliberate, documented
 reference conventions, both because the CPU/wgpu backends port **tomopy** and the
