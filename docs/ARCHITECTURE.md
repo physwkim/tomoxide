@@ -222,6 +222,30 @@ Buffer pointers and CUDA stream handles cross the boundary as opaque `void*`
 (tomocupy passes them as `size_t`); Rust treats them as `*mut c_void`. The
 `f16` variants correspond to tomocupy's `*fp16` classes, selected by `Dtype`.
 
+### 4.1 CUDA analytic output convention (vs CPU/wgpu)
+
+The vendored tomocupy back-projection / Fourier kernels carry tomocupy's own
+output convention, which differs from the CPU/wgpu (tomopy) path. For the same
+sinogram, geometry, and centre, a CUDA analytic reconstruction is, relative to
+the CPU/wgpu output:
+
+| algorithm | image orientation | amplitude scale (cuda / cpu) |
+|-----------|-------------------|------------------------------|
+| `fbp`, `linerec`      | **vertically flipped** (rows reversed) | `4/π ≈ 1.273` (`4/nproj` vs tomopy `π/nproj`) |
+| `fourierrec`          | **vertically flipped**                 | `≈ 4·n²` (USFFT normalization) |
+| `lprec`               | same orientation as CPU                | `1` |
+| `gridrec`             | same orientation as CPU                | `1` |
+
+The reconstruction is otherwise **numerically identical** to the CPU reference:
+after undoing the flip (and amplitude-normalizing), CUDA matches CPU to the
+f32/cuFFT floor (Pearson 1.0). This is a fixed handedness/scale convention, not a
+numerical error — so it is intentional and preserved, but consumers comparing
+CUDA output against CPU/wgpu (or against absolute physical units) must account
+for it. The cross-backend regression test
+`tests/cuda_cpu_convention_parity.rs` pins both the orientation (per the table)
+and structural agreement, so any *other* CUDA divergence is caught and any change
+to this convention is surfaced deliberately.
+
 ---
 
 ## 5. Streaming pipeline (`tomoxide::pipeline`)
