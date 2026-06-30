@@ -13,7 +13,8 @@
 
 use ndarray::{Array2, Axis};
 use tomoxide::{
-    recon, sim, Algorithm, Angles, CpuBackend, CudaBackend, Dtype, Geometry, ReconParams,
+    recon, sim, Algorithm, Angles, CpuBackend, CudaBackend, Dtype, FilterName, Geometry,
+    ReconParams,
 };
 
 fn pearson_disk(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) -> f32 {
@@ -60,6 +61,9 @@ fn cuda_fbp_matches_cpu_and_phantom() {
     let (n, nang) = (128usize, 180usize);
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these analytic parity/phantom checks are calibrated for the
+        // sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
 
@@ -118,6 +122,9 @@ fn cuda_fourierrec_matches_cpu_and_phantom() {
     let (n, nang) = (128usize, 180usize);
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these analytic parity/phantom checks are calibrated for the
+        // sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     // cfunc_fourierrec pairs slices into complex, so it needs an even count.
@@ -168,7 +175,7 @@ fn cuda_fourierrec_matches_cpu_and_phantom() {
 #[test]
 fn cuda_fbp_filter_matches_cpu() {
     use tomoxide::backend::Backend;
-    use tomoxide::{FilterName, Layout, Tomo};
+    use tomoxide::{Layout, Tomo};
     let cuda = match CudaBackend::new() {
         Ok(b) => b,
         Err(e) => {
@@ -236,7 +243,7 @@ fn cuda_fused_equals_per_stage() {
     // module). The tolerance sits ~5 orders below the output scale, so the all-zero
     // regression that a <2-slice linerec chunk produces still trips it.
     use tomoxide::backend::Backend;
-    use tomoxide::{FilterName, Layout, Tomo, Volume};
+    use tomoxide::{Layout, Tomo, Volume};
     let cuda = match CudaBackend::new() {
         Ok(b) => b,
         Err(e) => {
@@ -247,6 +254,9 @@ fn cuda_fused_equals_per_stage() {
     let (n, nang, nz) = (96usize, 72usize, 4usize);
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these analytic parity/phantom checks are calibrated for the
+        // sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let phantom = sim::shepp2d(n).unwrap();
@@ -331,11 +341,15 @@ fn cuda_fbp_f16_matches_f32_and_phantom() {
 
     let p32 = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these analytic parity/phantom checks are calibrated for the
+        // sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let p16 = ReconParams {
         num_gridx: Some(n),
         dtype: Dtype::F16,
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let rec32 = recon::recon(&sino, &geom, Algorithm::Fbp, &p32, &cuda).unwrap();
@@ -376,11 +390,15 @@ fn cuda_fourierrec_f16_matches_f32_and_phantom() {
 
     let p32 = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these analytic parity/phantom checks are calibrated for the
+        // sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let p16 = ReconParams {
         num_gridx: Some(n),
         dtype: Dtype::F16,
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let rec32 = recon::recon(&sino, &geom, Algorithm::Fourierrec, &p32, &cuda).unwrap();

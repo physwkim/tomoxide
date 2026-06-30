@@ -36,7 +36,7 @@ impl Default for Config {
             file_name: String::new(),
             backend: "auto".into(),
             algorithm: "fbp".into(),
-            filter_name: "ramp".into(),
+            filter_name: "parzen".into(),
             rotation_axis: None,
             remove_stripe_method: "none".into(),
             retrieve_phase_method: "none".into(),

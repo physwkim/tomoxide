@@ -8,7 +8,9 @@
 //! forward/back-projector adjoint pair are correct together.
 
 use ndarray::{Array2, Axis};
-use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
+use tomoxide::{
+    recon, sim, Algorithm, Angles, CpuBackend, FilterName, Geometry, ReconParams, Volume,
+};
 
 /// Pearson correlation between two slices over a centered disk of the given
 /// radius fraction (kept inside the phantom support, away from clipped corners).
@@ -59,6 +61,9 @@ fn fbp_reconstructs_shepp_logan_phantom() {
 
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these roundtrip tests are calibrated for the sharp filter
+        // (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let recon = recon::recon(&sino, &geom, Algorithm::Fbp, &params, &cpu).unwrap();
@@ -86,6 +91,9 @@ fn gridrec_reconstructs_shepp_logan_phantom() {
 
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these roundtrip tests are calibrated for the sharp filter
+        // (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let recon = recon::recon(&sino, &geom, Algorithm::Gridrec, &params, &cpu).unwrap();

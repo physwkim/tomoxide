@@ -18,7 +18,9 @@
 
 use ndarray::{Array2, Axis};
 use std::f32::consts::PI;
-use tomoxide::{recon, sim, Algorithm, Angles, Center, CpuBackend, Geometry, ReconParams, Volume};
+use tomoxide::{
+    recon, sim, Algorithm, Angles, Center, CpuBackend, FilterName, Geometry, ReconParams, Volume,
+};
 
 /// Pearson correlation over a centered disk (scale-invariant; ignores the
 /// clipped corners outside the phantom support).
@@ -61,6 +63,9 @@ fn recon_at_center(algorithm: Algorithm, n: usize, nang: usize, center: f32) -> 
     let sino = sim::project(&vol, &geom, &cpu).unwrap();
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: this test checks off-centre phantom recovery, calibrated for
+        // the sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let recon = recon::recon(&sino, &geom, algorithm, &params, &cpu).unwrap();

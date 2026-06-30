@@ -24,7 +24,9 @@
 
 use ndarray::{Array1, Array2, Array3, Axis};
 use ndarray_npy::read_npy;
-use tomoxide::{recon, Algorithm, Angles, CpuBackend, Geometry, Layout, ReconParams, Tomo};
+use tomoxide::{
+    recon, Algorithm, Angles, CpuBackend, FilterName, Geometry, Layout, ReconParams, Tomo,
+};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
@@ -71,6 +73,9 @@ fn tomoxide_recon(algorithm: Algorithm) -> (Array2<f32>, usize) {
     let geom = Geometry::parallel(Angles(angles.to_vec()), n, 1, 1.0);
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: this test checks algorithm recovery against the phantom,
+        // calibrated for the sharp filter (the default is parzen).
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let vol = recon::recon(&tomo, &geom, algorithm, &params, &CpuBackend::new()).unwrap();

@@ -107,7 +107,6 @@ pub enum FilterName {
     /// No filtering.
     None,
     /// Pure ramp (Ram-Lak).
-    #[default]
     Ramp,
     /// Shepp-Logan.
     Shepp,
@@ -119,7 +118,8 @@ pub enum FilterName {
     Hamming,
     /// Hann.
     Hann,
-    /// Parzen.
+    /// Parzen. The default, matching tomocupy's default FBP filter.
+    #[default]
     Parzen,
 }
 
@@ -180,7 +180,8 @@ impl Default for ReconParams {
             num_gridx: None,
             num_gridy: None,
             num_iter: 1,
-            filter_name: FilterName::Ramp,
+            // Default to parzen, matching tomocupy's default FBP filter.
+            filter_name: FilterName::Parzen,
             filter_par: Vec::new(),
             reg_par: Vec::new(),
             reg_data: Vec::new(),

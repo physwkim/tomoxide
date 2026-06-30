@@ -12,7 +12,9 @@
 //!      deapodize / centring bug that a single-method round-trip might mask.
 
 use ndarray::{Array2, Axis};
-use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
+use tomoxide::{
+    recon, sim, Algorithm, Angles, CpuBackend, FilterName, Geometry, ReconParams, Volume,
+};
 
 /// Pearson correlation between two slices over a centered disk of the given
 /// radius fraction (kept inside the phantom support, away from clipped corners).
@@ -53,6 +55,9 @@ fn recon_slice(algorithm: Algorithm, n: usize, nang: usize) -> (Array2<f32>, Arr
     let sino = sim::project(&vol, &geom, &cpu).unwrap();
     let params = ReconParams {
         num_gridx: Some(n),
+        // Pin ramp: these tests check fourierrec recovery/agreement, calibrated
+        // for the sharp filter (the default is parzen); gridrec ignores the filter.
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let recon = recon::recon(&sino, &geom, algorithm, &params, &cpu).unwrap();
