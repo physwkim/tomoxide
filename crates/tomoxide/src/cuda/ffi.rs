@@ -89,6 +89,22 @@ unsafe extern "C" {
     );
     pub fn tomoxide_linerec_free(handle: *mut c_void);
 
+    // --- forward projection (adjoint of cfunc_linerec back-projection) ---
+    /// Parallel-beam forward projection (Radon), the exact discrete transpose of
+    /// `tomoxide_linerec_backproject`. `g` (output sinogram `[nz, nproj, n]`)
+    /// must be pre-zeroed; the kernel only `atomicAdd`s into it. `f` is the input
+    /// volume `[nz, n, n]`, `phi = π/2` for parallel beam.
+    pub fn tomoxide_forwardproject(
+        g: *mut c_void,
+        f: *const c_void,
+        theta: *const f32,
+        phi: f32,
+        nz: i32,
+        n: i32,
+        nproj: i32,
+        stream: *mut c_void,
+    );
+
     // --- fourierrec (cfunc_fourierrec) ---
     /// `cfunc_fourierrec(nproj, nz, n, theta_ptr)` — `nz` is the number of
     /// complex slice-pairs (real input slices / 2); `theta` is a device pointer.

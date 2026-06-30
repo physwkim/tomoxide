@@ -128,6 +128,14 @@ impl Backend for CudaBackend {
         Some(self)
     }
 
+    /// Parallel-beam forward projection on the GPU — the discrete adjoint of
+    /// `backprojector` (`cfunc_linerec`), which unlocks the iterative suite
+    /// (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV) on CUDA via the generic solvers.
+    #[cfg(feature = "cuda")]
+    fn projector(&self) -> Option<&dyn crate::backend::ForwardProject> {
+        Some(self)
+    }
+
     /// Fourier-gridding reconstruction on the GPU (`cfunc_fourierrec`).
     #[cfg(feature = "cuda")]
     fn fourier_reconstruct(&self) -> Option<&dyn crate::backend::FourierReconstruct> {
@@ -187,8 +195,8 @@ impl Backend for CudaBackend {
 mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
-        make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, FourierReconstruct,
-        LpRecReconstruct, RampShape, StreamingAnalytic,
+        make_fbp_filter, Elementwise, FbpFilter, FilteredBackproject, ForwardProject,
+        FourierReconstruct, LpRecReconstruct, RampShape, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -547,10 +555,14 @@ mod cuda_impl {
                     found: theta.len().to_string(),
                 });
             }
-            let sino_slice = s
-                .array
+            // Materialize a C-contiguous host buffer for the flat D2H upload:
+            // the analytic path hands a contiguous `sino.clone()` (borrowed, no
+            // copy), but the iterative solvers hand strided sub-sinograms
+            // (`select(Axis(1), …)` over an angle subset, e.g. OSEM) — copy those.
+            let sino_std = s.array.as_standard_layout();
+            let sino_slice = sino_std
                 .as_slice()
-                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+                .expect("as_standard_layout is C-contiguous");
 
             // Device buffers: filtered sinogram, theta, output volume.
             let g = DevBuf::from_host_f32(sino_slice)?;
@@ -584,6 +596,85 @@ mod cuda_impl {
             f.to_host_f32(&mut host)?;
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+            Ok(())
+        }
+    }
+
+    impl ForwardProject for CudaBackend {
+        /// Parallel-beam forward projection (`forwardprojection_ker`), the exact
+        /// discrete transpose of [`FilteredBackproject::backproject`]
+        /// (`cfunc_linerec`, phi = π/2): same y-flip, centre `n/2`, and `4/nproj`
+        /// scale. The two therefore form an `{A, Aᵀ}` pair, which is what the
+        /// generic iterative solvers (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV)
+        /// require — the recon carries the same y-flip/scale handedness as the
+        /// CUDA analytic path. Like the back-projector, the kernel hard-wires
+        /// centre `n/2` (it ignores `geom.center`) and assumes the detector width
+        /// equals the grid `n`. Output is `[nz, nproj, n]` in `Sinogram` layout.
+        fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
+            if geom.beam != Beam::Parallel {
+                return Err(Error::InvalidParam(
+                    "cuda forward projection supports parallel beam only".into(),
+                ));
+            }
+            let (nz, ny, nx) = vol.dims();
+            if ny != nx {
+                return Err(Error::InvalidParam(format!(
+                    "cuda forward projection needs a square grid; got {ny}x{nx}"
+                )));
+            }
+            let n = nx;
+            let nproj = geom.angles.0.len();
+            let ncols = geom.detector.width;
+            if ncols != n {
+                return Err(Error::InvalidParam(format!(
+                    "cuda forward projection needs detector width = grid {n}; got {ncols}"
+                )));
+            }
+            let theta = &geom.angles.0;
+            if theta.len() != nproj {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("{nproj} angles"),
+                    found: theta.len().to_string(),
+                });
+            }
+            // Materialize a C-contiguous host buffer for the flat D2H upload
+            // (borrowed when already contiguous, copied otherwise), so the
+            // iterative solvers may hand any array layout — symmetric with the
+            // back-projector's sinogram handling.
+            let vol_std = vol.array.as_standard_layout();
+            let vol_slice = vol_std
+                .as_slice()
+                .expect("as_standard_layout is C-contiguous");
+
+            // Device buffers: input volume, theta, zeroed output sinogram (the
+            // kernel only atomic-adds into it).
+            let f = DevBuf::from_host_f32(vol_slice)?;
+            let theta_d = DevBuf::from_host_f32(theta)?;
+            let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
+
+            let phi = std::f32::consts::FRAC_PI_2; // parallel beam
+            unsafe {
+                ffi::tomoxide_forwardproject(
+                    g.ptr,
+                    f.ptr,
+                    theta_d.ptr as *const f32,
+                    phi,
+                    nz as i32,
+                    n as i32,
+                    nproj as i32,
+                    std::ptr::null_mut(),
+                );
+            }
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+            }
+
+            let mut host = vec![0.0f32; nz * nproj * n];
+            g.to_host_f32(&mut host)?;
+            let array = Array3::from_shape_vec((nz, nproj, n), host)
+                .map_err(|e| Error::InvalidParam(format!("cuda sinogram shape: {e}")))?;
+            *out = Tomo::new(array, Layout::Sinogram);
             Ok(())
         }
     }
