@@ -146,6 +146,14 @@ impl Backend for CudaBackend {
         Some(self)
     }
 
+    /// Device-resident iterative reconstruction — keeps the volume/sinogram on
+    /// the GPU across all iterations (currently SIRT; others return `None` and
+    /// fall back to the generic host solver).
+    #[cfg(feature = "cuda")]
+    fn iterative_reconstruct(&self) -> Option<&dyn crate::backend::IterativeReconstruct> {
+        Some(self)
+    }
+
     /// Fourier-gridding reconstruction on the GPU (`cfunc_fourierrec`).
     #[cfg(feature = "cuda")]
     fn fourier_reconstruct(&self) -> Option<&dyn crate::backend::FourierReconstruct> {
@@ -206,8 +214,8 @@ mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
         make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter, FilteredBackproject,
-        ForwardProject, FourierReconstruct, LpRecReconstruct, RampShape, RayProject, RayRow,
-        StreamingAnalytic,
+        ForwardProject, FourierReconstruct, IterativeReconstruct, LpRecReconstruct, RampShape,
+        RayProject, RayRow, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -697,6 +705,143 @@ mod cuda_impl {
         /// [`parallel_ray_rows`] — byte-identical to the CPU backend's rows.
         fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>> {
             parallel_ray_rows(geom, n)
+        }
+    }
+
+    impl IterativeReconstruct for CudaBackend {
+        /// Device-resident SIRT: upload `b`/θ/ones once, precompute the ray-length
+        /// `R = 1/A(1)` and sensitivity `C = 1/Aᵀ(1)` weights on-device, then run
+        /// every iteration `x ← x + C ∘ Aᵀ(R ∘ (b − A x))` entirely on the GPU
+        /// (forward + back-projection kernels + fused elementwise ops), and
+        /// download `x` once. Reuses the same `A`/`Aᵀ` kernels (and back-projection
+        /// handle) as the generic path, so the result matches the host SIRT to the
+        /// atomic-add ordering floor. Returns `Ok(None)` for every other algorithm
+        /// (and non-parallel beam / non-square grid) → generic host fallback.
+        fn solve(
+            &self,
+            sino: &Tomo<f32>,
+            geom: &Geometry,
+            algorithm: crate::params::Algorithm,
+            params: &crate::params::ReconParams,
+        ) -> Result<Option<Volume<f32>>> {
+            use crate::params::Algorithm;
+            if algorithm != Algorithm::Sirt || geom.beam != Beam::Parallel {
+                return Ok(None);
+            }
+            let s = sino.as_layout(Layout::Sinogram);
+            let nz = s.n_rows();
+            let nproj = s.n_angles();
+            let ncols = s.n_cols();
+            let n = params.num_gridx.unwrap_or(ncols);
+            if n != ncols {
+                return Ok(None); // square-grid only (the kernels assume detector = n)
+            }
+            let theta = &geom.angles.0;
+            if theta.len() != nproj {
+                return Ok(None);
+            }
+            let sino_std = s.array.as_standard_layout();
+            let sino_slice = sino_std
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+            let nvol = nz * n * n;
+            let nsino = nz * nproj * ncols;
+            let vbytes = nvol * std::mem::size_of::<f32>();
+            let sbytes = nsino * std::mem::size_of::<f32>();
+            let null = std::ptr::null_mut::<c_void>();
+            let phi = std::f32::consts::FRAC_PI_2; // parallel beam
+            let theta_p = |t: &DevBuf| t.ptr as *const f32;
+
+            // Persistent device buffers (uploaded / allocated once).
+            let theta_d = DevBuf::from_host_f32(theta)?;
+            let b_d = DevBuf::from_host_f32(sino_slice)?; // measured sinogram b
+            let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
+            let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
+            let vol_d = DevBuf::zeroed(vbytes)?; // x (init 0)
+            let ax_d = DevBuf::zeroed(sbytes)?; // A x, reused as the weighted residual
+            let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…)
+            let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1)
+            let cw_d = DevBuf::zeroed(vbytes)?; // C = 1/Aᵀ(1)
+
+            // Back-projection handle for the whole stack, reused every iteration.
+            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+            if handle.is_null() {
+                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+            }
+
+            // All ops run on the per-thread default stream (null) → FIFO-ordered,
+            // so a single sync before the download suffices. The forward kernel
+            // scatter-adds and the back-projection accumulates, so each output is
+            // zeroed first.
+            unsafe {
+                // R = 1/A(1): ax = A(1); rw = recip_thresh(ax)
+                ffi::tomoxide_cuda_memset_async(ax_d.ptr, 0, sbytes, null);
+                ffi::tomoxide_forwardproject(
+                    ax_d.ptr,
+                    ones_v.ptr,
+                    theta_p(&theta_d),
+                    phi,
+                    nz as i32,
+                    n as i32,
+                    nproj as i32,
+                    null,
+                );
+                ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null);
+
+                // C = 1/Aᵀ(1): corr = Aᵀ(1); cw = recip_thresh(corr)
+                ffi::tomoxide_cuda_memset_async(corr_d.ptr, 0, vbytes, null);
+                ffi::tomoxide_linerec_backproject(
+                    handle,
+                    corr_d.ptr,
+                    ones_s.ptr,
+                    theta_p(&theta_d),
+                    phi,
+                    0,
+                    null,
+                );
+                ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null);
+
+                // x ← x + C ∘ Aᵀ(R ∘ (b − A x))
+                for _ in 0..params.num_iter.max(1) {
+                    ffi::tomoxide_cuda_memset_async(ax_d.ptr, 0, sbytes, null);
+                    ffi::tomoxide_forwardproject(
+                        ax_d.ptr,
+                        vol_d.ptr,
+                        theta_p(&theta_d),
+                        phi,
+                        nz as i32,
+                        n as i32,
+                        nproj as i32,
+                        null,
+                    ); // ax = A x
+                    ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null); // ax = (b − A x) ∘ R
+                    ffi::tomoxide_cuda_memset_async(corr_d.ptr, 0, vbytes, null);
+                    ffi::tomoxide_linerec_backproject(
+                        handle,
+                        corr_d.ptr,
+                        ax_d.ptr,
+                        theta_p(&theta_d),
+                        phi,
+                        0,
+                        null,
+                    ); // corr = Aᵀ(…)
+                    ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null);
+                    // x += C ∘ corr
+                }
+            }
+
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            unsafe { ffi::tomoxide_linerec_free(handle) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+            }
+
+            let mut host = vec![0.0f32; nvol];
+            vol_d.to_host_f32(&mut host)?;
+            let array = Array3::from_shape_vec((nz, n, n), host)
+                .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+            Ok(Some(Volume::new(array)))
         }
     }
 

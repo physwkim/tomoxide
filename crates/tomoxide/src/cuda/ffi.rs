@@ -105,6 +105,32 @@ unsafe extern "C" {
         stream: *mut c_void,
     );
 
+    // --- device-resident iterative solver elementwise ops (iterative.cu) ---
+    /// `ax[i] = (b[i] - ax[i]) * rw[i]` over `n` elements (in-place into `ax`).
+    pub fn tomoxide_iter_residual(
+        ax: *mut c_void,
+        b: *const c_void,
+        rw: *const c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `vol[i] += cw[i] * corr[i]` over `n` elements.
+    pub fn tomoxide_iter_update(
+        vol: *mut c_void,
+        cw: *const c_void,
+        corr: *const c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `out[i] = |x[i]| > thr ? 1/x[i] : 0` over `n` elements (in-place ok).
+    pub fn tomoxide_iter_recip_thresh(
+        out: *mut c_void,
+        x: *const c_void,
+        thr: f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
     // --- fourierrec (cfunc_fourierrec) ---
     /// `cfunc_fourierrec(nproj, nz, n, theta_ptr)` — `nz` is the number of
     /// complex slice-pairs (real input slices / 2); `theta` is a device pointer.

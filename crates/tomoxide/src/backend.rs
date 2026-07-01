@@ -133,6 +133,13 @@ pub trait Backend: Send + Sync {
     fn ray_projector(&self) -> Option<&dyn RayProject> {
         None
     }
+    /// Device-resident iterative reconstruction (bypasses the per-iteration
+    /// host↔device round-trips of the generic solvers). `None` ⇒ use the generic
+    /// solver composed from [`projector`](Backend::projector) /
+    /// [`backprojector`](Backend::backprojector).
+    fn iterative_reconstruct(&self) -> Option<&dyn IterativeReconstruct> {
+        None
+    }
     /// Elementwise preprocessing (dark/flat, minus-log, …).
     fn elementwise(&self) -> Option<&dyn Elementwise> {
         None
@@ -698,6 +705,27 @@ pub(crate) fn parallel_ray_rows(geom: &Geometry, n: usize) -> Result<Vec<Vec<Ray
         }
     }
     Ok(rows)
+}
+
+/// Device-resident iterative reconstruction.
+///
+/// The generic host solvers in [`crate::recon`] compose [`ForwardProject`] and
+/// [`FilteredBackproject`], each of which round-trips the whole volume/sinogram
+/// host↔device **every iteration**. A backend that can keep both resident on the
+/// device across all iterations — uploading once, iterating on-device, and
+/// downloading once — implements this to bypass that per-iteration transfer.
+pub trait IterativeReconstruct {
+    /// Run `algorithm` device-resident and return the reconstructed volume, or
+    /// `Ok(None)` if this backend has no device-resident path for `algorithm`
+    /// (the caller then falls back to the generic host solver). This mirrors
+    /// [`AnalyticReconstruct::streaming`]'s opt-in-or-fall-back contract.
+    fn solve(
+        &self,
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        algorithm: crate::params::Algorithm,
+        params: &crate::params::ReconParams,
+    ) -> Result<Option<Volume<f32>>>;
 }
 
 /// Elementwise preprocessing kernels.

@@ -163,6 +163,16 @@ fn iterative(
         };
     }
 
+    // Device-resident fast path: a backend that keeps the volume/sinogram on the
+    // device across all iterations (CUDA) runs the whole loop with no per-iteration
+    // host↔device transfers. It returns `None` for algorithms it does not
+    // device-implement, so those fall through to the generic host solvers below.
+    if let Some(it) = backend.iterative_reconstruct() {
+        if let Some(vol) = it.solve(sino, geom, algorithm, params)? {
+            return Ok(vol);
+        }
+    }
+
     let proj = backend
         .projector()
         .ok_or_else(|| missing("ForwardProject", backend))?;

@@ -233,6 +233,63 @@ fn cuda_sirt_recovers_phantom() {
     );
 }
 
+/// Device-resident CUDA SIRT — the on-GPU iterative path wired into
+/// `recon::recon` via `IterativeReconstruct` (volume/sinogram stay resident, no
+/// per-iteration host↔device transfer) — reproduces the CPU SIRT fixed point.
+/// Both solve the same normal-equation iteration from the *same* input
+/// sinogram; the only difference is CUDA's documented volume-space y-flip (the
+/// forward *and* back-projection kernels both flip, so with the same operator on
+/// both sides the SIRT fixed point comes out y-flipped vs CPU — see
+/// `cuda/mod.rs`). Comparing `flipud(cuda)` vs `cpu` isolates that convention and
+/// confirms the device-resident loop is numerically the same solver, not just a
+/// phantom-recovery check.
+#[test]
+fn cuda_sirt_matches_cpu() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(stack(&phantom, nz));
+    // Project on CPU so both backends reconstruct from a byte-identical sinogram
+    // — the parity is in the solver, not in the forward model.
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let params = ReconParams {
+        num_iter: 120,
+        num_gridx: Some(n),
+        ..Default::default()
+    };
+    let rc = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cpu).unwrap();
+    let rg = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
+
+    // Interior slices only (slice 0 is dropped by the CUDA ≥2-slice rule); undo
+    // the CUDA y-flip on the GPU slice before correlating.
+    let (mut cv, mut gv) = (Vec::new(), Vec::new());
+    for z in 1..nz {
+        let sc = rc.array.index_axis(Axis(0), z);
+        let sg = rg.array.index_axis(Axis(0), z);
+        for iy in 0..n {
+            for ix in 0..n {
+                cv.push(sc[[iy, ix]] as f64);
+                gv.push(sg[[n - 1 - iy, ix]] as f64);
+            }
+        }
+    }
+    let r = pearson(&gv, &cv);
+    eprintln!("cuda vs cpu SIRT (y-flip corrected): r = {r:.6}");
+    assert!(
+        r > 0.99,
+        "device-resident CUDA SIRT diverges from CPU SIRT: r = {r:.6} (expected > 0.99)"
+    );
+}
+
 /// Every iterative algorithm tomocupy lacks (tomopy-only) now runs on CUDA via
 /// the single `ForwardProject` primitive. The backend-generic solvers in `recon`
 /// pick up `projector()`/`backprojector()` with no dispatch change, so this

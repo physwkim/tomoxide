@@ -48,7 +48,7 @@ pub use pipeline::{reconstruct, PrepOptions, ReconSteps};
 // Flat re-exports of the common building blocks (was tomoxide-core's root).
 pub use backend::{
     Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
-    ForwardProject, RankFilter,
+    ForwardProject, IterativeReconstruct, RankFilter,
 };
 pub use cpu::CpuBackend;
 pub use cuda::CudaBackend;
