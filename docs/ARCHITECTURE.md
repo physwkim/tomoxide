@@ -185,6 +185,9 @@ backend that provides those two primitives. The row-action methods (`Art`,
 `Bart`) are the exception: they update the reconstruction one ray at a time, so
 they use the `RayProject` (single-ray) capability instead.
 
+For each method's strengths, use cases, and a selection guide (plus the
+device-resident GPU benchmark), see [`ALGORITHMS.md`](ALGORITHMS.md).
+
 ### 3.3 Center finding (`tomoxide-recon::center`)
 
 `find_center` (entropy), `find_center_vo` (Vo coarse+fine, the workhorse),
