@@ -152,6 +152,21 @@ unsafe extern "C" {
         n: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// De Pierro penalized-ML pixel update over the snapshot `old` → `vol`
+    /// (3-D grid `[nz,n,n]`). `delta` used only when `has_delta != 0` (hybrid
+    /// prior); `reg = 0` reduces to the OSEM step.
+    pub fn tomoxide_iter_pml_update(
+        vol: *mut c_void,
+        old: *const c_void,
+        corr: *const c_void,
+        sens: *const c_void,
+        reg: f32,
+        delta: f32,
+        has_delta: i32,
+        n: usize,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
     /// `ax[i] = ax[i]*r - b[i]` (GD data proximal, in-place into `ax`).
     pub fn tomoxide_iter_grad_prox(
         ax: *mut c_void,

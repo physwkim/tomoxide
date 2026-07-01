@@ -394,6 +394,54 @@ fn cuda_em_matches_per_iteration() {
     }
 }
 
+/// Device-resident OSPML/PML (all four quad/hybrid × subset/single-block
+/// variants) reproduce the per-iteration CUDA path. Both run the identical CUDA
+/// `A`/`Aᵀ` kernels; the device path additionally does the EM ratio and the De
+/// Pierro penalized-ML stencil (`iter_pml_update`) on-device. EM-based +
+/// positivity ⇒ stable, so the parity is tight.
+#[test]
+fn cuda_ospml_matches_per_iteration() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let periter = PerIterCuda(&cuda);
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0)); // penalized ML ⇒ non-negative
+    let vol = Volume::new(stack(&phantom, nz));
+    let sino = sim::project(&vol, &geom, &cuda).unwrap();
+
+    for algo in [
+        Algorithm::OspmlQuad,
+        Algorithm::PmlQuad,
+        Algorithm::OspmlHybrid,
+        Algorithm::PmlHybrid,
+    ] {
+        let params = ReconParams {
+            num_iter: 20,
+            num_gridx: Some(n),
+            num_block: 3,
+            reg_par: vec![0.1, 0.01], // reg=0.1; hybrid edge threshold delta=0.01
+            ..Default::default()
+        };
+        let rd = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
+        let rp = recon::recon(&sino, &geom, algo, &params, &periter).unwrap();
+        let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+        eprintln!(
+            "{algo:?} device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}"
+        );
+        assert!(
+            r > 0.9999,
+            "{algo:?} device-resident diverges from per-iteration CUDA: r={r:.6}"
+        );
+        assert!(nrmse < 5e-3, "{algo:?} NRMSE too large: {nrmse:.3e}");
+    }
+}
+
 /// Device-resident GRAD/TIKH reproduce the per-iteration CUDA path. Both run the
 /// identical CUDA `A`/`Aᵀ` kernels; the device path additionally does the data
 /// proximal, gradient assembly, Barzilai–Borwein reductions, and the per-slice

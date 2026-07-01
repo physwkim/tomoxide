@@ -852,28 +852,31 @@ mod cuda_impl {
         sbytes: usize,
     }
 
-    /// Device-resident MLEM / OSEM. Uploads each ordered subset's θ / `bₛ` once and
-    /// precomputes `Aₛᵀ(1)` on-device, then runs every subset update
-    /// `x ← x ∘ Aₛᵀ(bₛ ⊘ Aₛ x) ⊘ Aₛᵀ(1)` on the GPU, downloading `x` once. MLEM is
-    /// the single-subset case (all angles, identity order) — the caller passes the
-    /// subset partition ([`crate::recon::ordered_subsets`], shared with the host
-    /// solver so the two agree). Reuses the same `A`/`Aᵀ` kernels as the generic
-    /// path ⇒ matches the host EM output to the atomic-add floor.
+    // RAII for the cfunc_linerec handle so every path (early `?`, sync error,
+    // normal return) frees it — the single owner of the handle's lifetime. The
+    // solver syncs before dropping, so no kernel still references it at free.
     #[cfg(feature = "cuda")]
-    fn em_device(
-        sino: &Tomo<f32>,
+    impl Drop for DevSubset {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { ffi::tomoxide_linerec_free(self.handle) };
+            }
+        }
+    }
+
+    /// Build every ordered subset device-resident: for each subset gather its θ
+    /// and measured sinogram `bₛ` (uploaded once), precompute the sensitivity
+    /// `Aₛᵀ(1)` on-device, and create a reused `cfunc_linerec` handle (freed by
+    /// [`DevSubset`]'s `Drop`). Shared by [`em_device`] and [`ospml_device`].
+    #[cfg(feature = "cuda")]
+    fn build_dev_subsets(
+        s: &Tomo<f32>,
         geom: &Geometry,
         n: usize,
-        num_iter: usize,
         subsets_idx: Vec<Vec<usize>>,
-    ) -> Result<Volume<f32>> {
-        let s = sino.as_layout(Layout::Sinogram);
+    ) -> Result<Vec<DevSubset>> {
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let nvol = nz * n * n;
-        let vbytes = nvol * std::mem::size_of::<f32>();
-        let null = std::ptr::null_mut::<c_void>();
-
-        // Build every subset device-resident (θ, gathered bₛ, sensitivity Aₛᵀ(1)).
+        let vbytes = nz * n * n * std::mem::size_of::<f32>();
         let mut subs: Vec<DevSubset> = Vec::with_capacity(subsets_idx.len());
         for idx in subsets_idx {
             let len = idx.len();
@@ -888,9 +891,6 @@ mod cuda_impl {
             let sbytes = nz * len * ncols * std::mem::size_of::<f32>();
             let handle = unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) };
             if handle.is_null() {
-                for sub in &subs {
-                    unsafe { ffi::tomoxide_linerec_free(sub.handle) };
-                }
                 return Err(Error::Backend("cfunc_linerec allocation failed".into()));
             }
             let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nz * len * ncols])?;
@@ -914,7 +914,31 @@ mod cuda_impl {
                 sbytes,
             });
         }
+        Ok(subs)
+    }
 
+    /// Device-resident MLEM / OSEM. Uploads each ordered subset's θ / `bₛ` once and
+    /// precomputes `Aₛᵀ(1)` on-device, then runs every subset update
+    /// `x ← x ∘ Aₛᵀ(bₛ ⊘ Aₛ x) ⊘ Aₛᵀ(1)` on the GPU, downloading `x` once. MLEM is
+    /// the single-subset case (all angles, identity order) — the caller passes the
+    /// subset partition ([`crate::recon::ordered_subsets`], shared with the host
+    /// solver so the two agree). Reuses the same `A`/`Aᵀ` kernels as the generic
+    /// path ⇒ matches the host EM output to the atomic-add floor.
+    #[cfg(feature = "cuda")]
+    fn em_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+        subsets_idx: Vec<Vec<usize>>,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, ncols) = (s.n_rows(), s.n_cols());
+        let nvol = nz * n * n;
+        let vbytes = nvol * std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+
+        let subs = build_dev_subsets(&s, geom, n, subsets_idx)?;
         let vol_d = DevBuf::from_host_f32(&vec![1.0f32; nvol])?; // positive init
         let corr_d = DevBuf::zeroed(vbytes)?;
         unsafe {
@@ -932,9 +956,72 @@ mod cuda_impl {
         }
 
         let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        for sub in &subs {
-            unsafe { ffi::tomoxide_linerec_free(sub.handle) };
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
+        let mut host = vec![0.0f32; nvol];
+        vol_d.to_host_f32(&mut host)?; // handles freed by DevSubset::drop after this
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+        Ok(Volume::new(array))
+    }
+
+    /// Device-resident OSPML / PML (quadratic or hybrid prior). OSEM's subset EM
+    /// correction `Aₛᵀ(bₛ ⊘ Aₛ x)` on-device, followed by the De Pierro penalized
+    /// pixel update (`iter_pml_update`, an 8-neighbour quadratic solved per pixel
+    /// against the pre-update snapshot `old`). PML is the single-subset case; the
+    /// hybrid prior passes `delta = Some(edge threshold)`, the quadratic `None`.
+    /// `reg` is `reg_par[0]` (0 ⇒ reduces to OSEM). Mirrors the host `ospml`.
+    #[cfg(feature = "cuda")]
+    fn ospml_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+        reg: f32,
+        delta: Option<f32>,
+        subsets_idx: Vec<Vec<usize>>,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, ncols) = (s.n_rows(), s.n_cols());
+        let nvol = nz * n * n;
+        let vbytes = nvol * std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let (has_delta, delta_v) = match delta {
+            Some(d) => (1i32, d),
+            None => (0i32, 0.0f32),
+        };
+
+        let subs = build_dev_subsets(&s, geom, n, subsets_idx)?;
+        let vol_d = DevBuf::from_host_f32(&vec![1.0f32; nvol])?; // positive init
+        let old_d = DevBuf::zeroed(vbytes)?; // pre-update snapshot for the stencil
+        let corr_d = DevBuf::zeroed(vbytes)?;
+        unsafe {
+            for _ in 0..num_iter.max(1) {
+                for sub in &subs {
+                    let tp = sub.theta_d.ptr as *const f32;
+                    let nsub = nz * sub.len * ncols;
+                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, nz, n, sub.len, sub.sbytes); // Aₛ x
+                    ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null); // bₛ ⊘ Aₛ x
+                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, vbytes); // Aₛᵀ(…)
+                    ffi::tomoxide_cuda_memcpy_d2d_async(old_d.ptr, vol_d.ptr, vbytes, null); // snapshot
+                    ffi::tomoxide_iter_pml_update(
+                        vol_d.ptr,
+                        old_d.ptr,
+                        corr_d.ptr,
+                        sub.sens_d.ptr,
+                        reg,
+                        delta_v,
+                        has_delta,
+                        n,
+                        nz,
+                        null,
+                    );
+                }
+            }
+        }
+
+        let rc = unsafe { ffi::tomoxide_cuda_sync() };
         if rc != 0 {
             return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
@@ -1100,6 +1187,28 @@ mod cuda_impl {
                 Algorithm::Osem => {
                     let subsets = crate::recon::ordered_subsets(nproj, params);
                     em_device(sino, geom, n, it, subsets).map(Some)
+                }
+                // pml_* are ospml_* with a single block; the hybrid prior uses
+                // reg_par[1] as the edge threshold (absent ⇒ quadratic prior).
+                Algorithm::OspmlQuad
+                | Algorithm::PmlQuad
+                | Algorithm::OspmlHybrid
+                | Algorithm::PmlHybrid => {
+                    let reg = params.reg_par.first().copied().unwrap_or(0.0);
+                    let (block_count, delta) = match algorithm {
+                        Algorithm::OspmlQuad => (params.num_block, None),
+                        Algorithm::PmlQuad => (1, None),
+                        Algorithm::OspmlHybrid => {
+                            (params.num_block, params.reg_par.get(1).copied())
+                        }
+                        _ => (1, params.reg_par.get(1).copied()), // PmlHybrid
+                    };
+                    let block_params = crate::params::ReconParams {
+                        num_block: block_count,
+                        ..params.clone()
+                    };
+                    let subsets = crate::recon::ordered_subsets(nproj, &block_params);
+                    ospml_device(sino, geom, n, it, reg, delta, subsets).map(Some)
                 }
                 Algorithm::Grad => grad_device(sino, geom, n, it, &params.reg_par, None).map(Some),
                 Algorithm::Tikh => {

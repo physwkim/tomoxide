@@ -60,6 +60,62 @@ __global__ void iter_em_update_ker(float *vol, const float *corr, const float *s
         vol[i] = vol[i] * corr[i] / s;
 }
 
+// --- ordered-subset penalized ML (ospml / pml) ---
+
+// De Pierro penalized-ML pixel update over the pre-update snapshot `old` (one
+// thread per voxel). Solves the quadratic `2F·x'² + G·x' + E = 0` (positive
+// root) with E = −x·corr, and over the in-grid 8-neighbours g (cardinal weight
+// 1, diagonal 1/√2, normalized by the present-weight sum): F = Σ 2·reg·w_g·γ_g,
+// G = sens − Σ 2·reg·w_g·γ_g·(x + x_g). γ_g = 1 (quadratic, has_delta=0) or
+// 1/(1+|x−x_g|/δ) (hybrid). reg=0 ⇒ the MLEM/OSEM step −E/G. Verbatim port of
+// the host `penalized_ml_update`, same neighbour order (so f/g accumulate
+// identically) and same n/2-independent grid indexing.
+__global__ void iter_pml_update_ker(float *vol, const float *old, const float *corr,
+                                    const float *sens, float reg, float delta, int has_delta, int n,
+                                    int nz) {
+    const float S = 0.70710678118654752440f; // 1/√2
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z;
+    if (ix >= n || iy >= n || z >= nz)
+        return;
+    long long base = (long long)z * n * n;
+    long long idx = base + (long long)iy * n + ix;
+    // Host NEIGHBORS order: (di=row, dj=col) cardinal then diagonal.
+    const int di[8] = {-1, 1, 0, 0, -1, -1, 1, 1};
+    const int dj[8] = {0, 0, -1, 1, -1, 1, -1, 1};
+    const float raw[8] = {1.0f, 1.0f, 1.0f, 1.0f, S, S, S, S};
+    float xij = old[idx];
+    float e = -xij * corr[idx];
+    float f = 0.0f, g = sens[idx];
+    if (reg != 0.0f) {
+        float wtot = 0.0f;
+        for (int k = 0; k < 8; k++) {
+            int ni = iy + di[k], nj = ix + dj[k];
+            if (ni >= 0 && ni < n && nj >= 0 && nj < n)
+                wtot += raw[k];
+        }
+        for (int k = 0; k < 8; k++) {
+            int ni = iy + di[k], nj = ix + dj[k];
+            if (ni >= 0 && ni < n && nj >= 0 && nj < n) {
+                float xg = old[base + (long long)ni * n + nj];
+                float gamma = has_delta ? (1.0f / (1.0f + fabsf((xij - xg) / delta))) : 1.0f;
+                float coef = 2.0f * reg * (raw[k] / wtot) * gamma;
+                f += coef;
+                g -= coef * (xij + xg);
+            }
+        }
+    }
+    float out;
+    if (f != 0.0f)
+        out = (-g + sqrtf(g * g - 8.0f * f * e)) / (4.0f * f);
+    else if (fabsf(g) > 1e-6f)
+        out = -e / g;
+    else
+        out = xij;
+    vol[idx] = out;
+}
+
 // --- gradient descent (grad / tikh) ---
 
 // ax[i] = ax[i]*r - b[i]  — data proximal r·R x − b (in-place into `ax`).
@@ -156,6 +212,17 @@ __global__ void iter_bb_lambda_ker(float *lambda, const float *num, const float 
 }
 
 extern "C" {
+
+int tomoxide_iter_pml_update(void *vol, const void *old, const void *corr, const void *sens,
+                             float reg, float delta, int has_delta, size_t n, size_t nz,
+                             void *stream) {
+    dim3 block(16, 16, 1);
+    dim3 grid(((unsigned)n + 15) / 16, ((unsigned)n + 15) / 16, (unsigned)nz);
+    iter_pml_update_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)vol, (const float *)old, (const float *)corr, (const float *)sens, reg, delta,
+        has_delta, (int)n, (int)nz);
+    return (int)cudaGetLastError();
+}
 
 int tomoxide_iter_grad_prox(void *ax, const void *b, float r, size_t n, void *stream) {
     long long total = (long long)n;
