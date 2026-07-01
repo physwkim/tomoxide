@@ -81,7 +81,7 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
             f0 += tex2DLayered<float>(tex, u + 0.5f, v + 0.5f, t);
         }
     }
-    f[tx + (n-ty-1) * n + tz * n * n] += static_cast<real>(f0*c);
+    f[tx + ty * n + tz * n * n] += static_cast<real>(f0*c);
 }
 
 #else // !HALF: f32 direct-gather back-projection (see note above)
@@ -144,7 +144,7 @@ void __global__ backprojection_ker(real *f, real *data, float *theta, float phi,
                     data[ur+1+t*n+(vr+1)*n*nproj]*static_cast<real>((0+u)*(0+v));
         }
     }
-    f[tx + (n-ty-1) * n + tz * n * n] += static_cast<real>((float)f0*c);
+    f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
 }
 
 #endif // HALF
@@ -205,8 +205,8 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
                     
         }
     }
-    f[tx + (n-ty-1) * n + tz * n * n] += static_cast<real>((float)f0*c);        
-}  
+    f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
+}
 void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta, float* phi, float c, int sz, int ncz, int n, int nz, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;

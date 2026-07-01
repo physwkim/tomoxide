@@ -13,7 +13,11 @@ void __global__ divphi(real2 *g, real2 *f, float mu, int n, int nz, int nproj, i
   //note overfilling with computing exp and float16 precision
   real phi = static_cast<real>(__expf(mu * (n * n) * (dx * dx + dy * dy)) / nproj);
   phi *= (1-n%4);////1-n%4 gives '-' sign for n%4!=0 width
-  int f_ind = tx + ty * n + tz * n * n;
+  // Store the deapodized value for source row `ty` at output row `n-1-ty`: a
+  // clean row-flip of the result (the value is unchanged, only its destination
+  // row). Un-flips the tomocupy `-sin θ` gather geometry (`takexy`) to the CPU
+  // fourierrec / gridrec / linerec handedness, without perturbing the numerics.
+  int f_ind = tx + (n - 1 - ty) * n + tz * n * n;
   int g_ind = (tx + n / 2 + m) + (ty+1 + n / 2 + m) * (2 * n + 2 * m) + tz * (2 * n + 2 * m) * (2 * n + 2 * m); // ty + 1 adjust for tomopy
 
   f[f_ind].x = g[g_ind].x * phi;

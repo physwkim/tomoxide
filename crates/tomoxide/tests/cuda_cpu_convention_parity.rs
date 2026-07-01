@@ -1,24 +1,22 @@
-//! Cross-backend parity: CUDA analytic reconstruction vs the CPU reference,
-//! correcting for CUDA's documented tomocupy output convention.
+//! Cross-backend parity: CUDA analytic reconstruction vs the CPU reference.
 //!
-//! The CUDA analytic kernels (`cfunc_rec`/`cfunc_linerec`/`cfunc_fourierrec`)
-//! emit each slice with a **fixed handedness and scale inherited from tomocupy**
-//! — the reconstruction is vertically flipped (image rows reversed) and scaled by
-//! a per-algorithm constant — relative to the CPU/wgpu path (which follows
-//! tomopy). See the note at `cuda/mod.rs` (`analytic_fbp_chunk` / `cfunc_linerec`
-//! doc) and `docs/ARCHITECTURE.md`. CUDA's `lprec` kernel does **not** flip.
+//! Since the orientation unification (Phase 1) the CUDA analytic kernels
+//! (`cfunc_rec`/`cfunc_linerec`/`cfunc_fourierrec`) emit each slice in the **same
+//! handedness as the CPU/wgpu path** (which follows tomopy) — no vertical flip.
+//! A per-algorithm **scale** difference may remain until the scale unification
+//! (Phase 2); it is absorbed here by the scale-invariant Pearson metric. See the
+//! note at `cuda/mod.rs` (`cfunc_linerec` doc) and `docs/ARCHITECTURE.md`.
+//! (Laminography is the one path still flipped in BOTH backends, consistently,
+//! and is not exercised here.)
 //!
 //! The pre-existing CUDA streaming tests only compared CUDA-streaming against
 //! CUDA-whole-volume (same convention) or against tomocupy — never against the
 //! CPU/wgpu reference — so a real divergence in the CUDA recon (wrong geometry,
-//! angle, filter, centre) beyond the known flip+scale would have been invisible.
-//! This test closes that blind spot: it reconstructs the same sinogram on both
-//! backends, undoes the documented convention (flip per the table below; scale is
-//! absorbed by the scale-invariant Pearson metric), and asserts the result
-//! matches the CPU reference. It also pins the *orientation* by asserting the
-//! WRONG handedness correlates clearly worse — so if the CUDA convention ever
-//! changes, this test fails and forces a deliberate update here, rather than the
-//! change passing silently.
+//! angle, filter, centre) would have been invisible. This test closes that blind
+//! spot: it reconstructs the same sinogram on both backends and asserts the CUDA
+//! result matches the CPU reference directly (scale absorbed by Pearson). It also
+//! pins the *orientation* by asserting the WRONG (y-flipped) handedness correlates
+//! clearly worse — so a flip regression fails here rather than passing silently.
 //!
 //! Only built under `cuda`; needs a real CUDA device (skipped otherwise).
 //! Run: `cargo test -p tomoxide --features cuda`.
@@ -169,23 +167,27 @@ fn check(algorithm: Algorithm, flipped: bool) {
     );
 }
 
+// After the orientation unification, NO CUDA reconstruction path flips vs CPU —
+// every analytic method matches the CPU/wgpu handedness directly (`flipped =
+// false`). A scale difference (Phase 2) may remain, absorbed by the
+// scale-invariant Pearson; `fit_scale` logs it. Laminography is the one path
+// still flipped in BOTH backends (consistently) and is not exercised here.
 #[test]
 fn cuda_fbp_matches_cpu_under_convention() {
-    check(Algorithm::Fbp, true);
+    check(Algorithm::Fbp, false);
 }
 
 #[test]
 fn cuda_linerec_matches_cpu_under_convention() {
-    check(Algorithm::Linerec, true);
+    check(Algorithm::Linerec, false);
 }
 
 #[test]
 fn cuda_fourierrec_matches_cpu_under_convention() {
-    check(Algorithm::Fourierrec, true);
+    check(Algorithm::Fourierrec, false);
 }
 
 #[test]
 fn cuda_lprec_matches_cpu_under_convention() {
-    // CUDA lprec does NOT flip — it already matches the CPU/wgpu orientation.
     check(Algorithm::Lprec, false);
 }

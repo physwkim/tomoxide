@@ -87,9 +87,9 @@ fn cuda_fbp_matches_cpu_and_phantom() {
     let cuda_slice = cuda_rec.array.index_axis(Axis(0), mid).to_owned();
     assert_eq!(cuda_slice.dim(), (n, n));
 
-    // CUDA vs CPU back-projector: identical up to the kernel's y-flip + scale.
-    let r_cpu = pearson_disk(&cuda_slice, &flipud(&cpu_slice), n, 0.85);
-    eprintln!("cuda↔cpu (y-flipped) Pearson = {r_cpu:.5}");
+    // CUDA vs CPU back-projector: same orientation now, identical up to scale.
+    let r_cpu = pearson_disk(&cuda_slice, &cpu_slice, n, 0.85);
+    eprintln!("cuda↔cpu Pearson = {r_cpu:.5}");
     assert!(
         r_cpu > 0.99,
         "CUDA FBP disagrees with CPU FBP: r = {r_cpu:.5}"

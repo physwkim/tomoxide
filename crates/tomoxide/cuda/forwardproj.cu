@@ -2,14 +2,15 @@
 // transpose of `kernels_linerec.cuh::backprojection_ker`.
 //
 // The voxel-driven back-projector gathers, for output voxel
-//   j = tx + (n-ty-1)*n + tz*n*n,
+//   j = tx + ty*n + tz*n*n,
 //   f[j] += c * Σ_t  bilinear(g; u(j,t), v(j,t))   with c = 4/nproj,
 // i.e. as a matrix `f = (c·W)·g` where `W` is the bilinear gather operator.
 // Its adjoint (the forward projector the iterative solvers need as `A`, with the
 // back-projector serving as `Aᵀ`) is `g = (c·Wᵀ)·f`: each voxel scatters its
 // value into the *same* (u,v) taps with the *same* bilinear weights and the same
-// `c`. Keeping the geometry byte-identical to `backprojection_ker` — the y-flip
-// `(n-ty-1)`, the `n/2` centre, the rotation matrix `R`, the `(int)(·-1e-5)` tap,
+// `c`. Keeping the geometry byte-identical to `backprojection_ker` — the
+// (un-flipped) row `ty`, the `n/2` centre, the rotation matrix `R`, the
+// `(int)(·-1e-5)` tap,
 // and the in-bounds guard — makes {project, backproject} a true {A, Aᵀ} pair, so
 // SIRT/MLEM/OSEM/… converge. The shared guard `vr < nz-1` drops slice 0 for the
 // parallel beam (`v = tz` ⇒ `vr = tz-1`), the documented ≥2-slice rule, exactly
@@ -47,8 +48,8 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
     if (tx >= n || ty >= n || tz >= nz)
         return;
 
-    // Same y-flip and centre as the back-projector's accumulation index.
-    float val = c * f[tx + (n - ty - 1) * n + tz * n * n];
+    // Same (un-flipped) row and centre as the back-projector's accumulation index.
+    float val = c * f[tx + ty * n + tz * n * n];
     if (val == 0.0f)
         return; // a zero voxel scatters nothing
 

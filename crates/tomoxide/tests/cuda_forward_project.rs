@@ -196,7 +196,7 @@ fn cuda_forward_is_adjoint_of_backproject() {
 }
 
 #[test]
-fn cuda_forward_matches_cpu_under_flip() {
+fn cuda_forward_matches_cpu() {
     let cuda = match CudaBackend::new() {
         Ok(c) => c,
         Err(_) => {
@@ -208,21 +208,22 @@ fn cuda_forward_matches_cpu_under_flip() {
     let (n, nproj, nz) = (128usize, 180usize, 4usize);
     let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
 
-    // Shepp–Logan is y-asymmetric, so the flip is detectable.
+    // Shepp–Logan is y-asymmetric, so a flip regression would be detectable.
     let phantom = sim::shepp2d(n).unwrap();
     let vol = Volume::new(stack(&phantom, nz));
     let vol_flip = Volume::new(flipud(&vol.array));
 
+    // Orientation is unified: cuda(P) ≈ scale · cpu(P), same handedness.
     let cuda_sino = sim::project(&vol, &geom, &cuda).unwrap();
-    let cpu_sino_flip = sim::project(&vol_flip, &geom, &cpu).unwrap(); // cuda(P) ≈ s·cpu(flipud P)
-    let cpu_sino = sim::project(&vol, &geom, &cpu).unwrap(); // wrong handedness
+    let cpu_sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let cpu_sino_flip = sim::project(&vol_flip, &geom, &cpu).unwrap(); // wrong handedness
 
     let g = interior(&cuda_sino);
-    let r_ok = pearson(&g, &interior(&cpu_sino_flip));
-    let r_wrong = pearson(&g, &interior(&cpu_sino));
+    let r_ok = pearson(&g, &interior(&cpu_sino));
+    let r_wrong = pearson(&g, &interior(&cpu_sino_flip));
 
-    // Best-fit scale cuda/cpu over the interior (≈ 4/nproj; logged, not asserted).
-    let p = interior(&cpu_sino_flip);
+    // Best-fit scale cuda/cpu over the interior (≈ 4/nproj until Phase 2; logged).
+    let p = interior(&cpu_sino);
     let (num, den): (f64, f64) = g
         .iter()
         .zip(p.iter())
@@ -231,14 +232,14 @@ fn cuda_forward_matches_cpu_under_flip() {
         });
     let scale = if den > 0.0 { num / den } else { 0.0 };
     eprintln!(
-        "forward parity: flipped r = {r_ok:.6}, wrong-handedness r = {r_wrong:.6}, \
+        "forward parity: r = {r_ok:.6}, wrong-handedness r = {r_wrong:.6}, \
          scale (cuda/cpu) = {scale:.6} (4/nproj = {:.6})",
         4.0 / nproj as f64
     );
 
     assert!(
         r_ok > 0.999,
-        "CUDA forward disagrees with CPU forward (flipud): r = {r_ok:.6} (expected > 0.999)"
+        "CUDA forward disagrees with CPU forward: r = {r_ok:.6} (expected > 0.999)"
     );
     assert!(
         r_wrong < 0.99,
@@ -298,12 +299,12 @@ fn cuda_sirt_recovers_phantom() {
 /// `recon::recon` via `IterativeReconstruct` (volume/sinogram stay resident, no
 /// per-iteration host↔device transfer) — reproduces the CPU SIRT fixed point.
 /// Both solve the same normal-equation iteration from the *same* input
-/// sinogram; the only difference is CUDA's documented volume-space y-flip (the
-/// forward *and* back-projection kernels both flip, so with the same operator on
-/// both sides the SIRT fixed point comes out y-flipped vs CPU — see
-/// `cuda/mod.rs`). Comparing `flipud(cuda)` vs `cpu` isolates that convention and
-/// confirms the device-resident loop is numerically the same solver, not just a
-/// phantom-recovery check.
+/// sinogram. Since the orientation unification the CUDA forward/back-projection
+/// kernels no longer flip, so the SIRT fixed point comes out in the *same*
+/// orientation as CPU — a direct (no-flip) correlation confirms the
+/// device-resident loop is numerically the same solver, not just a
+/// phantom-recovery check. (A residual scale is Phase 2; Pearson is
+/// scale-invariant.)
 #[test]
 fn cuda_sirt_matches_cpu() {
     let cuda = match CudaBackend::new() {
@@ -330,8 +331,8 @@ fn cuda_sirt_matches_cpu() {
     let rc = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cpu).unwrap();
     let rg = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
 
-    // Interior slices only (slice 0 is dropped by the CUDA ≥2-slice rule); undo
-    // the CUDA y-flip on the GPU slice before correlating.
+    // Interior slices only (slice 0 is dropped by the CUDA ≥2-slice rule); same
+    // orientation on both backends now, so compare directly.
     let (mut cv, mut gv) = (Vec::new(), Vec::new());
     for z in 1..nz {
         let sc = rc.array.index_axis(Axis(0), z);
@@ -339,12 +340,12 @@ fn cuda_sirt_matches_cpu() {
         for iy in 0..n {
             for ix in 0..n {
                 cv.push(sc[[iy, ix]] as f64);
-                gv.push(sg[[n - 1 - iy, ix]] as f64);
+                gv.push(sg[[iy, ix]] as f64);
             }
         }
     }
     let r = pearson(&gv, &cv);
-    eprintln!("cuda vs cpu SIRT (y-flip corrected): r = {r:.6}");
+    eprintln!("cuda vs cpu SIRT: r = {r:.6}");
     assert!(
         r > 0.99,
         "device-resident CUDA SIRT diverges from CPU SIRT: r = {r:.6} (expected > 0.99)"
