@@ -38,7 +38,48 @@ __global__ void iter_recip_thresh_ker(float *out, const float *x, float thr, lon
     out[i] = (fabsf(v) > thr) ? (1.0f / v) : 0.0f;
 }
 
+// ax[i] = |ax[i]| > 1e-6 ? b[i] / ax[i] : 0  — EM ratio b ⊘ A x, in-place into
+// `ax` (which held `A x`). Matches the host MLEM/OSEM zero-guard.
+__global__ void iter_em_ratio_ker(float *ax, const float *b, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    float a = ax[i];
+    ax[i] = (fabsf(a) > 1e-6f) ? (b[i] / a) : 0.0f;
+}
+
+// vol[i] = |sens[i]| > 1e-6 ? vol[i]*corr[i]/sens[i] : vol[i]  — EM multiplicative
+// update x ∘ Aᵀ(ratio) ⊘ Aᵀ(1) (pixels with zero sensitivity left untouched).
+__global__ void iter_em_update_ker(float *vol, const float *corr, const float *sens,
+                                   long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    float s = sens[i];
+    if (fabsf(s) > 1e-6f)
+        vol[i] = vol[i] * corr[i] / s;
+}
+
 extern "C" {
+
+int tomoxide_iter_em_ratio(void *ax, const void *b, size_t n, void *stream) {
+    long long total = (long long)n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_em_ratio_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)ax, (const float *)b, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_em_update(void *vol, const void *corr, const void *sens, size_t n,
+                            void *stream) {
+    long long total = (long long)n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_em_update_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)vol, (const float *)corr, (const float *)sens, total);
+    return (int)cudaGetLastError();
+}
 
 int tomoxide_iter_residual(void *ax, const void *b, const void *rw, size_t n, void *stream) {
     long long total = (long long)n;

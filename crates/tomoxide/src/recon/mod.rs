@@ -326,7 +326,7 @@ fn mlem(
 /// `0..nang`. Subset `os` has `nang/num_block + (os < nang % num_block)` angles,
 /// so the blocks tile `0..nang` exactly. `num_block` is clamped to `1..=nang`,
 /// and `1` yields the single full-angle subset (i.e. plain MLEM).
-fn ordered_subsets(nang: usize, params: &ReconParams) -> Vec<Vec<usize>> {
+pub(crate) fn ordered_subsets(nang: usize, params: &ReconParams) -> Vec<Vec<usize>> {
     let num_block = params.num_block.clamp(1, nang.max(1));
     let order: Vec<usize> = if params.ind_block.len() == nang {
         params.ind_block.iter().map(|&i| i as usize).collect()

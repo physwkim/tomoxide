@@ -130,6 +130,21 @@ unsafe extern "C" {
         n: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// `ax[i] = |ax[i]| > 1e-6 ? b[i]/ax[i] : 0` (EM ratio, in-place into `ax`).
+    pub fn tomoxide_iter_em_ratio(
+        ax: *mut c_void,
+        b: *const c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `vol[i] = |sens[i]| > 1e-6 ? vol[i]*corr[i]/sens[i] : vol[i]` (EM update).
+    pub fn tomoxide_iter_em_update(
+        vol: *mut c_void,
+        corr: *const c_void,
+        sens: *const c_void,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
 
     // --- fourierrec (cfunc_fourierrec) ---
     /// `cfunc_fourierrec(nproj, nz, n, theta_ptr)` — `nz` is the number of

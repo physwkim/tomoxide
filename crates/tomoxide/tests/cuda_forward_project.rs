@@ -22,9 +22,70 @@
 use ndarray::{Array3, Axis};
 use std::f32::consts::PI;
 use tomoxide::{
-    recon, sim, Algorithm, Angles, Backend, CpuBackend, CudaBackend, Geometry, Layout, ReconParams,
-    Tomo, Volume,
+    recon, sim, Algorithm, Angles, Backend, CpuBackend, CudaBackend, DeviceKind, Dtype,
+    FilteredBackproject, ForwardProject, Geometry, IterativeReconstruct, Layout, ReconParams, Tomo,
+    Volume,
 };
+
+/// A `CudaBackend` view that hides its device-resident iterative path
+/// (`iterative_reconstruct()` → `None`), forcing `recon` down the generic host
+/// solver composed from the CUDA projector/backprojector — the pre-device-
+/// resident behaviour. Everything else delegates to the inner backend, so both
+/// paths run the *same* CUDA `A`/`Aᵀ` kernels; the only difference is where the
+/// per-iteration elementwise lives (GPU vs host) and the host↔device round-trips.
+/// Lets a test assert the device-resident `solve` reproduces the per-iteration
+/// result to the atomic-add floor, in the *same* orientation (no y-flip needed).
+struct PerIterCuda<'a>(&'a CudaBackend);
+
+impl Backend for PerIterCuda<'_> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn device(&self) -> DeviceKind {
+        self.0.device()
+    }
+    fn supports(&self, dt: Dtype) -> bool {
+        self.0.supports(dt)
+    }
+    fn projector(&self) -> Option<&dyn ForwardProject> {
+        self.0.projector()
+    }
+    fn backprojector(&self) -> Option<&dyn FilteredBackproject> {
+        self.0.backprojector()
+    }
+    fn iterative_reconstruct(&self) -> Option<&dyn IterativeReconstruct> {
+        None
+    }
+}
+
+/// Pearson + NRMSE + max|Δ| of the device-resident vs per-iteration CUDA volume
+/// over the interior slices `1..nz` (slice 0 is dropped by the ≥2-slice rule).
+/// Same kernels & orientation ⇒ no flip; differences are the atomic-add floor.
+fn compare_interior(rd: &Volume<f32>, rp: &Volume<f32>, nz: usize) -> (f64, f64, f64) {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for z in 1..nz {
+        for (x, y) in rd
+            .array
+            .index_axis(Axis(0), z)
+            .iter()
+            .zip(rp.array.index_axis(Axis(0), z).iter())
+        {
+            a.push(*x as f64);
+            b.push(*y as f64);
+        }
+    }
+    let r = pearson(&a, &b);
+    let n = a.len() as f64;
+    let mut se = 0.0;
+    let mut sb = 0.0;
+    let mut mx: f64 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        se += (x - y) * (x - y);
+        sb += y * y;
+        mx = mx.max((x - y).abs());
+    }
+    ((se / n).sqrt() / (sb / n).sqrt(), r, mx)
+}
 
 /// Deterministic pseudo-random fill in roughly `[-1, 1)` (LCG; no RNG dependency
 /// and reproducible across runs).
@@ -288,6 +349,49 @@ fn cuda_sirt_matches_cpu() {
         r > 0.99,
         "device-resident CUDA SIRT diverges from CPU SIRT: r = {r:.6} (expected > 0.99)"
     );
+}
+
+/// Device-resident MLEM/OSEM reproduce the per-iteration CUDA path to the
+/// atomic-add floor. Both run the identical CUDA `A`/`Aᵀ` kernels (via
+/// `PerIterCuda`) in the same orientation, isolating the device-resident change
+/// (on-device elementwise + no per-iteration transfer). MLEM is the single-
+/// subset case; OSEM exercises the ordered-subset partition (num_block=3).
+#[test]
+fn cuda_em_matches_per_iteration() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let periter = PerIterCuda(&cuda);
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    // Non-negative phantom: the EM b ⊘ Ax ratio and multiplicative update need it.
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(stack(&phantom, nz));
+    let sino = sim::project(&vol, &geom, &cuda).unwrap();
+
+    for (algo, num_block) in [(Algorithm::Mlem, 0usize), (Algorithm::Osem, 3usize)] {
+        let params = ReconParams {
+            num_iter: 30,
+            num_gridx: Some(n),
+            num_block,
+            ..Default::default()
+        };
+        let rd = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
+        let rp = recon::recon(&sino, &geom, algo, &params, &periter).unwrap();
+        let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+        eprintln!(
+            "{algo:?} device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}"
+        );
+        assert!(
+            r > 0.9999,
+            "{algo:?} device-resident diverges from per-iteration CUDA: r={r:.6}"
+        );
+        assert!(nrmse < 5e-3, "{algo:?} NRMSE too large: {nrmse:.3e}");
+    }
 }
 
 /// Every iterative algorithm tomocupy lacks (tomopy-only) now runs on CUDA via

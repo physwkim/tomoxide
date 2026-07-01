@@ -708,15 +708,252 @@ mod cuda_impl {
         }
     }
 
+    /// On-device forward projection `g = A f` (parallel beam): zero `g` (the
+    /// scatter-add kernel accumulates) then launch. `sbytes` = byte size of `g`.
+    ///
+    /// # Safety
+    /// `g`/`f`/`theta` must be valid device pointers sized for `[nz,nproj,n]` /
+    /// `[nz,n,n]` / `[nproj]`; `sbytes == nz*nproj*n*4`.
+    #[cfg(feature = "cuda")]
+    unsafe fn dev_forward(
+        g: *mut c_void,
+        f: *const c_void,
+        theta: *const f32,
+        nz: usize,
+        n: usize,
+        nproj: usize,
+        sbytes: usize,
+    ) {
+        let null = std::ptr::null_mut::<c_void>();
+        ffi::tomoxide_cuda_memset_async(g, 0, sbytes, null);
+        ffi::tomoxide_forwardproject(
+            g,
+            f,
+            theta,
+            std::f32::consts::FRAC_PI_2,
+            nz as i32,
+            n as i32,
+            nproj as i32,
+            null,
+        );
+    }
+
+    /// On-device back projection `f = Aᵀ g` (parallel beam) via a reused
+    /// `cfunc_linerec` handle: zero `f` (the kernel accumulates) then launch.
+    /// `vbytes` = byte size of `f`.
+    ///
+    /// # Safety
+    /// `handle` from [`ffi::tomoxide_linerec_new`]; `f`/`g`/`theta` valid device
+    /// pointers sized for `[nz,n,n]` / `[nz,nproj,n]` / `[nproj]`.
+    #[cfg(feature = "cuda")]
+    unsafe fn dev_backproject(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        theta: *const f32,
+        vbytes: usize,
+    ) {
+        let null = std::ptr::null_mut::<c_void>();
+        ffi::tomoxide_cuda_memset_async(f, 0, vbytes, null);
+        ffi::tomoxide_linerec_backproject(
+            handle,
+            f,
+            g,
+            theta,
+            std::f32::consts::FRAC_PI_2,
+            0,
+            null,
+        );
+    }
+
+    /// Device-resident SIRT: upload `b`/θ/ones once, precompute the ray-length
+    /// `R = 1/A(1)` and sensitivity `C = 1/Aᵀ(1)` weights on-device, then run every
+    /// iteration `x ← x + C ∘ Aᵀ(R ∘ (b − A x))` entirely on the GPU, and download
+    /// `x` once. Reuses the same `A`/`Aᵀ` kernels (and one back-projection handle)
+    /// as the generic path, so the result matches the host SIRT to the atomic-add
+    /// ordering floor.
+    #[cfg(feature = "cuda")]
+    fn sirt_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
+        let sino_std = s.array.as_standard_layout();
+        let sino_slice = sino_std
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+        let theta = &geom.angles.0;
+
+        let (nvol, nsino) = (nz * n * n, nz * nproj * ncols);
+        let (vbytes, sbytes) = (
+            nvol * std::mem::size_of::<f32>(),
+            nsino * std::mem::size_of::<f32>(),
+        );
+        let null = std::ptr::null_mut::<c_void>();
+
+        let theta_d = DevBuf::from_host_f32(theta)?;
+        let tp = theta_d.ptr as *const f32;
+        let b_d = DevBuf::from_host_f32(sino_slice)?;
+        let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
+        let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
+        let vol_d = DevBuf::zeroed(vbytes)?; // x (init 0)
+        let ax_d = DevBuf::zeroed(sbytes)?; // A x, reused as the weighted residual
+        let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…)
+        let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1)
+        let cw_d = DevBuf::zeroed(vbytes)?; // C = 1/Aᵀ(1)
+
+        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+        if handle.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+
+        // All ops on the per-thread default stream (null) → FIFO-ordered, so one
+        // sync before the download suffices.
+        unsafe {
+            dev_forward(ax_d.ptr, ones_v.ptr, tp, nz, n, nproj, sbytes); // A(1)
+            ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null); // R
+            dev_backproject(handle, corr_d.ptr, ones_s.ptr, tp, vbytes); // Aᵀ(1)
+            ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null); // C
+            for _ in 0..num_iter.max(1) {
+                dev_forward(ax_d.ptr, vol_d.ptr, tp, nz, n, nproj, sbytes); // ax = A x
+                ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null); // (b−Ax)∘R
+                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, vbytes); // corr = Aᵀ(…)
+                ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null);
+                // x += C∘corr
+            }
+        }
+
+        let rc = unsafe { ffi::tomoxide_cuda_sync() };
+        unsafe { ffi::tomoxide_linerec_free(handle) };
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+        }
+        let mut host = vec![0.0f32; nvol];
+        vol_d.to_host_f32(&mut host)?;
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+        Ok(Volume::new(array))
+    }
+
+    /// One ordered subset held device-resident: its angles (θ), gathered
+    /// measured sinogram `bₛ`, iteration-invariant sensitivity `Aₛᵀ(1)`, a reused
+    /// `cfunc_linerec` handle, and a scratch `Aₛ x` buffer. `len` = subset angles.
+    #[cfg(feature = "cuda")]
+    struct DevSubset {
+        theta_d: DevBuf,
+        b_d: DevBuf,
+        sens_d: DevBuf,
+        ax_d: DevBuf,
+        handle: *mut c_void,
+        len: usize,
+        sbytes: usize,
+    }
+
+    /// Device-resident MLEM / OSEM. Uploads each ordered subset's θ / `bₛ` once and
+    /// precomputes `Aₛᵀ(1)` on-device, then runs every subset update
+    /// `x ← x ∘ Aₛᵀ(bₛ ⊘ Aₛ x) ⊘ Aₛᵀ(1)` on the GPU, downloading `x` once. MLEM is
+    /// the single-subset case (all angles, identity order) — the caller passes the
+    /// subset partition ([`crate::recon::ordered_subsets`], shared with the host
+    /// solver so the two agree). Reuses the same `A`/`Aᵀ` kernels as the generic
+    /// path ⇒ matches the host EM output to the atomic-add floor.
+    #[cfg(feature = "cuda")]
+    fn em_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+        subsets_idx: Vec<Vec<usize>>,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, ncols) = (s.n_rows(), s.n_cols());
+        let nvol = nz * n * n;
+        let vbytes = nvol * std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+
+        // Build every subset device-resident (θ, gathered bₛ, sensitivity Aₛᵀ(1)).
+        let mut subs: Vec<DevSubset> = Vec::with_capacity(subsets_idx.len());
+        for idx in subsets_idx {
+            let len = idx.len();
+            let theta_sub: Vec<f32> = idx.iter().map(|&p| geom.angles.0[p]).collect();
+            let theta_d = DevBuf::from_host_f32(&theta_sub)?;
+            let sub_b = s.array.select(ndarray::Axis(1), &idx); // [nz, len, ncols], strided
+            let sub_b_std = sub_b.as_standard_layout();
+            let b_d =
+                DevBuf::from_host_f32(sub_b_std.as_slice().ok_or_else(|| {
+                    Error::InvalidParam("non-contiguous subset sinogram".into())
+                })?)?;
+            let sbytes = nz * len * ncols * std::mem::size_of::<f32>();
+            let handle = unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) };
+            if handle.is_null() {
+                for sub in &subs {
+                    unsafe { ffi::tomoxide_linerec_free(sub.handle) };
+                }
+                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+            }
+            let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nz * len * ncols])?;
+            let sens_d = DevBuf::zeroed(vbytes)?;
+            unsafe {
+                dev_backproject(
+                    handle,
+                    sens_d.ptr,
+                    ones_s.ptr,
+                    theta_d.ptr as *const f32,
+                    vbytes,
+                )
+            };
+            subs.push(DevSubset {
+                theta_d,
+                b_d,
+                sens_d,
+                ax_d: DevBuf::zeroed(sbytes)?,
+                handle,
+                len,
+                sbytes,
+            });
+        }
+
+        let vol_d = DevBuf::from_host_f32(&vec![1.0f32; nvol])?; // positive init
+        let corr_d = DevBuf::zeroed(vbytes)?;
+        unsafe {
+            for _ in 0..num_iter.max(1) {
+                for sub in &subs {
+                    let tp = sub.theta_d.ptr as *const f32;
+                    let nsub = nz * sub.len * ncols;
+                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, nz, n, sub.len, sub.sbytes); // Aₛ x
+                    ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null); // bₛ ⊘ Aₛ x
+                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, vbytes); // Aₛᵀ(…)
+                    ffi::tomoxide_iter_em_update(vol_d.ptr, corr_d.ptr, sub.sens_d.ptr, nvol, null);
+                    // x ∘ corr ⊘ sens
+                }
+            }
+        }
+
+        let rc = unsafe { ffi::tomoxide_cuda_sync() };
+        for sub in &subs {
+            unsafe { ffi::tomoxide_linerec_free(sub.handle) };
+        }
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+        }
+        let mut host = vec![0.0f32; nvol];
+        vol_d.to_host_f32(&mut host)?;
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+        Ok(Volume::new(array))
+    }
+
     impl IterativeReconstruct for CudaBackend {
-        /// Device-resident SIRT: upload `b`/θ/ones once, precompute the ray-length
-        /// `R = 1/A(1)` and sensitivity `C = 1/Aᵀ(1)` weights on-device, then run
-        /// every iteration `x ← x + C ∘ Aᵀ(R ∘ (b − A x))` entirely on the GPU
-        /// (forward + back-projection kernels + fused elementwise ops), and
-        /// download `x` once. Reuses the same `A`/`Aᵀ` kernels (and back-projection
-        /// handle) as the generic path, so the result matches the host SIRT to the
-        /// atomic-add ordering floor. Returns `Ok(None)` for every other algorithm
-        /// (and non-parallel beam / non-square grid) → generic host fallback.
+        /// Device-resident iterative reconstruction — the volume/sinogram stay on
+        /// the GPU across all iterations (no per-iteration host↔device transfer).
+        /// Implemented for SIRT ([`sirt_device`]) and MLEM/OSEM ([`em_device`]);
+        /// every other algorithm returns `Ok(None)` → generic host fallback. Also
+        /// falls back for non-parallel beam or a non-square grid (the kernels
+        /// assume detector width = grid `n`). Reuses the same `A`/`Aᵀ` kernels as
+        /// the generic solvers, so results match the host to the atomic-add floor
+        /// (up to CUDA's documented volume-space y-flip).
         fn solve(
             &self,
             sino: &Tomo<f32>,
@@ -725,123 +962,27 @@ mod cuda_impl {
             params: &crate::params::ReconParams,
         ) -> Result<Option<Volume<f32>>> {
             use crate::params::Algorithm;
-            if algorithm != Algorithm::Sirt || geom.beam != Beam::Parallel {
+            if geom.beam != Beam::Parallel {
                 return Ok(None);
             }
             let s = sino.as_layout(Layout::Sinogram);
-            let nz = s.n_rows();
-            let nproj = s.n_angles();
-            let ncols = s.n_cols();
+            let (nproj, ncols) = (s.n_angles(), s.n_cols());
             let n = params.num_gridx.unwrap_or(ncols);
-            if n != ncols {
-                return Ok(None); // square-grid only (the kernels assume detector = n)
+            if n != ncols || geom.angles.0.len() != nproj {
+                return Ok(None); // square-grid + matching θ only
             }
-            let theta = &geom.angles.0;
-            if theta.len() != nproj {
-                return Ok(None);
-            }
-            let sino_std = s.array.as_standard_layout();
-            let sino_slice = sino_std
-                .as_slice()
-                .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
-
-            let nvol = nz * n * n;
-            let nsino = nz * nproj * ncols;
-            let vbytes = nvol * std::mem::size_of::<f32>();
-            let sbytes = nsino * std::mem::size_of::<f32>();
-            let null = std::ptr::null_mut::<c_void>();
-            let phi = std::f32::consts::FRAC_PI_2; // parallel beam
-            let theta_p = |t: &DevBuf| t.ptr as *const f32;
-
-            // Persistent device buffers (uploaded / allocated once).
-            let theta_d = DevBuf::from_host_f32(theta)?;
-            let b_d = DevBuf::from_host_f32(sino_slice)?; // measured sinogram b
-            let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
-            let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
-            let vol_d = DevBuf::zeroed(vbytes)?; // x (init 0)
-            let ax_d = DevBuf::zeroed(sbytes)?; // A x, reused as the weighted residual
-            let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…)
-            let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1)
-            let cw_d = DevBuf::zeroed(vbytes)?; // C = 1/Aᵀ(1)
-
-            // Back-projection handle for the whole stack, reused every iteration.
-            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
-            if handle.is_null() {
-                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-            }
-
-            // All ops run on the per-thread default stream (null) → FIFO-ordered,
-            // so a single sync before the download suffices. The forward kernel
-            // scatter-adds and the back-projection accumulates, so each output is
-            // zeroed first.
-            unsafe {
-                // R = 1/A(1): ax = A(1); rw = recip_thresh(ax)
-                ffi::tomoxide_cuda_memset_async(ax_d.ptr, 0, sbytes, null);
-                ffi::tomoxide_forwardproject(
-                    ax_d.ptr,
-                    ones_v.ptr,
-                    theta_p(&theta_d),
-                    phi,
-                    nz as i32,
-                    n as i32,
-                    nproj as i32,
-                    null,
-                );
-                ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null);
-
-                // C = 1/Aᵀ(1): corr = Aᵀ(1); cw = recip_thresh(corr)
-                ffi::tomoxide_cuda_memset_async(corr_d.ptr, 0, vbytes, null);
-                ffi::tomoxide_linerec_backproject(
-                    handle,
-                    corr_d.ptr,
-                    ones_s.ptr,
-                    theta_p(&theta_d),
-                    phi,
-                    0,
-                    null,
-                );
-                ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null);
-
-                // x ← x + C ∘ Aᵀ(R ∘ (b − A x))
-                for _ in 0..params.num_iter.max(1) {
-                    ffi::tomoxide_cuda_memset_async(ax_d.ptr, 0, sbytes, null);
-                    ffi::tomoxide_forwardproject(
-                        ax_d.ptr,
-                        vol_d.ptr,
-                        theta_p(&theta_d),
-                        phi,
-                        nz as i32,
-                        n as i32,
-                        nproj as i32,
-                        null,
-                    ); // ax = A x
-                    ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null); // ax = (b − A x) ∘ R
-                    ffi::tomoxide_cuda_memset_async(corr_d.ptr, 0, vbytes, null);
-                    ffi::tomoxide_linerec_backproject(
-                        handle,
-                        corr_d.ptr,
-                        ax_d.ptr,
-                        theta_p(&theta_d),
-                        phi,
-                        0,
-                        null,
-                    ); // corr = Aᵀ(…)
-                    ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null);
-                    // x += C ∘ corr
+            let it = params.num_iter;
+            match algorithm {
+                Algorithm::Sirt => sirt_device(sino, geom, n, it).map(Some),
+                Algorithm::Mlem => {
+                    em_device(sino, geom, n, it, vec![(0..nproj).collect()]).map(Some)
                 }
+                Algorithm::Osem => {
+                    let subsets = crate::recon::ordered_subsets(nproj, params);
+                    em_device(sino, geom, n, it, subsets).map(Some)
+                }
+                _ => Ok(None),
             }
-
-            let rc = unsafe { ffi::tomoxide_cuda_sync() };
-            unsafe { ffi::tomoxide_linerec_free(handle) };
-            if rc != 0 {
-                return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
-            }
-
-            let mut host = vec![0.0f32; nvol];
-            vol_d.to_host_f32(&mut host)?;
-            let array = Array3::from_shape_vec((nz, n, n), host)
-                .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
-            Ok(Some(Volume::new(array)))
         }
     }
 
