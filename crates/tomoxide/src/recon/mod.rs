@@ -372,7 +372,15 @@ fn build_subsets(
         let len = idx.len();
         let mut sub_geom = geom.clone();
         sub_geom.angles = Angles(idx.iter().map(|&p| geom.angles.0[p]).collect());
-        let sub_b = b.array.select(Axis(1), &idx);
+        // `select` returns a non-standard-layout owned array; the recon backends
+        // consume the subset sinogram via `as_slice()` (CPU back-projection errors
+        // on a non-contiguous input), so make it C-contiguous once here — the
+        // single owner of subset construction, so every consumer sees contiguous.
+        let sub_b = b
+            .array
+            .select(Axis(1), &idx)
+            .as_standard_layout()
+            .into_owned();
         let ones = Tomo::new(Array3::from_elem((nz, len, ncols), 1.0), Layout::Sinogram);
         let mut sens = Volume::new(Array3::zeros((nz, n, n)));
         bp.backproject(&ones, &sub_geom, &mut sens)?;

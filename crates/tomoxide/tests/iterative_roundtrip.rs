@@ -174,6 +174,46 @@ fn osem_reconstructs_nonnegative_phantom() {
     );
 }
 
+/// Regression: multi-slice (`nz > 1`) OSEM / OSPML on the CPU must not error.
+/// `build_subsets` gathers each subset with `select(Axis(1))`, whose owned result
+/// is C-contiguous only for `nz == 1` and non-contiguous for `nz > 1`; the CPU
+/// back-projector consumes it via `as_slice()` and errored ("non-contiguous
+/// sinogram") on the multi-slice, multi-block path — invisible to the `nz == 1`
+/// tests above. Both algorithms share `build_subsets`, so one guards the family.
+#[test]
+fn osem_ospml_multislice_cpu_runs() {
+    let (n, nang, nz, num_block) = (48usize, 60usize, 3usize, 4usize);
+    let cpu = CpuBackend::new();
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let mut vol3 = ndarray::Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        vol3.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let vol = Volume::new(vol3);
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    for (algo, reg_par) in [
+        (Algorithm::Osem, vec![]),
+        (Algorithm::OspmlQuad, vec![0.1f32]),
+    ] {
+        let params = ReconParams {
+            num_gridx: Some(n),
+            num_iter: 5,
+            num_block,
+            reg_par,
+            ..Default::default()
+        };
+        let rec = recon::recon(&sino, &geom, algo, &params, &cpu)
+            .unwrap_or_else(|e| panic!("{algo:?} multi-slice CPU errored: {e}"));
+        assert_eq!(rec.dims(), (nz, n, n));
+        assert!(
+            rec.array.iter().all(|v| v.is_finite()),
+            "{algo:?} produced non-finite values"
+        );
+    }
+}
+
 #[test]
 fn osem_with_one_block_equals_mlem() {
     // Boundary invariant: a single ordered subset is the full angle set, so
