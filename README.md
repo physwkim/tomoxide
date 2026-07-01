@@ -57,6 +57,170 @@ cargo build -p tomoxide-cuda --features cuda
 The `cuda` feature never compiles on a machine without `nvcc`; the default
 build selects the CPU backend so the whole workspace builds on this Mac.
 
+## Command-line usage
+
+The `tomoxide` binary (crate `tomoxide-cli`) is the front-end. Build it, then run
+either the installed binary or through cargo:
+
+```sh
+cargo build --release -p tomoxide-cli            # → target/release/tomoxide
+cargo build --release -p tomoxide-cli --features cuda   # CUDA-enabled build
+
+# Run directly…
+target/release/tomoxide recon scan.h5 --algorithm fbp
+# …or via cargo (note the `--` separating cargo args from tomoxide args):
+cargo run --release -p tomoxide-cli -- recon scan.h5 --algorithm fbp
+```
+
+The input is a DXchange/HDF5 file (`/exchange/{data,data_white,data_dark,theta}`).
+Output is written next to the input as `<name>_rec` — a directory of per-slice
+TIFFs by default, or a single `.h5` / `.zarr` with `--save_format`. Don't have a
+dataset? Generate a synthetic one:
+
+```sh
+cargo run --release --example make_synthetic_dxchange -- <nproj> <nz> <nx> scan.h5
+```
+
+### Global options
+
+| Option | Values | Meaning |
+|---|---|---|
+| `--backend` | `auto` (default) · `cpu` · `cuda` · `wgpu` | Compute backend. `auto` picks the best available; a `--config` `backend` is used only when this is left at `auto`. |
+| `-v`, `--verbose` | — | Debug logging (prints the resolved preprocessing / iteration settings, chunk source, multi-GPU sharding, …). |
+
+### Subcommands
+
+| Command | Purpose |
+|---|---|
+| `init` | Write a default TOML config you can edit (`--config tomoxide.toml`). |
+| `status` | Print the resolved backend and, with `--config <f>`, the parsed config. |
+| `recon` | Full reconstruction. On CUDA the fused methods auto-stream per chunk and fan across GPUs; everything else runs whole-volume. |
+| `recon_steps` | Explicit out-of-core streaming reconstruction (tomocupy `recon_steps`), chunked over detector rows. |
+| `tune_chunk` | Measure and cache the fastest `--chunk` for a file/algorithm/GPU (CUDA fused methods only). |
+
+### `recon` / `recon_steps` options
+
+Both share the same reconstruction knobs. Every option is optional: an omitted
+flag falls back to the `--config` file (if given), then to a built-in default —
+**precedence is `flag > config > default`** (tomocupy-style).
+
+**Core**
+
+| Option | Values / default | Meaning |
+|---|---|---|
+| `<FILE>` | — | Input DXchange HDF5 (positional, required). |
+| `--config <F>` | — | TOML config supplying defaults for the options below. |
+| `--algorithm <A>` | default `fbp` | Method, or a **comma-separated chain** (see below). |
+| `--center <C>` | auto-find | Rotation-axis column. |
+| `--dtype <D>` | `float32` (also `float16`) | Precision; `float16` only affects the CUDA/wgpu analytic paths. |
+| `--save_format <F>` | `tiff` · `h5` · `zarr` | Output container (default `tiff`). |
+| `--filter <F>` | `parzen` (default) | Apodization: `none` `ramp` `shepp` `cosine` `cosine2` `hamming` `hann` `parzen`. |
+| `--num_iter <N>` | `1` | Iterations for iterative methods (analytic methods ignore it). |
+| `--reg_par <csv>` | — | Regularization parameters for iterative methods, e.g. `--reg_par 0.5,0.01`. |
+
+Analytic methods: `fbp` `gridrec` `fourierrec` `lprec` `linerec`.
+Iterative methods: `art` `bart` `sirt` `mlem` `osem` `ospml_hybrid` `ospml_quad`
+`pml_hybrid` `pml_quad` `tv` `grad` `tikh`.
+
+**Preprocessing — stripe removal** (`--remove_stripe <M>`, applied before recon).
+Each method reads only its own parameters (all overridable; defaults shown):
+
+| `<M>` | Parameters (default) |
+|---|---|
+| `none` (default) | — |
+| `fw` (Fourier-wavelet) | `--fw_sigma 2.0` · `--fw_level 0` (0 = auto) |
+| `ti` (Titarenko) | `--ti_nblock 0` · `--ti_beta 1.5` |
+| `sf` (smoothing filter) | `--sf_size 5` |
+| `vo-all` (Vo combined) | `--vo_snr 3.0` · `--vo_la_size 61` · `--vo_sm_size 21` |
+
+**Preprocessing — phase retrieval** (`--retrieve_phase <M>`). Shared physics flags:
+`--pixel_size 1e-4` (cm) · `--propagation_distance 50` (cm) · `--energy 30` (keV) ·
+`--alpha 1e-3` · `--db 1000` · `--w 2e-4` (cm).
+
+| `<M>` | Uses |
+|---|---|
+| `none` (default) | — |
+| `paganin` | pixel_size, distance, energy, alpha |
+| `Gpaganin` | pixel_size, distance, energy, db, w |
+| `farago` | pixel_size, distance, energy, db |
+
+**`recon`-only**
+
+| Option | Meaning |
+|---|---|
+| `--chunk <N>` | Detector rows per CUDA streaming chunk. Omitted → the `tune_chunk` cache, else a safe default. |
+| `--start_row`, `--end_row` | Reconstruct only a contiguous z-shard (also used internally by the multi-GPU orchestrator). |
+| `--lamino_angle <deg>` | Laminography tilt (CUDA `fbp`/`linerec`, f32); forces the whole-stack path. |
+| `--lamino_rh <N>` | Laminography output height (default `ceil(nz / cos(angle) / 2) * 2`). |
+
+**`recon_steps`-only**
+
+| Option | Meaning |
+|---|---|
+| `--chunk <N>` | Slices per streaming chunk (tomocupy `--nsino-per-chunk`); omitted → config `nsino_per_chunk`, else default. |
+
+### Config file & precedence
+
+`tomoxide init` writes an editable TOML; `recon`/`recon_steps` load it with
+`--config` and use it as the defaults, with any CLI flag overriding. So a config
+pins the pipeline once, and a flag tweaks one run:
+
+```sh
+tomoxide init --config scan.toml            # then edit scan.toml
+tomoxide recon scan.h5 --config scan.toml   # config drives everything
+tomoxide recon scan.h5 --config scan.toml --filter ramp --center 512.5
+#   ^ ramp + center override the config; all other values still come from it
+tomoxide status --config scan.toml          # inspect the parsed config
+```
+
+### Algorithm chaining (warm-start)
+
+A comma-separated `--algorithm` runs the stages in order, seeding each from the
+previous stage's volume — e.g. give an iterative solver a fast analytic starting
+point so it converges in fewer iterations:
+
+```sh
+tomoxide recon scan.h5 --algorithm fbp,sirt --num_iter 30
+#   fbp reconstructs, then sirt (30 iters) is warm-started from the fbp result
+```
+
+`num_iter` / `reg_par` / `filter` apply to every stage. Chaining uses the
+whole-volume path, so it is supported by `recon` only (not the streaming
+`recon_steps`).
+
+### Multi-GPU, chunking, laminography
+
+```sh
+# Tune & cache the fastest streaming chunk for this file/algorithm/GPU:
+tomoxide --backend cuda tune_chunk scan.h5 --algorithm fourierrec --dtype float16
+# A later recon then auto-applies the cached chunk (see the -v log line).
+
+# Multi-GPU: recon auto-fans one z-shard subprocess per selected GPU for CUDA
+# TIFF jobs at width ≥ 2048. Restrict the device set with TOMOXIDE_CUDA_DEVICES:
+TOMOXIDE_CUDA_DEVICES=0,1,2,3 tomoxide --backend cuda recon scan.h5 --algorithm fbp
+
+# Laminography (tilted rotation axis), CUDA fbp/linerec:
+tomoxide --backend cuda recon scan.h5 --algorithm linerec --lamino_angle 20 --center 512
+```
+
+### Examples
+
+```sh
+# GPU FBP, half precision, HDF5 output:
+tomoxide --backend cuda recon scan.h5 --algorithm fbp --dtype float16 --save_format h5
+
+# CPU gridrec with Vo stripe removal (tightened) + a fixed center:
+tomoxide --backend cpu recon scan.h5 --algorithm gridrec \
+    --remove_stripe vo-all --vo_snr 4 --center 640.5
+
+# Paganin phase retrieval, then FBP:
+tomoxide recon scan.h5 --retrieve_phase paganin \
+    --pixel_size 0.65e-4 --propagation_distance 20 --energy 25 --alpha 2e-3
+
+# Out-of-core streaming SIRT, 16 rows per chunk:
+tomoxide recon_steps scan.h5 --algorithm sirt --num_iter 50 --chunk 16
+```
+
 ## Choosing a backend (performance)
 
 Not every algorithm is faster on the GPU — there are two reconstruction paths
