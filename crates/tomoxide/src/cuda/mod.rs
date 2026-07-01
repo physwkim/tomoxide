@@ -533,13 +533,15 @@ mod cuda_impl {
     }
 
     impl FilteredBackproject for CudaBackend {
-        /// Parallel-beam voxel-driven back-projection via tomocupy's
-        /// `cfunc_linerec` (phi = π/2). The sinogram must already be filtered and
-        /// centred on the detector midpoint (`recon` does this through the shared
-        /// FBP filter), so the kernel assumes centre `n/2`. Output is
-        /// `[nz, n, n]` with the kernel's y-flip and `4/nproj` scaling (tomocupy
-        /// convention — a fixed handedness/scale vs the CPU back-projector, which
-        /// scale-invariant correlation tests account for).
+        /// Parallel-beam voxel-driven back-projection via the vendored
+        /// `cfunc_linerec` kernel (phi = π/2). The sinogram must already be filtered
+        /// and centred on the detector midpoint (`recon` does this through the
+        /// shared FBP filter), so the kernel assumes centre `n/2`. Output is
+        /// `[nz, n, n]` in the **CPU/tomopy convention**: the kernel's tomocupy
+        /// y-flip and `4/nproj` gain have been unified to the CPU handedness and
+        /// `π/nproj` scale (Phase 1/2 cross-backend unification), so CUDA back-
+        /// projection matches the CPU back-projector directly (see
+        /// `tests/cuda_cpu_convention_parity.rs` and `docs/ARCHITECTURE.md §4.1`).
         fn backproject(
             &self,
             sino: &Tomo<f32>,
@@ -622,11 +624,12 @@ mod cuda_impl {
     impl ForwardProject for CudaBackend {
         /// Parallel-beam forward projection (`forwardprojection_ker`), the exact
         /// discrete transpose of [`FilteredBackproject::backproject`]
-        /// (`cfunc_linerec`, phi = π/2): same y-flip, centre `n/2`, and `4/nproj`
-        /// scale. The two therefore form an `{A, Aᵀ}` pair, which is what the
-        /// generic iterative solvers (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV)
-        /// require — the recon carries the same y-flip/scale handedness as the
-        /// CUDA analytic path. Like the back-projector, the kernel hard-wires
+        /// (`cfunc_linerec`, phi = π/2): same handedness, centre `n/2`, and matching
+        /// `π/nproj` scale (both unified off tomocupy's y-flip/`4/nproj` to the
+        /// CPU/tomopy convention). The two therefore form a symmetric `{A, Aᵀ}` pair
+        /// at the SAME scale — matching the now-adjoint CPU projector pair — which is
+        /// what the generic iterative solvers (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV)
+        /// require. Like the back-projector, the kernel hard-wires
         /// centre `n/2` (it ignores `geom.center`) and assumes the detector width
         /// equals the grid `n`. Output is `[nz, nproj, n]` in `Sinogram` layout.
         fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
@@ -1279,7 +1282,8 @@ mod cuda_impl {
         /// falls back for non-parallel beam or a non-square grid (the kernels
         /// assume detector width = grid `n`). Reuses the same `A`/`Aᵀ` kernels as
         /// the generic solvers, so results match the host to the atomic-add floor
-        /// (up to CUDA's documented volume-space y-flip).
+        /// (since the orientation/scale unification the CUDA projectors share the
+        /// CPU handedness and `π/nproj` scale — no volume-space y-flip).
         fn solve(
             &self,
             sino: &Tomo<f32>,
@@ -1383,18 +1387,26 @@ mod cuda_impl {
         }
     }
 
-    /// Complex FBP weight `w[z, k] = ½·ramp[k]·exp(-2πi·k·δ_z/pad)/pad`, for
+    /// Complex FBP weight `w[z, k] = ramp[k]·exp(-2πi·k·δ_z/pad)/pad`, for
     /// `k in 0..ne/2+1`, `δ_z = ncols/2 − center(z)` (half spectrum ⇒ `f_k = k ≥
     /// 0`), interleaved re/im — folds the ramp, signed-frequency centre-shift
-    /// phase, and the `½/ne` cuFFT-inverse normalization.
+    /// phase, and the `1/pad` cuFFT-inverse normalization.
     ///
-    /// The `½` matches tomocupy's net FBP filter gain: with the back-projection
-    /// `4/nproj` byte-identical to tomocupy, tomoxide's CUDA analytic output was
-    /// measured at exactly 2.000× tomocupy across all slices (scale-invariant
-    /// Pearson parity hid it). The factor lives only here, so this single site
-    /// corrects every CUDA analytic method (fbp/linerec/fourierrec/lamino, f32 +
-    /// f16, one-shot + streaming). The residual sub-0.1% is the deferred
-    /// `make_fbp_filter` `_wint` quadrature shape, not scale.
+    /// The filter gain is `1/pad` (CPU/tomopy convention). It was tomocupy's
+    /// `½/pad`: that extra `½` halved the CUDA analytic amplitude to match tomocupy
+    /// (tomoxide's CUDA output measured exactly 2.000× tomopy, hidden by the scale-
+    /// invariant Pearson parity), but the cross-backend convention unification
+    /// (Phase 2) targets CPU/tomopy — whose filter carries no such ½ — so it was
+    /// dropped. The gain lives only here, so this single site sets the filter scale
+    /// for every CUDA analytic method (fbp/linerec/fourierrec f32 + f16, one-shot +
+    /// streaming). fbp/linerec additionally need the back-projector `c` change
+    /// (`4/nproj → π/nproj`, `cfunc_linerec.cu`) to reach CPU scale; fourierrec
+    /// additionally normalizes its unnormalized cuFFT inverse by `(2n)²`. The
+    /// laminography path also reads this filter but is a *different algorithm* from
+    /// CPU USFFT lamino and is excluded from the unification (its cuda/cpu scale +
+    /// sign difference is documented, not unified). The residual ~1.6% on the
+    /// unified paths is the `make_fbp_filter` `_wint` quadrature ramp SHAPE (vs the
+    /// CPU linear ramp), not scale.
     fn build_filter_w(
         filter: &[f32],
         geom: &Geometry,
@@ -1512,8 +1524,14 @@ mod cuda_impl {
     /// (c) passes the chunk's global z-start `sz` so the kernel's
     /// `z = (tz + sz) − nz/2` lands on the right detector plane. The full
     /// projection stack (`nz` rows) is filtered once and back-projected into every
-    /// output slice. Returns the chunk volume `[rh, n, n]` (with the kernel's
-    /// `(n−1−ty)` y-flip and `4/nproj` scale already applied, matching tomocupy).
+    /// output slice. Returns the chunk volume `[rh, n, n]` with the kernel's
+    /// `(n−1−ty)` y-flip and `4/nproj` scale (tomocupy convention). Unlike the
+    /// parallel-beam analytic paths, laminography is **deliberately excluded** from
+    /// the CPU/tomopy convention unification: the CUDA lamino kernel and the CPU
+    /// `recon::lamino` USFFT algorithm are different reconstructions with different
+    /// filter frameworks, so they are not scale-comparable (see `docs/ARCHITECTURE.md
+    /// §4.1`). Each lamino path is validated against its own reference (CUDA vs
+    /// tomocupy, CPU vs wgpu). Both stay y-flipped, consistently.
     #[allow(clippy::too_many_arguments)]
     fn analytic_lamino_chunk(
         raw: &[f32],

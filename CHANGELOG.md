@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A **cross-backend convention unification** release. The CUDA analytic
+reconstruction now matches the **CPU/wgpu (tomopy) convention** in both
+orientation and amplitude, replacing 0.3.0's deliberate CUDA-matches-tomocupy
+parity. For the same sinogram, geometry, and centre, `fbp`/`linerec`/`fourierrec`/
+`lprec` now produce the same image (same handedness, `cuda/cpu ≈ 1`) on every
+backend, up to a deterministic ~1.6% `_wint`-vs-linear ramp *shape* residual.
+
+> **Behaviour changes — read before upgrading.** CUDA analytic output changes
+> *orientation* (the tomocupy vertical flip is removed) and *amplitude* (now
+> tomopy scale, not tomocupy's) relative to 0.3.0. If you depended on CUDA output
+> matching tomocupy, this is a breaking change.
+
+### Changed
+
+- **CUDA analytic orientation → CPU/tomopy.** The tomocupy y-flip is removed from
+  `cfunc_linerec` (back-projection storage index) and `cfunc_fourierrec` (a clean
+  output-row flip in `divphi`), so CUDA emits the CPU/wgpu handedness. Back- and
+  forward-projectors flip together, so they remain a discrete transpose.
+- **CUDA analytic scale → CPU/tomopy.** The `cfunc_linerec` back-projection
+  constant `4/nproj` (tomocupy) becomes `π/nproj` (tomopy); the CUDA-only `½` FBP
+  filter gain in `build_filter_w` is removed; the CUDA `fourierrec` divides its
+  unnormalized cuFFT inverse by `(2n)²` to match the CPU's normalized inverse FFT.
+  Net: `cuda/cpu ≈ 1` for `fbp`/`linerec`/`fourierrec`/`lprec`.
+- **CPU forward projector is now a true adjoint.** `sim::project` is scaled by
+  `π/nproj` so the CPU `{A, Aᵀ}` pair is symmetric at one scale (matching the CUDA
+  pair), keeping the iterative solvers well-posed cross-backend. The fixed-step
+  `grad`/`tv` solvers gain-normalize the data residual (`nproj/π`) so their
+  conditioning is unchanged by the forward-scale change. **`sim::project` output
+  values change by `π/nproj`.**
+
+### Not changed (documented exceptions)
+
+- **Laminography is excluded from the unification.** The CUDA lamino path
+  (`cfunc_linerec` tilted back-projector) and the CPU `recon::lamino` path (a USFFT
+  algorithm) are *different reconstruction algorithms* with different filter
+  frameworks, so they are not scale-comparable (measured `cuda/cpu ≈ −0.89`, a sign
+  flip plus a filter-gain difference). Each is validated against its own reference
+  (CUDA vs tomocupy, CPU vs wgpu); both stay y-flipped, consistently. Do not
+  warm-start one lamino backend from the other.
+- **`gridrec`** is backend-agnostic (`recon::gridrec` over the `Fft` capability),
+  already identical across backends — unaffected.
+
 ## [0.3.0] - 2026-06-30
 
 A filter correctness / convention release. The CUDA backend now matches

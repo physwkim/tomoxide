@@ -227,43 +227,60 @@ Buffer pointers and CUDA stream handles cross the boundary as opaque `void*`
 
 ### 4.1 CUDA analytic output convention (vs CPU/wgpu)
 
-The vendored tomocupy back-projection / Fourier kernels carry tomocupy's own
-output convention, which differs from the CPU/wgpu (tomopy) path. For the same
-sinogram, geometry, and centre, a CUDA analytic reconstruction is, relative to
-the CPU/wgpu output:
+The vendored tomocupy back-projection / Fourier kernels originally carried
+tomocupy's own output convention (y-flipped, `4/nproj` back-projection, a `½`
+filter gain), which differed from the CPU/wgpu (tomopy) path. A **cross-backend
+convention unification** brought the CUDA analytic output onto the CPU/tomopy
+convention, so for the same sinogram, geometry, and centre a CUDA analytic
+reconstruction now matches the CPU/wgpu output in **both orientation and scale**:
 
 | algorithm | image orientation | amplitude scale (cuda / cpu) |
 |-----------|-------------------|------------------------------|
-| `fbp`, `linerec`      | **vertically flipped** (rows reversed) | `2/π ≈ 0.637` (`4/nproj` back-projection vs tomopy `π/nproj`, and the CUDA-only `½` filter normalization that matches tomocupy) |
-| `fourierrec`          | **vertically flipped**                 | `≈ 2·n²` (USFFT normalization × the `½` filter normalization) |
-| `lprec`               | same orientation as CPU                | `½ ≈ 0.5` (the CUDA-only `½` filter normalization; lprec's log-polar back-projection carries no extra scale vs the CPU port, so the filter ½ is the whole ratio) |
-| `gridrec`             | same orientation as CPU                | `1` (gridrec builds its own ramp, never `build_filter_w`, so no `½`) |
+| `fbp`, `linerec`      | same as CPU | `≈ 1` (back-projection unified `4/nproj → π/nproj`, filter `½` removed) |
+| `fourierrec`          | same as CPU | `≈ 1` (filter `½` removed, unnormalized cuFFT inverse normalized by `(2n)²`) |
+| `lprec`               | same as CPU | `≈ 1` (filter `½` removed; log-polar back-projection already matched the CPU port) |
+| `gridrec`             | same as CPU | `1` (backend-agnostic `recon::gridrec` over the `Fft` capability; never used `build_filter_w`) |
 
-The CUDA and CPU/wgpu analytic paths differ by two deliberate, documented
-reference conventions, both because the CPU/wgpu backends port **tomopy** and the
-CUDA backend ports **tomocupy**:
+What the unification changed (the CPU/wgpu backends port **tomopy**, the CUDA
+backend ports **tomocupy**, and the unification target is tomopy):
 
-1. **Filter amplitude** — the CUDA analytic filter carries tomocupy's net FBP
-   gain (the CUDA-only `½` in `build_filter_w`), half tomopy's. This drives the
-   `cuda / cpu` ratios in the table above, so CUDA matches tomocupy in absolute
-   amplitude and CPU/wgpu matches tomopy.
-2. **Ramp shape** — the base ramp itself differs: CPU/wgpu build tomopy's plain
-   linear ramp (`2·k/pad`), CUDA builds tomocupy's degree-12 `_wint` quadrature
-   ramp. The two diverge ≈0.6% near DC/Nyquist. This is selected per backend via
-   `backend::RampShape` (`Linear` for CPU/wgpu, `Wint` for CUDA) in the single
-   shared `make_fbp_filter`; everything else (windowing, padding, ≥0 clamp, DC
-   doubling, symmetric FFT layout) stays identical across backends.
+1. **Orientation** — the tomocupy y-flip was removed from `cfunc_linerec`
+   (storage-index un-flip) and `cfunc_fourierrec` (a clean output-row flip in
+   `divphi`), so CUDA emits the CPU/tomopy handedness. Both back- and
+   forward-projectors were flipped together, so they remain a discrete transpose.
+2. **Filter amplitude** — the CUDA-only `½` in `build_filter_w` (tomocupy's net
+   FBP gain) was dropped; the gain is now `1/pad`, matching tomopy.
+3. **Back-projection scale** — `cfunc_linerec`'s `c = 4/nproj` (tomocupy) became
+   `π/nproj` (tomopy). The CPU forward projector (`sim::project`) was scaled by the
+   same `π/nproj` so the CPU `{A, Aᵀ}` pair is a true adjoint at one scale, and the
+   CUDA forward projector matches — keeping the iterative solvers well-posed on both
+   backends (see `recon/mod.rs` grad/tv gain-normalization).
+4. **fourierrec normalization** — cuFFT does not normalize its inverse transform
+   and `plan2d` is `(2n)²`, so the CUDA fourierrec ran `(2n)²`× hot; `divphi` now
+   divides by `(2n)²` to match the CPU's normalized inverse FFT.
 
-After undoing the flip and amplitude scale, CUDA matches CPU very closely but
-**not** to the bare f32 floor: the `_wint`-vs-linear ramp leaves a deterministic
-≈0.6% residual (e.g. lprec cuda×2 ↔ cpu max-rel 5.6e-3). Pearson correlation
-stays ≈1.0 because the shape difference is small and smooth. These are fixed
-handedness/scale/shape conventions, not numerical errors — intentional and
-preserved — but consumers comparing CUDA output against CPU/wgpu (or against
-absolute physical units) must account for them. The cross-backend regression test
-`tests/cuda_cpu_convention_parity.rs` pins both the orientation (per the table)
-and structural agreement, so any *other* CUDA divergence is caught and any change
-to this convention is surfaced deliberately.
+**Ramp shape (the remaining residual).** The base ramp still differs per backend:
+CPU/wgpu build tomopy's plain linear ramp (`2·k/pad`), CUDA builds tomocupy's
+degree-12 `_wint` quadrature ramp, selected via `backend::RampShape` (`Linear`
+for CPU/wgpu, `Wint` for CUDA) in the single shared `make_fbp_filter`. This leaves
+a deterministic **~1.6%** amplitude residual on the unified paths (the measured
+`cuda/cpu` scale is ≈1.016, not exactly 1); Pearson stays ≈1.0 because the shape
+difference is small and smooth. This is a shape convention, not a numerical error.
+
+**Laminography is excluded.** The CUDA lamino path (`cfunc_linerec` tilted
+back-projector) and the CPU lamino path (`recon::lamino`, a USFFT algorithm) are
+*different reconstruction algorithms* with different filter frameworks (CUDA:
+`make_fbp_filter(Wint)`; CPU: a bare `|f|/ne` ramp), so they are not
+scale-comparable and are **not** unified. The measured `cuda/cpu` lamino ratio is
+`≈ −0.89` (a sign flip plus a filter-framework gain difference); both remain
+y-flipped, consistently. Each lamino path is validated against its own reference
+(CUDA vs tomocupy, CPU vs wgpu) rather than against each other. Consumers must not
+assume CUDA and CPU laminography agree in absolute amplitude or sign.
+
+The cross-backend regression test `tests/cuda_cpu_convention_parity.rs` pins both
+the orientation and the `cuda/cpu ≈ 1` scale (|Δ| < 5%) for fbp/linerec/fourierrec/
+lprec, so any re-appearance of a per-algorithm convention scale — or any other CUDA
+divergence — fails there rather than hiding behind a scale-invariant metric.
 
 ---
 

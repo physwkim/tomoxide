@@ -8,10 +8,11 @@
 //!     exact discrete transpose of the back-projector (`cfunc_linerec`). This is
 //!     the invariant the iterative solvers rely on; it holds independently of any
 //!     geometry/centre convention.
-//!  2. **Forward parity vs CPU** — the CUDA forward reads the volume with the
-//!     documented y-flip, so `cuda_forward(P) ≈ scale · cpu_forward(flipud(P))`.
-//!     Pins the geometry against the CPU reference and the orientation against a
-//!     flip regression.
+//!  2. **Forward parity vs CPU** — since the orientation/scale unification the
+//!     CUDA forward matches the CPU forward directly, `cuda_forward(P) ≈
+//!     cpu_forward(P)` (no flip), while `cpu_forward(flipud(P))` is the *wrong*
+//!     handedness. Pins the geometry against the CPU reference and the orientation
+//!     against a flip regression.
 //!  3. **SIRT self-consistency** — reconstruct a phantom from its own CUDA
 //!     forward projection and recover it.
 //!

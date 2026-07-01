@@ -155,8 +155,10 @@ pml/ospml quad & hybrid, grad, tikh, tv, art, bart). Vector tomography
   exposed as the `FilteredBackproject` capability. The FBP **filter** reuses the
   shared CPU definition (`CudaBackend::fbp_filter` → `CpuBackend`), so
   `recon(Fbp, &CudaBackend)` filters on the host and back-projects on the device.
-  Verified on an RTX 5000 Ada: CUDA↔CPU back-projection Pearson = 1.00000 (up to
-  the kernel's y-flip + `4/nproj` vs `π/nproj` scale), CUDA↔phantom 0.96
+  Verified on an RTX 5000 Ada: CUDA↔CPU back-projection Pearson = 1.00000, and
+  since the cross-backend convention unification CUDA matches CPU directly in
+  orientation and scale (no y-flip; `4/nproj → π/nproj`; filter `½` removed —
+  `cuda/cpu ≈ 1` up to the ~1.6% `_wint` ramp-shape residual). CUDA↔phantom 0.96
   (`crates/tomoxide/tests/cuda_fbp_parity.rs`). Needs ≥2 slices (the kernel
   interpolates vertically).
 - ✅ `fourierrec` GPU reconstruction (`cfunc_fourierrec`, cuFFT) via a new

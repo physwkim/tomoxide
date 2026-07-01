@@ -3,11 +3,21 @@
 //! Since the orientation unification (Phase 1) the CUDA analytic kernels
 //! (`cfunc_rec`/`cfunc_linerec`/`cfunc_fourierrec`) emit each slice in the **same
 //! handedness as the CPU/wgpu path** (which follows tomopy) — no vertical flip.
-//! A per-algorithm **scale** difference may remain until the scale unification
-//! (Phase 2); it is absorbed here by the scale-invariant Pearson metric. See the
-//! note at `cuda/mod.rs` (`cfunc_linerec` doc) and `docs/ARCHITECTURE.md`.
-//! (Laminography is the one path still flipped in BOTH backends, consistently,
-//! and is not exercised here.)
+//! Since the scale unification (Phase 2) they also emit the **same amplitude** as
+//! the CPU path: fbp/linerec back-project at `π/nproj` (was tomocupy's `4/nproj`),
+//! the tomocupy filter ½-gain is removed, fourierrec normalizes its unnormalized
+//! cuFFT inverse by `(2n)²`, and lprec matches directly. So this test now asserts
+//! both `cuda == cpu` orientation (Pearson) AND `cuda/cpu ≈ 1` scale; the residual
+//! ~1.6 % is the ramp-SHAPE gap (CUDA `_wint` order-12 quadrature ramp vs the CPU
+//! linear ramp) plus the fourierrec USFFT deapodization, not a convention scale.
+//! See `cuda/mod.rs` (`cfunc_linerec` doc) and `docs/ARCHITECTURE.md`.
+//!
+//! Laminography is deliberately NOT exercised here: the CUDA lamino path
+//! (`cfunc_linerec` tilted back-projector) and the CPU lamino path
+//! (`recon::lamino`, a USFFT algorithm) are *different reconstruction algorithms*
+//! with different filter frameworks, so they are not scale-comparable and are
+//! excluded from the unification (each is validated against its own reference —
+//! CUDA vs tomocupy, CPU vs wgpu). Both stay y-flipped, consistently.
 //!
 //! The pre-existing CUDA streaming tests only compared CUDA-streaming against
 //! CUDA-whole-volume (same convention) or against tomocupy — never against the
@@ -55,10 +65,11 @@ fn pearson_disk(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) ->
     sxy / (sxx.sqrt() * syy.sqrt())
 }
 
-/// Best-fit scale `a` minimizing `||cuda − a·cpu||` over the disk (for logging the
-/// per-algorithm convention scale; not asserted, since it differs per algorithm:
-/// 2/π for fbp/linerec, ≈2·n² for fourierrec, 1 for lprec — the CUDA analytic
-/// filter carries tomocupy's net gain, half tomopy's).
+/// Best-fit scale `a` minimizing `||cuda − a·cpu||` over the disk. After the scale
+/// unification (Phase 2) this is `≈ 1` for every path (fbp/linerec/fourierrec/
+/// lprec), so `check` asserts it; the residual ~1.6 % is the ramp-shape + USFFT
+/// deapodization gap, not a convention scale. (Pre-unification it was 2/π for
+/// fbp/linerec, ≈4·n² for fourierrec, ½ for lprec.)
 fn fit_scale(cuda: &Array2<f32>, cpu: &Array2<f32>, n: usize, radius_frac: f32) -> f64 {
     let c = (n as f32 - 1.0) / 2.0;
     let r2 = (radius_frac * (n as f32 / 2.0)).powi(2);
@@ -165,13 +176,23 @@ fn check(algorithm: Algorithm, flipped: bool) {
         "{algorithm:?}: opposite handedness also matches (r = {r_wrong:.5}); the \
          orientation pin is ineffective for this phantom"
     );
+    // (3) Scale pin (Phase 2): CUDA emits the same amplitude as CPU, `cuda/cpu ≈ 1`.
+    //     The ~1.6 % residual is the ramp-shape + USFFT-deapodization gap; the 5 %
+    //     bar is far below any convention regression (½, 2/π ≈ 0.64, ≈4n²) so those
+    //     fail here instead of hiding behind the scale-invariant Pearson.
+    assert!(
+        (scale - 1.0).abs() < 0.05,
+        "{algorithm:?}: CUDA/CPU scale = {scale:.5}, expected ≈ 1 (|Δ| < 0.05). A \
+         per-algorithm convention scale has re-appeared — the Phase 2 unification \
+         regressed."
+    );
 }
 
-// After the orientation unification, NO CUDA reconstruction path flips vs CPU —
-// every analytic method matches the CPU/wgpu handedness directly (`flipped =
-// false`). A scale difference (Phase 2) may remain, absorbed by the
-// scale-invariant Pearson; `fit_scale` logs it. Laminography is the one path
-// still flipped in BOTH backends (consistently) and is not exercised here.
+// After the orientation + scale unification, NO CUDA reconstruction path flips or
+// rescales vs CPU — every analytic method matches the CPU/wgpu handedness
+// (`flipped = false`) AND amplitude (`scale ≈ 1`, asserted in `check`).
+// Laminography is a different algorithm per backend (see the module doc) and is
+// not exercised here.
 #[test]
 fn cuda_fbp_matches_cpu_under_convention() {
     check(Algorithm::Fbp, false);
