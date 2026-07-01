@@ -125,7 +125,10 @@ struct CommonRecon {
     /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …). A
     /// comma-separated list chains stages, warm-starting each from the previous
     /// stage's volume (e.g. `--algorithm fbp,sirt` seeds SIRT with the FBP
-    /// result); chaining uses the whole-volume path (`recon` only).
+    /// result); chaining uses the whole-volume path (`recon` only). Append
+    /// `:iters` to an iterative stage to give it its own iteration budget
+    /// (e.g. `--algorithm fbp,sirt:30,tv:10`); stages without it use
+    /// `--num_iter`. Analytic stages reject `:iters`.
     #[arg(long)]
     algorithm: Option<String>,
     /// Rotation-axis column (omit to auto-find / use the detector midline).
@@ -149,7 +152,8 @@ struct CommonRecon {
     #[arg(long)]
     retrieve_phase: Option<String>,
     /// Iterations for iterative algorithms (sirt/mlem/osem/… ). Ignored by the
-    /// analytic methods.
+    /// analytic methods. In a chain this is the default per stage; a stage's
+    /// own `name:iters` suffix (see `--algorithm`) overrides it.
     #[arg(long)]
     num_iter: Option<usize>,
     /// Regularization parameters for iterative methods (`reg_par`), a
@@ -200,12 +204,22 @@ struct CommonRecon {
     w: Option<f32>,
 }
 
+/// One stage of a warm-start chain: an algorithm plus its resolved iteration
+/// budget. `num_iter` is honored only by iterative algorithms (analytic stages
+/// ignore it); it comes from a `name:iters` suffix in `--algorithm`, else the
+/// global `--num_iter`/config value.
+#[derive(Clone, Copy, Debug)]
+struct ChainStage {
+    algo: Algorithm,
+    num_iter: usize,
+}
+
 /// Fully-resolved reconstruction settings (config merged with CLI flags), plus
 /// the string forms needed to forward the choice to multi-GPU shard subprocesses.
 struct ReconPlan {
     algorithm: String,
     /// Parsed algorithm chain (length 1 = single algorithm; >1 = warm-start chain).
-    chain: Vec<Algorithm>,
+    chain: Vec<ChainStage>,
     /// First (and, for a non-chain, only) algorithm — drives path dispatch.
     algo: Algorithm,
     center: Option<f32>,
@@ -321,6 +335,39 @@ fn parse_f32_list(s: &str) -> anyhow::Result<Vec<f32>> {
         .collect()
 }
 
+/// Parse one `--algorithm` chain segment: `name` or `name:iters`. The optional
+/// `:iters` suffix sets that stage's iteration budget (iterative algorithms
+/// only); without it the stage uses `default_iter` (the global `--num_iter` /
+/// config value). Analytic algorithms reject a `:iters` suffix.
+fn parse_chain_stage(seg: &str, default_iter: usize) -> anyhow::Result<ChainStage> {
+    let (name, iters) = match seg.split_once(':') {
+        Some((n, i)) => {
+            let it = i
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| anyhow!("bad iteration count '{}' in stage '{seg}': {e}", i.trim()))?;
+            if it == 0 {
+                return Err(anyhow!("stage '{seg}': iteration count must be >= 1"));
+            }
+            (n.trim(), Some(it))
+        }
+        None => (seg, None),
+    };
+    let algo: Algorithm = name.parse().map_err(|e| anyhow!("{e}"))?;
+    if let Some(it) = iters {
+        if algo.is_analytic() {
+            return Err(anyhow!(
+                "analytic algorithm '{name}' takes no iteration count; drop the \
+                 ':{it}' (per-stage iters apply only to iterative methods)"
+            ));
+        }
+    }
+    Ok(ChainStage {
+        algo,
+        num_iter: iters.unwrap_or(default_iter),
+    })
+}
+
 /// Resolve the effective reconstruction settings: load the optional config, then
 /// override each field with any explicitly-given CLI flag. Returns the plan plus
 /// the loaded config (the caller reads `config.backend` for backend fallback).
@@ -330,17 +377,22 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         None => Config::default(),
     };
     let algorithm = c.algorithm.clone().unwrap_or_else(|| cfg.algorithm.clone());
+    // Global iteration default: any `name:iters` stage suffix overrides it.
+    let global_num_iter = c.num_iter.unwrap_or(cfg.num_iter);
     // A comma-separated `--algorithm` is a warm-start chain; a single name is a
-    // one-element chain. Parse every stage up front so a typo fails before I/O.
-    let chain: Vec<Algorithm> = algorithm
+    // one-element chain. Each stage may carry a `:iters` suffix (iterative only)
+    // for its own iteration budget. Parse every stage up front so a typo fails
+    // before I/O.
+    let chain: Vec<ChainStage> = algorithm
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<Algorithm>().map_err(|e| anyhow!("{e}")))
+        .map(|s| parse_chain_stage(s, global_num_iter))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let algo = *chain
+    let algo = chain
         .first()
-        .ok_or_else(|| anyhow!("no algorithm given (empty --algorithm)"))?;
+        .ok_or_else(|| anyhow!("no algorithm given (empty --algorithm)"))?
+        .algo;
     let center = c.center.or(cfg.rotation_axis);
     let dtype: Dtype = c.dtype.parse().map_err(|e| anyhow!("{e}"))?;
     let save_format_str = c
@@ -351,7 +403,9 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         save_format_str.parse().map_err(|e| anyhow!("{e}"))?;
     let filter_str = c.filter.clone().unwrap_or_else(|| cfg.filter_name.clone());
     let filter: FilterName = filter_str.parse().map_err(|e| anyhow!("{e}"))?;
-    let num_iter = c.num_iter.unwrap_or(cfg.num_iter);
+    // The primary stage's resolved iters — used by the single-algorithm paths
+    // (streaming/whole-volume/shard). The chain path reads each stage directly.
+    let num_iter = chain[0].num_iter;
     let reg_par = match &c.reg_par {
         Some(s) => parse_f32_list(s)?,
         None => cfg.reg_par.clone(),
@@ -524,7 +578,7 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "recon: file={} algorithm={:?} center={:?} dtype={} filter={} stripe={} phase={} backend={}",
                 file.display(),
-                plan.chain,
+                plan.algorithm,
                 plan.center,
                 dtype.as_str(),
                 plan.filter_str,
@@ -1197,9 +1251,10 @@ fn recon_params(
 /// reconstructs the same prepared sinogram, seeding its initial estimate with the
 /// prior stage's output. The classic use is `fbp,sirt`: the analytic FBP gives a
 /// fast seed the iterative SIRT then refines (fewer iterations for the same
-/// quality). `num_iter`/`reg_par`/`filter` apply to every stage (analytic stages
-/// ignore `num_iter`). Whole-volume only (the warm-start needs the full prior
-/// volume). Returns the final stage's volume.
+/// quality). Each stage uses its own `num_iter` (from a `name:iters` suffix, else
+/// the global `--num_iter`); `reg_par`/`filter` still apply to every stage
+/// (analytic stages ignore iterations). Whole-volume only (the warm-start needs
+/// the full prior volume). Returns the final stage's volume.
 fn reconstruct_chain(
     mut ds: tomoxide::Dataset<f32>,
     geom: &Geometry,
@@ -1215,21 +1270,27 @@ fn reconstruct_chain(
 
     let n = plan.chain.len();
     let mut init: Option<tomoxide::Volume<f32>> = None;
-    for (i, &algo) in plan.chain.iter().enumerate() {
+    for (i, stage) in plan.chain.iter().enumerate() {
         let mut params = recon_params(
             geom,
             plan.dtype,
             plan.filter,
-            plan.num_iter,
+            stage.num_iter,
             plan.reg_par.clone(),
         );
         params.lamino_rh = lamino_rh;
         params.init = init.take();
         let warm = params.init.is_some();
-        let vol = tomoxide::recon::recon(&sino, geom, algo, &params, backend)?;
+        let vol = tomoxide::recon::recon(&sino, geom, stage.algo, &params, backend)?;
+        let iters_note = if stage.algo.is_analytic() {
+            String::new()
+        } else {
+            format!(" ×{} iters", stage.num_iter)
+        };
         println!(
-            "  chain [{}/{n}] {algo:?}{}",
+            "  chain [{}/{n}] {:?}{iters_note}{}",
             i + 1,
+            stage.algo,
             if warm { " (warm-started)" } else { "" }
         );
         init = Some(vol);
@@ -1240,4 +1301,58 @@ fn reconstruct_chain(
 /// Output path for a reconstruction: `<input-without-extension>_rec`.
 fn recon_out_path(file: &Path) -> String {
     format!("{}_rec", file.with_extension("").display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_stage_uses_default_iters_without_suffix() {
+        let s = parse_chain_stage("sirt", 25).unwrap();
+        assert_eq!(s.algo, Algorithm::Sirt);
+        assert_eq!(s.num_iter, 25);
+    }
+
+    #[test]
+    fn chain_stage_suffix_overrides_default() {
+        let s = parse_chain_stage("sirt:30", 25).unwrap();
+        assert_eq!(s.algo, Algorithm::Sirt);
+        assert_eq!(s.num_iter, 30);
+    }
+
+    #[test]
+    fn chain_stage_trims_whitespace() {
+        let s = parse_chain_stage(" tv : 10 ", 5).unwrap();
+        assert_eq!(s.algo, Algorithm::Tv);
+        assert_eq!(s.num_iter, 10);
+    }
+
+    #[test]
+    fn analytic_stage_rejects_iters() {
+        let err = parse_chain_stage("fbp:5", 25).unwrap_err().to_string();
+        assert!(err.contains("analytic"), "{err}");
+    }
+
+    #[test]
+    fn analytic_stage_without_iters_ok() {
+        let s = parse_chain_stage("fbp", 25).unwrap();
+        assert_eq!(s.algo, Algorithm::Fbp);
+    }
+
+    #[test]
+    fn zero_iters_rejected() {
+        let err = parse_chain_stage("sirt:0", 25).unwrap_err().to_string();
+        assert!(err.contains(">= 1"), "{err}");
+    }
+
+    #[test]
+    fn non_numeric_iters_rejected() {
+        assert!(parse_chain_stage("sirt:abc", 25).is_err());
+    }
+
+    #[test]
+    fn unknown_algorithm_rejected() {
+        assert!(parse_chain_stage("nope", 25).is_err());
+    }
 }

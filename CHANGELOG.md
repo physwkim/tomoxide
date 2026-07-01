@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-stage iteration budgets in algorithm chains.** An iterative stage in a
+  `--algorithm` chain can carry a `:iters` suffix
+  (e.g. `--algorithm fbp,sirt:30,tv:10`); stages without one fall back to
+  `--num_iter`. Analytic stages reject the suffix. Lets a chain spend, say, 30
+  SIRT iterations then 10 TV iterations in one run — previously every stage shared
+  a single `--num_iter`.
+
 ## [0.4.0] - 2026-07-01
 
 Two headline themes. First, the **full iterative reconstruction suite now runs on

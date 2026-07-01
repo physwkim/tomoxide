@@ -207,9 +207,17 @@ tomoxide recon scan.h5 --algorithm fbp,sirt --num_iter 30
 #   fbp reconstructs, then sirt (30 iters) is warm-started from the fbp result
 ```
 
-`num_iter` / `reg_par` / `filter` apply to every stage. Chaining uses the
-whole-volume path, so it is supported by `recon` only (not the streaming
-`recon_steps`).
+Each iterative stage can carry its own iteration budget with a `:iters` suffix;
+stages without one fall back to `--num_iter`:
+
+```sh
+tomoxide recon scan.h5 --algorithm fbp,sirt:30,tv:10
+#   fbp seed → sirt 30 iters → tv 10 iters, each warm-started from the previous
+```
+
+Analytic stages reject a `:iters` suffix (they take no iterations). `reg_par` /
+`filter` still apply to every stage. Chaining uses the whole-volume path, so it
+is supported by `recon` only (not the streaming `recon_steps`).
 
 ### Multi-GPU, chunking, laminography
 
