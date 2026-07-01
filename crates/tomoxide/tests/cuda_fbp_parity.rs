@@ -209,24 +209,24 @@ fn cuda_fbp_filter_matches_cpu() {
         .apply(&mut t_cuda, &kernel, &geom)
         .unwrap();
 
-    // The CUDA analytic filter carries tomocupy's net FBP gain, which is half
-    // tomopy's (the CPU path). So `cuda == ½·cpu` by convention; undo the ½ before
-    // comparing the filter *shape* to the cuFFT/rustfft round-off floor. See
-    // `cuda/mod.rs::build_filter_w` and `docs/ARCHITECTURE.md` §4.1.
+    // Since the convention unification (Phase 2) the CUDA analytic filter carries
+    // the same net gain as tomopy (the CPU path) — the tomocupy ½ was removed from
+    // `build_filter_w`. So `cuda == cpu`; compare the filter *shape* directly to the
+    // cuFFT/rustfft round-off floor. See `cuda/mod.rs::build_filter_w`.
     let scale = t_cpu.array.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let max_abs = t_cpu
         .array
         .iter()
         .zip(t_cuda.array.iter())
-        .fold(0.0f32, |m, (&a, &b)| m.max((a - 2.0 * b).abs()));
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
     eprintln!(
-        "fbp filter max|Δ| (cuda×2 vs cpu) = {max_abs:e} (rel {:e})",
+        "fbp filter max|Δ| (cuda vs cpu) = {max_abs:e} (rel {:e})",
         max_abs / scale
     );
     // cuFFT vs rustfft: f32 FFT round-off floor.
     assert!(
         max_abs / scale < 1e-4,
-        "GPU filter ≠ ½·CPU filter: rel {}",
+        "GPU filter ≠ CPU filter: rel {}",
         max_abs / scale
     );
 }

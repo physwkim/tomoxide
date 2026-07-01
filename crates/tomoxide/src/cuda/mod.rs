@@ -1387,7 +1387,12 @@ mod cuda_impl {
     ) -> Vec<f32> {
         let nfreq = pad / 2 + 1;
         let half = ncols as f32 / 2.0;
-        let inv_pad = 0.5f32 / pad as f32;
+        // Filter gain `1/pad` (was tomocupy's `0.5/pad`). The extra ½ halved the
+        // CUDA analytic amplitude to match tomocupy; the cross-backend convention
+        // unification (Phase 2) targets CPU/tomopy instead, whose filter carries no
+        // such ½ — so drop it. This alone brings lprec to cpu scale (k ½→1); fbp/
+        // linerec additionally need the back-projector `c` change (4/nproj→π/nproj).
+        let inv_pad = 1.0f32 / pad as f32;
         let mut w = vec![0.0f32; nz * nfreq * 2];
         for z in 0..nz {
             let delta = half - geom.center.at(z);
