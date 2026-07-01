@@ -214,6 +214,68 @@ fn osem_ospml_multislice_cpu_runs() {
     }
 }
 
+/// Warm-start correctness: splitting SIRT via `init` reproduces the continuous
+/// run. SIRT(20) then SIRT(20) seeded with that output must equal SIRT(40) from
+/// scratch — SIRT is deterministic on the CPU (no atomics), so the two are the
+/// same arithmetic sequence and agree to the f32 floor. Locks that `init`
+/// genuinely seeds the iterate rather than being ignored.
+#[test]
+fn warmstart_split_sirt_equals_continuous() {
+    let (n, nang) = (64usize, 90usize);
+    let cpu = CpuBackend::new();
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |num_iter, init: Option<Volume<f32>>| ReconParams {
+        num_gridx: Some(n),
+        num_iter,
+        init,
+        ..Default::default()
+    };
+    let full = recon::recon(&sino, &geom, Algorithm::Sirt, &p(40, None), &cpu).unwrap();
+    let half = recon::recon(&sino, &geom, Algorithm::Sirt, &p(20, None), &cpu).unwrap();
+    let chained = recon::recon(&sino, &geom, Algorithm::Sirt, &p(20, Some(half)), &cpu).unwrap();
+
+    let (mut se, mut sref) = (0.0f64, 0.0f64);
+    for (a, b) in chained.array.iter().zip(full.array.iter()) {
+        se += (*a as f64 - *b as f64).powi(2);
+        sref += (*b as f64).powi(2);
+    }
+    let nrmse = (se / full.array.len() as f64).sqrt() / (sref / full.array.len() as f64).sqrt();
+    eprintln!("split-vs-continuous SIRT NRMSE = {nrmse:.2e}");
+    assert!(
+        nrmse < 1e-5,
+        "warm-started split diverged from continuous: {nrmse:.2e}"
+    );
+}
+
+/// Every iterative method honours `init` except the row-action pair (ART/BART);
+/// supplying `init` there must error rather than silently drop the caller's seed.
+#[test]
+fn warmstart_rejected_for_unsupported() {
+    let (n, nang) = (32usize, 60usize);
+    let cpu = CpuBackend::new();
+    let phantom = sim::shepp2d(n).unwrap().mapv(|v| v.max(0.0));
+    let vol = Volume::new(phantom.insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 3,
+        reg_par: vec![1e-3],
+        init: Some(vol.clone()),
+        ..Default::default()
+    };
+    let err = recon::recon(&sino, &geom, Algorithm::Art, &params, &cpu);
+    assert!(
+        err.is_err(),
+        "ART silently accepted an unsupported warm-start init"
+    );
+}
+
 #[test]
 fn osem_with_one_block_equals_mlem() {
     // Boundary invariant: a single ordered subset is the full angle set, so

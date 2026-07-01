@@ -172,6 +172,15 @@ pub struct ReconParams {
     /// uses tomocupy's auto height `ceil(nz / cos(lamino_angle) / 2) * 2`. Only
     /// consumed when the geometry's beam is [`crate::geometry::Beam::Laminography`].
     pub lamino_rh: Option<usize>,
+    /// Optional warm-start volume (`[nz, n, n]`): the initial iterate for an
+    /// iterative method, replacing its built-in default (SIRT/GRAD/TIKH/TV → 0,
+    /// the EM methods MLEM/OSEM/PML/OSPML → 1). Enables algorithm chaining — e.g.
+    /// FBP → SIRT, or OSEM → MLEM — where one method's output seeds the next.
+    /// Honoured by every iterative method except the row-action pair (ART/BART),
+    /// which reject a non-`None` init rather than silently ignoring it; analytic
+    /// methods ignore it. Consumed on both the host and the CUDA device-resident
+    /// path.
+    pub init: Option<crate::data::Volume<f32>>,
 }
 
 impl Default for ReconParams {
@@ -189,6 +198,7 @@ impl Default for ReconParams {
             ind_block: Vec::new(),
             dtype: crate::dtype::Dtype::F32,
             lamino_rh: None,
+            init: None,
         }
     }
 }

@@ -59,6 +59,25 @@ fn grid_size(sino: &Tomo<f32>, params: &ReconParams) -> usize {
     params.num_gridx.unwrap_or_else(|| sino.n_cols())
 }
 
+/// Starting iterate for an iterative solver: the warm-start `params.init` volume
+/// when provided (validated to `[nz, n, n]`), else a constant-`default` volume
+/// (SIRT/TV seed with 0, the EM methods with 1). This is the single site that
+/// turns a caller's chained reconstruction into an initial guess.
+fn init_volume(params: &ReconParams, nz: usize, n: usize, default: f32) -> Result<Volume<f32>> {
+    match &params.init {
+        Some(v) => {
+            if v.dims() != (nz, n, n) {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("init volume [{nz}, {n}, {n}]"),
+                    found: format!("{:?}", v.dims()),
+                });
+            }
+            Ok(v.clone())
+        }
+        None => Ok(Volume::new(Array3::from_elem((nz, n, n), default))),
+    }
+}
+
 fn analytic(
     sino: &Tomo<f32>,
     geom: &Geometry,
@@ -151,6 +170,15 @@ fn iterative(
     params: &ReconParams,
     backend: &dyn Backend,
 ) -> Result<Volume<f32>> {
+    // Every iterative method consumes an initial iterate except the row-action
+    // pair (ART/BART), which sweep single rays and have no whole-volume seed.
+    // Reject a warm-start there rather than silently dropping the caller's seed.
+    if params.init.is_some() && matches!(algorithm, Algorithm::Art | Algorithm::Bart) {
+        return Err(Error::InvalidParam(
+            "warm-start `init` is not supported for row-action ART/BART".into(),
+        ));
+    }
+
     // ART/BART are row-action (Kaczmarz) — they consume the single-ray rows, not
     // the whole-sinogram forward/back-projectors the other methods compose.
     if matches!(algorithm, Algorithm::Art | Algorithm::Bart) {
@@ -166,7 +194,9 @@ fn iterative(
     // Device-resident fast path: a backend that keeps the volume/sinogram on the
     // device across all iterations (CUDA) runs the whole loop with no per-iteration
     // host↔device transfers. It returns `None` for algorithms it does not
-    // device-implement, so those fall through to the generic host solvers below.
+    // device-implement, so those fall through to the generic host solvers below. A
+    // warm-start `init` is uploaded once by the device solver, so it is honoured
+    // here too (ART/BART were already rejected above and never reach this path).
     if let Some(it) = backend.iterative_reconstruct() {
         if let Some(vol) = it.solve(sino, geom, algorithm, params)? {
             return Ok(vol);
@@ -259,7 +289,7 @@ fn sirt(
         .array
         .mapv(|v| if v.abs() > 1e-6 { 1.0 / v } else { 0.0 });
 
-    let mut vol = Volume::new(Array3::zeros((nz, n, n)));
+    let mut vol = init_volume(params, nz, n, 0.0)?;
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
     let mut corr = Volume::new(Array3::zeros((nz, n, n)));
     for _ in 0..params.num_iter.max(1) {
@@ -296,7 +326,7 @@ fn mlem(
     let mut sens = Volume::new(Array3::zeros((nz, n, n)));
     bp.backproject(&ones_sino, geom, &mut sens)?;
 
-    let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
+    let mut vol = init_volume(params, nz, n, 1.0)?; // positive init (or warm-start)
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
     let mut corr = Volume::new(Array3::zeros((nz, n, n)));
     for _ in 0..params.num_iter.max(1) {
@@ -438,7 +468,7 @@ fn osem(
     let nz = b.n_rows();
     let subsets = build_subsets(&b, geom, n, params, bp)?;
 
-    let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
+    let mut vol = init_volume(params, nz, n, 1.0)?; // positive init (or warm-start)
     let mut corr = Volume::new(Array3::zeros((nz, n, n)));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
@@ -568,7 +598,7 @@ fn ospml(
     };
     let subsets = build_subsets(&b, geom, n, &block_params, bp)?;
 
-    let mut vol = Volume::new(Array3::from_elem((nz, n, n), 1.0)); // positive init
+    let mut vol = init_volume(params, nz, n, 1.0)?; // positive init (or warm-start)
     let mut corr = Volume::new(Array3::zeros((nz, n, n)));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
@@ -631,7 +661,9 @@ fn gradient_descent(
     let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
     let fixed_step = params.reg_par.first().copied().unwrap_or(1.0);
 
-    let mut vol = Volume::new(Array3::zeros((nz, n, n))); // r-scaled domain, init 0
+    // r-scaled domain (physical = r · iterate); a warm-start seed enters as init / r.
+    let mut vol = init_volume(params, nz, n, 0.0)?;
+    vol.array.mapv_inplace(|v| v / r);
     let mut recon0 = vol.array.clone();
     let mut grad0 = Array3::<f32>::zeros((nz, n, n));
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
@@ -772,8 +804,11 @@ fn tv(
     let lambda = params.reg_par.first().copied().unwrap_or(1.0); // TV strength
     const C: f32 = 0.35; // tomopy's fixed primal–dual step
 
-    let mut xbar = Volume::new(Array3::zeros((nz, n, n))); // extrapolated primal (recon)
-    let mut x = Array3::<f32>::zeros((nz, n, n)); // primal iterate (update)
+    // The iterate lives in the r-scaled domain (physical = r · iterate; the final
+    // `xbar × r` unscales), so a warm-start seed enters as init / r.
+    let mut xbar = init_volume(params, nz, n, 0.0)?; // extrapolated primal (recon)
+    xbar.array.mapv_inplace(|v| v / r);
+    let mut x = xbar.array.clone(); // primal iterate (update)
     let mut p0x = Array3::<f32>::zeros((nz, n, n)); // TV dual, x-gradient
     let mut p0y = Array3::<f32>::zeros((nz, n, n)); // TV dual, y-gradient
     let mut pd = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram); // data dual

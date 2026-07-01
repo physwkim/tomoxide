@@ -646,3 +646,73 @@ fn cuda_art_bart_match_cpu_bit_for_bit() {
         );
     }
 }
+
+/// Warm-start on the device-resident path: SIRT is a stationary linear iteration,
+/// so splitting a 40-iteration run into 20 + 20 (feeding the first half's output
+/// back as `init`) must land on the same fixed-point trajectory as the continuous
+/// 40-iteration run. This proves the device solver uploads and consumes the seed
+/// (a dropped seed would restart the second half from zero and diverge sharply);
+/// agreement is to the atomic-add ordering floor, not bit-exact.
+#[test]
+fn cuda_warmstart_split_sirt_matches_continuous() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(stack(&phantom, nz));
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |it| ReconParams {
+        num_iter: it,
+        num_gridx: Some(n),
+        ..Default::default()
+    };
+    // Continuous 40 iters, all device-resident.
+    let cont = recon::recon(&sino, &geom, Algorithm::Sirt, &p(40), &cuda).unwrap();
+    // Split 20 + 20: the second call warm-starts from the first's device-convention
+    // output (no host reorientation — same convention on both sides of the seam).
+    let pre = recon::recon(&sino, &geom, Algorithm::Sirt, &p(20), &cuda).unwrap();
+    let split = recon::recon(
+        &sino,
+        &geom,
+        Algorithm::Sirt,
+        &ReconParams {
+            init: Some(pre),
+            ..p(20)
+        },
+        &cuda,
+    )
+    .unwrap();
+
+    // Interior slices only (slice 0 dropped by the CUDA ≥2-slice rule); both are in
+    // the same device convention, so compare directly with no flip.
+    let (mut cv, mut sv) = (Vec::new(), Vec::new());
+    for z in 1..nz {
+        let sc = cont.array.index_axis(Axis(0), z);
+        let ss = split.array.index_axis(Axis(0), z);
+        for iy in 0..n {
+            for ix in 0..n {
+                cv.push(sc[[iy, ix]] as f64);
+                sv.push(ss[[iy, ix]] as f64);
+            }
+        }
+    }
+    let r = pearson(&sv, &cv);
+    let se: f64 = sv.iter().zip(&cv).map(|(&a, &b)| (a - b) * (a - b)).sum();
+    let sb: f64 = cv.iter().map(|&b| b * b).sum();
+    let nrmse = (se / cv.len() as f64).sqrt() / (sb / cv.len() as f64).sqrt();
+    eprintln!(
+        "device-resident SIRT split(20+20) vs continuous(40): r = {r:.6}, NRMSE = {nrmse:.2e}"
+    );
+    assert!(
+        r > 0.9999 && nrmse < 1e-3,
+        "device-resident warm-start diverged from continuous SIRT: r = {r:.6}, NRMSE = {nrmse:.2e}"
+    );
+}

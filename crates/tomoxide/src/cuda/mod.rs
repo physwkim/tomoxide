@@ -772,12 +772,27 @@ mod cuda_impl {
     /// `x` once. Reuses the same `A`/`Aᵀ` kernels (and one back-projection handle)
     /// as the generic path, so the result matches the host SIRT to the atomic-add
     /// ordering floor.
+    /// Initial device iterate for a device-resident solver: the warm-start `init`
+    /// host volume (physical domain) scaled by `inv_scale` — `1.0` for the
+    /// physical-domain solvers (SIRT/EM/OSPML), `1/r` for the r-scaled ones
+    /// (GRAD/TIKH/TV) — else a constant-`default` volume. Single upload; mirrors
+    /// the host [`crate::recon::init_volume`] seeding.
+    #[cfg(feature = "cuda")]
+    fn seed_buf(init: Option<&[f32]>, default: f32, len: usize, inv_scale: f32) -> Result<DevBuf> {
+        let host: Vec<f32> = match init {
+            Some(h) => h.iter().map(|v| v * inv_scale).collect(),
+            None => vec![default; len],
+        };
+        DevBuf::from_host_f32(&host)
+    }
+
     #[cfg(feature = "cuda")]
     fn sirt_device(
         sino: &Tomo<f32>,
         geom: &Geometry,
         n: usize,
         num_iter: usize,
+        init: Option<&[f32]>,
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
@@ -799,7 +814,7 @@ mod cuda_impl {
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
-        let vol_d = DevBuf::zeroed(vbytes)?; // x (init 0)
+        let vol_d = seed_buf(init, 0.0, nvol, 1.0)?; // x (init 0 or warm-start)
         let ax_d = DevBuf::zeroed(sbytes)?; // A x, reused as the weighted residual
         let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…)
         let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1)
@@ -931,6 +946,7 @@ mod cuda_impl {
         n: usize,
         num_iter: usize,
         subsets_idx: Vec<Vec<usize>>,
+        init: Option<&[f32]>,
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
@@ -939,7 +955,7 @@ mod cuda_impl {
         let null = std::ptr::null_mut::<c_void>();
 
         let subs = build_dev_subsets(&s, geom, n, subsets_idx)?;
-        let vol_d = DevBuf::from_host_f32(&vec![1.0f32; nvol])?; // positive init
+        let vol_d = seed_buf(init, 1.0, nvol, 1.0)?; // positive init (or warm-start)
         let corr_d = DevBuf::zeroed(vbytes)?;
         unsafe {
             for _ in 0..num_iter.max(1) {
@@ -978,10 +994,13 @@ mod cuda_impl {
         geom: &Geometry,
         n: usize,
         num_iter: usize,
-        reg: f32,
-        delta: Option<f32>,
+        // Penalty config: strength `reg_par[0]` and the hybrid edge threshold
+        // (`Some` ⇒ hybrid prior, `None` ⇒ quadratic).
+        prior: (f32, Option<f32>),
         subsets_idx: Vec<Vec<usize>>,
+        init: Option<&[f32]>,
     ) -> Result<Volume<f32>> {
+        let (reg, delta) = prior;
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
         let nvol = nz * n * n;
@@ -993,7 +1012,7 @@ mod cuda_impl {
         };
 
         let subs = build_dev_subsets(&s, geom, n, subsets_idx)?;
-        let vol_d = DevBuf::from_host_f32(&vec![1.0f32; nvol])?; // positive init
+        let vol_d = seed_buf(init, 1.0, nvol, 1.0)?; // positive init (or warm-start)
         let old_d = DevBuf::zeroed(vbytes)?; // pre-update snapshot for the stencil
         let corr_d = DevBuf::zeroed(vbytes)?;
         unsafe {
@@ -1048,6 +1067,7 @@ mod cuda_impl {
         num_iter: usize,
         reg_par: &[f32],
         tikh: Option<(f32, Vec<f32>)>,
+        init: Option<&[f32]>,
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
@@ -1075,7 +1095,7 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
-        let vol_d = DevBuf::zeroed(vbytes)?; // x, r-scaled, init 0
+        let vol_d = seed_buf(init, 0.0, nvol, 1.0 / r)?; // x, r-scaled (init 0 or warm-start/r)
         let recon0_d = DevBuf::zeroed(vbytes)?; // previous x (BB)
         let grad0_d = DevBuf::zeroed(vbytes)?; // previous grad (BB)
         let grad_d = DevBuf::zeroed(vbytes)?;
@@ -1166,6 +1186,7 @@ mod cuda_impl {
         n: usize,
         num_iter: usize,
         lambda: f32,
+        init: Option<&[f32]>,
     ) -> Result<Volume<f32>> {
         const C: f32 = 0.35; // tomopy's fixed primal–dual step
         let s = sino.as_layout(Layout::Sinogram);
@@ -1188,8 +1209,10 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
-        let xbar_d = DevBuf::zeroed(vbytes)?; // extrapolated primal (recon)
-        let x_d = DevBuf::zeroed(vbytes)?; // primal iterate
+        // Both the extrapolated and the primal iterate start from the seed / r
+        // (r-scaled domain); a `None` init is the plain zero start.
+        let xbar_d = seed_buf(init, 0.0, nvol, 1.0 / r)?; // extrapolated primal (recon)
+        let x_d = seed_buf(init, 0.0, nvol, 1.0 / r)?; // primal iterate
         let p0x_d = DevBuf::zeroed(vbytes)?; // TV dual, x-gradient
         let p0y_d = DevBuf::zeroed(vbytes)?; // TV dual, y-gradient
         let pd_d = DevBuf::zeroed(sbytes)?; // data dual (persists across iters)
@@ -1258,14 +1281,34 @@ mod cuda_impl {
                 return Ok(None); // square-grid + matching θ only
             }
             let it = params.num_iter;
+            // Warm-start seed (physical domain, `[nz, n, n]`), uploaded once by
+            // each device solver; the r-scaled solvers rescale it themselves.
+            let init_host: Option<Vec<f32>> = match &params.init {
+                Some(v) => {
+                    if v.dims() != (nz, n, n) {
+                        return Err(Error::ShapeMismatch {
+                            expected: format!("init volume [{nz}, {n}, {n}]"),
+                            found: format!("{:?}", v.dims()),
+                        });
+                    }
+                    let std = v.array.as_standard_layout();
+                    Some(
+                        std.as_slice()
+                            .ok_or_else(|| Error::InvalidParam("non-contiguous init".into()))?
+                            .to_vec(),
+                    )
+                }
+                None => None,
+            };
+            let init = init_host.as_deref();
             match algorithm {
-                Algorithm::Sirt => sirt_device(sino, geom, n, it).map(Some),
+                Algorithm::Sirt => sirt_device(sino, geom, n, it, init).map(Some),
                 Algorithm::Mlem => {
-                    em_device(sino, geom, n, it, vec![(0..nproj).collect()]).map(Some)
+                    em_device(sino, geom, n, it, vec![(0..nproj).collect()], init).map(Some)
                 }
                 Algorithm::Osem => {
                     let subsets = crate::recon::ordered_subsets(nproj, params);
-                    em_device(sino, geom, n, it, subsets).map(Some)
+                    em_device(sino, geom, n, it, subsets, init).map(Some)
                 }
                 // pml_* are ospml_* with a single block; the hybrid prior uses
                 // reg_par[1] as the edge threshold (absent ⇒ quadratic prior).
@@ -1287,9 +1330,11 @@ mod cuda_impl {
                         ..params.clone()
                     };
                     let subsets = crate::recon::ordered_subsets(nproj, &block_params);
-                    ospml_device(sino, geom, n, it, reg, delta, subsets).map(Some)
+                    ospml_device(sino, geom, n, it, (reg, delta), subsets, init).map(Some)
                 }
-                Algorithm::Grad => grad_device(sino, geom, n, it, &params.reg_par, None).map(Some),
+                Algorithm::Grad => {
+                    grad_device(sino, geom, n, it, &params.reg_par, None, init).map(Some)
+                }
                 Algorithm::Tikh => {
                     // Tikhonov prior: reg_data ([nz,n,n] flat) or zeros. Wrong-sized
                     // reg_data ⇒ fall back so the host raises the shape error.
@@ -1301,11 +1346,20 @@ mod cuda_impl {
                     } else {
                         return Ok(None);
                     };
-                    grad_device(sino, geom, n, it, &params.reg_par, Some((reg1, prior))).map(Some)
+                    grad_device(
+                        sino,
+                        geom,
+                        n,
+                        it,
+                        &params.reg_par,
+                        Some((reg1, prior)),
+                        init,
+                    )
+                    .map(Some)
                 }
                 Algorithm::Tv => {
                     let lambda = params.reg_par.first().copied().unwrap_or(1.0);
-                    tv_device(sino, geom, n, it, lambda).map(Some)
+                    tv_device(sino, geom, n, it, lambda, init).map(Some)
                 }
                 _ => Ok(None),
             }
