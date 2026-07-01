@@ -4,19 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-07-01
 
-A **cross-backend convention unification** release. The CUDA analytic
-reconstruction now matches the **CPU/wgpu (tomopy) convention** in both
-orientation and amplitude, replacing 0.3.0's deliberate CUDA-matches-tomocupy
-parity. For the same sinogram, geometry, and centre, `fbp`/`linerec`/`fourierrec`/
-`lprec` now produce the same image (same handedness, `cuda/cpu ≈ 1`) on every
-backend, up to a deterministic ~1.6% `_wint`-vs-linear ramp *shape* residual.
+Two headline themes. First, the **full iterative reconstruction suite now runs on
+the GPU**, device-resident (one upload / one download across all iterations).
+Second, a **cross-backend convention unification**: CUDA analytic reconstruction
+now matches the **CPU/wgpu (tomopy) convention** in both orientation and
+amplitude, replacing 0.3.0's deliberate CUDA-matches-tomocupy parity. The CLI
+also gains the full preprocessing / iterative / filter composition surface and a
+live TOML config.
 
 > **Behaviour changes — read before upgrading.** CUDA analytic output changes
 > *orientation* (the tomocupy vertical flip is removed) and *amplitude* (now
 > tomopy scale, not tomocupy's) relative to 0.3.0. If you depended on CUDA output
 > matching tomocupy, this is a breaking change.
+
+### Added
+
+- **GPU iterative reconstruction suite (device-resident).** `ForwardProject for
+  CudaBackend` (an exact adjoint of the `cfunc_linerec` back-projector) unlocks
+  tomopy's iterative family on CUDA via the backend-generic solvers. `sirt`,
+  `mlem`, `osem`, `ospml_hybrid`/`ospml_quad`, `pml_hybrid`/`pml_quad`, `grad`,
+  `tikh`, and `tv` keep the volume and sinogram resident on the device across all
+  iterations (H2D once, D2H once, fused per-iteration kernels), 1.3–11.4× faster
+  than a per-iteration CUDA loop and 51–95× faster than CPU at 512²; output
+  matches the host solvers. `art`/`bart` run on CUDA via shared row-action
+  geometry, bit-identical to CPU.
+- **Warm-start / algorithm chaining.** `ReconParams.init` seeds a solver from a
+  prior volume, so an analytic result can warm-start an iterative refinement
+  (e.g. `fbp` → `sirt` converges in fewer iterations). Available across the
+  iterative suite on both the host and the CUDA device-resident path.
+- **CLI preprocessing / iterative / filter knobs + live config.** `recon` and
+  `recon_steps` gain `--filter`, `--remove_stripe`, `--retrieve_phase` (with the
+  phase physics flags), `--num_iter`, `--reg_par`, and the per-method stripe/phase
+  parameters (`--fw_*`, `--ti_*`, `--sf_size`, `--vo_*`). `--config` (a
+  `tomoxide init` TOML) now actually drives reconstruction, with precedence
+  `flag > config > default`. `--algorithm a,b` chains stages (warm-start) on the
+  whole-volume path.
 
 ### Changed
 
@@ -47,6 +71,30 @@ backend, up to a deterministic ~1.6% `_wint`-vs-linear ramp *shape* residual.
   warm-start one lamino backend from the other.
 - **`gridrec`** is backend-agnostic (`recon::gridrec` over the `Fft` capability),
   already identical across backends — unaffected.
+
+### Fixed
+
+- **CPU `osem`/`ospml`/`pml` crashed on multi-slice reconstruction.** Their
+  subset builder (and the CPU back-projector) indexed with `select(Axis(1))`,
+  which is non-contiguous for any `nz > 1`; both now take standard-layout arrays,
+  so these methods work for real multi-slice volumes.
+- **`tomoxide init` template serialization.** The phase-physics config fields are
+  now `f64`, so the template writes clean decimals (`pixel_size = 0.0001`) instead
+  of f32→f64 promotion noise (`0.00009999999747…`).
+
+### Removed
+
+- **`docs/ROADMAP.md`.** Superseded by this changelog and the per-release notes;
+  all references were removed.
+
+### Documentation
+
+- Rewrote the README to the working v0.4.0 state: accurate two-crate layout,
+  feature-gated build instructions, and a detailed command-line usage section
+  (all subcommands, options, config precedence, chaining, multi-GPU, examples).
+- Added an iterative-algorithm selection guide and a chaining (warm-start)
+  section to `docs/ALGORITHMS.md`, and documented the convention unification
+  across `docs/ARCHITECTURE.md` and `docs/ALGORITHMS.md`.
 
 ## [0.3.0] - 2026-06-30
 
