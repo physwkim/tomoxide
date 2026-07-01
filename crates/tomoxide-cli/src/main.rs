@@ -122,7 +122,10 @@ struct CommonRecon {
     /// below overrides its config value.
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …).
+    /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …). A
+    /// comma-separated list chains stages, warm-starting each from the previous
+    /// stage's volume (e.g. `--algorithm fbp,sirt` seeds SIRT with the FBP
+    /// result); chaining uses the whole-volume path (`recon` only).
     #[arg(long)]
     algorithm: Option<String>,
     /// Rotation-axis column (omit to auto-find / use the detector midline).
@@ -153,30 +156,57 @@ struct CommonRecon {
     /// comma-separated f32 list (e.g. `--reg_par 0.5,0.01`).
     #[arg(long)]
     reg_par: Option<String>,
-    /// Phase retrieval: detector pixel size (cm).
-    #[arg(long, default_value_t = 1e-4)]
-    pixel_size: f32,
-    /// Phase retrieval: sample-to-detector propagation distance (cm).
-    #[arg(long, default_value_t = 50.0)]
-    propagation_distance: f32,
-    /// Phase retrieval: X-ray energy (keV).
-    #[arg(long, default_value_t = 30.0)]
-    energy: f32,
-    /// Phase retrieval (paganin): regularization parameter `alpha`.
-    #[arg(long, default_value_t = 1e-3)]
-    alpha: f32,
-    /// Phase retrieval (Gpaganin/farago): material `delta/beta` ratio.
-    #[arg(long, default_value_t = 1000.0)]
-    db: f32,
-    /// Phase retrieval (Gpaganin): characteristic transverse length `W` (cm).
-    #[arg(long, default_value_t = 2e-4)]
-    w: f32,
+    /// Stripe removal (`fw`): damping factor `sigma` [default: 2.0].
+    #[arg(long)]
+    fw_sigma: Option<f32>,
+    /// Stripe removal (`fw`): decomposition level (`0`/omitted = auto).
+    #[arg(long)]
+    fw_level: Option<usize>,
+    /// Stripe removal (`ti`): number of blocks (`0` = whole sinogram) [default: 0].
+    #[arg(long)]
+    ti_nblock: Option<usize>,
+    /// Stripe removal (`ti`): damping factor `beta` [default: 1.5].
+    #[arg(long)]
+    ti_beta: Option<f32>,
+    /// Stripe removal (`sf`): median window size [default: 5].
+    #[arg(long)]
+    sf_size: Option<usize>,
+    /// Stripe removal (`vo-all`): signal-to-noise ratio [default: 3.0].
+    #[arg(long)]
+    vo_snr: Option<f32>,
+    /// Stripe removal (`vo-all`): large-stripe window size [default: 61].
+    #[arg(long)]
+    vo_la_size: Option<usize>,
+    /// Stripe removal (`vo-all`): small-stripe window size [default: 21].
+    #[arg(long)]
+    vo_sm_size: Option<usize>,
+    /// Phase retrieval: detector pixel size (cm) [default: 1e-4].
+    #[arg(long)]
+    pixel_size: Option<f32>,
+    /// Phase retrieval: sample-to-detector propagation distance (cm) [default: 50].
+    #[arg(long)]
+    propagation_distance: Option<f32>,
+    /// Phase retrieval: X-ray energy (keV) [default: 30].
+    #[arg(long)]
+    energy: Option<f32>,
+    /// Phase retrieval (paganin): regularization parameter `alpha` [default: 1e-3].
+    #[arg(long)]
+    alpha: Option<f32>,
+    /// Phase retrieval (Gpaganin/farago): material `delta/beta` ratio [default: 1000].
+    #[arg(long)]
+    db: Option<f32>,
+    /// Phase retrieval (Gpaganin): characteristic transverse length `W` (cm) [default: 2e-4].
+    #[arg(long)]
+    w: Option<f32>,
 }
 
 /// Fully-resolved reconstruction settings (config merged with CLI flags), plus
 /// the string forms needed to forward the choice to multi-GPU shard subprocesses.
 struct ReconPlan {
     algorithm: String,
+    /// Parsed algorithm chain (length 1 = single algorithm; >1 = warm-start chain).
+    chain: Vec<Algorithm>,
+    /// First (and, for a non-chain, only) algorithm — drives path dispatch.
     algo: Algorithm,
     center: Option<f32>,
     dtype: Dtype,
@@ -189,6 +219,28 @@ struct ReconPlan {
     prep: PrepOptions,
     stripe_str: String,
     phase_str: String,
+    stripe_params: StripeParams,
+    phase_params: PhaseParams,
+}
+
+/// Resolved stripe-removal parameters for the selected method (config merged with
+/// flags). Only the selected method's fields are consulted by [`build_stripe`].
+#[derive(Clone, Copy)]
+struct StripeParams {
+    fw_sigma: f32,
+    fw_level: Option<usize>,
+    ti_nblock: usize,
+    ti_beta: f32,
+    sf_size: usize,
+    vo_snr: f32,
+    vo_la_size: usize,
+    vo_sm_size: usize,
+}
+
+/// Resolved phase-retrieval physics for the selected method (config merged with
+/// flags). Only the selected method's fields are consulted by [`build_phase`].
+#[derive(Clone, Copy)]
+struct PhaseParams {
     pixel_size: f32,
     dist: f32,
     energy: f32,
@@ -198,23 +250,24 @@ struct ReconPlan {
 }
 
 /// Map a stripe-removal method name (matching `Config::remove_stripe_method`) to a
-/// [`StripeMethod`] with the tomopy/tomocupy default parameters.
-fn parse_stripe(name: &str) -> anyhow::Result<StripeMethod> {
+/// [`StripeMethod`], filling the selected variant from the resolved [`StripeParams`]
+/// (config merged with CLI flags; defaults are the tomopy/tomocupy values).
+fn build_stripe(name: &str, p: &StripeParams) -> anyhow::Result<StripeMethod> {
     Ok(match name.to_ascii_lowercase().as_str() {
         "none" => StripeMethod::None,
         "fw" => StripeMethod::Fw {
-            sigma: 2.0,
-            level: None,
+            sigma: p.fw_sigma,
+            level: p.fw_level,
         },
         "ti" => StripeMethod::Ti {
-            nblock: 0,
-            beta: 1.5,
+            nblock: p.ti_nblock,
+            beta: p.ti_beta,
         },
-        "sf" => StripeMethod::Sf { size: 5 },
+        "sf" => StripeMethod::Sf { size: p.sf_size },
         "vo-all" | "vo_all" | "voall" => StripeMethod::VoAll {
-            snr: 3.0,
-            la_size: 61,
-            sm_size: 21,
+            snr: p.vo_snr,
+            la_size: p.vo_la_size,
+            sm_size: p.vo_sm_size,
         },
         other => {
             return Err(anyhow!(
@@ -224,37 +277,29 @@ fn parse_stripe(name: &str) -> anyhow::Result<StripeMethod> {
     })
 }
 
-/// Map a phase-retrieval method name to a [`PhaseMethod`] with the given physics
-/// parameters.
-fn parse_phase(
-    name: &str,
-    ps: f32,
-    dist: f32,
-    energy: f32,
-    alpha: f32,
-    db: f32,
-    w: f32,
-) -> anyhow::Result<PhaseMethod> {
+/// Map a phase-retrieval method name to a [`PhaseMethod`], filling the selected
+/// variant from the resolved [`PhaseParams`] (config merged with CLI flags).
+fn build_phase(name: &str, p: &PhaseParams) -> anyhow::Result<PhaseMethod> {
     Ok(match name.to_ascii_lowercase().as_str() {
         "none" => PhaseMethod::None,
         "paganin" => PhaseMethod::Paganin {
-            pixel_size: ps,
-            dist,
-            energy,
-            alpha,
+            pixel_size: p.pixel_size,
+            dist: p.dist,
+            energy: p.energy,
+            alpha: p.alpha,
         },
         "gpaganin" => PhaseMethod::GPaganin {
-            pixel_size: ps,
-            dist,
-            energy,
-            db,
-            w,
+            pixel_size: p.pixel_size,
+            dist: p.dist,
+            energy: p.energy,
+            db: p.db,
+            w: p.w,
         },
         "farago" => PhaseMethod::Farago {
-            pixel_size: ps,
-            dist,
-            energy,
-            db,
+            pixel_size: p.pixel_size,
+            dist: p.dist,
+            energy: p.energy,
+            db: p.db,
         },
         other => {
             return Err(anyhow!(
@@ -285,7 +330,17 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         None => Config::default(),
     };
     let algorithm = c.algorithm.clone().unwrap_or_else(|| cfg.algorithm.clone());
-    let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
+    // A comma-separated `--algorithm` is a warm-start chain; a single name is a
+    // one-element chain. Parse every stage up front so a typo fails before I/O.
+    let chain: Vec<Algorithm> = algorithm
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<Algorithm>().map_err(|e| anyhow!("{e}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let algo = *chain
+        .first()
+        .ok_or_else(|| anyhow!("no algorithm given (empty --algorithm)"))?;
     let center = c.center.or(cfg.rotation_axis);
     let dtype: Dtype = c.dtype.parse().map_err(|e| anyhow!("{e}"))?;
     let save_format_str = c
@@ -299,7 +354,7 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
     let num_iter = c.num_iter.unwrap_or(cfg.num_iter);
     let reg_par = match &c.reg_par {
         Some(s) => parse_f32_list(s)?,
-        None => Vec::new(),
+        None => cfg.reg_par.clone(),
     };
     let stripe_str = c
         .remove_stripe
@@ -309,21 +364,37 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         .retrieve_phase
         .clone()
         .unwrap_or_else(|| cfg.retrieve_phase_method.clone());
+    // Per-method parameters: each = explicit flag, else config, else built-in
+    // default (already baked into `Config::default`). `fw_level` 0 ⇒ auto (None).
+    let stripe_params = StripeParams {
+        fw_sigma: c.fw_sigma.unwrap_or(cfg.fw_sigma),
+        fw_level: {
+            let l = c.fw_level.unwrap_or(cfg.fw_level);
+            (l != 0).then_some(l)
+        },
+        ti_nblock: c.ti_nblock.unwrap_or(cfg.ti_nblock),
+        ti_beta: c.ti_beta.unwrap_or(cfg.ti_beta),
+        sf_size: c.sf_size.unwrap_or(cfg.sf_size),
+        vo_snr: c.vo_snr.unwrap_or(cfg.vo_snr),
+        vo_la_size: c.vo_la_size.unwrap_or(cfg.vo_la_size),
+        vo_sm_size: c.vo_sm_size.unwrap_or(cfg.vo_sm_size),
+    };
+    let phase_params = PhaseParams {
+        pixel_size: c.pixel_size.unwrap_or(cfg.pixel_size),
+        dist: c.propagation_distance.unwrap_or(cfg.propagation_distance),
+        energy: c.energy.unwrap_or(cfg.energy),
+        alpha: c.alpha.unwrap_or(cfg.alpha),
+        db: c.db.unwrap_or(cfg.db),
+        w: c.w.unwrap_or(cfg.w),
+    };
     let prep = PrepOptions {
-        stripe: parse_stripe(&stripe_str)?,
-        phase: parse_phase(
-            &phase_str,
-            c.pixel_size,
-            c.propagation_distance,
-            c.energy,
-            c.alpha,
-            c.db,
-            c.w,
-        )?,
+        stripe: build_stripe(&stripe_str, &stripe_params)?,
+        phase: build_phase(&phase_str, &phase_params)?,
     };
     Ok((
         ReconPlan {
             algorithm,
+            chain,
             algo,
             center,
             dtype,
@@ -336,12 +407,8 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
             prep,
             stripe_str,
             phase_str,
-            pixel_size: c.pixel_size,
-            dist: c.propagation_distance,
-            energy: c.energy,
-            alpha: c.alpha,
-            db: c.db,
-            w: c.w,
+            stripe_params,
+            phase_params,
         },
         cfg,
     ))
@@ -454,7 +521,7 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "recon: file={} algorithm={:?} center={:?} dtype={} filter={} stripe={} phase={} backend={}",
                 file.display(),
-                plan.algo,
+                plan.chain,
                 plan.center,
                 dtype.as_str(),
                 plan.filter_str,
@@ -462,11 +529,35 @@ fn main() -> anyhow::Result<()> {
                 plan.phase_str,
                 engine.name()
             );
+            log::debug!(
+                "resolved prep={:?} num_iter={} reg_par={:?}",
+                plan.prep,
+                plan.num_iter,
+                plan.reg_par
+            );
             let out = recon_out_path(&file);
-            // Laminography is whole-stack only (the tilt couples all detector rows
-            // into every output voxel), so it cannot use the per-slice pipelined /
-            // multi-GPU shard path — force the whole-volume route below.
-            if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
+            // Algorithm chaining (`--algorithm a,b`) warm-starts each stage from the
+            // previous stage's volume, which needs the whole prior volume — so it
+            // takes the whole-volume path and never the per-slice pipeline/shard.
+            // Laminography is likewise whole-stack only (the tilt couples all
+            // detector rows into every output voxel).
+            if plan.chain.len() > 1 {
+                let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
+                let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
+                if let Some(deg) = lamino_angle {
+                    use std::f32::consts::PI;
+                    geom.beam = tomoxide::Beam::Laminography {
+                        phi: PI / 2.0 + deg * PI / 180.0,
+                    };
+                    println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
+                }
+                let ds = reader.read_all()?;
+                let vol = reconstruct_chain(ds, &geom, &plan, lamino_rh, &engine)?;
+                let mut writer = tomoxide::io::create_writer(&out, save_format)?;
+                let nz = vol.dims().0;
+                writer.reserve(nz)?;
+                writer.write_chunk(&vol, 0, nz)?;
+            } else if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
                 // else the safe default.
@@ -556,6 +647,14 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ReconSteps { common, chunk } => {
             let (plan, cfg) = resolve(&common)?;
+            if plan.chain.len() > 1 {
+                return Err(anyhow!(
+                    "algorithm chaining ({}) needs the whole prior volume to \
+                     warm-start; it is supported only by `recon` (whole-volume), \
+                     not the streaming `recon_steps`",
+                    plan.algorithm
+                ));
+            }
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
             let file = common.file.clone();
             let chunk = chunk.unwrap_or(cfg.nsino_per_chunk);
@@ -570,6 +669,12 @@ fn main() -> anyhow::Result<()> {
                 plan.phase_str,
                 chunk,
                 engine.name()
+            );
+            log::debug!(
+                "resolved prep={:?} num_iter={} reg_par={:?}",
+                plan.prep,
+                plan.num_iter,
+                plan.reg_par
             );
             let out = recon_out_path(&file);
             run_pipelined(
@@ -730,21 +835,51 @@ fn run_sharded_subprocesses(
                 .join(",");
             cmd.arg("--reg_par").arg(csv);
         }
+        // Forward only the selected stripe method's parameters (the others would be
+        // ignored) so each shard reproduces the parent's stripe removal exactly.
+        let sp = &plan.stripe_params;
+        match plan.stripe_str.to_ascii_lowercase().as_str() {
+            "fw" => {
+                cmd.arg("--fw_sigma").arg(sp.fw_sigma.to_string());
+                if let Some(l) = sp.fw_level {
+                    cmd.arg("--fw_level").arg(l.to_string());
+                }
+            }
+            "ti" => {
+                cmd.arg("--ti_nblock")
+                    .arg(sp.ti_nblock.to_string())
+                    .arg("--ti_beta")
+                    .arg(sp.ti_beta.to_string());
+            }
+            "sf" => {
+                cmd.arg("--sf_size").arg(sp.sf_size.to_string());
+            }
+            "vo-all" | "vo_all" | "voall" => {
+                cmd.arg("--vo_snr")
+                    .arg(sp.vo_snr.to_string())
+                    .arg("--vo_la_size")
+                    .arg(sp.vo_la_size.to_string())
+                    .arg("--vo_sm_size")
+                    .arg(sp.vo_sm_size.to_string());
+            }
+            _ => {}
+        }
         // Phase-retrieval physics only matters when a phase method is selected;
         // forward it so the shards match the parent exactly.
         if !plan.phase_str.eq_ignore_ascii_case("none") {
+            let pp = &plan.phase_params;
             cmd.arg("--pixel_size")
-                .arg(plan.pixel_size.to_string())
+                .arg(pp.pixel_size.to_string())
                 .arg("--propagation_distance")
-                .arg(plan.dist.to_string())
+                .arg(pp.dist.to_string())
                 .arg("--energy")
-                .arg(plan.energy.to_string())
+                .arg(pp.energy.to_string())
                 .arg("--alpha")
-                .arg(plan.alpha.to_string())
+                .arg(pp.alpha.to_string())
                 .arg("--db")
-                .arg(plan.db.to_string())
+                .arg(pp.db.to_string())
                 .arg("--w")
-                .arg(plan.w.to_string());
+                .arg(pp.w.to_string());
         }
         if let Some(c) = plan.center {
             cmd.arg("--center").arg(c.to_string());
@@ -1049,6 +1184,54 @@ fn recon_params(
         reg_par,
         ..Default::default()
     }
+}
+
+/// Reconstruct through an algorithm chain (`--algorithm a,b,c`), warm-starting each
+/// stage from the previous stage's volume via [`ReconParams::init`].
+///
+/// Preprocessing (flat/dark + minus-log → phase retrieval → sinogram → stripe
+/// removal) runs **once** — mirroring [`tomoxide::reconstruct`] — then each stage
+/// reconstructs the same prepared sinogram, seeding its initial estimate with the
+/// prior stage's output. The classic use is `fbp,sirt`: the analytic FBP gives a
+/// fast seed the iterative SIRT then refines (fewer iterations for the same
+/// quality). `num_iter`/`reg_par`/`filter` apply to every stage (analytic stages
+/// ignore `num_iter`). Whole-volume only (the warm-start needs the full prior
+/// volume). Returns the final stage's volume.
+fn reconstruct_chain(
+    mut ds: tomoxide::Dataset<f32>,
+    geom: &Geometry,
+    plan: &ReconPlan,
+    lamino_rh: Option<usize>,
+    engine: &Engine,
+) -> anyhow::Result<tomoxide::Volume<f32>> {
+    let backend = engine.backend();
+    tomoxide::prep::normalize_dataset(&mut ds, backend)?;
+    tomoxide::prep::retrieve_phase(&mut ds.data, plan.prep.phase, backend)?;
+    let mut sino = ds.data.to_layout(tomoxide::Layout::Sinogram);
+    tomoxide::prep::remove_stripe(&mut sino, plan.prep.stripe)?;
+
+    let n = plan.chain.len();
+    let mut init: Option<tomoxide::Volume<f32>> = None;
+    for (i, &algo) in plan.chain.iter().enumerate() {
+        let mut params = recon_params(
+            geom,
+            plan.dtype,
+            plan.filter,
+            plan.num_iter,
+            plan.reg_par.clone(),
+        );
+        params.lamino_rh = lamino_rh;
+        params.init = init.take();
+        let warm = params.init.is_some();
+        let vol = tomoxide::recon::recon(&sino, geom, algo, &params, backend)?;
+        println!(
+            "  chain [{}/{n}] {algo:?}{}",
+            i + 1,
+            if warm { " (warm-started)" } else { "" }
+        );
+        init = Some(vol);
+    }
+    init.ok_or_else(|| anyhow!("empty algorithm chain"))
 }
 
 /// Output path for a reconstruction: `<input-without-extension>_rec`.
