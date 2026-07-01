@@ -659,6 +659,11 @@ fn gradient_descent(
 
     let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
     let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
+                                                        // The forward projector now carries the adjoint gain π/nang (see `CpuBackend::
+                                                        // project`); divide it back out of the data residual so the fixed-step/BB
+                                                        // conditioning is invariant to that gain (identical to the pre-adjoint-unification
+                                                        // behaviour, and matched by the CUDA device-resident solver).
+    let fwd_gain_inv = nang as f32 / std::f32::consts::PI;
     let fixed_step = params.reg_par.first().copied().unwrap_or(1.0);
 
     // r-scaled domain (physical = r · iterate); a warm-start seed enters as init / r.
@@ -675,7 +680,7 @@ fn gradient_descent(
         let mut prox1 = ax.array.clone();
         ndarray::Zip::from(&mut prox1)
             .and(&b.array)
-            .for_each(|p, &d| *p = *p * r - d); // r·R x − b
+            .for_each(|p, &d| *p = (*p * r - d) * fwd_gain_inv); // (r·R x − b)/gain
         bp.backproject(&Tomo::new(prox1, Layout::Sinogram), geom, &mut bpv)?;
         let mut grad = bpv.array.mapv(|v| 2.0 * r * adj_scale * v); // 2r·Rᵀ(…)
 
@@ -801,6 +806,11 @@ fn tv(
 
     let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
     let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
+                                                        // Divide the forward projector's adjoint gain π/nang back out of the data term
+                                                        // (see `gradient_descent`) so the fixed Chambolle–Pock step stays well-
+                                                        // conditioned regardless of that gain; keeps the CP data operator norm — and
+                                                        // thus the convergence rate and the TV/data balance — invariant to it.
+    let fwd_gain_inv = nang as f32 / std::f32::consts::PI;
     let lambda = params.reg_par.first().copied().unwrap_or(1.0); // TV strength
     const C: f32 = 0.35; // tomopy's fixed primal–dual step
 
@@ -822,7 +832,7 @@ fn tv(
         ndarray::Zip::from(&mut pd.array)
             .and(&ax.array)
             .and(&b.array)
-            .for_each(|q, &a, &d| *q = (*q + C * r * a - C * d) / (1.0 + C));
+            .for_each(|q, &a, &d| *q = (*q + fwd_gain_inv * (C * r * a - C * d)) / (1.0 + C));
         bp.backproject(&pd, geom, &mut bpv)?; // (π/nang)·Rᵀ(pᵈ)
 
         for z in 0..nz {

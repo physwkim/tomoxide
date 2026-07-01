@@ -174,6 +174,7 @@ unsafe extern "C" {
         b: *const c_void,
         c: f32,
         r: f32,
+        g: f32,
         n: usize,
         stream: *mut c_void,
     ) -> i32;

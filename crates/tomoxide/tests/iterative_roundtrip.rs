@@ -818,7 +818,7 @@ fn tv_stronger_lambda_smooths() {
     let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
     let sino = sim::project(&vol, &geom, &cpu).unwrap();
 
-    let p = |lambda| ReconParams {
+    let p = |lambda: f32| ReconParams {
         num_gridx: Some(n),
         num_iter: 200,
         reg_par: vec![lambda],

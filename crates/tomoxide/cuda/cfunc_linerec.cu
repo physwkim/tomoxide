@@ -66,9 +66,13 @@ void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float ph
     dim3 fillBlock(32, 8, 1);
     dim3 fillGrid(ceil(n / 32.0), ceil(ncz / 8.0), ncproj);
     fill_tex_ker<<<fillGrid, fillBlock, 0, stream>>>(surf_obj, g, ncz, n, ncproj);
-    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
+    // Back-projector gain π/nproj (was tomocupy's 4/nproj). Matches the CPU/tomopy
+    // back-projector (cpu/mod.rs `PI/nang`) so fbp/linerec are scale-unified, and —
+    // paired with the identical change in forwardproj.cu — keeps {forward, back} a
+    // true adjoint pair for the iterative suite (convention unification Phase 2b).
+    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, 3.14159265358979f/nproj, sz, ncz, n, nz, ncproj);
 #else
-    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
+    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, ncz, n, nz, ncproj);
 #endif
 }
 
@@ -84,7 +88,7 @@ void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size
     dim3 GS3d0;  
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
     size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
-    backprojection_try_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, sh, ncz, n, nz, ncproj);
+    backprojection_try_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, sh, ncz, n, nz, ncproj);
 }                                            
 
 void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz,  size_t stream_) {

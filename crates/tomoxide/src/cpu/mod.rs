@@ -572,6 +572,14 @@ impl ForwardProject for CpuBackend {
                     }
                 }
             });
+        // Scale by π/n_angles so the forward projector is the true adjoint of the
+        // back-projector (which carries the same `PI/nang`, see the recon path). The
+        // raw geometry scatter above is `W`; the back-projector is `(π/nang)·Wᵀ`, so
+        // the forward must be `(π/nang)·W` for {A, Aᵀ} to be a matched adjoint pair.
+        // The iterative solvers rely on this; it also matches the CUDA projector pair
+        // (both π/nproj) so iterative recon is scale-consistent across backends.
+        let scale = std::f32::consts::PI / nang as f32;
+        data.par_iter_mut().for_each(|v| *v *= scale);
         let array = ndarray::Array3::from_shape_vec((nz, nang, ncols), data)
             .map_err(|e| Error::InvalidParam(format!("forward-projection shape: {e}")))?;
         *out = Tomo::new(array, Layout::Sinogram);
@@ -818,16 +826,20 @@ mod tests {
     fn forward_project_center_pixel_hits_center_column() {
         // A single pixel at the grid center (cx = cy = 2) projects to t = center
         // = width/2 = 2 for every angle, so column 2 holds the value everywhere.
+        // The projector carries the adjoint gain π/n_angles (see `project`), so the
+        // unit pixel lands as π/nang, not 1.0.
         let mut varr = Array3::<f32>::zeros((1, 4, 4));
         varr[[0, 2, 2]] = 1.0;
         let v = Volume::new(varr);
-        let geom = Geometry::parallel(Angles::uniform(4, 0.0, PI), 4, 1, 1.0);
+        let nang = 4;
+        let scale = PI / nang as f32;
+        let geom = Geometry::parallel(Angles::uniform(nang, 0.0, PI), 4, 1, 1.0);
         let mut s = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Sinogram);
         CpuBackend.project(&v, &geom, &mut s).unwrap();
         assert_eq!(s.layout, Layout::Sinogram);
         assert_eq!(s.array.dim(), (1, 4, 4));
         for ia in 0..4 {
-            assert!((s.array[[0, ia, 2]] - 1.0).abs() < 1e-4, "ia={ia}");
+            assert!((s.array[[0, ia, 2]] - scale).abs() < 1e-4, "ia={ia}");
             assert!(s.array[[0, ia, 0]].abs() < 1e-6);
         }
     }

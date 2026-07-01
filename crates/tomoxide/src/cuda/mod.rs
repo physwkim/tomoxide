@@ -1088,7 +1088,11 @@ mod cuda_impl {
 
         let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
         let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
-        let coef = 2.0 * r * adj_scale;
+                                                             // Divide the forward projector's adjoint gain π/nproj back out of the data
+                                                             // gradient (folded into `coef`, since grad = coef·Rᵀ(r·R x − b)) so the
+                                                             // conditioning is invariant to that gain — matching the host `gradient_descent`.
+        let fwd_gain_inv = nproj as f32 / std::f32::consts::PI;
+        let coef = 2.0 * r * adj_scale * fwd_gain_inv;
         let fixed_step = reg_par.first().copied().unwrap_or(1.0);
         let two_reg1 = tikh.as_ref().map(|(r1, _)| 2.0 * r1).unwrap_or(0.0);
 
@@ -1205,6 +1209,10 @@ mod cuda_impl {
         let null = std::ptr::null_mut::<c_void>();
         let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
         let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
+                                                             // Divide the forward projector's adjoint gain π/nproj back out of the data
+                                                             // residual so the fixed Chambolle–Pock step stays well-conditioned regardless
+                                                             // of that gain (matches the host `tv`).
+        let fwd_gain_inv = nproj as f32 / std::f32::consts::PI;
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
@@ -1227,7 +1235,16 @@ mod cuda_impl {
         unsafe {
             for _ in 0..num_iter.max(1) {
                 dev_forward(ax_d.ptr, xbar_d.ptr, tp, nz, n, nproj, sbytes); // R x̄
-                ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null);
+                ffi::tomoxide_iter_tv_datadual(
+                    pd_d.ptr,
+                    ax_d.ptr,
+                    b_d.ptr,
+                    C,
+                    r,
+                    fwd_gain_inv,
+                    nsino,
+                    null,
+                );
                 dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, vbytes); // (π/nproj)·Rᵀ(pd)
                 ffi::tomoxide_iter_tv_dual(
                     p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,

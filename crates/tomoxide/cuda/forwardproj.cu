@@ -3,7 +3,7 @@
 //
 // The voxel-driven back-projector gathers, for output voxel
 //   j = tx + ty*n + tz*n*n,
-//   f[j] += c * Σ_t  bilinear(g; u(j,t), v(j,t))   with c = 4/nproj,
+//   f[j] += c * Σ_t  bilinear(g; u(j,t), v(j,t))   with c = π/nproj,
 // i.e. as a matrix `f = (c·W)·g` where `W` is the bilinear gather operator.
 // Its adjoint (the forward projector the iterative solvers need as `A`, with the
 // back-projector serving as `Aᵀ`) is `g = (c·Wᵀ)·f`: each voxel scatters its
@@ -84,7 +84,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 }
 
 // C-ABI host wrapper. `g` (output sinogram [nz][nproj][n]) must be pre-zeroed.
-// `c = 4/nproj` matches backprojection_ker exactly so {forward, back} are a true
+// `c = π/nproj` matches backprojection_ker exactly so {forward, back} are a true
 // adjoint pair. The launch geometry mirrors cfunc_linerec::backprojection.
 extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
                                         int nz, int n, int nproj, void *stream)
@@ -92,7 +92,10 @@ extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *the
     dim3 dimBlock(32, 32, 1);
     dim3 grid((unsigned)ceil(n / 32.0), (unsigned)ceil(n / 32.0), (unsigned)nz);
     size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
-    float c = 4.0f / (float)nproj;
+    // π/nproj matches backprojection_ker's gain (see cfunc_linerec.cu) so
+    // {forward, back} stay a true adjoint pair, and matches the CPU forward/back
+    // (both PI/nang) so the iterative suite is scale-unified across backends.
+    float c = 3.14159265358979f / (float)nproj;
     forwardprojection_ker<<<grid, dimBlock, shmem, (cudaStream_t)stream>>>(
         (float *)g, (const float *)f, theta, phi, c, n, nz, nproj);
 }
