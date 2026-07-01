@@ -167,6 +167,43 @@ unsafe extern "C" {
         nz: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// TV data dual proximal `pd = (pd + c·r·ax − c·b)/(1+c)` (in-place into `pd`).
+    pub fn tomoxide_iter_tv_datadual(
+        pd: *mut c_void,
+        ax: *const c_void,
+        b: *const c_void,
+        c: f32,
+        r: f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// TV dual ascent on `xbar` + λ-ball projection (interior stencil; last
+    /// row/col of `p0x`/`p0y` untouched). 3-D grid `[nz,n,n]`.
+    pub fn tomoxide_iter_tv_dual(
+        p0x: *mut c_void,
+        p0y: *mut c_void,
+        xbar: *const c_void,
+        c: f32,
+        lambda: f32,
+        n: usize,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// TV primal step + over-relaxation: `x ← x − c·r·adj·Rᵀ(pd) + c·div(pᵀᵛ)`,
+    /// `xbar ← 2x − x_old`. 3-D grid `[nz,n,n]`.
+    pub fn tomoxide_iter_tv_primal(
+        x: *mut c_void,
+        xbar: *mut c_void,
+        bpv: *const c_void,
+        p0x: *const c_void,
+        p0y: *const c_void,
+        c: f32,
+        r: f32,
+        adj_scale: f32,
+        n: usize,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
     /// `ax[i] = ax[i]*r - b[i]` (GD data proximal, in-place into `ax`).
     pub fn tomoxide_iter_grad_prox(
         ax: *mut c_void,

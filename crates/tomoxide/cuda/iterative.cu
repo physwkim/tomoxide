@@ -116,6 +116,61 @@ __global__ void iter_pml_update_ker(float *vol, const float *old, const float *c
     vol[idx] = out;
 }
 
+// --- total variation (tv, Chambolle–Pock) ---
+
+// Data dual proximal: pd = (pd + c·r·ax − c·b)/(1+c), elementwise over the
+// sinogram (ax = R x̄). In-place into pd.
+__global__ void iter_tv_datadual_ker(float *pd, const float *ax, const float *b, float c, float r,
+                                     long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    pd[i] = (pd[i] + c * r * ax[i] - c * b[i]) / (1.0f + c);
+}
+
+// TV dual ascent on x̄ then projection onto the λ-ball, interior stencil only
+// (last row/col of p0x/p0y stay 0 — matching the host's `0..n-1` loop bounds).
+__global__ void iter_tv_dual_ker(float *p0x, float *p0y, const float *xbar, float c, float lambda,
+                                 int n, int nz) {
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z;
+    if (ix >= n - 1 || iy >= n - 1 || z >= nz)
+        return;
+    long long base = (long long)z * n * n;
+    long long idx = base + (long long)iy * n + ix;
+    float xb = xbar[idx];
+    float px = p0x[idx] + c * (xbar[base + (long long)iy * n + (ix + 1)] - xb);
+    float py = p0y[idx] + c * (xbar[base + (long long)(iy + 1) * n + ix] - xb);
+    float upd = fmaxf(sqrtf(px * px + py * py) / lambda, 1.0f);
+    p0x[idx] = px / upd;
+    p0y[idx] = py / upd;
+}
+
+// Primal step xₙ = x_old − c·r·adj·Rᵀ(pd) + c·div(pᵀᵛ), then over-relax
+// x̄ = 2xₙ − x_old. div uses a forward difference with a zero left/top boundary
+// (div at ix=0 is p0x[0], else p0x[ix]−p0x[ix−1]; likewise for y). Each voxel
+// reads only its own x_old, so the in-place x update is race-free.
+__global__ void iter_tv_primal_ker(float *x, float *xbar, const float *bpv, const float *p0x,
+                                   const float *p0y, float c, float r, float adj_scale, int n,
+                                   int nz) {
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z;
+    if (ix >= n || iy >= n || z >= nz)
+        return;
+    long long base = (long long)z * n * n;
+    long long idx = base + (long long)iy * n + ix;
+    float x_old = x[idx];
+    float u = x_old - c * r * adj_scale * bpv[idx];
+    u += (ix == 0) ? c * p0x[base + (long long)iy * n]
+                   : c * (p0x[idx] - p0x[base + (long long)iy * n + (ix - 1)]);
+    u += (iy == 0) ? c * p0y[base + ix]
+                   : c * (p0y[idx] - p0y[base + (long long)(iy - 1) * n + ix]);
+    x[idx] = u;
+    xbar[idx] = 2.0f * u - x_old;
+}
+
 // --- gradient descent (grad / tikh) ---
 
 // ax[i] = ax[i]*r - b[i]  — data proximal r·R x − b (in-place into `ax`).
@@ -221,6 +276,34 @@ int tomoxide_iter_pml_update(void *vol, const void *old, const void *corr, const
     iter_pml_update_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
         (float *)vol, (const float *)old, (const float *)corr, (const float *)sens, reg, delta,
         has_delta, (int)n, (int)nz);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_tv_datadual(void *pd, const void *ax, const void *b, float c, float r, size_t n,
+                              void *stream) {
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    iter_tv_datadual_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)pd, (const float *)ax, (const float *)b, c, r, (long long)n);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_tv_dual(void *p0x, void *p0y, const void *xbar, float c, float lambda, size_t n,
+                          size_t nz, void *stream) {
+    dim3 block(16, 16, 1);
+    dim3 grid(((unsigned)n + 15) / 16, ((unsigned)n + 15) / 16, (unsigned)nz);
+    iter_tv_dual_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)p0x, (float *)p0y, (const float *)xbar, c, lambda, (int)n, (int)nz);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_tv_primal(void *x, void *xbar, const void *bpv, const void *p0x, const void *p0y,
+                            float c, float r, float adj_scale, size_t n, size_t nz, void *stream) {
+    dim3 block(16, 16, 1);
+    dim3 grid(((unsigned)n + 15) / 16, ((unsigned)n + 15) / 16, (unsigned)nz);
+    iter_tv_primal_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)x, (float *)xbar, (const float *)bpv, (const float *)p0x, (const float *)p0y, c, r,
+        adj_scale, (int)n, (int)nz);
     return (int)cudaGetLastError();
 }
 

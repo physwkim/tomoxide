@@ -1152,11 +1152,90 @@ mod cuda_impl {
         Ok(Volume::new(array))
     }
 
+    /// Device-resident total variation (`tv`, Chambolle–Pock primal–dual). The
+    /// r-scaled iterate (`x`, extrapolated primal `xbar`), the TV dual fields
+    /// (`p0x`/`p0y`), and the data dual (`pd`) all stay on the GPU across
+    /// iterations. Each iteration: forward `R xbar`, the data dual proximal, the
+    /// back-projection `Rᵀ(pd)`, the TV dual ascent + λ-ball projection, and the
+    /// primal step with over-relaxation — then unscale by r. Mirrors the host
+    /// `tv` op-for-op (same fixed step `C = 0.35`).
+    #[cfg(feature = "cuda")]
+    fn tv_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+        lambda: f32,
+    ) -> Result<Volume<f32>> {
+        const C: f32 = 0.35; // tomopy's fixed primal–dual step
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
+        let sino_std = s.array.as_standard_layout();
+        let sino_slice = sino_std
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+        let theta = &geom.angles.0;
+
+        let (nvol, nsino) = (nz * n * n, nz * nproj * ncols);
+        let (vbytes, sbytes) = (
+            nvol * std::mem::size_of::<f32>(),
+            nsino * std::mem::size_of::<f32>(),
+        );
+        let null = std::ptr::null_mut::<c_void>();
+        let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
+        let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
+
+        let theta_d = DevBuf::from_host_f32(theta)?;
+        let tp = theta_d.ptr as *const f32;
+        let b_d = DevBuf::from_host_f32(sino_slice)?;
+        let xbar_d = DevBuf::zeroed(vbytes)?; // extrapolated primal (recon)
+        let x_d = DevBuf::zeroed(vbytes)?; // primal iterate
+        let p0x_d = DevBuf::zeroed(vbytes)?; // TV dual, x-gradient
+        let p0y_d = DevBuf::zeroed(vbytes)?; // TV dual, y-gradient
+        let pd_d = DevBuf::zeroed(sbytes)?; // data dual (persists across iters)
+        let ax_d = DevBuf::zeroed(sbytes)?;
+        let bpv_d = DevBuf::zeroed(vbytes)?;
+
+        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+        if handle.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+
+        unsafe {
+            for _ in 0..num_iter.max(1) {
+                dev_forward(ax_d.ptr, xbar_d.ptr, tp, nz, n, nproj, sbytes); // R x̄
+                ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null);
+                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, vbytes); // (π/nproj)·Rᵀ(pd)
+                ffi::tomoxide_iter_tv_dual(
+                    p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
+                );
+                ffi::tomoxide_iter_tv_primal(
+                    x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, adj_scale, n, nz,
+                    null,
+                );
+            }
+            ffi::tomoxide_iter_scale_inplace(xbar_d.ptr, r, nvol, null); // back to physical domain
+        }
+
+        let rc = unsafe { ffi::tomoxide_cuda_sync() };
+        unsafe { ffi::tomoxide_linerec_free(handle) };
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+        }
+        let mut host = vec![0.0f32; nvol];
+        xbar_d.to_host_f32(&mut host)?;
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+        Ok(Volume::new(array))
+    }
+
     impl IterativeReconstruct for CudaBackend {
         /// Device-resident iterative reconstruction — the volume/sinogram stay on
         /// the GPU across all iterations (no per-iteration host↔device transfer).
-        /// Implemented for SIRT ([`sirt_device`]) and MLEM/OSEM ([`em_device`]);
-        /// every other algorithm returns `Ok(None)` → generic host fallback. Also
+        /// Implemented for SIRT ([`sirt_device`]), MLEM/OSEM ([`em_device`]),
+        /// OSPML/PML ([`ospml_device`]), GRAD/TIKH ([`grad_device`]), and TV
+        /// ([`tv_device`]); every other algorithm returns `Ok(None)` → generic
+        /// host fallback (ART/BART are dispatched earlier, by ray projector). Also
         /// falls back for non-parallel beam or a non-square grid (the kernels
         /// assume detector width = grid `n`). Reuses the same `A`/`Aᵀ` kernels as
         /// the generic solvers, so results match the host to the atomic-add floor
@@ -1223,6 +1302,10 @@ mod cuda_impl {
                         return Ok(None);
                     };
                     grad_device(sino, geom, n, it, &params.reg_par, Some((reg1, prior))).map(Some)
+                }
+                Algorithm::Tv => {
+                    let lambda = params.reg_par.first().copied().unwrap_or(1.0);
+                    tv_device(sino, geom, n, it, lambda).map(Some)
                 }
                 _ => Ok(None),
             }

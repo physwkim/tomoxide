@@ -442,6 +442,40 @@ fn cuda_ospml_matches_per_iteration() {
     }
 }
 
+/// Device-resident TV (Chambolle–Pock) reproduces the per-iteration CUDA path.
+/// Both run the identical CUDA `A`/`Aᵀ` kernels; the device path additionally
+/// does the data dual, TV dual, and primal steps (`iter_tv_*`) on-device. The
+/// primal–dual iteration with a fixed step is contractive ⇒ tight parity.
+#[test]
+fn cuda_tv_matches_per_iteration() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let periter = PerIterCuda(&cuda);
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(stack(&phantom, nz));
+    let sino = sim::project(&vol, &geom, &cuda).unwrap();
+
+    let params = ReconParams {
+        num_iter: 30,
+        num_gridx: Some(n),
+        reg_par: vec![1e-3], // TV strength λ
+        ..Default::default()
+    };
+    let rd = recon::recon(&sino, &geom, Algorithm::Tv, &params, &cuda).unwrap();
+    let rp = recon::recon(&sino, &geom, Algorithm::Tv, &params, &periter).unwrap();
+    let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+    eprintln!("Tv device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}");
+    assert!(r > 0.9999, "Tv device-resident diverges: r={r:.6}");
+    assert!(nrmse < 5e-3, "Tv NRMSE too large: {nrmse:.3e}");
+}
+
 /// Device-resident GRAD/TIKH reproduce the per-iteration CUDA path. Both run the
 /// identical CUDA `A`/`Aᵀ` kernels; the device path additionally does the data
 /// proximal, gradient assembly, Barzilai–Borwein reductions, and the per-slice
