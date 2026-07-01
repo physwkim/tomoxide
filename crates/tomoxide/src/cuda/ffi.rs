@@ -28,6 +28,13 @@ unsafe extern "C" {
     pub fn tomoxide_cuda_memcpy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
     /// `cudaMemcpy` device→host; returns 0 on success.
     pub fn tomoxide_cuda_memcpy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
+    /// `cudaMemcpyAsync` device→device on `stream` (null = per-thread default); 0 ok.
+    pub fn tomoxide_cuda_memcpy_d2d_async(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
     /// `cudaMemset`; returns 0 on success.
     pub fn tomoxide_cuda_memset(p: *mut c_void, value: i32, bytes: usize) -> i32;
     /// `cudaDeviceSynchronize`; returns 0 on success.
@@ -143,6 +150,70 @@ unsafe extern "C" {
         corr: *const c_void,
         sens: *const c_void,
         n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `ax[i] = ax[i]*r - b[i]` (GD data proximal, in-place into `ax`).
+    pub fn tomoxide_iter_grad_prox(
+        ax: *mut c_void,
+        b: *const c_void,
+        r: f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `grad[i] = coef * bpv[i]` (GD data gradient, fresh write).
+    pub fn tomoxide_iter_grad_assemble(
+        grad: *mut c_void,
+        bpv: *const c_void,
+        coef: f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `grad[i] += two_reg1 * (vol[i] - prior[i])` (Tikhonov gradient).
+    pub fn tomoxide_iter_grad_tikh(
+        grad: *mut c_void,
+        vol: *const c_void,
+        prior: *const c_void,
+        two_reg1: f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `x[i] *= s` over `n` elements.
+    pub fn tomoxide_iter_scale_inplace(
+        x: *mut c_void,
+        s: f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `vol[i] -= lambda[i/slice_len] * grad[i]` (per-slice gradient step).
+    pub fn tomoxide_iter_axpy_neg_slice(
+        vol: *mut c_void,
+        grad: *const c_void,
+        lambda: *const c_void,
+        slice_len: usize,
+        total_n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Per-slice BB reductions `num[z]=Σ(x−x0)(g−g0)`, `den[z]=Σ(g−g0)²` (one block
+    /// per slice). `num`/`den` are device `[nz]`.
+    pub fn tomoxide_iter_bb_reduce(
+        num: *mut c_void,
+        den: *mut c_void,
+        x: *const c_void,
+        x0: *const c_void,
+        g: *const c_void,
+        g0: *const c_void,
+        slice_len: usize,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `lambda[z] = fixed_step≥0 ? fixed_step : (is_first ? 1e-3 : den≠0 ? num/den : 1e-3)`.
+    pub fn tomoxide_iter_bb_lambda(
+        lambda: *mut c_void,
+        num: *const c_void,
+        den: *const c_void,
+        fixed_step: f32,
+        is_first: i32,
+        nz: usize,
         stream: *mut c_void,
     ) -> i32;
 

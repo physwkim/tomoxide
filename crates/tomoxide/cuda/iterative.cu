@@ -60,7 +60,168 @@ __global__ void iter_em_update_ker(float *vol, const float *corr, const float *s
         vol[i] = vol[i] * corr[i] / s;
 }
 
+// --- gradient descent (grad / tikh) ---
+
+// ax[i] = ax[i]*r - b[i]  — data proximal r·R x − b (in-place into `ax`).
+__global__ void iter_grad_prox_ker(float *ax, const float *b, float r, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    ax[i] = ax[i] * r - b[i];
+}
+
+// grad[i] = coef * bpv[i]  — data gradient 2r·adj_scale·Rᵀ(…). Fresh write.
+__global__ void iter_grad_assemble_ker(float *grad, const float *bpv, float coef, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    grad[i] = coef * bpv[i];
+}
+
+// grad[i] += two_reg1 * (vol[i] - prior[i])  — Tikhonov gradient 2·reg1·(x−prior).
+__global__ void iter_grad_tikh_ker(float *grad, const float *vol, const float *prior,
+                                   float two_reg1, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    grad[i] += two_reg1 * (vol[i] - prior[i]);
+}
+
+// x[i] *= s  — final unscale back to the physical domain (x ← r·x).
+__global__ void iter_scale_inplace_ker(float *x, float s, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    x[i] *= s;
+}
+
+// vol[i] -= lambda[z]*grad[i], z = i/slice_len  — per-slice gradient step.
+__global__ void iter_axpy_neg_slice_ker(float *vol, const float *grad, const float *lambda,
+                                        long long slice_len, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    int z = (int)(i / slice_len);
+    vol[i] -= lambda[z] * grad[i];
+}
+
+// Per-slice Barzilai–Borwein reductions: num[z] = Σ(x−x0)(g−g0), den[z] = Σ(g−g0)².
+// One block per slice; blockDim must be a power of two (shared-mem tree reduce).
+__global__ void iter_bb_reduce_ker(float *num, float *den, const float *x, const float *x0,
+                                   const float *g, const float *g0, long long slice_len, int nz) {
+    int z = blockIdx.x;
+    if (z >= nz)
+        return;
+    extern __shared__ float sh[];
+    float *snum = sh;
+    float *sden = sh + blockDim.x;
+    long long base = (long long)z * slice_len;
+    float ln = 0.0f, ld = 0.0f;
+    for (long long i = threadIdx.x; i < slice_len; i += blockDim.x) {
+        float dx = x[base + i] - x0[base + i];
+        float dg = g[base + i] - g0[base + i];
+        ln += dx * dg;
+        ld += dg * dg;
+    }
+    snum[threadIdx.x] = ln;
+    sden[threadIdx.x] = ld;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            snum[threadIdx.x] += snum[threadIdx.x + s];
+            sden[threadIdx.x] += sden[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        num[z] = snum[0];
+        den[z] = sden[0];
+    }
+}
+
+// lambda[z] = fixed_step≥0 ? fixed_step : (is_first ? 1e-3 : (den≠0 ? num/den : 1e-3)).
+__global__ void iter_bb_lambda_ker(float *lambda, const float *num, const float *den,
+                                   float fixed_step, int is_first, int nz) {
+    int z = blockIdx.x * blockDim.x + threadIdx.x;
+    if (z >= nz)
+        return;
+    float lam;
+    if (fixed_step >= 0.0f)
+        lam = fixed_step;
+    else if (is_first)
+        lam = 1e-3f;
+    else
+        lam = (den[z] != 0.0f) ? (num[z] / den[z]) : 1e-3f;
+    lambda[z] = lam;
+}
+
 extern "C" {
+
+int tomoxide_iter_grad_prox(void *ax, const void *b, float r, size_t n, void *stream) {
+    long long total = (long long)n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_grad_prox_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)ax, (const float *)b, r, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_grad_assemble(void *grad, const void *bpv, float coef, size_t n, void *stream) {
+    long long total = (long long)n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_grad_assemble_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)grad, (const float *)bpv, coef, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_grad_tikh(void *grad, const void *vol, const void *prior, float two_reg1,
+                            size_t n, void *stream) {
+    long long total = (long long)n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_grad_tikh_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)grad, (const float *)vol, (const float *)prior, two_reg1, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_scale_inplace(void *x, float s, size_t n, void *stream) {
+    long long total = (long long)n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_scale_inplace_ker<<<grid, block, 0, (cudaStream_t)stream>>>((float *)x, s, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_axpy_neg_slice(void *vol, const void *grad, const void *lambda, size_t slice_len,
+                                 size_t total_n, void *stream) {
+    long long total = (long long)total_n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_axpy_neg_slice_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)vol, (const float *)grad, (const float *)lambda, (long long)slice_len, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_bb_reduce(void *num, void *den, const void *x, const void *x0, const void *g,
+                            const void *g0, size_t slice_len, size_t nz, void *stream) {
+    int block = 256;
+    int grid = (int)nz;
+    size_t shmem = 2 * (size_t)block * sizeof(float);
+    iter_bb_reduce_ker<<<grid, block, shmem, (cudaStream_t)stream>>>(
+        (float *)num, (float *)den, (const float *)x, (const float *)x0, (const float *)g,
+        (const float *)g0, (long long)slice_len, (int)nz);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_bb_lambda(void *lambda, const void *num, const void *den, float fixed_step,
+                            int is_first, size_t nz, void *stream) {
+    int block = 256;
+    int grid = (int)(((int)nz + block - 1) / block);
+    iter_bb_lambda_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)lambda, (const float *)num, (const float *)den, fixed_step, is_first, (int)nz);
+    return (int)cudaGetLastError();
+}
 
 int tomoxide_iter_em_ratio(void *ax, const void *b, size_t n, void *stream) {
     long long total = (long long)n;

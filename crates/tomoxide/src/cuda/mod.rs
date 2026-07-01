@@ -945,6 +945,126 @@ mod cuda_impl {
         Ok(Volume::new(array))
     }
 
+    /// Device-resident least-squares gradient descent (`grad`) and its Tikhonov
+    /// variant (`tikh`). The iterate lives on the GPU in the r-scaled domain
+    /// (init 0); each iteration computes `grad = 2r·adj·Rᵀ(r·R x − b)` (+ the
+    /// Tikhonov term `2·reg1·(x − prior)` when `tikh` is `Some`), a per-slice step
+    /// `λ` (fixed if `reg_par[0] ≥ 0`, else Barzilai–Borwein via on-device
+    /// reductions), and `x ← x − λ g`, then unscales by `r`. `recon0`/`grad0`
+    /// (previous iterate/gradient, needed for BB) are kept device-resident and
+    /// refreshed with D2D copies. Mirrors the host `gradient_descent` op-for-op.
+    #[cfg(feature = "cuda")]
+    fn grad_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+        reg_par: &[f32],
+        tikh: Option<(f32, Vec<f32>)>,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
+        let sino_std = s.array.as_standard_layout();
+        let sino_slice = sino_std
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+        let theta = &geom.angles.0;
+
+        let (nvol, nsino) = (nz * n * n, nz * nproj * ncols);
+        let (vbytes, sbytes) = (
+            nvol * std::mem::size_of::<f32>(),
+            nsino * std::mem::size_of::<f32>(),
+        );
+        let zbytes = nz * std::mem::size_of::<f32>();
+        let slice_len = n * n;
+        let null = std::ptr::null_mut::<c_void>();
+
+        let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
+        let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
+        let coef = 2.0 * r * adj_scale;
+        let fixed_step = reg_par.first().copied().unwrap_or(1.0);
+        let two_reg1 = tikh.as_ref().map(|(r1, _)| 2.0 * r1).unwrap_or(0.0);
+
+        let theta_d = DevBuf::from_host_f32(theta)?;
+        let tp = theta_d.ptr as *const f32;
+        let b_d = DevBuf::from_host_f32(sino_slice)?;
+        let vol_d = DevBuf::zeroed(vbytes)?; // x, r-scaled, init 0
+        let recon0_d = DevBuf::zeroed(vbytes)?; // previous x (BB)
+        let grad0_d = DevBuf::zeroed(vbytes)?; // previous grad (BB)
+        let grad_d = DevBuf::zeroed(vbytes)?;
+        let ax_d = DevBuf::zeroed(sbytes)?;
+        let bpv_d = DevBuf::zeroed(vbytes)?;
+        let lambda_d = DevBuf::zeroed(zbytes)?;
+        let num_d = DevBuf::zeroed(zbytes)?;
+        let den_d = DevBuf::zeroed(zbytes)?;
+        let prior_d = match &tikh {
+            Some((_, p)) => Some(DevBuf::from_host_f32(p)?),
+            None => None,
+        };
+
+        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+        if handle.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+
+        unsafe {
+            for it in 0..num_iter.max(1) {
+                dev_forward(ax_d.ptr, vol_d.ptr, tp, nz, n, nproj, sbytes); // ax = R x
+                ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null); // r·R x − b
+                dev_backproject(handle, bpv_d.ptr, ax_d.ptr, tp, vbytes); // Rᵀ(…)
+                ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·adj·Rᵀ
+                if let Some(pd) = &prior_d {
+                    ffi::tomoxide_iter_grad_tikh(
+                        grad_d.ptr, vol_d.ptr, pd.ptr, two_reg1, nvol, null,
+                    );
+                }
+                // Step size from the previous iterate/gradient, then save them.
+                ffi::tomoxide_iter_bb_reduce(
+                    num_d.ptr,
+                    den_d.ptr,
+                    vol_d.ptr,
+                    recon0_d.ptr,
+                    grad_d.ptr,
+                    grad0_d.ptr,
+                    slice_len,
+                    nz,
+                    null,
+                );
+                ffi::tomoxide_iter_bb_lambda(
+                    lambda_d.ptr,
+                    num_d.ptr,
+                    den_d.ptr,
+                    fixed_step,
+                    i32::from(it == 0),
+                    nz,
+                    null,
+                );
+                ffi::tomoxide_cuda_memcpy_d2d_async(recon0_d.ptr, vol_d.ptr, vbytes, null);
+                ffi::tomoxide_cuda_memcpy_d2d_async(grad0_d.ptr, grad_d.ptr, vbytes, null);
+                ffi::tomoxide_iter_axpy_neg_slice(
+                    vol_d.ptr,
+                    grad_d.ptr,
+                    lambda_d.ptr,
+                    slice_len,
+                    nvol,
+                    null,
+                ); // x ← x − λ g
+            }
+            ffi::tomoxide_iter_scale_inplace(vol_d.ptr, r, nvol, null); // back to physical domain
+        }
+
+        let rc = unsafe { ffi::tomoxide_cuda_sync() };
+        unsafe { ffi::tomoxide_linerec_free(handle) };
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+        }
+        let mut host = vec![0.0f32; nvol];
+        vol_d.to_host_f32(&mut host)?;
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+        Ok(Volume::new(array))
+    }
+
     impl IterativeReconstruct for CudaBackend {
         /// Device-resident iterative reconstruction — the volume/sinogram stay on
         /// the GPU across all iterations (no per-iteration host↔device transfer).
@@ -966,7 +1086,7 @@ mod cuda_impl {
                 return Ok(None);
             }
             let s = sino.as_layout(Layout::Sinogram);
-            let (nproj, ncols) = (s.n_angles(), s.n_cols());
+            let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
             let n = params.num_gridx.unwrap_or(ncols);
             if n != ncols || geom.angles.0.len() != nproj {
                 return Ok(None); // square-grid + matching θ only
@@ -980,6 +1100,20 @@ mod cuda_impl {
                 Algorithm::Osem => {
                     let subsets = crate::recon::ordered_subsets(nproj, params);
                     em_device(sino, geom, n, it, subsets).map(Some)
+                }
+                Algorithm::Grad => grad_device(sino, geom, n, it, &params.reg_par, None).map(Some),
+                Algorithm::Tikh => {
+                    // Tikhonov prior: reg_data ([nz,n,n] flat) or zeros. Wrong-sized
+                    // reg_data ⇒ fall back so the host raises the shape error.
+                    let reg1 = params.reg_par.get(1).copied().unwrap_or(0.0);
+                    let prior = if params.reg_data.is_empty() {
+                        vec![0.0f32; nz * n * n]
+                    } else if params.reg_data.len() == nz * n * n {
+                        params.reg_data.clone()
+                    } else {
+                        return Ok(None);
+                    };
+                    grad_device(sino, geom, n, it, &params.reg_par, Some((reg1, prior))).map(Some)
                 }
                 _ => Ok(None),
             }

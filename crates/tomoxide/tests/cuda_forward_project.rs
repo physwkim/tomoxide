@@ -394,6 +394,57 @@ fn cuda_em_matches_per_iteration() {
     }
 }
 
+/// Device-resident GRAD/TIKH reproduce the per-iteration CUDA path. Both run the
+/// identical CUDA `A`/`Aᵀ` kernels; the device path additionally does the data
+/// proximal, gradient assembly, Barzilai–Borwein reductions, and the per-slice
+/// step on-device. Barzilai–Borwein step (reg_par[0] < 0) — the stable path for
+/// this projector; TIKH adds a zero-prior ridge term (reg_par[1] = 0.1).
+#[test]
+fn cuda_grad_tikh_matches_per_iteration() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let periter = PerIterCuda(&cuda);
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    let phantom = sim::shepp2d(n).unwrap(); // signed — GD imposes no positivity
+    let vol = Volume::new(stack(&phantom, nz));
+    let sino = sim::project(&vol, &geom, &cuda).unwrap();
+
+    // GRAD: a fixed small step (reg_par[0] ≥ 0) → deterministic λ, so the data-
+    // gradient path (prox / assemble / per-slice step / unscale) is compared with
+    // only the forward/back-project atomic-add noise between the two runs.
+    // TIKH: Barzilai–Borwein step (reg_par[0] < 0) → exercises the on-device BB
+    // reductions + λ kernel; the ridge term (reg_par[1]) contracts, so the two
+    // runs stay tight despite BB amplifying atomic-add noise.
+    for (algo, reg_par) in [
+        (Algorithm::Grad, vec![1e-3f32]),
+        (Algorithm::Tikh, vec![-1.0f32, 0.1]),
+    ] {
+        let params = ReconParams {
+            num_iter: 30,
+            num_gridx: Some(n),
+            reg_par,
+            ..Default::default()
+        };
+        let rd = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
+        let rp = recon::recon(&sino, &geom, algo, &params, &periter).unwrap();
+        let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+        eprintln!(
+            "{algo:?} device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}"
+        );
+        assert!(
+            r > 0.9999,
+            "{algo:?} device-resident diverges from per-iteration CUDA: r={r:.6}"
+        );
+        assert!(nrmse < 5e-3, "{algo:?} NRMSE too large: {nrmse:.3e}");
+    }
+}
+
 /// Every iterative algorithm tomocupy lacks (tomopy-only) now runs on CUDA via
 /// the single `ForwardProject` primitive. The backend-generic solvers in `recon`
 /// pick up `projector()`/`backprojector()` with no dispatch change, so this

@@ -67,6 +67,10 @@ int tomoxide_cuda_memcpy_h2d(void* dst, const void* src, size_t bytes) {
 int tomoxide_cuda_memcpy_d2h(void* dst, const void* src, size_t bytes) {
   return (int) cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
 }
+// Device→device async on `stream` (null = per-thread default). 0 on success.
+int tomoxide_cuda_memcpy_d2d_async(void* dst, const void* src, size_t bytes, void* stream) {
+  return (int) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+}
 int tomoxide_cuda_memset(void* p, int value, size_t bytes) {
   return (int) cudaMemset(p, value, bytes);
 }
