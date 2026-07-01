@@ -238,6 +238,7 @@ fn iterative(
         ),
         Algorithm::Grad => grad(sino, geom, params, proj, bp),
         Algorithm::Tikh => tikh(sino, geom, params, proj, bp),
+        Algorithm::Cgls => cgls(sino, geom, params, proj, bp),
         Algorithm::Tv => tv(sino, geom, params, proj, bp),
         // Vector tomography reconstructs a vector field from one to three tilt
         // datasets, so it can't fit the scalar (one sinogram → one volume)
@@ -768,6 +769,114 @@ fn tikh(
         })?
     };
     gradient_descent(sino, geom, params, proj, bp, Some((reg1, prior)))
+}
+
+/// Conjugate-Gradient Least Squares (CGLS).
+///
+/// A Krylov-subspace solver of the normal equations `AᵀA x = Aᵀb`, i.e.
+/// `min_x ‖A x − b‖²`, the same least-squares objective as [`grad`]/[`sirt`] but
+/// with the optimal per-iteration step and conjugate search directions, so it
+/// reaches a given residual in far fewer iterations than gradient descent. `A` =
+/// forward projector, `Aᵀ` = back-projector (an exact adjoint pair, which CGLS
+/// requires). This is the standard algorithm (Björck, *Numerical Methods for
+/// Least Squares Problems*); the recurrence below was cross-checked for exact
+/// step-for-step agreement against ASTRA's `CglsAlgorithm`, but is an
+/// independent implementation on tomoxide's own projector pair (ASTRA is
+/// GPL-3.0; no ASTRA code is used here).
+///
+/// Every scalar (`alpha`, `beta`, `gamma`) is computed **per z-slice**: each
+/// slice is an independent 2-D problem, so coupling their step sizes through a
+/// whole-volume dot product would let one slice's conditioning drive another's.
+/// The recurrence, per slice:
+///
+/// ```text
+/// r = b − A x0 ;  z = Aᵀ r ;  p = z ;  gamma = ⟨z,z⟩       (init)
+/// w = A p ;  alpha = gamma / ⟨w,w⟩
+/// x += alpha·p ;  r −= alpha·w ;  z = Aᵀ r
+/// beta = ⟨z,z⟩ / gamma ;  gamma = ⟨z,z⟩ ;  p = z + beta·p  (repeat)
+/// ```
+///
+/// The warm-start `init` (`x0`) enters through the initial residual `b − A x0`
+/// (ASTRA starts from `x0 = 0`, i.e. `r = b`; this generalizes it). No
+/// positivity clamp is applied — plain CGLS, matching ASTRA's default (its
+/// optional min/max clamp on the gradient is flagged "CHECKME" upstream and is
+/// not part of the algorithm).
+fn cgls(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    params: &ReconParams,
+    proj: &dyn ForwardProject,
+    bp: &dyn FilteredBackproject,
+) -> Result<Volume<f32>> {
+    let n = grid_size(sino, params);
+    let b = sino.as_layout(Layout::Sinogram);
+    let nz = b.n_rows();
+    let nang = b.n_angles();
+    let ncols = b.n_cols();
+
+    // Per-slice sum over a 2-D view (an [nz]-length accumulator lives one entry
+    // per independent slice problem).
+    fn slice_dot(a: &ndarray::ArrayView2<f32>, c: &ndarray::ArrayView2<f32>) -> f32 {
+        let mut acc = 0.0f32;
+        ndarray::Zip::from(a).and(c).for_each(|&x, &y| acc += x * y);
+        acc
+    }
+
+    let mut vol = init_volume(params, nz, n, 0.0)?; // x = x0 (0, or warm-start)
+
+    // r = b − A x0.
+    let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    proj.project(&vol, geom, &mut ax)?;
+    let mut r = Tomo::new(&b.array - &ax.array, Layout::Sinogram);
+
+    // z = Aᵀ r ;  p = z ;  gamma = ⟨z,z⟩ per slice.
+    let mut z = Volume::new(Array3::zeros((nz, n, n)));
+    bp.backproject(&r, geom, &mut z)?;
+    let mut p = z.clone();
+    let mut gamma: Vec<f32> = (0..nz)
+        .map(|s| {
+            let zs = z.array.index_axis(Axis(0), s);
+            slice_dot(&zs, &zs)
+        })
+        .collect();
+
+    let mut w = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
+    for _ in 0..params.num_iter.max(1) {
+        proj.project(&p, geom, &mut w)?; // w = A p
+        for (s, ws) in w.array.outer_iter().enumerate() {
+            let wdot = slice_dot(&ws, &ws);
+            // A p = 0 ⇒ p is in the null space (or gamma already 0): this slice
+            // has converged, leave x/r/p untouched (alpha would be 0/0). The
+            // `<= 0 || NaN` guard is exactly "not strictly positive".
+            if wdot <= 0.0 || wdot.is_nan() {
+                continue;
+            }
+            let alpha = gamma[s] / wdot;
+            // x += alpha·p ;  r −= alpha·w.
+            ndarray::Zip::from(vol.array.index_axis_mut(Axis(0), s))
+                .and(p.array.index_axis(Axis(0), s))
+                .for_each(|x, &pv| *x += alpha * pv);
+            ndarray::Zip::from(r.array.index_axis_mut(Axis(0), s))
+                .and(ws)
+                .for_each(|rv, &wv| *rv -= alpha * wv);
+        }
+
+        bp.backproject(&r, geom, &mut z)?; // z = Aᵀ r
+        for (s, zs) in z.array.outer_iter().enumerate() {
+            let gamma_new = slice_dot(&zs, &zs);
+            let beta = if gamma[s] > 0.0 {
+                gamma_new / gamma[s]
+            } else {
+                0.0
+            };
+            gamma[s] = gamma_new;
+            // p = z + beta·p.
+            ndarray::Zip::from(p.array.index_axis_mut(Axis(0), s))
+                .and(zs)
+                .for_each(|pv, &zv| *pv = zv + beta * *pv);
+        }
+    }
+    Ok(vol)
 }
 
 /// Total-variation regularized least squares (tomopy `tv.c`), a Chambolle–Pock

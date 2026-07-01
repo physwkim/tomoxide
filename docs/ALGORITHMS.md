@@ -21,7 +21,7 @@ device-resident suite.
 | Family | Members | Core update | Positivity |
 |--------|---------|-------------|------------|
 | Row-action (Kaczmarz) | `Art`, `Bart` | one ray (ART) / one block (BART) at a time | no |
-| Least-squares / SIRT | `Sirt`, `Grad`, `Tikh` | gradient of `‖Ax − b‖²` (+ regularizer) | no |
+| Least-squares / SIRT | `Sirt`, `Grad`, `Tikh`, `Cgls` | gradient / conjugate-gradient of `‖Ax − b‖²` (+ regularizer) | no |
 | Statistical EM (Poisson) | `Mlem`, `Osem` | multiplicative `x ∘ Aᵀ(b ⊘ Ax) ⊘ Aᵀ(1)` | yes (by construction) |
 | Penalized-ML (De Pierro) | `PmlQuad`, `PmlHybrid`, `OspmlQuad`, `OspmlHybrid` | EM step + 8-neighbour smoothness prior | yes |
 | Total variation | `Tv` | Chambolle–Pock primal–dual on `‖Ax−b‖² + λ‖∇x‖₁` | no |
@@ -48,7 +48,7 @@ device-resident suite.
   `RayProject` rows; the Kaczmarz sweep is inherently sequential). CUDA output is
   bit-identical to CPU, and there is essentially no GPU speed-up (~1×).
 
-### Least-squares & SIRT — `Sirt`, `Grad`, `Tikh`
+### Least-squares & SIRT — `Sirt`, `Grad`, `Tikh`, `Cgls`
 
 - **SIRT** — parameter-free, convergent `x ← x + C∘Aᵀ(R∘(b − Ax))` with
   `R = 1/A(1)`, `C = 1/Aᵀ(1)`.
@@ -68,6 +68,21 @@ device-resident suite.
   - *Strengths:* the ridge contracts → **stable** (BB step is safe); can fold in
     a prior/reference volume.
   - *Use for:* when you have a prior volume, or when GRAD is too unstable.
+- **CGLS** — conjugate-gradient least squares (the standard algorithm, Björck;
+  its recurrence cross-checked against ASTRA's `CglsAlgorithm`, implemented
+  independently — ASTRA is GPL-3.0, no ASTRA code is used): a Krylov solver of
+  the same `‖Ax − b‖²` normal equations as GRAD/SIRT, but with the optimal step
+  and conjugate search directions, so it reaches a given residual in **far fewer
+  iterations** (≈4–30× vs SIRT here). Parameter-free; per-slice scalars; CUDA
+  device-resident.
+  - *Strengths:* fastest convergence of the least-squares family; no tuning.
+  - *Caveat:* **no built-in regularization** — on ill-posed (sparse/noisy) data
+    it semi-converges quickly, so it needs **early stopping** (peak quality often
+    at ~10 iterations, then it fits sparse-view/noise artifacts). Being a Krylov
+    method it is also more float-order sensitive than the contractive solvers
+    (device vs host agree to ~1e-2 relative, Pearson ≈ 1, not the ~1e-8 of SIRT).
+  - *Use for:* well-posed / densely-sampled data, or a fast few-iteration solve;
+    pair with early stopping on sparse/noisy data. For noisy data prefer TV.
 
 ### Statistical EM — `Mlem`, `Osem`
 

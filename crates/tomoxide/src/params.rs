@@ -56,6 +56,9 @@ pub enum Algorithm {
     Grad,
     /// Tikhonov regularized.
     Tikh,
+    /// Conjugate-gradient least squares (standard CGLS; behaviour matches ASTRA
+    /// `CglsAlgorithm`, independent implementation — see [`crate::recon`]).
+    Cgls,
     /// Vector (multi-axis) reconstruction.
     Vector,
 }
@@ -95,6 +98,7 @@ impl std::str::FromStr for Algorithm {
             "tv" => Algorithm::Tv,
             "grad" => Algorithm::Grad,
             "tikh" => Algorithm::Tikh,
+            "cgls" => Algorithm::Cgls,
             "vector" => Algorithm::Vector,
             other => return Err(Error::InvalidParam(format!("unknown algorithm '{other}'"))),
         })

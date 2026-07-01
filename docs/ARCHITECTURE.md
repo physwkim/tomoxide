@@ -177,6 +177,7 @@ the same set.
 | `Tv`             | `num_iter, reg_par`                      | tomopy `tv.c` |
 | `Grad`           | `num_iter, reg_par`                      | tomopy `grad.c` |
 | `Tikh`           | `num_iter, reg_data, reg_par`            | tomopy `tikh.c` |
+| `Cgls`           | `num_iter`                               | standard CGLS (Björck); parity-checked vs ASTRA `CglsAlgorithm` |
 | `Vector{,2,3}`   | `num_iter, axis…`                        | tomopy `vector.c` |
 
 Most iterative solvers reduce to `ForwardProject` + `FilteredBackproject`

@@ -943,3 +943,68 @@ fn bart_ordered_subsets_reconstruct_and_accelerate() {
         "ordered subsets did not accelerate: 15-block {res_many:.1} >= 1-block {res_one:.1}"
     );
 }
+
+#[test]
+fn cgls_reconstructs_and_beats_sirt_convergence() {
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+
+    let p = |iters| ReconParams {
+        num_gridx: Some(n),
+        num_iter: iters,
+        ..Default::default()
+    };
+
+    // Convergence: the data residual shrinks as iterations grow.
+    let r5 = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Cgls, &p(5), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    let rec = recon::recon(&sino, &geom, Algorithm::Cgls, &p(40), &cpu).unwrap();
+    let r40 = residual_norm(&rec, &sino, &geom, &cpu);
+    eprintln!("CGLS residual: 5 iters = {r5:.3}, 40 iters = {r40:.3}");
+    assert!(r40 < r5, "CGLS residual did not decrease: {r5} -> {r40}");
+    assert!(
+        rec.array.iter().all(|v| v.is_finite()),
+        "CGLS produced non-finite values"
+    );
+
+    // Reconstruction quality.
+    let slice = rec.array.index_axis(Axis(0), 0).to_owned();
+    let corr = pearson_disk(&slice, &phantom, n, 0.85);
+    eprintln!("CGLS (40 iters) Pearson correlation = {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "CGLS correlates poorly with phantom: r = {corr:.4}"
+    );
+
+    // The whole point of CGLS: conjugate directions + optimal step reach a lower
+    // residual than plain SIRT gradient descent at the SAME iteration count.
+    let iters = 10;
+    let cgls_res = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Cgls, &p(iters), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    let sirt_res = residual_norm(
+        &recon::recon(&sino, &geom, Algorithm::Sirt, &p(iters), &cpu).unwrap(),
+        &sino,
+        &geom,
+        &cpu,
+    );
+    eprintln!("residual at {iters} iters: CGLS = {cgls_res:.3}, SIRT = {sirt_res:.3}");
+    assert!(
+        cgls_res < sirt_res,
+        "CGLS did not converge faster than SIRT at {iters} iters: \
+         CGLS {cgls_res:.3} >= SIRT {sirt_res:.3}"
+    );
+}

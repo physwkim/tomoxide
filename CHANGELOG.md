@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **CGLS reconstruction (`--algorithm cgls`).** Conjugate-gradient least squares
+  (the standard algorithm; recurrence parity-checked against ASTRA's
+  `CglsAlgorithm` but implemented independently — ASTRA is GPL-3.0, no ASTRA code
+  is used): a Krylov solver of the same `‖Ax − b‖²` normal equations as SIRT/GRAD
+  but with the optimal step and conjugate directions, so it reaches a given
+  residual in far fewer iterations (≈4–30× vs SIRT). Runs on every backend via
+  the generic solver, plus a CUDA device-resident fast path (per-slice dot/axpy
+  kernels; one upload / one download across all iterations). Parameter-free;
+  supports warm-start chaining. No built-in regularization, so it needs early
+  stopping on ill-posed data.
 - **Per-stage iteration budgets in algorithm chains.** An iterative stage in a
   `--algorithm` chain can carry a `:iters` suffix
   (e.g. `--algorithm fbp,sirt:30,tv:10`); stages without one fall back to

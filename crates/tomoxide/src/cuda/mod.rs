@@ -1179,6 +1179,118 @@ mod cuda_impl {
         Ok(Volume::new(array))
     }
 
+    /// Device-resident Conjugate-Gradient Least Squares (`cgls`). The iterate
+    /// `x`, the sinogram residual `r`, the search direction `p`, the gradient
+    /// `z = Aᵀr`, and the scratch `w = Ap` all stay on the GPU across every
+    /// iteration — one upload (b, θ, optional seed), one download (x). Mirrors
+    /// the host [`crate::recon::cgls`] op-for-op with per-slice scalars
+    /// (`gamma`/`wdot`/`alpha`/`beta` are device `[nz]`): each z-slice is an
+    /// independent 2-D problem, so no dot product couples slices.
+    ///
+    /// The `x += alpha·p` and `r −= alpha·w` updates reuse the per-slice
+    /// `iter_axpy_neg_slice` kernel (x with `−alpha`, r with `+alpha`); CGLS is
+    /// self-scaling, so no r-domain rescaling is applied (unlike grad/tv).
+    #[cfg(feature = "cuda")]
+    fn cgls_device(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        n: usize,
+        num_iter: usize,
+        init: Option<&[f32]>,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
+        let sino_std = s.array.as_standard_layout();
+        let sino_slice = sino_std
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+        let theta = &geom.angles.0;
+
+        let (nvol, nsino) = (nz * n * n, nz * nproj * ncols);
+        let sz = std::mem::size_of::<f32>();
+        let (vbytes, sbytes, zbytes) = (nvol * sz, nsino * sz, nz * sz);
+        let vslice = n * n; // volume slice length
+        let sslice = nproj * ncols; // sinogram slice length
+        let null = std::ptr::null_mut::<c_void>();
+
+        let theta_d = DevBuf::from_host_f32(theta)?;
+        let tp = theta_d.ptr as *const f32;
+        let b_d = DevBuf::from_host_f32(sino_slice)?;
+        let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?; // r = (b − A x0)·1
+
+        let vol_d = seed_buf(init, 0.0, nvol, 1.0)?; // x = x0 (0 or warm-start)
+        let r_d = DevBuf::zeroed(sbytes)?; // residual b − A x (sinogram)
+        let w_d = DevBuf::zeroed(sbytes)?; // A p (sinogram)
+        let z_d = DevBuf::zeroed(vbytes)?; // Aᵀ r (volume)
+        let p_d = DevBuf::zeroed(vbytes)?; // search direction (volume)
+        let gamma_d = DevBuf::zeroed(zbytes)?; // ⟨z,z⟩, advanced each iter
+        let gnew_d = DevBuf::zeroed(zbytes)?; // new ⟨z,z⟩
+        let wdot_d = DevBuf::zeroed(zbytes)?; // ⟨w,w⟩
+        let alpha_d = DevBuf::zeroed(zbytes)?;
+        let neg_alpha_d = DevBuf::zeroed(zbytes)?;
+        let beta_d = DevBuf::zeroed(zbytes)?;
+
+        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+        if handle.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+
+        unsafe {
+            // Init: r = b − A x0 ; z = Aᵀ r ; p = z ; gamma = ⟨z,z⟩ per slice.
+            dev_forward(r_d.ptr, vol_d.ptr, tp, nz, n, nproj, sbytes); // r = A x0
+            ffi::tomoxide_iter_residual(r_d.ptr, b_d.ptr, ones_s.ptr, nsino, null); // r = b − A x0
+            dev_backproject(handle, z_d.ptr, r_d.ptr, tp, vbytes); // z = Aᵀ r
+            ffi::tomoxide_cuda_memcpy_d2d_async(p_d.ptr, z_d.ptr, vbytes, null); // p = z
+            ffi::tomoxide_iter_slice_dot(gamma_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null);
+
+            for _ in 0..num_iter.max(1) {
+                dev_forward(w_d.ptr, p_d.ptr, tp, nz, n, nproj, sbytes); // w = A p
+                ffi::tomoxide_iter_slice_dot(wdot_d.ptr, w_d.ptr, w_d.ptr, sslice, nz, null);
+                ffi::tomoxide_iter_cgls_alpha(
+                    alpha_d.ptr,
+                    neg_alpha_d.ptr,
+                    gamma_d.ptr,
+                    wdot_d.ptr,
+                    nz,
+                    null,
+                );
+                // x += alpha·p  (x −= (−alpha)·p) ;  r −= alpha·w.
+                ffi::tomoxide_iter_axpy_neg_slice(
+                    vol_d.ptr,
+                    p_d.ptr,
+                    neg_alpha_d.ptr,
+                    vslice,
+                    nvol,
+                    null,
+                );
+                ffi::tomoxide_iter_axpy_neg_slice(
+                    r_d.ptr,
+                    w_d.ptr,
+                    alpha_d.ptr,
+                    sslice,
+                    nsino,
+                    null,
+                );
+                dev_backproject(handle, z_d.ptr, r_d.ptr, tp, vbytes); // z = Aᵀ r
+                ffi::tomoxide_iter_slice_dot(gnew_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null);
+                ffi::tomoxide_iter_cgls_beta(beta_d.ptr, gamma_d.ptr, gnew_d.ptr, nz, null);
+                ffi::tomoxide_iter_xpby_slice(p_d.ptr, z_d.ptr, beta_d.ptr, vslice, nvol, null);
+                // p = z + beta·p
+            }
+        }
+
+        let rc = unsafe { ffi::tomoxide_cuda_sync() };
+        unsafe { ffi::tomoxide_linerec_free(handle) };
+        if rc != 0 {
+            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+        }
+        let mut host = vec![0.0f32; nvol];
+        vol_d.to_host_f32(&mut host)?;
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+        Ok(Volume::new(array))
+    }
+
     /// Device-resident total variation (`tv`, Chambolle–Pock primal–dual). The
     /// r-scaled iterate (`x`, extrapolated primal `xbar`), the TV dual fields
     /// (`p0x`/`p0y`), and the data dual (`pd`) all stay on the GPU across
@@ -1382,6 +1494,7 @@ mod cuda_impl {
                     let lambda = params.reg_par.first().copied().unwrap_or(1.0);
                     tv_device(sino, geom, n, it, lambda, init).map(Some)
                 }
+                Algorithm::Cgls => cgls_device(sino, geom, n, it, init).map(Some),
                 _ => Ok(None),
             }
         }

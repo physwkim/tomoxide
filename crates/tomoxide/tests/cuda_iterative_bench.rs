@@ -103,8 +103,9 @@ fn bench_iterative_cpu_vs_cuda() {
             num_gridx: Some(n),
             ..Default::default()
         };
-        let methods: [(Algorithm, ReconParams); 8] = [
+        let methods: [(Algorithm, ReconParams); 9] = [
             (Algorithm::Sirt, base.clone()),
+            (Algorithm::Cgls, base.clone()),
             (Algorithm::Mlem, base.clone()),
             (
                 Algorithm::Osem,

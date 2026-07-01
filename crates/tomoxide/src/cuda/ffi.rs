@@ -269,6 +269,42 @@ unsafe extern "C" {
         nz: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// Per-slice dot product `out[z] = Σ_i a[z,i]·b[z,i]` (one block per slice).
+    /// `out` is device `[nz]`; `slice_len` is the per-slice element count.
+    pub fn tomoxide_iter_slice_dot(
+        out: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        slice_len: usize,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// CGLS direction recurrence `p[i] = z[i] + beta[s]·p[i]`, `s = i/slice_len`.
+    pub fn tomoxide_iter_xpby_slice(
+        p: *mut c_void,
+        zv: *const c_void,
+        beta: *const c_void,
+        slice_len: usize,
+        total_n: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// CGLS step `alpha[z] = wdot>0 ? gamma/wdot : 0`, `neg_alpha[z] = −alpha[z]`.
+    pub fn tomoxide_iter_cgls_alpha(
+        alpha: *mut c_void,
+        neg_alpha: *mut c_void,
+        gamma: *const c_void,
+        wdot: *const c_void,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    /// CGLS `beta[z] = gamma>0 ? gnew/gamma : 0`, then advance `gamma[z] = gnew[z]`.
+    pub fn tomoxide_iter_cgls_beta(
+        beta: *mut c_void,
+        gamma: *mut c_void,
+        gnew: *const c_void,
+        nz: usize,
+        stream: *mut c_void,
+    ) -> i32;
 
     // --- fourierrec (cfunc_fourierrec) ---
     /// `cfunc_fourierrec(nproj, nz, n, theta_ptr)` — `nz` is the number of

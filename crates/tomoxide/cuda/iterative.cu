@@ -269,7 +269,107 @@ __global__ void iter_bb_lambda_ker(float *lambda, const float *num, const float 
     lambda[z] = lam;
 }
 
+// --- CGLS (conjugate-gradient least squares) device-resident kernels ---
+//
+// Every scalar is per z-slice (each slice is an independent 2-D problem), so the
+// dot products reduce one block per slice and the vector updates index the
+// scalar by z = i/slice_len. The x += alpha*p and r -= alpha*w updates reuse
+// `iter_axpy_neg_slice_ker` (x uses -alpha, r uses +alpha); only the per-slice
+// dot, the p = z + beta*p recurrence, and the alpha/beta scalars are new here.
+
+// out[z] = Σ_i a[z,i]*b[z,i] over slice z. One block per slice; blockDim a power
+// of two (shared-mem tree reduce), mirroring iter_bb_reduce_ker.
+__global__ void iter_slice_dot_ker(float *out, const float *a, const float *b,
+                                   long long slice_len, int nslices) {
+    int z = blockIdx.x;
+    if (z >= nslices)
+        return;
+    extern __shared__ float sh[];
+    long long base = (long long)z * slice_len;
+    float acc = 0.0f;
+    for (long long i = threadIdx.x; i < slice_len; i += blockDim.x)
+        acc += a[base + i] * b[base + i];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        out[z] = sh[0];
+}
+
+// p[i] = z[i] + beta[s]*p[i], s = i/slice_len  — the CGLS direction recurrence.
+__global__ void iter_xpby_slice_ker(float *p, const float *zv, const float *beta,
+                                    long long slice_len, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    int s = (int)(i / slice_len);
+    p[i] = zv[i] + beta[s] * p[i];
+}
+
+// alpha[z] = wdot>0 ? gamma/wdot : 0 ;  neg_alpha[z] = -alpha[z].  (wdot = ⟨w,w⟩;
+// a non-positive wdot means A p = 0 on that slice ⇒ no step, leave x/r unchanged.)
+__global__ void iter_cgls_alpha_ker(float *alpha, float *neg_alpha, const float *gamma,
+                                    const float *wdot, int nz) {
+    int z = blockIdx.x * blockDim.x + threadIdx.x;
+    if (z >= nz)
+        return;
+    float a = (wdot[z] > 0.0f) ? (gamma[z] / wdot[z]) : 0.0f;
+    alpha[z] = a;
+    neg_alpha[z] = -a;
+}
+
+// beta[z] = gamma>0 ? gnew/gamma : 0 ;  then gamma[z] = gnew[z] (advance for the
+// next iteration). Each thread owns its slice z, so the read-then-write is safe.
+__global__ void iter_cgls_beta_ker(float *beta, float *gamma, const float *gnew, int nz) {
+    int z = blockIdx.x * blockDim.x + threadIdx.x;
+    if (z >= nz)
+        return;
+    beta[z] = (gamma[z] > 0.0f) ? (gnew[z] / gamma[z]) : 0.0f;
+    gamma[z] = gnew[z];
+}
+
 extern "C" {
+
+int tomoxide_iter_slice_dot(void *out, const void *a, const void *b, size_t slice_len, size_t nz,
+                            void *stream) {
+    int block = 256;
+    int grid = (int)nz;
+    size_t shmem = (size_t)block * sizeof(float);
+    iter_slice_dot_ker<<<grid, block, shmem, (cudaStream_t)stream>>>(
+        (float *)out, (const float *)a, (const float *)b, (long long)slice_len, (int)nz);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_xpby_slice(void *p, const void *zv, const void *beta, size_t slice_len,
+                             size_t total_n, void *stream) {
+    long long total = (long long)total_n;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    iter_xpby_slice_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)p, (const float *)zv, (const float *)beta, (long long)slice_len, total);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_cgls_alpha(void *alpha, void *neg_alpha, const void *gamma, const void *wdot,
+                             size_t nz, void *stream) {
+    int block = 256;
+    int grid = (int)(((int)nz + block - 1) / block);
+    iter_cgls_alpha_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)alpha, (float *)neg_alpha, (const float *)gamma, (const float *)wdot, (int)nz);
+    return (int)cudaGetLastError();
+}
+
+int tomoxide_iter_cgls_beta(void *beta, void *gamma, const void *gnew, size_t nz, void *stream) {
+    int block = 256;
+    int grid = (int)(((int)nz + block - 1) / block);
+    iter_cgls_beta_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (float *)beta, (float *)gamma, (const float *)gnew, (int)nz);
+    return (int)cudaGetLastError();
+}
 
 int tomoxide_iter_pml_update(void *vol, const void *old, const void *corr, const void *sens,
                              float reg, float delta, int has_delta, size_t n, size_t nz,
