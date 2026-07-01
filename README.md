@@ -5,10 +5,16 @@
 > streaming reconstruction of [tomocupy](https://github.com/tomography/tomocupy),
 > behind a single **tri-backend** abstraction: **CPU · CUDA · wgpu (Metal)**.
 
-> ⚠️ **Status: scaffold (v0.0.0).** This is a broad module skeleton plus a
-> design/porting plan. Most numerical kernels are stubs that return
-> `Error::NotImplemented` and carry a doc comment pointing at the exact
-> upstream C / CUDA source to port from. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: working — v0.3.0.** All three backends reconstruct real datasets.
+> The **CPU** backend ports tomopy's analytic (`fbp`, `gridrec`, `fourierrec`,
+> `lprec`, `linerec`) and iterative (`sirt`, `mlem`, `osem`, `ospml`, `pml`,
+> `tv`, `grad`, `tikh`, `art`, `bart`) families; the **CUDA** backend ports
+> tomocupy's device-resident streaming kernels (multi-GPU, fp16, laminography,
+> and the full iterative suite on-device); the **wgpu** backend runs a portable
+> subset (Metal / Vulkan / DX12) with no NVIDIA toolkit. See
+> [CHANGELOG.md](CHANGELOG.md), the
+> [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md), and
+> [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -23,39 +29,57 @@
 
 ## Workspace layout
 
+Two crates: the `tomoxide` library (everything — all three backends live in it as
+modules behind `cuda` / `gpu-wgpu` features) and the `tomoxide-cli` binary.
+
 ```
 crates/
-  tomoxide-core    data model (Projections/Sinogram/Volume), geometry,
-                   the Backend trait + capability traits, params/enums, errors
-  tomoxide-cpu     CPU backend (ndarray + rayon)         — ports libtomo
-  tomoxide-cuda    CUDA backend (FFI to vendored .cu)    — ports tomocupy kernels
-  tomoxide-wgpu    portable GPU backend (WGSL/Metal)     — optional `gpu-wgpu`
-  tomoxide-recon   reconstruction algorithms + center finding
-  tomoxide-prep    normalize, stripe removal, phase retrieval, ring removal, …
-  tomoxide-io      DXchange/HDF5 + TIFF/zarr readers & writers
-  tomoxide-sim     phantoms + forward projection
-  tomoxide         umbrella crate: re-exports + high-level pipelines
-  tomoxide-cli     `tomoxide` command-line front-end
+  tomoxide       library: data model, geometry, the Backend trait, all three
+                 backends, reconstruction, preprocessing, I/O, simulation, and
+                 the high-level pipelines
+  tomoxide-cli   `tomoxide` command-line front-end (init/status/recon/recon_steps/tune_chunk)
+```
+
+Inside the library:
+
+```
+crates/tomoxide/src/
+  backend.rs   Backend trait + capability traits (Fft, FbpFilter,
+               FilteredBackproject, ForwardProject, RankFilter, …)
+  cpu/         CPU backend (ndarray + rayon)              — ports libtomo
+  cuda/        CUDA backend (FFI to the vendored kernels) — ports tomocupy kernels
+  wgpu/        portable GPU backend (WGSL)                — feature `gpu-wgpu`
+  recon/       reconstruction algorithms + center finding
+  prep/        normalize, stripe removal, phase retrieval, …
+  io/          DXchange/HDF5 + TIFF/zarr readers & writers
+  sim          phantoms + forward projection
+  data.rs geometry.rs params.rs dtype.rs engine.rs pipeline.rs error.rs
+crates/tomoxide/cuda/   vendored tomocupy .cu/.cuh kernels + shim.cpp
+                        (compiled by build.rs via nvcc when `cuda` is enabled)
 ```
 
 ## Build
 
+Backends are Cargo features on the `tomoxide` / `tomoxide-cli` crates (default =
+CPU only). Enable one when building.
+
 ```sh
-# Default: CPU backend only — builds & tests on any machine (incl. Apple Silicon).
-cargo build --workspace
+# Default: CPU backend only — builds & tests on any machine, no GPU (incl. Apple Silicon).
+cargo build --release
 cargo nextest run --workspace      # or: cargo test --workspace
 
-# Portable GPU backend (Metal on macOS, Vulkan/DX12 elsewhere):
-cargo build -p tomoxide-wgpu --features gpu-wgpu
+# CUDA backend (NVIDIA). The vendored kernels in crates/tomoxide/cuda/ are compiled
+# by build.rs via nvcc when the `cuda` feature is on — no env setup needed
+# (TOMOXIDE_CUDA_KERNELS defaults to that dir). Requires an NVIDIA toolkit (nvcc):
+cargo build --release -p tomoxide-cli --features cuda
 
-# CUDA backend — requires an NVIDIA toolkit (nvcc) and is compiled only when
-# the `cuda` feature is enabled. Point it at the kernel sources first:
-export TOMOXIDE_CUDA_KERNELS=/path/to/tomocupy/src/cuda
-cargo build -p tomoxide-cuda --features cuda
+# Portable GPU backend (Metal on macOS, Vulkan/DX12 elsewhere) — no NVIDIA toolkit:
+cargo build --release -p tomoxide-cli --features gpu-wgpu
 ```
 
-The `cuda` feature never compiles on a machine without `nvcc`; the default
-build selects the CPU backend so the whole workspace builds on this Mac.
+The `cuda` feature never compiles on a machine without `nvcc`; the default build
+selects the CPU backend so the whole workspace builds anywhere (including
+GPU-less CI and Apple Silicon).
 
 ## Command-line usage
 
@@ -433,9 +457,11 @@ tomocupy's pipeline dominates. Reproduce by generating a DXchange file with the
 
 ## Documentation
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline, cross-backend conventions.
+- [docs/ALGORITHMS.md](docs/ALGORITHMS.md) — the analytic and iterative methods and their parameters.
 - [docs/PORTING.md](docs/PORTING.md) — upstream tomopy/tomocupy → tomoxide module map with provenance.
-- [docs/ROADMAP.md](docs/ROADMAP.md) — milestones from scaffold to feature parity.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — milestones toward full feature parity.
+- [CHANGELOG.md](CHANGELOG.md) — release-by-release changes; [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md).
 
 ## License
 
