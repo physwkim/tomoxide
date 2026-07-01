@@ -17,7 +17,7 @@
 //! # Ok::<(), tomoxide::Error>(())
 //! ```
 //!
-//! See `docs/ARCHITECTURE.md` for the design and `docs/ROADMAP.md` for status.
+//! See `docs/ARCHITECTURE.md` for the design and `CHANGELOG.md` for status.
 
 // Foundational layer (was tomoxide-core).
 pub mod backend;

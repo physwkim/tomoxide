@@ -12,9 +12,8 @@
 > tomocupy's device-resident streaming kernels (multi-GPU, fp16, laminography,
 > and the full iterative suite on-device); the **wgpu** backend runs a portable
 > subset (Metal / Vulkan / DX12) with no NVIDIA toolkit. See
-> [CHANGELOG.md](CHANGELOG.md), the
-> [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md), and
-> [docs/ROADMAP.md](docs/ROADMAP.md).
+> [CHANGELOG.md](CHANGELOG.md) and the
+> [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md).
 
 ## Why
 
@@ -460,7 +459,6 @@ tomocupy's pipeline dominates. Reproduce by generating a DXchange file with the
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline, cross-backend conventions.
 - [docs/ALGORITHMS.md](docs/ALGORITHMS.md) — the analytic and iterative methods and their parameters.
 - [docs/PORTING.md](docs/PORTING.md) — upstream tomopy/tomocupy → tomoxide module map with provenance.
-- [docs/ROADMAP.md](docs/ROADMAP.md) — milestones toward full feature parity.
 - [CHANGELOG.md](CHANGELOG.md) — release-by-release changes; [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md).
 
 ## License
