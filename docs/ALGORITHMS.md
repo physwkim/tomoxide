@@ -2,14 +2,15 @@
 
 Practical companion to [`ARCHITECTURE.md` §3.2](ARCHITECTURE.md#32-iterative-project--backproject-loop),
 which lists each iterative algorithm's parameters and tomopy upstream. This
-document covers **what each method is good at and when to reach for it**, plus
-the measured GPU behaviour of the device-resident suite.
+document covers **what each method is good at and when to reach for it**,
+**how to chain methods** (warm-start), plus the measured GPU behaviour of the
+device-resident suite.
 
 > **Scope of the claims.** The "strengths / use cases" below are the *design
 > properties* of each algorithm (as defined by tomopy and the reconstruction
 > literature). What tomoxide has *verified empirically* is: (a) every CUDA
 > device-resident method reproduces the per-iteration CUDA path at Pearson
-> r = 1.000000, and (b) the wall-clock numbers in [§4](#4-benchmark). A
+> r = 1.000000, and (b) the wall-clock numbers in [§5](#5-benchmark). A
 > per-sample reconstruction-quality comparison across methods has **not** been
 > run here — pick by the guidance below, then validate on your data.
 
@@ -99,7 +100,7 @@ on top (like OSEM); `Pml*` are the single-block case.
   - *Use for:* low-dose + samples where sharp boundaries matter.
 - *Cost note:* `Ospml*` show the **largest** device-residency speed-up in
   tomoxide (per-iteration stencil + subset back-projections are all kept on the
-  GPU) — see [§4](#4-benchmark).
+  GPU) — see [§5](#5-benchmark).
 
 ### Total variation — `Tv`
 
@@ -124,10 +125,81 @@ Chambolle–Pock primal–dual on `‖Ax − b‖² + λ‖∇x‖₁` (`λ = re
 | have a prior volume, or GRAD is unstable | **TIKH** |
 | want maximum GPU throughput | **OSEM / OSPML** (largest device-residency gain) |
 | need reproducible least-squares | **SIRT** or **TIKH** (avoid unregularized GRAD+BB) |
+| want faster convergence, or a rough pass then a polish | **chain** an analytic seed into an iterative method (see [§4](#4-chaining-warm-start)) |
 
 ---
 
-## 4. Benchmark
+## 4. Chaining (warm-start)
+
+An iterative reconstruction does not have to start from a blank (or flat)
+volume — it can be **warm-started** from another reconstruction's output through
+`ReconParams.init`. This is the tomography analogue of ptychography's engine
+chaining (DM/RAAR → ML): run a fast method to get a good global estimate, then
+hand it to a second method to refine.
+
+Two motivations, both about *quality per iteration*, not escaping local minima
+(tomographic least-squares is largely convex):
+
+- **Convergence speed.** An analytic seed already carries the low-frequency
+  structure that an iterative-from-zero solver spends many iterations building up,
+  so the iterative pass starts far closer to the answer.
+- **Regularizer polish.** A cheap rough reconstruction followed by a
+  regularizing method (TV, PML) cleans up noise/streaks the first pass left.
+
+### Producers vs. consumers
+
+- **Seed producers** — *any* full-volume reconstruction. The analytic / direct
+  methods **`Fbp`, `Gridrec`, `Fourierrec`, `Lprec`, `Linerec`** (whichever your
+  backend provides) are the natural first stage: one fast pass, no tuning. The
+  output of *any* iterative method can equally seed the next.
+- **Seed consumers** (`ReconParams.init`) — **every iterative method except the
+  row-action pair `Art`/`Bart`**, which sweep single rays and have no
+  whole-volume iterate to seed (they *reject* a non-`None` init rather than
+  silently dropping it). The analytic methods above **ignore** `init` — they
+  produce, they do not consume.
+
+So the "FBP →" in the recipes below is shorthand for *any* analytic seed:
+**`Linerec`, `Fourierrec`, `Lprec`, and `Gridrec` are equally valid first
+stages** — FBP is simply the one measured here.
+
+### Recipes and measured effect
+
+Under a **fixed total iteration budget** (so a chain is a fair comparison against
+a single method run for the same number of iterations), on a Shepp–Logan phantom
+at 64 sparse views with 3 % Gaussian noise, CPU backend, NRMSE over a centred
+disk (`tests/warmstart_experiment.rs`):
+
+| Chain | NRMSE | vs. the single method (same budget) |
+|-------|------:|-------------------------------------|
+| `Fbp → Sirt(40)`        | **0.249** | SIRT(40) from scratch 0.356 |
+| `Fbp → Tv(40)`          | **0.268** | TV(40) from scratch 0.443 |
+| `Osem(10) → Mlem(30)`   | **0.189** | MLEM(40) 0.214, OSEM(40) 0.215 — best overall |
+| `Sirt(20) → Tv(20)`     | 0.393 | SIRT(40) 0.356 — **worse**: chaining into a regularizer is λ-sensitive |
+
+Convergence: an FBP-warm-started SIRT reaches the quality of a 40-iteration
+scratch SIRT in **≈10 iterations** (≈4× fewer). Full tables in the experiment.
+
+**Reading it:** analytic → iterative and OSEM → MLEM are clear wins; chaining into
+a regularizer (SIRT → TV) only helps if that regularizer's parameters are tuned —
+a poorly-chosen `λ` can undo the head start. This is a single phantom / noise /
+geometry; treat the numbers as indicative and validate on your data.
+
+### Backend note (convention)
+
+The experiment runs on the **CPU backend** on purpose: there the analytic and
+iterative solvers share one orientation/scale convention, so an analytic seed
+drops straight into an iterative solver. On **CUDA** the analytic path is
+y-flipped and 4/π-scaled relative to the iterative path (documented in
+`cuda/mod.rs`), so an analytic → iterative seed is *not* convention-matched out of
+the box — verify orientation/scale on your data before relying on it. An
+iterative → iterative CUDA chain (e.g. `Osem → Mlem`) *is* convention-consistent;
+warm-start is honoured on both the host solvers and the CUDA device-resident path
+(the seed is uploaded once), verified by the device-resident split-SIRT test in
+`tests/cuda_forward_project.rs`.
+
+---
+
+## 5. Benchmark
 
 Device-resident CUDA (volume/sinogram/weights stay on the GPU across all
 iterations) vs. the per-iteration CUDA path (host round-trip every iteration)
