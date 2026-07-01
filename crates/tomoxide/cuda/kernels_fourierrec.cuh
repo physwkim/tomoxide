@@ -20,8 +20,13 @@ void __global__ divphi(real2 *g, real2 *f, float mu, int n, int nz, int nproj, i
   int f_ind = tx + (n - 1 - ty) * n + tz * n * n;
   int g_ind = (tx + n / 2 + m) + (ty+1 + n / 2 + m) * (2 * n + 2 * m) + tz * (2 * n + 2 * m) * (2 * n + 2 * m); // ty + 1 adjust for tomopy
 
-  f[f_ind].x = g[g_ind].x * phi;
-  f[f_ind].y = g[g_ind].y * phi;
+  // Normalize the unnormalized cuFFT inverse (plan2d is (2n)², so cuFFT scales the
+  // inverse by (2n)²). The CPU fourierrec divides its inverse 2-D FFT by nf²=(2n)²,
+  // so divide by the same factor here to match the CPU/tomopy scale. Done in float
+  // (not folded into `phi`) so the divisor doesn't underflow half precision.
+  float inv_nf2 = 1.0f / (4.0f * (float)n * (float)n);
+  f[f_ind].x = static_cast<real>((float)g[g_ind].x * (float)phi * inv_nf2);
+  f[f_ind].y = static_cast<real>((float)g[g_ind].y * (float)phi * inv_nf2);
 }
 
 void __global__ takexy(float *x, float *y, float *theta, int n, int nproj)
