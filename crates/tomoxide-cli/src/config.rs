@@ -60,18 +60,21 @@ pub struct Config {
     pub vo_sm_size: usize,
 
     // --- Phase-retrieval physics (used when a phase method is selected) ---
+    // Stored as f64 so decimal quantities like `1e-4` serialize cleanly in the
+    // template (an f32 field promotes to f64 on write and leaks precision noise,
+    // e.g. `0.00009999999747…`); cast to f32 at the reconstruction boundary.
     /// Detector pixel size (cm).
-    pub pixel_size: f32,
+    pub pixel_size: f64,
     /// Sample-to-detector propagation distance (cm).
-    pub propagation_distance: f32,
+    pub propagation_distance: f64,
     /// X-ray energy (keV).
-    pub energy: f32,
+    pub energy: f64,
     /// Paganin regularization parameter `alpha`.
-    pub alpha: f32,
+    pub alpha: f64,
     /// Gpaganin/farago material `delta/beta` ratio.
-    pub db: f32,
+    pub db: f64,
     /// Gpaganin characteristic transverse length `W` (cm).
-    pub w: f32,
+    pub w: f64,
 }
 
 impl Default for Config {

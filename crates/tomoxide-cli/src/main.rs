@@ -379,13 +379,16 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         vo_la_size: c.vo_la_size.unwrap_or(cfg.vo_la_size),
         vo_sm_size: c.vo_sm_size.unwrap_or(cfg.vo_sm_size),
     };
+    // Config physics are f64 (clean TOML); cast to the f32 the phase methods use.
     let phase_params = PhaseParams {
-        pixel_size: c.pixel_size.unwrap_or(cfg.pixel_size),
-        dist: c.propagation_distance.unwrap_or(cfg.propagation_distance),
-        energy: c.energy.unwrap_or(cfg.energy),
-        alpha: c.alpha.unwrap_or(cfg.alpha),
-        db: c.db.unwrap_or(cfg.db),
-        w: c.w.unwrap_or(cfg.w),
+        pixel_size: c.pixel_size.unwrap_or(cfg.pixel_size as f32),
+        dist: c
+            .propagation_distance
+            .unwrap_or(cfg.propagation_distance as f32),
+        energy: c.energy.unwrap_or(cfg.energy as f32),
+        alpha: c.alpha.unwrap_or(cfg.alpha as f32),
+        db: c.db.unwrap_or(cfg.db as f32),
+        w: c.w.unwrap_or(cfg.w as f32),
     };
     let prep = PrepOptions {
         stripe: build_stripe(&stripe_str, &stripe_params)?,
