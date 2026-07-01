@@ -11,8 +11,9 @@ device-resident suite.
 > literature). What tomoxide has *verified empirically* is: (a) every CUDA
 > device-resident method reproduces the per-iteration CUDA path at Pearson
 > r = 1.000000, and (b) the wall-clock numbers in [§5](#5-benchmark). A
-> per-sample reconstruction-quality comparison across methods has **not** been
-> run here — pick by the guidance below, then validate on your data.
+> per-sample reconstruction-quality comparison across methods (on one real
+> dataset) lives in [`BENCHMARKS.md`](BENCHMARKS.md) — consult it for measured
+> quality/filter/iteration behaviour, then validate on your own data.
 
 ---
 

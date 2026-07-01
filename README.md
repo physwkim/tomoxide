@@ -466,6 +466,7 @@ tomocupy's pipeline dominates. Reproduce by generating a DXchange file with the
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline, cross-backend conventions.
 - [docs/ALGORITHMS.md](docs/ALGORITHMS.md) — the analytic and iterative methods and their parameters.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — measured reconstruction quality, speed, and iteration behaviour of the methods on real data (which method/filter to pick).
 - [docs/PORTING.md](docs/PORTING.md) — upstream tomopy/tomocupy → tomoxide module map with provenance.
 - [CHANGELOG.md](CHANGELOG.md) — release-by-release changes; [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md).
 
