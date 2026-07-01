@@ -12,7 +12,10 @@ use clap::{Parser, Subcommand};
 use tomoxide::io::DatasetReader;
 use tomoxide::Algorithm;
 use tomoxide::Center;
-use tomoxide::{Angles, BackendKind, Dtype, Engine, Geometry, ReconParams};
+use tomoxide::{
+    Angles, BackendKind, Dtype, Engine, FilterName, Geometry, PhaseMethod, PrepOptions,
+    ReconParams, StripeMethod,
+};
 
 use crate::config::Config;
 
@@ -47,21 +50,8 @@ enum Command {
     },
     /// Full in-memory reconstruction.
     Recon {
-        /// Input DXchange HDF5 file.
-        file: PathBuf,
-        /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …).
-        #[arg(long, default_value = "fbp")]
-        algorithm: String,
-        /// Rotation-axis column (omit to auto-find).
-        #[arg(long)]
-        center: Option<f32>,
-        /// Reconstruction precision: float32 | float16 (CUDA fbp/linerec/
-        /// fourierrec only).
-        #[arg(long, default_value = "float32")]
-        dtype: String,
-        /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
-        #[arg(long, default_value = "tiff")]
-        save_format: String,
+        #[command(flatten)]
+        common: CommonRecon,
         /// Detector rows per streaming chunk for the auto-pipelined CUDA path.
         /// Omit to use the `tune_chunk` cache for this file/algorithm/GPU if
         /// present, else the safe default; an explicit value always overrides.
@@ -90,25 +80,14 @@ enum Command {
     },
     /// Chunked / streaming reconstruction (out-of-core).
     ReconSteps {
-        /// Input DXchange HDF5 file.
-        file: PathBuf,
-        /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …).
-        #[arg(long, default_value = "fbp")]
-        algorithm: String,
-        /// Rotation-axis column (omit to use the detector midline).
-        #[arg(long)]
-        center: Option<f32>,
-        /// Reconstruction precision: float32 | float16 (CUDA only).
-        #[arg(long, default_value = "float32")]
-        dtype: String,
-        /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
-        #[arg(long, default_value = "tiff")]
-        save_format: String,
+        #[command(flatten)]
+        common: CommonRecon,
         /// Detector rows (slices) reconstructed/written per pipeline chunk
-        /// (tomocupy `--nsino-per-chunk`). Smaller = more read/compute/write
-        /// overlap; larger = fewer per-chunk launches.
-        #[arg(long, default_value_t = DEFAULT_PIPELINE_CHUNK)]
-        chunk: usize,
+        /// (tomocupy `--nsino-per-chunk`). Omit to use the config's
+        /// `nsino_per_chunk`, else the safe default. Smaller = more
+        /// read/compute/write overlap; larger = fewer per-chunk launches.
+        #[arg(long)]
+        chunk: Option<usize>,
     },
     /// Measure the best pipeline `--chunk` for this file/algorithm/GPU and
     /// cache it (so a later `recon` auto-applies it). Times a full streaming
@@ -127,6 +106,245 @@ enum Command {
         #[arg(long, default_value = "float32")]
         dtype: String,
     },
+}
+
+/// Reconstruction knobs shared by `recon` and `recon_steps`. Every flag is
+/// optional; an omitted flag falls back to the `--config` file (if given), then
+/// to the built-in default. A given flag always overrides the config
+/// (tomocupy-style precedence). See [`resolve`].
+#[derive(clap::Args, Debug)]
+#[command(rename_all = "snake_case")]
+struct CommonRecon {
+    /// Input DXchange HDF5 file.
+    file: PathBuf,
+    /// Optional TOML config (from `tomoxide init`). Supplies defaults for
+    /// algorithm/center/filter/stripe/phase/num_iter/save_format/chunk; any flag
+    /// below overrides its config value.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …).
+    #[arg(long)]
+    algorithm: Option<String>,
+    /// Rotation-axis column (omit to auto-find / use the detector midline).
+    #[arg(long)]
+    center: Option<f32>,
+    /// Reconstruction precision: float32 | float16 (CUDA analytic paths only).
+    #[arg(long, default_value = "float32")]
+    dtype: String,
+    /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
+    #[arg(long)]
+    save_format: Option<String>,
+    /// Apodization filter (none|ramp|shepp|cosine|cosine2|hamming|hann|parzen).
+    #[arg(long)]
+    filter: Option<String>,
+    /// Stripe-removal method (none|fw|ti|sf|vo-all), applied before recon with
+    /// tomopy/tomocupy default parameters.
+    #[arg(long)]
+    remove_stripe: Option<String>,
+    /// Phase-retrieval method (none|paganin|Gpaganin|farago), applied before
+    /// recon using the physics flags below.
+    #[arg(long)]
+    retrieve_phase: Option<String>,
+    /// Iterations for iterative algorithms (sirt/mlem/osem/… ). Ignored by the
+    /// analytic methods.
+    #[arg(long)]
+    num_iter: Option<usize>,
+    /// Regularization parameters for iterative methods (`reg_par`), a
+    /// comma-separated f32 list (e.g. `--reg_par 0.5,0.01`).
+    #[arg(long)]
+    reg_par: Option<String>,
+    /// Phase retrieval: detector pixel size (cm).
+    #[arg(long, default_value_t = 1e-4)]
+    pixel_size: f32,
+    /// Phase retrieval: sample-to-detector propagation distance (cm).
+    #[arg(long, default_value_t = 50.0)]
+    propagation_distance: f32,
+    /// Phase retrieval: X-ray energy (keV).
+    #[arg(long, default_value_t = 30.0)]
+    energy: f32,
+    /// Phase retrieval (paganin): regularization parameter `alpha`.
+    #[arg(long, default_value_t = 1e-3)]
+    alpha: f32,
+    /// Phase retrieval (Gpaganin/farago): material `delta/beta` ratio.
+    #[arg(long, default_value_t = 1000.0)]
+    db: f32,
+    /// Phase retrieval (Gpaganin): characteristic transverse length `W` (cm).
+    #[arg(long, default_value_t = 2e-4)]
+    w: f32,
+}
+
+/// Fully-resolved reconstruction settings (config merged with CLI flags), plus
+/// the string forms needed to forward the choice to multi-GPU shard subprocesses.
+struct ReconPlan {
+    algorithm: String,
+    algo: Algorithm,
+    center: Option<f32>,
+    dtype: Dtype,
+    save_format: tomoxide::io::SaveFormat,
+    save_format_str: String,
+    filter: FilterName,
+    filter_str: String,
+    num_iter: usize,
+    reg_par: Vec<f32>,
+    prep: PrepOptions,
+    stripe_str: String,
+    phase_str: String,
+    pixel_size: f32,
+    dist: f32,
+    energy: f32,
+    alpha: f32,
+    db: f32,
+    w: f32,
+}
+
+/// Map a stripe-removal method name (matching `Config::remove_stripe_method`) to a
+/// [`StripeMethod`] with the tomopy/tomocupy default parameters.
+fn parse_stripe(name: &str) -> anyhow::Result<StripeMethod> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "none" => StripeMethod::None,
+        "fw" => StripeMethod::Fw {
+            sigma: 2.0,
+            level: None,
+        },
+        "ti" => StripeMethod::Ti {
+            nblock: 0,
+            beta: 1.5,
+        },
+        "sf" => StripeMethod::Sf { size: 5 },
+        "vo-all" | "vo_all" | "voall" => StripeMethod::VoAll {
+            snr: 3.0,
+            la_size: 61,
+            sm_size: 21,
+        },
+        other => {
+            return Err(anyhow!(
+                "unknown stripe method '{other}' (none|fw|ti|sf|vo-all)"
+            ))
+        }
+    })
+}
+
+/// Map a phase-retrieval method name to a [`PhaseMethod`] with the given physics
+/// parameters.
+fn parse_phase(
+    name: &str,
+    ps: f32,
+    dist: f32,
+    energy: f32,
+    alpha: f32,
+    db: f32,
+    w: f32,
+) -> anyhow::Result<PhaseMethod> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "none" => PhaseMethod::None,
+        "paganin" => PhaseMethod::Paganin {
+            pixel_size: ps,
+            dist,
+            energy,
+            alpha,
+        },
+        "gpaganin" => PhaseMethod::GPaganin {
+            pixel_size: ps,
+            dist,
+            energy,
+            db,
+            w,
+        },
+        "farago" => PhaseMethod::Farago {
+            pixel_size: ps,
+            dist,
+            energy,
+            db,
+        },
+        other => {
+            return Err(anyhow!(
+                "unknown phase method '{other}' (none|paganin|Gpaganin|farago)"
+            ))
+        }
+    })
+}
+
+/// Parse a comma-separated `f32` list (empty string ⇒ empty vector).
+fn parse_f32_list(s: &str) -> anyhow::Result<Vec<f32>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            t.parse::<f32>()
+                .map_err(|e| anyhow!("bad value '{t}': {e}"))
+        })
+        .collect()
+}
+
+/// Resolve the effective reconstruction settings: load the optional config, then
+/// override each field with any explicitly-given CLI flag. Returns the plan plus
+/// the loaded config (the caller reads `config.backend` for backend fallback).
+fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
+    let cfg = match &c.config {
+        Some(p) => Config::load(p).with_context(|| format!("loading {}", p.display()))?,
+        None => Config::default(),
+    };
+    let algorithm = c.algorithm.clone().unwrap_or_else(|| cfg.algorithm.clone());
+    let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
+    let center = c.center.or(cfg.rotation_axis);
+    let dtype: Dtype = c.dtype.parse().map_err(|e| anyhow!("{e}"))?;
+    let save_format_str = c
+        .save_format
+        .clone()
+        .unwrap_or_else(|| cfg.save_format.clone());
+    let save_format: tomoxide::io::SaveFormat =
+        save_format_str.parse().map_err(|e| anyhow!("{e}"))?;
+    let filter_str = c.filter.clone().unwrap_or_else(|| cfg.filter_name.clone());
+    let filter: FilterName = filter_str.parse().map_err(|e| anyhow!("{e}"))?;
+    let num_iter = c.num_iter.unwrap_or(cfg.num_iter);
+    let reg_par = match &c.reg_par {
+        Some(s) => parse_f32_list(s)?,
+        None => Vec::new(),
+    };
+    let stripe_str = c
+        .remove_stripe
+        .clone()
+        .unwrap_or_else(|| cfg.remove_stripe_method.clone());
+    let phase_str = c
+        .retrieve_phase
+        .clone()
+        .unwrap_or_else(|| cfg.retrieve_phase_method.clone());
+    let prep = PrepOptions {
+        stripe: parse_stripe(&stripe_str)?,
+        phase: parse_phase(
+            &phase_str,
+            c.pixel_size,
+            c.propagation_distance,
+            c.energy,
+            c.alpha,
+            c.db,
+            c.w,
+        )?,
+    };
+    Ok((
+        ReconPlan {
+            algorithm,
+            algo,
+            center,
+            dtype,
+            save_format,
+            save_format_str,
+            filter,
+            filter_str,
+            num_iter,
+            reg_par,
+            prep,
+            stripe_str,
+            phase_str,
+            pixel_size: c.pixel_size,
+            dist: c.propagation_distance,
+            energy: c.energy,
+            alpha: c.alpha,
+            db: c.db,
+            w: c.w,
+        },
+        cfg,
+    ))
 }
 
 /// Default z-rows per streaming pipeline chunk. Small enough that the
@@ -183,12 +401,25 @@ fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {
     })
 }
 
+/// Resolve the backend for a recon subcommand: an explicit top-level `--backend`
+/// wins; when it is left at the `auto` default, the `--config` file's `backend`
+/// applies (so a config can pin a device without a flag). `auto` either way
+/// leaves backend auto-detection to [`Engine`].
+fn resolve_backend(flag: &str, cfg: &Config) -> anyhow::Result<BackendKind> {
+    let chosen = if flag == "auto" { &cfg.backend } else { flag };
+    parse_backend(chosen)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let level = if cli.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
     let backend_kind = parse_backend(&cli.backend)?;
+    // The recon subcommands may override the backend from a `--config` file when
+    // the top-level `--backend` is left at its `auto` default; captured here since
+    // the match moves `cli.command`.
+    let backend_flag = cli.backend.clone();
 
     match cli.command {
         Command::Init { config } => {
@@ -208,43 +439,42 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Recon {
-            file,
-            algorithm,
-            center,
-            dtype,
-            save_format,
+            common,
             chunk,
             start_row,
             end_row,
             lamino_angle,
             lamino_rh,
         } => {
-            let engine = Engine::new(backend_kind)?;
-            let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
-            let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
-            let save_format_str = save_format.clone();
-            let save_format: tomoxide::io::SaveFormat =
-                save_format.parse().map_err(|e| anyhow!("{e}"))?;
+            let (plan, cfg) = resolve(&common)?;
+            let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
+            let file = common.file.clone();
+            let dtype = plan.dtype;
+            let save_format = plan.save_format;
             println!(
-                "recon: file={} algorithm={:?} center={:?} dtype={} backend={}",
+                "recon: file={} algorithm={:?} center={:?} dtype={} filter={} stripe={} phase={} backend={}",
                 file.display(),
-                algo,
-                center,
+                plan.algo,
+                plan.center,
                 dtype.as_str(),
+                plan.filter_str,
+                plan.stripe_str,
+                plan.phase_str,
                 engine.name()
             );
             let out = recon_out_path(&file);
             // Laminography is whole-stack only (the tilt couples all detector rows
             // into every output voxel), so it cannot use the per-slice pipelined /
             // multi-GPU shard path — force the whole-volume route below.
-            if pipelines_well(&engine, algo) && lamino_angle.is_none() {
+            if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
                 // else the safe default.
                 let mut probe = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let (nproj, nz, nx, _nflat, _ndark) = probe.read_sizes()?;
                 drop(probe);
-                let (chunk, source) = resolve_chunk(chunk, &file, &algorithm, dtype, nx, nproj, nz);
+                let (chunk, source) =
+                    resolve_chunk(chunk, &file, &plan.algorithm, dtype, nx, nproj, nz);
                 println!("  chunk: {chunk} ({source})");
                 // Multi-GPU fan-out: when this is the top-level invocation (no
                 // explicit row range), the backend is CUDA, the output is TIFF
@@ -272,16 +502,7 @@ fn main() -> anyhow::Result<()> {
                     && nz > devices.len()
                     && nx >= MULTI_GPU_MIN_NX;
                 if shardable {
-                    run_sharded_subprocesses(
-                        &file,
-                        &algorithm,
-                        center,
-                        dtype,
-                        &save_format_str,
-                        chunk,
-                        nz,
-                        &devices,
-                    )?;
+                    run_sharded_subprocesses(&file, &plan, chunk, nz, &devices)?;
                 } else {
                     // Overlapped streaming path: same output as the whole-volume
                     // path (cuFFT-floor identical, Pearson 1.0), lower peak memory,
@@ -289,13 +510,17 @@ fn main() -> anyhow::Result<()> {
                     run_pipelined(
                         &file,
                         &out,
-                        algo,
-                        center,
+                        plan.algo,
+                        plan.center,
                         dtype,
                         save_format,
                         chunk,
                         start_row,
                         end_row,
+                        plan.filter,
+                        plan.num_iter,
+                        plan.reg_par.clone(),
+                        plan.prep,
                         &engine,
                     )?;
                 }
@@ -303,8 +528,14 @@ fn main() -> anyhow::Result<()> {
                 // Whole-volume path (CPU/wgpu, chunking-hostile GPU methods, or
                 // laminography).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
-                let mut geom = geometry_from_reader(reader.as_mut(), center)?;
-                let mut params = recon_params(&geom, dtype);
+                let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
+                let mut params = recon_params(
+                    &geom,
+                    dtype,
+                    plan.filter,
+                    plan.num_iter,
+                    plan.reg_par.clone(),
+                );
                 if let Some(deg) = lamino_angle {
                     use std::f32::consts::PI;
                     geom.beam = tomoxide::Beam::Laminography {
@@ -314,14 +545,8 @@ fn main() -> anyhow::Result<()> {
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
                 let ds = reader.read_all()?;
-                let vol = tomoxide::reconstruct(
-                    ds,
-                    &geom,
-                    algo,
-                    &params,
-                    &tomoxide::PrepOptions::default(),
-                    &engine,
-                )?;
+                let vol =
+                    tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
                 let mut writer = tomoxide::io::create_writer(&out, save_format)?;
                 let nz = vol.dims().0;
                 writer.reserve(nz)?;
@@ -329,25 +554,20 @@ fn main() -> anyhow::Result<()> {
             }
             println!("wrote reconstruction to {out}");
         }
-        Command::ReconSteps {
-            file,
-            algorithm,
-            center,
-            dtype,
-            save_format,
-            chunk,
-        } => {
-            let engine = Engine::new(backend_kind)?;
-            let algo: Algorithm = algorithm.parse().map_err(|e| anyhow!("{e}"))?;
-            let dtype: Dtype = dtype.parse().map_err(|e| anyhow!("{e}"))?;
-            let save_format: tomoxide::io::SaveFormat =
-                save_format.parse().map_err(|e| anyhow!("{e}"))?;
+        Command::ReconSteps { common, chunk } => {
+            let (plan, cfg) = resolve(&common)?;
+            let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
+            let file = common.file.clone();
+            let chunk = chunk.unwrap_or(cfg.nsino_per_chunk);
             println!(
-                "recon_steps: file={} algorithm={:?} center={:?} dtype={} chunk={} backend={}",
+                "recon_steps: file={} algorithm={:?} center={:?} dtype={} filter={} stripe={} phase={} chunk={} backend={}",
                 file.display(),
-                algo,
-                center,
-                dtype.as_str(),
+                plan.algo,
+                plan.center,
+                plan.dtype.as_str(),
+                plan.filter_str,
+                plan.stripe_str,
+                plan.phase_str,
                 chunk,
                 engine.name()
             );
@@ -355,13 +575,17 @@ fn main() -> anyhow::Result<()> {
             run_pipelined(
                 &file,
                 &out,
-                algo,
-                center,
-                dtype,
-                save_format,
+                plan.algo,
+                plan.center,
+                plan.dtype,
+                plan.save_format,
                 chunk,
                 None,
                 None,
+                plan.filter,
+                plan.num_iter,
+                plan.reg_par,
+                plan.prep,
                 &engine,
             )?;
             println!("wrote streamed reconstruction to {out}");
@@ -407,6 +631,10 @@ fn run_pipelined(
     chunk: usize,
     start_row: Option<usize>,
     end_row: Option<usize>,
+    filter: FilterName,
+    num_iter: usize,
+    reg_par: Vec<f32>,
+    prep: PrepOptions,
     engine: &Engine,
 ) -> anyhow::Result<()> {
     let path = file.to_string_lossy().into_owned();
@@ -415,7 +643,7 @@ fn run_pipelined(
     let mut probe = tomoxide::io::open_dxchange(&path)?;
     let geom = geometry_from_reader(probe.as_mut(), center)?;
     drop(probe);
-    let params = recon_params(&geom, dtype);
+    let params = recon_params(&geom, dtype, filter, num_iter, reg_par);
     let read_path = path;
     let write_path = out.to_string();
     // Reconstruct only `[start_row, end_row)` (a z-shard); both omitted ⇒ the
@@ -430,7 +658,7 @@ fn run_pipelined(
         &geom,
         algo,
         &params,
-        &tomoxide::PrepOptions::default(),
+        &prep,
         engine,
     )?;
     Ok(())
@@ -447,14 +675,12 @@ fn run_pipelined(
 ///
 /// Each child re-executes this same binary. The parent passes the already-resolved
 /// `chunk` (so children skip cache lookups and all use the same value) and the
-/// same `center`/`dtype`/`save_format`. The call fails if any child fails.
-#[allow(clippy::too_many_arguments)]
+/// full resolved [`ReconPlan`] as explicit flags (so children need no `--config`
+/// and reproduce the parent's filter/stripe/phase/iteration settings exactly).
+/// The call fails if any child fails.
 fn run_sharded_subprocesses(
     file: &Path,
-    algorithm: &str,
-    center: Option<f32>,
-    dtype: Dtype,
-    save_format: &str,
+    plan: &ReconPlan,
     chunk: usize,
     nz: usize,
     devices: &[i32],
@@ -476,18 +702,51 @@ fn run_sharded_subprocesses(
             .arg("recon")
             .arg(file)
             .arg("--algorithm")
-            .arg(algorithm)
+            .arg(&plan.algorithm)
             .arg("--dtype")
-            .arg(dtype.as_str())
+            .arg(plan.dtype.as_str())
             .arg("--save_format")
-            .arg(save_format)
+            .arg(&plan.save_format_str)
+            .arg("--filter")
+            .arg(&plan.filter_str)
+            .arg("--remove_stripe")
+            .arg(&plan.stripe_str)
+            .arg("--retrieve_phase")
+            .arg(&plan.phase_str)
+            .arg("--num_iter")
+            .arg(plan.num_iter.to_string())
             .arg("--chunk")
             .arg(chunk.to_string())
             .arg("--start_row")
             .arg(z0.to_string())
             .arg("--end_row")
             .arg(z1.to_string());
-        if let Some(c) = center {
+        if !plan.reg_par.is_empty() {
+            let csv = plan
+                .reg_par
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            cmd.arg("--reg_par").arg(csv);
+        }
+        // Phase-retrieval physics only matters when a phase method is selected;
+        // forward it so the shards match the parent exactly.
+        if !plan.phase_str.eq_ignore_ascii_case("none") {
+            cmd.arg("--pixel_size")
+                .arg(plan.pixel_size.to_string())
+                .arg("--propagation_distance")
+                .arg(plan.dist.to_string())
+                .arg("--energy")
+                .arg(plan.energy.to_string())
+                .arg("--alpha")
+                .arg(plan.alpha.to_string())
+                .arg("--db")
+                .arg(plan.db.to_string())
+                .arg("--w")
+                .arg(plan.w.to_string());
+        }
+        if let Some(c) = plan.center {
             cmd.arg("--center").arg(c.to_string());
         }
         // Pin the child to one physical GPU; clear any inherited multi-device
@@ -772,11 +1031,22 @@ fn geometry_from_reader(
     Ok(geom)
 }
 
-/// Reconstruction params with the grid sized to the detector width.
-fn recon_params(geom: &Geometry, dtype: Dtype) -> ReconParams {
+/// Reconstruction params with the grid sized to the detector width, plus the
+/// filter (analytic methods) and iteration count / regularization (iterative
+/// methods). Fields not relevant to the chosen algorithm are ignored downstream.
+fn recon_params(
+    geom: &Geometry,
+    dtype: Dtype,
+    filter_name: FilterName,
+    num_iter: usize,
+    reg_par: Vec<f32>,
+) -> ReconParams {
     ReconParams {
         num_gridx: Some(geom.detector.width),
         dtype,
+        filter_name,
+        num_iter,
+        reg_par,
         ..Default::default()
     }
 }

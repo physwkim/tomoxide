@@ -1,5 +1,13 @@
 //! Reconstruction configuration (a subset of tomocupy's `config.py` groups),
 //! serializable to/from TOML for `tomoxide init`.
+//!
+//! `recon` and `recon_steps` load this via `--config` and use it as the default
+//! for `backend`/`algorithm`/`rotation_axis`/`filter_name`/`remove_stripe_method`/
+//! `retrieve_phase_method`/`num_iter`/`nsino_per_chunk`/`save_format`; any explicit
+//! CLI flag overrides its config value. `file_name` is informational — the input
+//! file is passed positionally on the command line. Stripe/phase methods are
+//! selected by name here and reconstructed with default parameters; per-method
+//! parameters (phase physics, etc.) are CLI flags.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
