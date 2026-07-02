@@ -5,8 +5,8 @@ properties. That guide notes a per-sample *quality* comparison had not been run;
 **this document is that comparison** — measured reconstruction quality, speed, and
 iteration behaviour of the analytic and iterative methods on real data.
 
-> **Scope & honesty of the claims.** All numbers below are from **one real
-> dataset** (a low-contrast, smooth-object micro-CT scan) on **one GPU**
+> **Scope & honesty of the claims.** Sections **2–7** (method *quality*) are from
+> **one real dataset** (a low-contrast, smooth-object micro-CT scan) on **one GPU**
 > (RTX 5000 Ada, CUDA, release build). They are a concrete data point, **not a
 > universal ranking** — a high-contrast, piecewise-constant object (metal/pore
 > samples) is exactly where total-variation shines more and the trade-offs shift.
@@ -14,6 +14,13 @@ iteration behaviour of the analytic and iterative methods on real data.
 > a sweep is stated, so cross-method quality reflects *behaviour*, not each
 > method's individually-tuned best. Reproduce on your own data before relying on a
 > specific ordering.
+>
+> Sections **8–9** (backend/engine *performance*) are a separate axis — they
+> compare the wgpu (Vulkan) and CUDA engines and the whole-volume vs streaming
+> paths, not reconstruction quality. Their provenance differs (controlled/synthetic
+> volumes, stated per section) and is called out inline. GPU clocks on this box are
+> unlocked and swing widely, so those numbers are **best-of-N** (the highest clock
+> wins); treat them as ratios, not absolute times.
 
 ---
 
@@ -306,6 +313,88 @@ iterations.
   chain to the data (`fbp,tv` for noise), and remember iteration savings ≠
   wall-time savings on a fast GPU.
 
-> All results reproduced with the `cuda` feature build on real data; scripts and
-> intermediate reconstructions are not committed. Re-run on your own sample before
-> committing to a method — see the scope note at the top.
+---
+
+## 8. Backend performance — wgpu (Vulkan) vs CUDA
+
+tomoxide's recon runs on three engines (CPU, CUDA, wgpu). wgpu is the portable
+GPU path (Vulkan/Metal/DX12); on this NVIDIA box it runs through Vulkan. The two
+GPU engines are **numerically equivalent** — `Pearson(cpu, wgpu) = 1.0` on every
+ported method — so this section is purely about *speed*, not fidelity.
+
+Per-slice kernel gap, controlled `1024²` volume, `nz = 2`, RTX 5000 Ada,
+best-of-N (ratio = wgpu wall ÷ CUDA wall; `< 1` means wgpu is faster):
+
+| algorithm | wgpu ÷ CUDA | why |
+|-----------|:-----------:|-----|
+| `fbp` / `linerec` | **~1.1× (parity)** | back-projection reads are already coalesced; the FBP filter is device-resident (pack/pad/crop on-GPU) |
+| `fourierrec` | ~1.6× | was ~2.6–2.8× when the Fourier gather-scatter emulated `atomicAdd` via a CAS loop; native f32 atomics (below) removed that penalty — the residual is per-dispatch submission overhead (~19 submits/chunk) |
+| `lprec` | **~0.8× (wgpu faster)** | both engines are dominated by the *shared* host `build_grids` precompute, not GPU throughput |
+| `gridrec` | ~1.5× | both host-bound (polar→Cartesian gridding runs on the host on both engines); neither is a true device reconstruction |
+| `sirt` | **~0.5× (wgpu faster, est.)** | the forward projector — a per-voxel atomic scatter, ~95 % of SIRT's wall — sped up 6.4× with native f32 atomics; measured wgpu SIRT(10) 235 ms vs the recorded CUDA ~515 ms (CUDA not re-measurable on this build) |
+
+- **Native f32 atomics (wgpu ≥ 24, `SHADER_FLOAT32_ATOMIC`).** The old
+  structural gap — WGSL had no float atomic, so every scatter accumulation
+  (forward projection, fourierrec gather/wrap, lprec gather) paid a
+  compare-exchange emulation loop with 2–3× the memory traffic of CUDA's one
+  native `atomicAdd` — is gone on hardware exposing Vulkan
+  `VK_EXT_shader_atomic_float`. Same-build A/B (CAS forced via
+  `TOMOXIDE_WGPU_NO_F32_ATOMICS=1` vs native, release, 1024² nz = 2):
+  forward project 139.5 → 21.0 ms (**6.6×**), SIRT(10) 1515 → 235 ms
+  (**6.4×**), fourierrec 32.5 → 23.0 ms (**1.4×**). Devices without the
+  feature (Metal, older drivers) transparently fall back to the CAS variant.
+- **fbp/linerec are at CUDA parity** — the fused device-resident analytic path
+  (filter → back-projection kept resident) closed the old 1.7× marshaling gap.
+- **lprec and gridrec are host-precompute / host-gridding bound**, so the engine
+  choice barely matters — the lever there is the shared host code, not the GPU.
+
+## 9. wgpu device-resident streaming (whole-volume vs streaming)
+
+The wgpu whole-volume `reconstruct()` wall is **60–82 % host cost**: the
+projection-domain minus-log runs through a wgpu round-trip (the whole projection
+volume is uploaded just to run one elementwise kernel, then downloaded) plus a
+full-volume projection→sinogram host transpose — neither is GPU-recon work. The
+streaming path removes both: it normalises each chunk on the **CPU** (parallel,
+memory-bound minus-log — no GPU round-trip), transposes just that chunk, runs the
+fused device recon (one PCIe hop up, one down), and overlaps disk read/compute/write
+across chunks.
+
+A/B on a **synthetic** `600 × 128 × 512` DXchange stack, TIFF output, chunk = 8,
+RTX 5000 Ada via Vulkan, best-of-3:
+
+| method | whole-volume | streaming | speedup |
+|--------|-------------:|----------:|:-------:|
+| `fbp` | 1.71 s | 1.20 s | **1.43×** |
+| `fourierrec` | 2.52 s | 2.35 s | 1.07× |
+| `lprec` | 2.18 s | 1.24 s | **1.76×** |
+
+- **The win scales with the host round-trip the whole-volume path pays.** `lprec`
+  gains most (1.76×) because its whole-volume path paid the minus-log round-trip
+  over the *entire* projection volume; `fourierrec` gains least (1.07×) because its
+  per-chunk wall is dominated by the GPU gather (§8), so removing host cost moves a
+  smaller fraction.
+- **Parity:** streaming output == whole-volume output, per-slice `Pearson > 0.999`,
+  including the partial trailing chunk (verified in `tests/wgpu_streaming.rs` for
+  fbp / fourierrec / lprec).
+- **Streaming also *enables* reconstructions that whole-volume cannot** — a large
+  `fourierrec` volume whose oversampled `2n × 2n` grid would exceed the wgpu
+  max-buffer limit fits chunk-by-chunk.
+- **Streaming does NOT close the per-slice kernel gap in §8** — that gap is
+  kernel-throughput-bound and measured with data already resident. A follow-up
+  device-transpose lever was measured and dropped: `fbp` streaming is I/O-bound
+  (compute ≪ wall, the transpose is already hidden behind the read/write threads)
+  and `fourierrec` is recon-bound (transpose < 10 % of a recon-dominated chunk), so
+  moving the transpose on-device buys nothing on this box.
+
+> `lprec` streaming needs the DXchange `/exchange/theta` stored in **degrees**
+> (the reader converts `deg/180·π`, matching tomocupy); a file with radian-stored
+> angles fails lprec's equal-spacing guard. This is a fixture convention, not a
+> code limit.
+
+---
+
+> Sections 2–7 were reproduced with the `cuda` feature build on real data;
+> sections 8–9 with the `cuda` and `gpu-wgpu` builds on the controlled/synthetic
+> volumes stated inline. Scripts and intermediate reconstructions are not
+> committed. Re-run on your own sample and GPU before committing to a method or an
+> engine — see the scope note at the top.
