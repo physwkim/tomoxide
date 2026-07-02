@@ -28,10 +28,13 @@ description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in
 tomoxide = { path = "crates/tomoxide", version = "0.4.0" }
 
 # --- x-ray physics (beam hardening; optional, pulled only by the
-# `beam-hardening` feature). Self-contained: vendors the xraylib C sources and
-# data tables, so no system libxrl. Its build runs bindgen, which needs
-# libclang at compile time (see crates/tomoxide-prep docs). ---
-xraylib = { path = "../xraylib-rs/crates/xraylib", version = "0.1" }
+# `beam-hardening` feature). From crates.io so the workspace is self-contained
+# (an external clone / CI resolves it without the sibling repo). Self-contained:
+# vendors the xraylib C sources and data tables, so no system libxrl. Its build
+# runs bindgen, which needs libclang at compile time (see crates/tomoxide-prep
+# docs). For local development against the sibling checkout, override with a
+# `[patch.crates-io] xraylib = { path = "../xraylib-rs/crates/xraylib" }`. ---
+xraylib = "0.1"
 
 # --- computer vision (SIFT center finding; optional, `sift-center` feature).
 # Links a system/conda OpenCV (≥4.x); its build runs bindgen → needs clang. ---

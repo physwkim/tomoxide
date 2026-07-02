@@ -2139,6 +2139,8 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 [[package]]
 name = "xraylib"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ed7de007c389aaee24f44b727ef85a60dce38e527bfc401bb7c7d88336c6ff7"
 dependencies = [
  "xraylib-sys",
 ]
@@ -2146,6 +2148,8 @@ dependencies = [
 [[package]]
 name = "xraylib-sys"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063d1afc49da8ef90a7ee65530a5ab50091c4b0293f85528dfb9be42def2eb01"
 dependencies = [
  "bindgen",
  "cc",
