@@ -29,6 +29,18 @@ pub struct WgpuBackend {
     pub device: wgpu::Device,
     /// The command queue.
     pub queue: wgpu::Queue,
+    /// Compiled compute-pipeline cache, keyed by a hash of `(shader source,
+    /// entry point)`. Every `dispatch1d` / `fft_shared_pass` call used to
+    /// `create_shader_module` + `create_compute_pipeline` from scratch — i.e.
+    /// re-run the naga→SPIR-V compile and driver pipeline build on *every*
+    /// dispatch. A single reconstruction issues dozens of dispatches (lprec runs
+    /// ~44, fourierrec similar), so that per-call compile dominated wall time vs
+    /// CUDA's precompiled kernels. Caching makes each unique kernel compile once
+    /// per backend; the source string (with its injected `const`s) is the key, so
+    /// size-specialized variants (e.g. fourierrec's `const M`, fft's `const NN`)
+    /// each get their own entry.
+    pipelines:
+        std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<wgpu::ComputePipeline>>>,
 }
 
 /// Handle to the portable GPU backend (stub: compiled without `gpu-wgpu`).
@@ -84,7 +96,11 @@ impl WgpuBackend {
             )
             .await
             .map_err(|e| Error::BackendUnavailable(format!("wgpu request_device: {e}")))?;
-        Ok(Self { device, queue })
+        Ok(Self {
+            device,
+            queue,
+            pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 }
 

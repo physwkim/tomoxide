@@ -485,22 +485,7 @@ impl WgpuBackend {
         let src = format!(
             "const WG : u32 = {wg}u;\nconst NN : u32 = {n}u;\nconst LOGN : u32 = {logn}u;\n{FFT_SHARED_WGSL}"
         );
-        let module = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("fft_shared"),
-                source: wgpu::ShaderSource::Wgsl(src.into()),
-            });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("fft_shared"),
-                layout: None,
-                module: &module,
-                entry_point: Some("fft_shared"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+        let pipeline = self.cached_pipeline(&src, "fft_shared");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fft_shared"),
             layout: &pipeline.get_bind_group_layout(0),

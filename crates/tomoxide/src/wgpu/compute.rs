@@ -106,14 +106,27 @@ impl WgpuBackend {
     /// `gid.x` in the common `wy == 1` case, so the same kernel source works for
     /// both. Tail workgroups (the grid rounds up) are handled by each kernel's
     /// existing `idx >= len` bounds check.
-    pub(crate) fn dispatch1d(
+    /// Fetch (or compile once and cache) the compute pipeline for `src`/`entry`.
+    ///
+    /// Keyed by a hash of the full source (including any injected `const`s) plus
+    /// the entry name, so distinct kernels and size-specialized variants each get
+    /// their own cached pipeline while a repeated dispatch reuses the compiled
+    /// one. This turns the per-dispatch naga compile + driver pipeline build into
+    /// a one-time cost per unique kernel — the dominant wgpu overhead vs CUDA's
+    /// precompiled kernels (see the `pipelines` field doc on [`WgpuBackend`]).
+    pub(crate) fn cached_pipeline(
         &self,
-        wgsl: &str,
+        src: &str,
         entry: &str,
-        buffers: &[&wgpu::Buffer],
-        n_threads: u32,
-    ) {
-        let src = format!("const WG : u32 = {WORKGROUP}u;\n{wgsl}");
+    ) -> std::sync::Arc<wgpu::ComputePipeline> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        entry.hash(&mut h);
+        let key = h.finish();
+        if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
+            return p.clone();
+        }
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -130,6 +143,20 @@ impl WgpuBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let arc = std::sync::Arc::new(pipeline);
+        self.pipelines.lock().unwrap().insert(key, arc.clone());
+        arc
+    }
+
+    pub(crate) fn dispatch1d(
+        &self,
+        wgsl: &str,
+        entry: &str,
+        buffers: &[&wgpu::Buffer],
+        n_threads: u32,
+    ) {
+        let src = format!("const WG : u32 = {WORKGROUP}u;\n{wgsl}");
+        let pipeline = self.cached_pipeline(&src, entry);
         let entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
             .enumerate()
@@ -153,6 +180,7 @@ impl WgpuBackend {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
+            // (pipeline is an Arc; &pipeline derefs to &ComputePipeline here.)
             // Fold the workgroup count into a 2-D grid so neither dimension
             // exceeds WebGPU's 65535 per-dimension cap (see method doc).
             let wg = n_threads.div_ceil(WORKGROUP);
