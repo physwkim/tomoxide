@@ -18,14 +18,28 @@ use bytemuck::{Pod, Zeroable};
 use ndarray::{Array3, Axis};
 
 use crate::wgpu::shaders::{
-    BACKPROJECT_WGSL, BLUESTEIN_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_TRANSPOSE_WGSL,
-    FFT_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
+    BACKPROJECT_WGSL, BLUESTEIN_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_SHARED_WGSL,
+    FFT_TRANSPOSE_WGSL, FFT_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
 };
 use crate::wgpu::WgpuBackend;
 
 /// Max window the GPU median kernel can hold (must match `MAX_WIN` in
 /// `medfilt3d.wgsl`): diameter 7, i.e. `size ≤ 7`.
 const MEDFILT_MAX_WIN: usize = 343;
+
+/// Largest transform length the shared-memory FFT kernel handles. At `vec2<f32>`
+/// (8 bytes) per element this is 32 KiB of workgroup memory, within the common
+/// desktop 48 KiB budget; longer transforms fall back to the global multi-pass
+/// kernel. The per-adapter `max_compute_workgroup_storage_size` is still checked
+/// at dispatch so downlevel adapters (16 KiB) drop to the global path sooner.
+const SHARED_FFT_MAX: usize = 4096;
+
+/// Threads per workgroup for the shared-memory FFT of length `n`: one thread per
+/// two elements, capped at 256 (a good occupancy point; each thread strides over
+/// the remaining butterflies). Always ≥ 1 and a power of two for power-of-two `n`.
+fn shared_fft_workgroup(n: usize) -> u32 {
+    ((n / 2).clamp(1, 256)) as u32
+}
 
 /// Uniform block for the `darkflat` kernel. Padded to 16 bytes to satisfy the
 /// WGSL uniform-buffer layout rules.
@@ -424,13 +438,113 @@ struct TParams {
 }
 
 impl WgpuBackend {
-    /// Issue the in-place radix-2 passes (bit-reversal + `log2(n)` butterfly
-    /// stages) over `data`, treating it as `lanes` contiguous transforms of
-    /// length `n`. Does not normalize; the inverse `1/n` is applied by the
-    /// caller. Submissions serialize on the queue, so each stage observes the
-    /// previous one's writes; transient uniform buffers stay alive through the
-    /// pending submissions even after this returns.
+    /// In-place radix-2 FFT of `data` as `lanes` contiguous transforms of length
+    /// `n`. Does not normalize; the inverse `1/n` is applied by the caller.
+    ///
+    /// Dispatches the single-pass shared-memory kernel when the transform fits
+    /// workgroup memory (the common FBP/gridrec/fourierrec lengths), and falls
+    /// back to the multi-submission global kernel for larger `n` — see
+    /// [`Self::fft_shared_pass`] and [`Self::fft_global_passes`].
     fn fft_passes(&self, data: &wgpu::Buffer, n: usize, lanes: usize, inverse: bool) {
+        let lim = self.device.limits();
+        let wg = shared_fft_workgroup(n);
+        let fits_shared = n <= SHARED_FFT_MAX
+            && (n * std::mem::size_of::<[f32; 2]>()) as u32
+                <= lim.max_compute_workgroup_storage_size
+            && wg <= lim.max_compute_invocations_per_workgroup;
+        if fits_shared {
+            self.fft_shared_pass(data, n, lanes, inverse, wg);
+        } else {
+            self.fft_global_passes(data, n, lanes, inverse);
+        }
+    }
+
+    /// Single-pass shared-memory FFT: one workgroup per transform, all stages in
+    /// workgroup memory. `wg` threads per workgroup (must equal
+    /// [`shared_fft_workgroup`]); the caller guarantees `n` fits shared memory.
+    /// The butterfly math matches [`Self::fft_global_passes`] bit-for-bit — only
+    /// the backing memory differs.
+    fn fft_shared_pass(&self, data: &wgpu::Buffer, n: usize, lanes: usize, inverse: bool, wg: u32) {
+        let logn = n.trailing_zeros();
+        let sign = if inverse { 1.0f32 } else { -1.0f32 };
+        let params = self.uniform(
+            "fft_sh_p",
+            &FftParams {
+                n: n as u32,
+                logn,
+                m: 0,
+                sign,
+            },
+        );
+        // Inject the workgroup size, transform length, and log2 as `const`, so the
+        // shared array is sized exactly and `@workgroup_size` has one source of
+        // truth matching the dispatched workgroup count.
+        let src = format!(
+            "const WG : u32 = {wg}u;\nconst NN : u32 = {n}u;\nconst LOGN : u32 = {logn}u;\n{FFT_SHARED_WGSL}"
+        );
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fft_shared"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("fft_shared"),
+                layout: None,
+                module: &module,
+                entry_point: Some("fft_shared"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fft_shared"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: data.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fft_shared"),
+            });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fft_shared"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            // One workgroup per transform, folded into a 2-D grid so neither
+            // dimension exceeds WebGPU's 65535 cap (the kernel recovers the lane
+            // as `wg.y * num_workgroups.x + wg.x`).
+            const MAX_DIM: u32 = 65535;
+            let lanes = lanes as u32;
+            let (wx, wy) = if lanes <= MAX_DIM {
+                (lanes, 1)
+            } else {
+                (MAX_DIM, lanes.div_ceil(MAX_DIM))
+            };
+            pass.dispatch_workgroups(wx, wy, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    /// Multi-submission global-memory radix-2 passes (bit-reversal + `log2(n)`
+    /// butterfly stages). Used for transforms too large for shared memory.
+    /// Submissions serialize on the queue, so each stage observes the previous
+    /// one's writes; transient uniform buffers stay alive through the pending
+    /// submissions even after this returns.
+    fn fft_global_passes(&self, data: &wgpu::Buffer, n: usize, lanes: usize, inverse: bool) {
         let logn = n.trailing_zeros();
         let sign = if inverse { 1.0f32 } else { -1.0f32 };
         let p0 = self.uniform(
