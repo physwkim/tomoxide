@@ -1094,7 +1094,7 @@ impl LpRecReconstruct for WgpuBackend {
 
         // Precompute the log-polar grids on the host (angle-independent), reusing
         // the CPU port's builder with this backend's Fft for the precompute FFTs.
-        let grids = crate::recon::lprec::build_grids(n, nang, self)?;
+        let grids = crate::recon::lprec::build_grids(n, nang, &crate::cpu::CpuBackend::new())?;
         let ntheta = grids.ntheta;
         let nrho = grids.nrho;
         let scale = 2.0 / (nrho as f32 * ntheta as f32);
