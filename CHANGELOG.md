@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-02
+
 ### Changed
 
 - **HDF5 reads are now rayon-parallel** (rust-hdf5 0.3.0 with the `parallel`
@@ -318,7 +320,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/physwkim/tomoxide/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/physwkim/tomoxide/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/physwkim/tomoxide/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/physwkim/tomoxide/compare/v0.2.0...v0.3.0
