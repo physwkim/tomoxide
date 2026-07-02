@@ -19,3 +19,10 @@ Cargo.lock.bak
 *.tiff
 *.tif
 *.zarr
+
+# ...but test fixtures are required INPUTS, not outputs — keep them tracked even
+# though their extensions match the output-ignore rules above.
+!crates/tomoxide/tests/fixtures/*.h5
+!crates/tomoxide/tests/fixtures/*.tiff
+!crates/tomoxide/tests/fixtures/*.tif
+!crates/tomoxide/tests/fixtures/*.zarr
