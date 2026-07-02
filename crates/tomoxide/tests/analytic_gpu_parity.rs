@@ -23,7 +23,9 @@
 
 use ndarray::{Array2, Axis};
 use tomoxide::wgpu::WgpuBackend;
-use tomoxide::{recon, sim, Algorithm, Angles, Backend, CpuBackend, Geometry, ReconParams, Volume};
+use tomoxide::{
+    recon, sim, Algorithm, Angles, Backend, CpuBackend, FilterName, Geometry, ReconParams, Volume,
+};
 
 /// Pearson correlation between two slices over a centered disk (amplitude-scale
 /// invariant), kept inside the phantom support away from clipped corners.
@@ -93,8 +95,16 @@ fn recon_both(
     let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
     let sino = sim::project(&vol, &geom, &cpu).unwrap();
 
+    // Use the ramp filter for the phantom-fidelity check: the default
+    // (`FilterName::Parzen`, matching tomocupy) apodizes so aggressively that even
+    // a correct FBP of a sharp Shepp-Logan reaches only r≈0.78–0.82 vs the
+    // phantom — below the >0.9 fidelity bar these tests assert. Ramp preserves
+    // resolution (r≈0.93–0.97) so the "did it reconstruct the phantom" assertion
+    // is meaningful; the GPU↔CPU parity check below is filter-independent (both
+    // backends run the same filter, so it stays r=1.0 / NRMSE≈1e-6 regardless).
     let params = ReconParams {
         num_gridx: Some(n),
+        filter_name: FilterName::Ramp,
         ..Default::default()
     };
     let rc = recon::recon(&sino, &geom, algorithm, &params, &cpu).unwrap();
