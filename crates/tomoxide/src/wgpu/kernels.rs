@@ -404,9 +404,13 @@ impl RankFilter for WgpuBackend {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FfltParams {
     pad: u32,
+    ncols: u32,
+    pad_side: u32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    scale: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 /// Uniform block for the radix-2 FFT kernel (16 bytes — already a multiple of 16,
@@ -807,34 +811,21 @@ impl FbpFilter for WgpuBackend {
                 "wgpu FBP filter requires a power-of-two length (got {pad}); use the CPU backend"
             )));
         }
-        // Gather every detector lane into the batch of complex transforms,
-        // centred and edge-replicate-padded exactly like CpuBackend::apply
-        // (tomocupy `fbp_filter_center`): lane `L` occupies
-        // `[L·pad + pad_side, L·pad + pad_side + ncols)`, and the borders
-        // replicate the first/last column. `lanes`/`lanes_mut` iterate in the
-        // same order, so `L` maps consistently between gather and scatter
-        // regardless of memory layout.
+        // Device-resident: upload only the raw REAL sinogram (batch·ncols f32),
+        // then pack / pad / FFT / filter / IFFT / crop entirely on-GPU. The old
+        // path built the full complex padded batch on the host, uploaded it
+        // (batch·pad complex = 2× the data), and scattered the complex result
+        // back — three single-threaded host passes over batch·pad elements plus
+        // a 2× transfer that dominated wall time (measured ~213 ms of a 227 ms
+        // 1024² filter, vs ~7 ms for the FFT itself). Now the GPU `pack`/`unpack`
+        // kernels do the edge-replicate padding and central crop, so only the
+        // compact real sinogram crosses the bus each way.
         let batch = sino.array.len() / ncols;
         let pad_side = pad / 2 - ncols / 2;
-        let mut host = vec![Complex32::new(0.0, 0.0); batch * pad];
-        for (l, lane) in sino.array.lanes(Axis(2)).into_iter().enumerate() {
-            let base = l * pad;
-            let first = lane[0];
-            let last = lane[ncols - 1];
-            for slot in host[base..base + pad_side].iter_mut() {
-                *slot = Complex32::new(first, 0.0);
-            }
-            for (i, &v) in lane.iter().enumerate() {
-                host[base + pad_side + i] = Complex32::new(v, 0.0);
-            }
-            for slot in host[base + pad_side + ncols..base + pad].iter_mut() {
-                *slot = Complex32::new(last, 0.0);
-            }
-        }
-        // Per-lane centre shift δ = ncols/2 − center(row). `lanes` iterates the
-        // two non-detector axes in C order, so lane `l` maps to slice row `l/d1`
-        // (Sinogram) or `l%d1` (Projection) — the same mapping CpuBackend::apply
-        // uses. δ=0 at the default centre keeps the GPU goldens identical.
+        // Per-lane centre shift δ = ncols/2 − center(row). Lane `l` (C-order over
+        // the two non-detector axes) maps to slice row `l/d1` (Sinogram) or
+        // `l%d1` (Projection), matching CpuBackend::apply. δ=0 at the default
+        // centre keeps the GPU goldens identical.
         let half = ncols as f32 / 2.0;
         let d1 = sino.array.shape()[1];
         let deltas: Vec<f32> = (0..batch)
@@ -846,19 +837,37 @@ impl FbpFilter for WgpuBackend {
                 half - geom.center.at(row)
             })
             .collect();
-        let data = self.upload_complex("fbp_filter", &host);
-        self.fft_passes(&data, pad, batch, false);
+        // Upload the sinogram in C order; lane `l` then occupies
+        // `[l·ncols, (l+1)·ncols)`, matching `pack`/`unpack` and the `lanes`
+        // enumeration order used for `deltas` and the scatter below.
+        let std = sino.array.as_standard_layout();
+        let sino_host = std
+            .as_slice()
+            .expect("as_standard_layout yields a contiguous slice");
+        let sino_buf = self.storage_ro("fbp_sino", sino_host);
+        let data = self.storage_empty("fbp_spectrum", batch * pad * 2);
         let w = self.storage_ro("fbp_w", filter);
         let deltas_buf = self.storage_ro("fbp_deltas", &deltas);
         let p = self.uniform(
             "fbp_p",
             &FfltParams {
                 pad: pad as u32,
+                ncols: ncols as u32,
+                pad_side: pad_side as u32,
                 _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
+                scale: 1.0 / pad as f32,
+                _pad1: 0.0,
+                _pad2: 0.0,
+                _pad3: 0.0,
             },
         );
+        self.dispatch1d(
+            FBP_FILTER_WGSL,
+            "pack",
+            &[&sino_buf, &data, &p],
+            (batch * pad) as u32,
+        );
+        self.fft_passes(&data, pad, batch, false);
         self.dispatch1d(
             FBP_FILTER_WGSL,
             "apply_filter",
@@ -866,12 +875,20 @@ impl FbpFilter for WgpuBackend {
             (batch * pad) as u32,
         );
         self.fft_passes(&data, pad, batch, true);
-        // fft_passes leaves the inverse unnormalized; fold the 1/pad in here.
-        self.download_complex(&data, &mut host, 1.0 / pad as f32);
+        // `unpack` crops the real central window and folds the 1/pad inverse-FFT
+        // normalisation (fft_passes leaves the inverse unscaled) into `scale`.
+        let out = self.storage_empty("fbp_out", batch * ncols);
+        self.dispatch1d(
+            FBP_FILTER_WGSL,
+            "unpack",
+            &[&data, &out, &p],
+            (batch * ncols) as u32,
+        );
+        let host_out = self.download_f32(&out, batch * ncols);
         for (l, mut lane) in sino.array.lanes_mut(Axis(2)).into_iter().enumerate() {
-            let base = l * pad + pad_side;
+            let base = l * ncols;
             for (i, slot) in lane.iter_mut().enumerate() {
-                *slot = host[base + i].re;
+                *slot = host_out[base + i];
             }
         }
         Ok(())
