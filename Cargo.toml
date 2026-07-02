@@ -59,8 +59,11 @@ toml = "0.8"
 
 # --- optional GPU backend (wgpu / Metal) ---
 # Pulled only when a crate enables its `gpu-wgpu` feature; the default
-# workspace build never compiles it.
-wgpu = "23"
+# workspace build never compiles it. ≥24 for `Features::SHADER_FLOAT32_ATOMIC`
+# (native f32 atomicAdd in WGSL, Vulkan VK_EXT_shader_atomic_float) — removes
+# the CAS-emulation penalty in the scatter kernels (forward projection,
+# fourierrec gather/wrap, lprec gather); falls back to CAS where unsupported.
+wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 

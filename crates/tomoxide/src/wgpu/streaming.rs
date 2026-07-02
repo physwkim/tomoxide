@@ -40,6 +40,7 @@ impl WgpuBackend {
             device: self.device.clone(),
             queue: self.queue.clone(),
             pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
+            f32_atomics: self.f32_atomics,
         }
     }
 }

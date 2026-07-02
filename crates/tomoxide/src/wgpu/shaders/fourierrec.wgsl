@@ -9,10 +9,12 @@
 // exactly. Every entry recovers its flat thread index as
 // `gid.y * nwg.x * WG + gid.x` (the 2-D dispatch fold used by all wgpu kernels).
 //
-// Float atomics: WGSL has only integer atomics, so `gather`/`wrap` accumulate
-// into an `array<atomic<u32>>` grid (two u32 lanes per complex cell) via a
-// compare-exchange add loop on the bit-cast float. Kernels that only read the
-// grid bind the same buffer as `array<f32>` (identical bytes).
+// Float atomics: `gather`/`wrap` accumulate into the grid (two lanes per
+// complex cell) through the injected `atom_add_ga_grid`/`atom_add_wr_grid`
+// helpers (WgpuBackend::atomic_f32_decl) — native f32 atomicAdd on devices with
+// SHADER_FLOAT32_ATOMIC, else the portable compare-exchange emulation on
+// bit-cast u32 lanes. Kernels that only read the grid bind the same buffer as
+// `array<f32>` (identical bytes either way).
 
 const PI : f32 = 3.14159265358979;
 const K : u32 = 2u * M + 1u; // separable Gaussian kernel length (2m+1)
@@ -74,8 +76,8 @@ fn postmod(@builtin(global_invocation_id) gid : vec3<u32>,
 }
 
 // --- 3. Gaussian gather (scatter each radial sample onto the Cartesian grid) --
+// @binding(1) `ga_grid` + `atom_add_ga_grid` — injected (atomic_f32_decl).
 @group(0) @binding(0) var<storage, read>       ga_radial : array<vec2<f32>>;
-@group(0) @binding(1) var<storage, read_write> ga_grid   : array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read>       ga_trig   : array<vec2<f32>>; // (cos, sin)
 @group(0) @binding(3) var<uniform>             ga_p      : FrParams;
 
@@ -121,26 +123,14 @@ fn gather(@builtin(global_invocation_id) gid : vec3<u32>,
             let w = ga_p.coeff0 * kern0[i0] * kern1[i1];
             let cc = u32(col0 + i32(i0));
             let cell = zbase + rr * ng + cc;
-            let ax = g0.x * w;
-            var ox = atomicLoad(&ga_grid[2u * cell]);
-            loop {
-                let r = atomicCompareExchangeWeak(&ga_grid[2u * cell], ox, bitcast<u32>(bitcast<f32>(ox) + ax));
-                if (r.exchanged) { break; }
-                ox = r.old_value;
-            }
-            let ay = g0.y * w;
-            var oy2 = atomicLoad(&ga_grid[2u * cell + 1u]);
-            loop {
-                let r = atomicCompareExchangeWeak(&ga_grid[2u * cell + 1u], oy2, bitcast<u32>(bitcast<f32>(oy2) + ay));
-                if (r.exchanged) { break; }
-                oy2 = r.old_value;
-            }
+            atom_add_ga_grid(2u * cell, g0.x * w);
+            atom_add_ga_grid(2u * cell + 1u, g0.y * w);
         }
     }
 }
 
 // --- 4. wrap the m-wide borders back into the interior (periodic over 2*nd) ---
-@group(0) @binding(0) var<storage, read_write> wr_grid : array<atomic<u32>>;
+// @binding(0) `wr_grid` + `atom_add_wr_grid`/`atom_load_wr_grid` — injected.
 @group(0) @binding(1) var<uniform>             wr_p    : FrParams;
 
 @compute @workgroup_size(WG)
@@ -160,20 +150,12 @@ fn wrap(@builtin(global_invocation_id) gid : vec3<u32>,
         let zbase = z * ng * ng;
         let src = zbase + ty * ng + tx;
         let dst = zbase + (ty0 + m) * ng + (tx0 + m);
-        let vx = bitcast<f32>(atomicLoad(&wr_grid[2u * src]));
-        let vy = bitcast<f32>(atomicLoad(&wr_grid[2u * src + 1u]));
-        var ox = atomicLoad(&wr_grid[2u * dst]);
-        loop {
-            let r = atomicCompareExchangeWeak(&wr_grid[2u * dst], ox, bitcast<u32>(bitcast<f32>(ox) + vx));
-            if (r.exchanged) { break; }
-            ox = r.old_value;
-        }
-        var oy2 = atomicLoad(&wr_grid[2u * dst + 1u]);
-        loop {
-            let r = atomicCompareExchangeWeak(&wr_grid[2u * dst + 1u], oy2, bitcast<u32>(bitcast<f32>(oy2) + vy));
-            if (r.exchanged) { break; }
-            oy2 = r.old_value;
-        }
+        // Border cells receive no in-place accumulation after the gather, and
+        // each border cell wraps to exactly one interior destination, so the
+        // loads race with nothing; the adds still race with other border cells
+        // mapping to the same interior cell.
+        atom_add_wr_grid(2u * dst, atom_load_wr_grid(2u * src));
+        atom_add_wr_grid(2u * dst + 1u, atom_load_wr_grid(2u * src + 1u));
     }
 }
 

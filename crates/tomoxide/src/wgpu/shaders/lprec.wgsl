@@ -10,9 +10,10 @@
 // log-polar buffer is a full [nrho, ntheta] complex grid (stride ntheta, no row
 // padding), matching the CPU port. `WG` is injected by dispatch1d.
 //
-// Float atomics: WGSL has only integer atomics, so `gather` accumulates into an
-// array<atomic<u32>> grid via an inlined compare-exchange add loop on the
-// bit-cast float (main and wrapping point sets can hit the same target).
+// Float atomics: `gather` accumulates through the injected `atom_add_ga_fl`
+// helper (WgpuBackend::atomic_f32_decl) — native f32 atomicAdd on devices with
+// SHADER_FLOAT32_ATOMIC, else the portable compare-exchange emulation on the
+// bit-cast u32 lane (main and wrapping point sets can hit the same target).
 
 const POLE : f32 = -0.2679492; // cubic-B-spline pole √3−2
 
@@ -104,8 +105,8 @@ fn prefilter_cols(@builtin(global_invocation_id) gid : vec3<u32>,
 }
 
 // --- gather: polar → log-polar cubic interpolation (atomic accumulate) --------
+// @binding(1) `ga_fl` + `atom_add_ga_fl` — injected (atomic_f32_decl).
 @group(0) @binding(0) var<storage, read>       ga_g       : array<f32>;
-@group(0) @binding(1) var<storage, read_write> ga_fl      : array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read>       ga_targets : array<u32>;
 @group(0) @binding(3) var<storage, read>       ga_xs      : array<f32>; // detector coord (width n)
 @group(0) @binding(4) var<storage, read>       ga_ys      : array<f32>; // angle coord (height nang)
@@ -144,12 +145,7 @@ fn gather(@builtin(global_invocation_id) gid : vec3<u32>,
     }
 
     let cell = s * ga_p.nrho * ga_p.ntheta + ga_targets[idx];
-    var old = atomicLoad(&ga_fl[cell]);
-    loop {
-        let r = atomicCompareExchangeWeak(&ga_fl[cell], old, bitcast<u32>(bitcast<f32>(old) + val));
-        if (r.exchanged) { break; }
-        old = r.old_value;
-    }
+    atom_add_ga_fl(cell, val);
 }
 
 // --- real → complex (load the atomic-accumulated real grid into the FFT buffer) ---

@@ -45,6 +45,14 @@ pub struct WgpuBackend {
     /// each get their own entry.
     pipelines:
         std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<wgpu::ComputePipeline>>>,
+    /// Whether the device was created with [`wgpu::Features::SHADER_FLOAT32_ATOMIC`]
+    /// (native `atomicAdd` on `atomic<f32>` storage — Vulkan
+    /// `VK_EXT_shader_atomic_float`). When set, the scatter kernels (forward
+    /// projection, fourierrec gather/wrap, lprec gather) accumulate with one
+    /// native float atomic per update; otherwise they fall back to the portable
+    /// compare-exchange emulation on `atomic<u32>` lanes, which pays a
+    /// read-modify-retry loop per update (2–3× the memory traffic).
+    pub(crate) f32_atomics: bool,
 }
 
 /// Handle to the portable GPU backend (stub: compiled without `gpu-wgpu`).
@@ -78,32 +86,47 @@ impl WgpuBackend {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
-            .ok_or_else(|| Error::BackendUnavailable("no wgpu adapter available".into()))?;
+            .map_err(|e| Error::BackendUnavailable(format!("no wgpu adapter available: {e}")))?;
         // `Limits::default()` is the conservative downlevel/WebGL profile
         // (256 MiB max buffer, 128 MiB max storage binding). A whole-volume
         // reconstruction's filter/FFT buffers blow past that (e.g. a 512²
         // nz=128 FBP needs a ~1 GiB spectrum buffer), so request the adapter's
         // reported maxima — the real hardware capability — instead.
+        // Native f32 atomics (VK_EXT_shader_atomic_float) let the scatter
+        // kernels accumulate with one atomicAdd instead of a CAS loop; request
+        // the feature when the adapter has it, fall back to CAS-emulation
+        // shader variants when it doesn't (Metal, older drivers).
+        // `TOMOXIDE_WGPU_NO_F32_ATOMICS=1` forces the CAS fallback even on a
+        // supporting adapter — for exercising/benchmarking the portable path on
+        // hardware that would otherwise never take it.
+        let f32_atomics = adapter
+            .features()
+            .contains(wgpu::Features::SHADER_FLOAT32_ATOMIC)
+            && std::env::var_os("TOMOXIDE_WGPU_NO_F32_ATOMICS").is_none();
+        let required_features = if f32_atomics {
+            wgpu::Features::SHADER_FLOAT32_ATOMIC
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("tomoxide-wgpu"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tomoxide-wgpu"),
+                required_features,
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .map_err(|e| Error::BackendUnavailable(format!("wgpu request_device: {e}")))?;
         Ok(Self {
             device: std::sync::Arc::new(device),
             queue: std::sync::Arc::new(queue),
             pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
+            f32_atomics,
         })
     }
 }
@@ -292,9 +315,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        be.device.poll(wgpu::Maintain::Wait);
+        be.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wgpu device poll");
         rx.recv().unwrap().unwrap();
-        let out: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        let out: Vec<f32> = {
+            let view = slice.get_mapped_range().expect("mapped range");
+            bytemuck::cast_slice(&view).to_vec()
+        };
         staging.unmap();
 
         assert_eq!(out, vec![2.0, 4.0, 6.0, 8.0, 10.0]);

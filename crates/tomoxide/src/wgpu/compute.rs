@@ -84,6 +84,45 @@ impl WgpuBackend {
             })
     }
 
+    /// WGSL header (binding declaration + accumulate/load helpers) for an
+    /// atomically-accumulated f32 storage buffer `name` at `@group(0)
+    /// @binding(binding)`. The scatter kernels (forward projection, fourierrec
+    /// gather/wrap, lprec gather) declare their accumulation target through this
+    /// so the *same kernel source* runs on both device classes:
+    ///
+    /// - with [`wgpu::Features::SHADER_FLOAT32_ATOMIC`] (`self.f32_atomics`):
+    ///   `array<atomic<f32>>` + native `atomicAdd` — one atomic per update;
+    /// - without: the portable emulation on `array<atomic<u32>>` — a
+    ///   compare-exchange loop on the bit-cast lane, which costs a
+    ///   read-modify-retry round per update (2–3× the memory traffic).
+    ///
+    /// Both variants leave the buffer's raw bytes as IEEE f32, so zeroing,
+    /// readback ([`Self::download_f32`]) and non-atomic re-binding as
+    /// `array<f32>` in later kernels are identical. The generated helpers are
+    /// `atom_add_{name}(idx, v)` and `atom_load_{name}(idx) -> f32`.
+    pub(crate) fn atomic_f32_decl(&self, name: &str, binding: u32) -> String {
+        if self.f32_atomics {
+            format!(
+                "@group(0) @binding({binding}) var<storage, read_write> {name} : array<atomic<f32>>;\n\
+                 fn atom_add_{name}(idx : u32, v : f32) {{ atomicAdd(&{name}[idx], v); }}\n\
+                 fn atom_load_{name}(idx : u32) -> f32 {{ return atomicLoad(&{name}[idx]); }}\n"
+            )
+        } else {
+            format!(
+                "@group(0) @binding({binding}) var<storage, read_write> {name} : array<atomic<u32>>;\n\
+                 fn atom_add_{name}(idx : u32, v : f32) {{\n\
+                     var old = atomicLoad(&{name}[idx]);\n\
+                     loop {{\n\
+                         let r = atomicCompareExchangeWeak(&{name}[idx], old, bitcast<u32>(bitcast<f32>(old) + v));\n\
+                         if (r.exchanged) {{ break; }}\n\
+                         old = r.old_value;\n\
+                     }}\n\
+                 }}\n\
+                 fn atom_load_{name}(idx : u32) -> f32 {{ return bitcast<f32>(atomicLoad(&{name}[idx])); }}\n"
+            )
+        }
+    }
+
     /// Compile `wgsl`, then dispatch its `entry` compute function over
     /// `n_threads` invocations, binding `buffers` at `@group(0)` in slice order.
     /// Uses the pipeline's auto-deduced bind-group layout, so each buffer's
@@ -218,9 +257,16 @@ impl WgpuBackend {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wgpu device poll");
         rx.recv().unwrap().unwrap();
-        let out = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        let out = {
+            let view = slice
+                .get_mapped_range()
+                .expect("mapped range after successful map_async");
+            bytemuck::cast_slice(&view).to_vec()
+        };
         staging.unmap();
         out
     }

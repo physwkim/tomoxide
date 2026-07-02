@@ -272,12 +272,13 @@ impl ForwardProject for WgpuBackend {
     ///
     /// Mirrors [`CpuBackend::project`](../../tomoxide_cpu) — the exact linear-
     /// interp adjoint of [`Self::backproject`]. Forward projection is a scatter
-    /// (each pixel splats onto two detector columns), so to stay race-free the
-    /// GPU maps one thread per `(row, angle)`: each owns a disjoint detector-
-    /// column span and visits pixels in the CPU's `(iy, ix)` order, so the
-    /// per-column accumulation order matches and only the multiply-accumulate
-    /// rounding diverges (tolerance parity, not Δ=0). `out` is overwritten with
-    /// a fresh `[row, angle, col]` sinogram.
+    /// (each pixel splats onto two detector columns); the GPU maps one thread
+    /// per object voxel and resolves the detector-column collisions with an
+    /// atomic f32 accumulate (native `atomicAdd` where the device supports it,
+    /// else the CAS emulation). The atomic order is nondeterministic, so the
+    /// result matches the CPU reference to a tolerance (accumulation-order
+    /// rounding), not bit-for-bit. `out` is overwritten with a fresh
+    /// `[row, angle, col]` sinogram.
     fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
         if geom.beam != Beam::Parallel {
             return Err(Error::InvalidParam(
@@ -316,9 +317,12 @@ impl ForwardProject for WgpuBackend {
         let param_buf = self.uniform("fp_params", &params);
         // One thread per object voxel; voxels atomic-splat onto the sinogram
         // (the exact transpose of the voxel-driven back-projector). sino_buf was
-        // zero-initialised above, which the accumulating kernel requires.
+        // zero-initialised above, which the accumulating kernel requires. The
+        // `sino` accumulation binding/helper is injected (native f32 atomicAdd
+        // or the CAS emulation, per device support).
+        let src = format!("{}{PROJECT_WGSL}", self.atomic_f32_decl("sino", 3));
         self.dispatch1d(
-            PROJECT_WGSL,
+            &src,
             "project",
             &[&vol_buf, &cossin_buf, &center_buf, &sino_buf, &param_buf],
             (nz * ny * nx) as u32,
@@ -1056,7 +1060,14 @@ impl WgpuBackend {
 
         // Inject the Gaussian half-width `m` as a `const` so `array<f32, 2m+1>`
         // is sized exactly (dispatch1d injects `WG` on top of this).
-        let src = format!("const M : u32 = {m}u;\n{FOURIERREC_WGSL}");
+        // Inject the atomic-accumulate bindings/helpers for the gather (ga_grid)
+        // and wrap (wr_grid) kernels — native f32 atomicAdd or CAS emulation per
+        // device support — alongside the Gaussian half-width constant.
+        let src = format!(
+            "const M : u32 = {m}u;\n{}{}{FOURIERREC_WGSL}",
+            self.atomic_f32_decl("ga_grid", 1),
+            self.atomic_f32_decl("wr_grid", 0),
+        );
 
         let trig_buf = self.storage_ro("fr_trig", &trig);
         let radial = self.storage_empty("fr_radial", nz * nang * nd * 2);
@@ -1298,10 +1309,14 @@ impl WgpuBackend {
         // npts=0 uniform shared by the whole-grid kernels (prefilter, r2c, cmul,
         // take_re); they read only nz/nang/n/ntheta/nrho/scale.
         let p0 = mk(0);
+        // Inject the gather accumulation binding/helper (native f32 atomicAdd or
+        // CAS emulation per device support); one source string shared by every
+        // entry of the module so the pipeline cache reuses compiled kernels.
+        let src = format!("{}{LPREC_WGSL}", self.atomic_f32_decl("ga_fl", 1));
 
         // Cubic-B-spline prefilter: detector axis then angle axis.
-        self.dispatch1d(LPREC_WGSL, "prefilter_rows", &[&g, &p0], (nz * nang) as u32);
-        self.dispatch1d(LPREC_WGSL, "prefilter_cols", &[&g, &p0], (nz * n) as u32);
+        self.dispatch1d(&src, "prefilter_rows", &[&g, &p0], (nz * nang) as u32);
+        self.dispatch1d(&src, "prefilter_cols", &[&g, &p0], (nz * n) as u32);
 
         self.zero_buffer(&f);
         for span in &grids.spans {
@@ -1310,7 +1325,7 @@ impl WgpuBackend {
             // 1. gather polar → log-polar (main set, then wrapping set).
             let p_main = mk(grids.lpids_len);
             self.dispatch1d(
-                LPREC_WGSL,
+                &src,
                 "gather",
                 &[
                     &g,
@@ -1325,7 +1340,7 @@ impl WgpuBackend {
             if let Some((xs_w, ys_w)) = &span.wrap {
                 let p_w = mk(grids.wids_len);
                 self.dispatch1d(
-                    LPREC_WGSL,
+                    &src,
                     "gather",
                     &[&g, &fl, &grids.wids_buf, xs_w, ys_w, &p_w],
                     (nz * grids.wids_len) as u32,
@@ -1335,32 +1350,22 @@ impl WgpuBackend {
             // 2. 2-D FFT convolution: fl → complex, forward, ×kfull, inverse,
             //    take real × scale.
             let grid_threads = (nz * nrho * ntheta) as u32;
-            self.dispatch1d(
-                LPREC_WGSL,
-                "real_to_complex",
-                &[&fl, &flc, &p0],
-                grid_threads,
-            );
+            self.dispatch1d(&src, "real_to_complex", &[&fl, &flc, &p0], grid_threads);
             self.fft_passes(&flc, ntheta, nrho * nz, false);
             self.fft_transpose(&flc, &scratch, nrho, ntheta, nz);
             self.fft_passes(&scratch, nrho, ntheta * nz, false);
             self.fft_transpose(&scratch, &flc, ntheta, nrho, nz);
-            self.dispatch1d(
-                LPREC_WGSL,
-                "cmul",
-                &[&flc, &grids.kfull_buf, &p0],
-                grid_threads,
-            );
+            self.dispatch1d(&src, "cmul", &[&flc, &grids.kfull_buf, &p0], grid_threads);
             self.fft_passes(&flc, ntheta, nrho * nz, true);
             self.fft_transpose(&flc, &scratch, nrho, ntheta, nz);
             self.fft_passes(&scratch, nrho, ntheta * nz, true);
             self.fft_transpose(&scratch, &flc, ntheta, nrho, nz);
-            self.dispatch1d(LPREC_WGSL, "take_re", &[&flc, &flcre, &p0], grid_threads);
+            self.dispatch1d(&src, "take_re", &[&flc, &flcre, &p0], grid_threads);
 
             // 3. scatter log-polar → Cartesian disk (accumulates across spans).
             let p_c = mk(grids.cids_len);
             self.dispatch1d(
-                LPREC_WGSL,
+                &src,
                 "scatter",
                 &[&flcre, &f, &grids.cids_buf, &span.xs_c, &span.ys_c, &p_c],
                 (nz * grids.cids_len) as u32,
@@ -1512,8 +1517,9 @@ impl WgpuBackend {
         };
         let pbuf = self.uniform("fp_params", &params);
         // One thread per object voxel (atomic-splat); sino zeroed above.
+        let src = format!("{}{PROJECT_WGSL}", self.atomic_f32_decl("sino", 3));
         self.dispatch1d(
-            PROJECT_WGSL,
+            &src,
             "project",
             &[vol_buf, cossin_buf, center_buf, sino_buf, &pbuf],
             (nz * ny * nx) as u32,
