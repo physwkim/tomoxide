@@ -150,15 +150,21 @@ impl Elementwise for CpuBackend {
     /// Ports tomopy `prep/normalize.py::minus_log` (normalize.py:72) and
     /// tomocupy `proc_functions.minus_log`.
     fn minus_log(&self, data: &mut Tomo<f32>) -> Result<()> {
-        data.array.mapv_inplace(|v| {
+        // Elementwise and order-independent, so parallelise across the whole
+        // projection volume (tens of millions of samples) via rayon — the rest
+        // of this backend's prep is already `par_chunks_mut`; the old
+        // `mapv_inplace` here was the lone single-threaded stage. Bit-identical:
+        // same per-element expression, no cross-element dependence.
+        let map = |v: &mut f32| {
             let clamped = v.max(1e-6);
             let out = -clamped.ln();
-            if out.is_finite() {
-                out
-            } else {
-                0.0
-            }
-        });
+            *v = if out.is_finite() { out } else { 0.0 };
+        };
+        match data.array.as_slice_memory_order_mut() {
+            Some(s) => s.par_iter_mut().for_each(map),
+            // Non-contiguous fallback keeps correctness for strided views.
+            None => data.array.iter_mut().for_each(map),
+        }
         Ok(())
     }
 }
