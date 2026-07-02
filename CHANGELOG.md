@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **HDF5 reads are now rayon-parallel** (rust-hdf5 0.3.0 with the `parallel`
+  feature: parallel chunk decode — deflate inflate + chunk gather). Read sits on
+  the critical path of the streaming reconstruction (each row-chunk re-decodes
+  the whole projection-chunked dataset), so this is a large end-to-end win. On a
+  1200×512×512 `fbp` streaming reconstruction (1 GPU): gzip-chunked input
+  73.5 s → 4.3 s (**17×**), uncompressed-chunked 9.5 s → 3.1 s (**3.1×**);
+  reconstruction output is byte-for-byte identical (the decode is deterministic).
+
 ## [0.5.0] - 2026-07-02
 
 Headline: the **wgpu (portable GPU) backend becomes device-resident end to end**,

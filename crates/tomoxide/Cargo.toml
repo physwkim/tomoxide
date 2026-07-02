@@ -41,7 +41,13 @@ log.workspace = true
 # one read) — a `[:, r0:r1, :]` z-chunk is `nproj` reads, not `nproj*(r1-r0)`;
 # ~1.6s/job faster streaming on the 1024-proj bench (was the recon_steps
 # read-bound bottleneck).
-rust-hdf5 = "0.2.28"
+# >=0.3.0 with `parallel`: rayon-parallel chunk decode (deflate inflate + chunk
+# gather). Read is on the critical path of the streaming recon (each row-chunk
+# re-decodes the whole projection-chunked dataset), so this is a large
+# end-to-end win — measured on a 1200x512x512 fbp streaming recon (1 GPU):
+# gzip-chunked 73.5s -> 4.3s (17x), uncompressed-chunked 9.5s -> 3.1s (3.1x);
+# output is byte-for-byte identical (deterministic decode).
+rust-hdf5 = { version = "0.3.0", features = ["parallel"] }
 tiff = "0.11"
 # optional GPU (wgpu / Metal) — only with `gpu-wgpu`
 wgpu = { workspace = true, optional = true }
