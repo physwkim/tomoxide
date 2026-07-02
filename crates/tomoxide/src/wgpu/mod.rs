@@ -167,6 +167,15 @@ impl Backend for WgpuBackend {
     fn lprec_reconstruct(&self) -> Option<&dyn crate::backend::LpRecReconstruct> {
         Some(self)
     }
+
+    /// Fused analytic path (fbp/linerec/fourierrec): filter → back-projection /
+    /// Fourier gridding, keeping the filtered sinogram device-resident so the
+    /// recon dispatcher pays one upload / one download instead of round-tripping
+    /// the filtered sinogram back to host between the filter and the recon.
+    #[cfg(feature = "gpu-wgpu")]
+    fn analytic_reconstruct(&self) -> Option<&dyn crate::backend::AnalyticReconstruct> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 

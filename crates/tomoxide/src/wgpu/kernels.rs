@@ -179,11 +179,34 @@ impl FilteredBackproject for WgpuBackend {
             });
         }
 
+        let sino_std = s.array.as_standard_layout();
+        let sino_buf = self.storage_ro("bp_sino", sino_std.as_slice().expect("standard layout"));
+        out.array = self.backproject_from_dev(&sino_buf, nz, nang, ncols, geom, (ny, nx))?;
+        Ok(())
+    }
+}
+
+impl WgpuBackend {
+    /// Device-resident filtered back-projection from an already-uploaded
+    /// (filtered) sinogram buffer (`[nz·nang, ncols]`, sinogram C-order),
+    /// returning the reconstructed volume as `[nz, ny, nx]`. Shared by
+    /// [`FilteredBackproject::backproject`] (which uploads the host sinogram
+    /// first) and the fused [`AnalyticReconstruct`] path for fbp/linerec (which
+    /// passes the filter's on-device output straight in). `geom` carries the
+    /// per-row centre and angles used for the sampling.
+    pub(crate) fn backproject_from_dev(
+        &self,
+        sino_buf: &wgpu::Buffer,
+        nz: usize,
+        nang: usize,
+        ncols: usize,
+        geom: &Geometry,
+        out_dims: (usize, usize),
+    ) -> Result<Array3<f32>> {
+        let (ny, nx) = out_dims;
         let (cossin, center) = cossin_center(geom, nz);
         let scale = std::f32::consts::PI / nang as f32;
 
-        let sino_std = s.array.as_standard_layout();
-        let sino_buf = self.storage_ro("bp_sino", sino_std.as_slice().expect("standard layout"));
         let cossin_buf = self.storage_ro("bp_cossin", &cossin);
         let center_buf = self.storage_ro("bp_center", &center);
         let total = nz * ny * nx;
@@ -202,12 +225,11 @@ impl FilteredBackproject for WgpuBackend {
         self.dispatch1d(
             BACKPROJECT_WGSL,
             "backproject",
-            &[&sino_buf, &cossin_buf, &center_buf, &vol_buf, &param_buf],
+            &[sino_buf, &cossin_buf, &center_buf, &vol_buf, &param_buf],
             total as u32,
         );
         let result = self.download_f32(&vol_buf, total);
-        out.array = Array3::from_shape_vec((nz, ny, nx), result).expect("len matches dims");
-        Ok(())
+        Ok(Array3::from_shape_vec((nz, ny, nx), result).expect("len matches dims"))
     }
 }
 
@@ -795,6 +817,40 @@ impl FbpFilter for WgpuBackend {
     /// power-of-two `pad` (the GPU FFT is radix-2 only); other lengths error so
     /// the caller can fall back to CPU.
     fn apply(&self, sino: &mut Tomo<f32>, filter: &[f32], geom: &Geometry) -> Result<()> {
+        let ncols = sino.n_cols();
+        let batch = sino.array.len() / ncols;
+        // Filter on-device, then download the compact real result and scatter it
+        // back into `sino` (lane order matches `filter_to_device`'s C-order upload).
+        let out = self.filter_to_device(sino, filter, geom)?;
+        let host_out = self.download_f32(&out, batch * ncols);
+        for (l, mut lane) in sino.array.lanes_mut(Axis(2)).into_iter().enumerate() {
+            let base = l * ncols;
+            for (i, slot) in lane.iter_mut().enumerate() {
+                *slot = host_out[base + i];
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WgpuBackend {
+    /// Device-resident FBP filter: upload only the raw REAL sinogram
+    /// (`batch·ncols` f32), then pack / pad / FFT / ×filter / IFFT / crop entirely
+    /// on-GPU, returning the filtered real sinogram **as a device buffer**
+    /// (`[batch·ncols]`, sinogram C-order — lane `l` at `[l·ncols, (l+1)·ncols)`).
+    ///
+    /// This is the shared core of [`FbpFilter::apply`] (which downloads + scatters
+    /// the result to host) and the fused [`AnalyticReconstruct`] path (which feeds
+    /// the buffer straight into the gridding / back-projection kernels, skipping
+    /// the filtered-sinogram download + re-upload round-trip). The old host path
+    /// built the full complex padded batch on the host and round-tripped 2× the
+    /// data; only the compact real sinogram crosses the bus now.
+    pub(crate) fn filter_to_device(
+        &self,
+        sino: &Tomo<f32>,
+        filter: &[f32],
+        geom: &Geometry,
+    ) -> Result<wgpu::Buffer> {
         let pad = filter.len();
         if pad == 0 {
             return Err(Error::InvalidParam("empty filter".into()));
@@ -811,15 +867,6 @@ impl FbpFilter for WgpuBackend {
                 "wgpu FBP filter requires a power-of-two length (got {pad}); use the CPU backend"
             )));
         }
-        // Device-resident: upload only the raw REAL sinogram (batch·ncols f32),
-        // then pack / pad / FFT / filter / IFFT / crop entirely on-GPU. The old
-        // path built the full complex padded batch on the host, uploaded it
-        // (batch·pad complex = 2× the data), and scattered the complex result
-        // back — three single-threaded host passes over batch·pad elements plus
-        // a 2× transfer that dominated wall time (measured ~213 ms of a 227 ms
-        // 1024² filter, vs ~7 ms for the FFT itself). Now the GPU `pack`/`unpack`
-        // kernels do the edge-replicate padding and central crop, so only the
-        // compact real sinogram crosses the bus each way.
         let batch = sino.array.len() / ncols;
         let pad_side = pad / 2 - ncols / 2;
         // Per-lane centre shift δ = ncols/2 − center(row). Lane `l` (C-order over
@@ -839,7 +886,7 @@ impl FbpFilter for WgpuBackend {
             .collect();
         // Upload the sinogram in C order; lane `l` then occupies
         // `[l·ncols, (l+1)·ncols)`, matching `pack`/`unpack` and the `lanes`
-        // enumeration order used for `deltas` and the scatter below.
+        // enumeration order used for `deltas`.
         let std = sino.array.as_standard_layout();
         let sino_host = std
             .as_slice()
@@ -884,14 +931,7 @@ impl FbpFilter for WgpuBackend {
             &[&data, &out, &p],
             (batch * ncols) as u32,
         );
-        let host_out = self.download_f32(&out, batch * ncols);
-        for (l, mut lane) in sino.array.lanes_mut(Axis(2)).into_iter().enumerate() {
-            let base = l * ncols;
-            for (i, slot) in lane.iter_mut().enumerate() {
-                *slot = host_out[base + i];
-            }
-        }
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -941,6 +981,33 @@ impl FourierReconstruct for WgpuBackend {
             )?));
         }
 
+        let bdata = b
+            .array
+            .as_slice()
+            .expect("contiguous sinogram (as_layout yields a standard-layout copy)");
+        // Upload the filtered sinogram, then run the device-resident core.
+        let sino_buf = self.storage_ro("fr_sino", bdata);
+        self.fourierrec_from_dev(&sino_buf, nz, nang, nd, geom, n)
+    }
+}
+
+impl WgpuBackend {
+    /// Device-resident Fourier-grid (regridding) reconstruction from an
+    /// already-uploaded filtered sinogram buffer (`[nz·nang, nd]`, sinogram
+    /// C-order). Shared by [`Fourierrec::reconstruct`] (which uploads the host
+    /// sinogram first) and the fused [`AnalyticReconstruct`] path (which passes
+    /// the filter's on-device output straight in, skipping the round-trip). All
+    /// Gaussian-kernel arithmetic mirrors the CPU port (recon/fourierrec.rs) so
+    /// the grids coincide. Caller guarantees `nd.is_power_of_two()`.
+    pub(crate) fn fourierrec_from_dev(
+        &self,
+        sino_buf: &wgpu::Buffer,
+        nz: usize,
+        nang: usize,
+        nd: usize,
+        geom: &Geometry,
+        n: usize,
+    ) -> Result<Volume<f32>> {
         // Gaussian-kernel parameters — identical arithmetic to the CPU port so
         // the grids coincide (recon/fourierrec.rs).
         const EPS: f64 = 1e-3;
@@ -985,16 +1052,10 @@ impl FourierReconstruct for WgpuBackend {
             })
             .collect();
 
-        let bdata = b
-            .array
-            .as_slice()
-            .expect("contiguous sinogram (as_layout yields a standard-layout copy)");
-
         // Inject the Gaussian half-width `m` as a `const` so `array<f32, 2m+1>`
         // is sized exactly (dispatch1d injects `WG` on top of this).
         let src = format!("const M : u32 = {m}u;\n{FOURIERREC_WGSL}");
 
-        let sino_buf = self.storage_ro("fr_sino", bdata);
         let trig_buf = self.storage_ro("fr_trig", &trig);
         let radial = self.storage_empty("fr_radial", nz * nang * nd * 2);
         let grid = self.storage_empty("fr_grid", nz * ng * ng * 2);
@@ -1011,7 +1072,7 @@ impl FourierReconstruct for WgpuBackend {
         self.dispatch1d(
             &src,
             "build_radial",
-            &[&sino_buf, &radial, &p],
+            &[sino_buf, &radial, &p],
             radial_threads,
         );
         // 2. centred 1-D FFT of every projection (length nd), then post-modulate.
@@ -1209,5 +1270,68 @@ impl LpRecReconstruct for WgpuBackend {
         let arr = Array3::from_shape_vec((nz, n, n), host)
             .expect("out buffer length nz*n*n matches the volume shape");
         Ok(Volume::new(arr))
+    }
+}
+
+impl crate::backend::AnalyticReconstruct for WgpuBackend {
+    /// Fused fbp/linerec/fourierrec: FBP-filter the sinogram on-device and feed
+    /// the filtered buffer straight into the back-projection / Fourier-gridding
+    /// kernels, keeping it device-resident. The composed capability path
+    /// (recon::recon's fallback) downloads the filtered sinogram after
+    /// `FbpFilter::apply` and re-uploads it inside the recon; this fuses the two
+    /// so the sinogram crosses the bus once (up) and only the volume comes back.
+    fn reconstruct(
+        &self,
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        algorithm: crate::params::Algorithm,
+        params: &crate::params::ReconParams,
+    ) -> Result<Volume<f32>> {
+        use crate::params::Algorithm;
+        let ncols = sino.n_cols();
+        let n = params.num_gridx.unwrap_or(ncols);
+        let nz = sino.n_rows();
+        let nang = sino.n_angles();
+        let kernel = self.make_filter(params.filter_name, ncols)?;
+
+        // fourierrec's device core drives the radix-2 FFT directly, so it needs a
+        // power-of-two detector width. For other widths, compose the host path
+        // (filter on-device to host, then the generic Bluestein-capable gridding)
+        // exactly as recon::recon's fallback does — the fused path is a pure
+        // optimisation and must not change which inputs are accepted.
+        if algorithm == Algorithm::Fourierrec && !ncols.is_power_of_two() {
+            let mut filtered = sino.clone();
+            <Self as FbpFilter>::apply(self, &mut filtered, &kernel, geom)?;
+            return Ok(Volume::new(crate::recon::fourierrec::fourierrec(
+                &filtered, geom, n, self,
+            )?));
+        }
+
+        // Filter in sinogram layout so the on-device buffer is [nz·nang, ncols] in
+        // the C-order the recon cores expect; the per-row centre shift is folded
+        // in by the filter (after it, the back-projector assumes centre = ncols/2).
+        let s = sino.as_layout(Layout::Sinogram);
+        let filt_dev = self.filter_to_device(&s, &kernel, geom)?;
+
+        match algorithm {
+            // fourierrec grids against the original angles; the centre shift is
+            // already baked into the filtered data.
+            Algorithm::Fourierrec => self.fourierrec_from_dev(&filt_dev, nz, nang, ncols, geom, n),
+            // fbp / linerec back-project against a centre = ncols/2 geometry, the
+            // axis the filter shifted the projections onto.
+            Algorithm::Fbp | Algorithm::Linerec => {
+                let centered = Geometry {
+                    center: crate::geometry::Center::Scalar(ncols as f32 / 2.0),
+                    ..geom.clone()
+                };
+                let arr =
+                    self.backproject_from_dev(&filt_dev, nz, nang, ncols, &centered, (n, n))?;
+                Ok(Volume::new(arr))
+            }
+            // recon::recon only routes these three algorithms here.
+            other => Err(Error::InvalidParam(format!(
+                "wgpu analytic_reconstruct does not handle {other:?}"
+            ))),
+        }
     }
 }
