@@ -19,12 +19,13 @@
 //! set lets fourierrec reconstruct volumes whose whole-volume oversampled grid
 //! would exceed the wgpu max-buffer limit.
 
-use crate::backend::{AnalyticReconstruct, StreamingAnalytic};
+use crate::backend::{AnalyticReconstruct, FbpFilter, StreamingAnalytic};
 use crate::data::{Dataset, Frames, Layout, Tomo, Volume};
 use crate::error::Result;
 use crate::geometry::Geometry;
 use crate::params::{Algorithm, ReconParams, StripeMethod};
 
+use super::kernels::WgpuLprecGrids;
 use super::WgpuBackend;
 
 impl WgpuBackend {
@@ -44,13 +45,17 @@ impl WgpuBackend {
 }
 
 /// Handle-reusing streaming reconstructor for the wgpu analytic methods
-/// (fbp / linerec / fourierrec), bound to a fixed `(algorithm, params)`. Built
-/// once on the first chunk by [`AnalyticReconstruct::streaming`] and driven on
-/// the streaming compute thread.
+/// (fbp / linerec / fourierrec via the fused `AnalyticReconstruct` path, and
+/// lprec via its own log-polar dispatch with grids cached across chunks), bound
+/// to a fixed `(algorithm, params)`. Built once on the first chunk by
+/// [`AnalyticReconstruct::streaming`] and driven on the streaming compute thread.
 pub(crate) struct WgpuFbpStream {
     be: WgpuBackend,
     algorithm: Algorithm,
     params: ReconParams,
+    /// lprec log-polar grids, built lazily on the first chunk and reused across
+    /// all later chunks (nz-independent). `None` for the fused analytic methods.
+    lprec_grids: Option<WgpuLprecGrids>,
 }
 
 impl WgpuFbpStream {
@@ -59,7 +64,34 @@ impl WgpuFbpStream {
             be,
             algorithm,
             params,
+            lprec_grids: None,
         }
+    }
+
+    /// Reconstruct one already-normalized, C-contiguous sinogram chunk on the
+    /// device. fbp/linerec/fourierrec take the fused `AnalyticReconstruct` path;
+    /// lprec FBP-filters the chunk, then runs the log-polar core reusing the
+    /// grids cached on the first chunk (rebuilding them per chunk would repeat
+    /// the ~175-230 ms host precompute — a regression vs the whole-volume path).
+    fn recon_sino(&mut self, sino: &Tomo<f32>, geom: &Geometry) -> Result<Volume<f32>> {
+        if self.algorithm != Algorithm::Lprec {
+            return self
+                .be
+                .reconstruct(sino, geom, self.algorithm, &self.params);
+        }
+        let n = self.params.num_gridx.unwrap_or(sino.n_cols());
+        if self.lprec_grids.is_none() {
+            self.lprec_grids = Some(self.be.build_lprec_grids(geom, n)?);
+        }
+        // lprec reconstructs from the FBP-filtered sinogram (recon::recon filters
+        // first, then calls LpRecReconstruct); mirror that here per chunk.
+        let kernel = self
+            .be
+            .make_filter(self.params.filter_name, sino.n_cols())?;
+        let mut filtered = sino.clone();
+        self.be.apply(&mut filtered, &kernel, geom)?;
+        let grids = self.lprec_grids.as_ref().expect("lprec grids built above");
+        self.be.lprec_run(&filtered, grids)
     }
 }
 
@@ -69,8 +101,7 @@ impl StreamingAnalytic for WgpuFbpStream {
     /// which normalizes/transposes the whole dataset up front; the fused device
     /// path keeps the sinogram resident across filter and recon.
     fn reconstruct_chunk(&mut self, sino: &Tomo<f32>, geom: &Geometry) -> Result<Volume<f32>> {
-        self.be
-            .reconstruct(sino, geom, self.algorithm, &self.params)
+        self.recon_sino(sino, geom)
     }
 
     /// Device fast path from the raw, un-normalized projection chunk
@@ -118,9 +149,7 @@ impl StreamingAnalytic for WgpuFbpStream {
         // recon cores can take a flat slice (matches the whole-volume host path).
         let mut sino = ds.data.to_layout(Layout::Sinogram);
         sino.array = sino.array.as_standard_layout().to_owned();
-        let vol = self
-            .be
-            .reconstruct(&sino, geom, self.algorithm, &self.params)?;
+        let vol = self.recon_sino(&sino, geom)?;
         Ok(Some(vol))
     }
 }

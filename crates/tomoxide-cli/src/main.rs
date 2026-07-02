@@ -522,7 +522,7 @@ fn pipelines_well(engine: &Engine, algo: Algorithm) -> bool {
         ),
         "wgpu" => matches!(
             algo,
-            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec | Algorithm::Lprec
         ),
         _ => false,
     }

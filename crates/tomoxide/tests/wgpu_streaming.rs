@@ -116,3 +116,12 @@ fn wgpu_fbp_pipelined_matches_whole_volume() {
 fn wgpu_fourierrec_pipelined_matches_whole_volume() {
     check(Algorithm::Fourierrec);
 }
+
+#[test]
+fn wgpu_lprec_pipelined_matches_whole_volume() {
+    // lprec caches the log-polar grids across chunks (built once on the first
+    // chunk); parity here proves the cached-grid per-chunk core matches the
+    // whole-volume build+run. The fixture is square (nd = nx = 128) with equally
+    // spaced angles over [0, π), which lprec requires.
+    check(Algorithm::Lprec);
+}

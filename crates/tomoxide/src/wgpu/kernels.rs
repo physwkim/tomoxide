@@ -1126,24 +1126,53 @@ struct LpParams {
     _p4: f32,
 }
 
-impl LpRecReconstruct for WgpuBackend {
-    /// Device-resident log-polar reconstruction (tomocupy `lprec`) — the cubic
-    /// B-spline prefilter, the polar↔log-polar↔Cartesian gather/scatter, and the
-    /// 2-D FFT convolution all run on the GPU, mirroring [`crate::recon::lprec`]
-    /// step-for-step. The geometry grids are precomputed once on the host
-    /// (`build_grids`) and uploaded; this replaces the host-interpolation +
-    /// per-call FFT-round-trip fallback that dominated wgpu lprec wall time.
-    fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>> {
-        let b = filtered.as_layout(Layout::Sinogram);
-        let nz = b.n_rows();
-        let nang = b.n_angles();
-        let nd = b.n_cols();
+/// Per-span (log-polar overlap set) gather/scatter coordinate buffers, uploaded
+/// once. `wrap` holds the wrapping-set coordinates when `grids.wids` is nonempty.
+struct LprecSpan {
+    xs_main: wgpu::Buffer,
+    ys_main: wgpu::Buffer,
+    wrap: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    xs_c: wgpu::Buffer,
+    ys_c: wgpu::Buffer,
+}
 
+/// Precomputed, device-resident log-polar grids for lprec — the host
+/// `build_grids` output uploaded to the GPU. Angle-count / grid-size dependent
+/// but **nz-independent**, so [`WgpuFbpStream`](super::streaming::WgpuFbpStream)
+/// builds this once via [`WgpuBackend::build_lprec_grids`] and reuses it across
+/// every z-chunk. The whole-volume [`LpRecReconstruct::reconstruct`] builds one
+/// per call (as before), so its behaviour is unchanged.
+pub(crate) struct WgpuLprecGrids {
+    ntheta: usize,
+    nrho: usize,
+    n: usize,
+    nang: usize,
+    scale: f32,
+    lpids_len: usize,
+    wids_len: usize,
+    cids_len: usize,
+    kfull_buf: wgpu::Buffer,
+    lpids_buf: wgpu::Buffer,
+    wids_buf: wgpu::Buffer,
+    cids_buf: wgpu::Buffer,
+    spans: Vec<LprecSpan>,
+}
+
+impl WgpuBackend {
+    /// Geometry guards + host `build_grids` + upload of every nz-independent
+    /// lprec buffer (the kfull kernel, the gather/scatter index sets, and the
+    /// per-span coordinate arrays). Split out of [`LpRecReconstruct::reconstruct`]
+    /// so the streaming path can build the grids once and reuse them per chunk
+    /// (a naive per-chunk `reconstruct` would rerun this ~175-230 ms precompute
+    /// every chunk — a regression vs the whole-volume path).
+    pub(crate) fn build_lprec_grids(&self, geom: &Geometry, n: usize) -> Result<WgpuLprecGrids> {
         // Same geometry guards as the CPU port (recon/lprec.rs): square geometry
-        // with equally spaced angles spanning [0, π).
-        if nang < 2 || nd != n {
+        // with equally spaced angles spanning [0, π). The detector-width == n
+        // check is deferred to `lprec_run` (it needs the sinogram's ncols).
+        let nang = geom.angles.0.len();
+        if nang < 2 {
             return Err(Error::InvalidParam(format!(
-                "lprec requires square geometry with detector width == grid size (got n={n}, ncols={nd})"
+                "lprec requires square geometry with detector width == grid size (got n={n})"
             )));
         }
         let angles = &geom.angles.0;
@@ -1155,12 +1184,85 @@ impl LpRecReconstruct for WgpuBackend {
             ));
         }
 
-        // Precompute the log-polar grids on the host (angle-independent), reusing
-        // the CPU port's builder with this backend's Fft for the precompute FFTs.
+        // Precompute the log-polar grids on the host, reusing the CPU port's
+        // builder (its precompute FFTs run on the CpuBackend's Fft).
         let grids = crate::recon::lprec::build_grids(n, nang, &crate::cpu::CpuBackend::new())?;
         let ntheta = grids.ntheta;
         let nrho = grids.nrho;
         let scale = 2.0 / (nrho as f32 * ntheta as f32);
+
+        let kfull_host: Vec<f32> = grids.kfull.iter().flat_map(|c| [c.re, c.im]).collect();
+        let kfull_buf = self.storage_ro("lp_kfull", &kfull_host);
+        let lpids: Vec<u32> = grids.lpids.iter().map(|&x| x as u32).collect();
+        let wids: Vec<u32> = grids.wids.iter().map(|&x| x as u32).collect();
+        let cids: Vec<u32> = grids.cids.iter().map(|&x| x as u32).collect();
+        let lpids_buf = self.storage_ro_u32("lp_lpids", &lpids);
+        let wids_buf = self.storage_ro_u32("lp_wids", &wids);
+        let cids_buf = self.storage_ro_u32("lp_cids", &cids);
+
+        let mut spans = Vec::with_capacity(grids.lp2p1.len());
+        for k in 0..grids.lp2p1.len() {
+            let xs_main = self.storage_ro("lp_xs", &grids.lp2p2[k]);
+            let ys_main = self.storage_ro("lp_ys", &grids.lp2p1[k]);
+            let wrap = if !wids.is_empty() {
+                Some((
+                    self.storage_ro("lp_xsw", &grids.lp2p2w[k]),
+                    self.storage_ro("lp_ysw", &grids.lp2p1w[k]),
+                ))
+            } else {
+                None
+            };
+            let xs_c = self.storage_ro("lp_xsc", &grids.c2lp1[k]);
+            let ys_c = self.storage_ro("lp_ysc", &grids.c2lp2[k]);
+            spans.push(LprecSpan {
+                xs_main,
+                ys_main,
+                wrap,
+                xs_c,
+                ys_c,
+            });
+        }
+
+        Ok(WgpuLprecGrids {
+            ntheta,
+            nrho,
+            n,
+            nang,
+            scale,
+            lpids_len: lpids.len(),
+            wids_len: wids.len(),
+            cids_len: cids.len(),
+            kfull_buf,
+            lpids_buf,
+            wids_buf,
+            cids_buf,
+            spans,
+        })
+    }
+
+    /// Per-chunk lprec core: the cubic-B-spline prefilter + gather / 2-D FFT
+    /// convolution / scatter over `nz` slices, reusing the precomputed
+    /// [`WgpuLprecGrids`]. `filtered` is the FBP-filtered sinogram for this chunk;
+    /// only the nz-sized scratch/output buffers are allocated here.
+    pub(crate) fn lprec_run(
+        &self,
+        filtered: &Tomo<f32>,
+        grids: &WgpuLprecGrids,
+    ) -> Result<Volume<f32>> {
+        let b = filtered.as_layout(Layout::Sinogram);
+        let nz = b.n_rows();
+        let nang = b.n_angles();
+        let nd = b.n_cols();
+        let n = grids.n;
+        if nd != n || nang != grids.nang {
+            return Err(Error::InvalidParam(format!(
+                "lprec chunk geometry {nang}×{nd} does not match prepared grids {}×{n}",
+                grids.nang
+            )));
+        }
+        let ntheta = grids.ntheta;
+        let nrho = grids.nrho;
+        let scale = grids.scale;
 
         let bdata = b
             .array
@@ -1173,15 +1275,6 @@ impl LpRecReconstruct for WgpuBackend {
         let scratch = self.storage_empty("lp_scratch", nz * nrho * ntheta * 2);
         let flcre = self.storage_empty("lp_flcre", nz * nrho * ntheta);
         let f = self.storage_empty("lp_f", nz * n * n);
-
-        let kfull_host: Vec<f32> = grids.kfull.iter().flat_map(|c| [c.re, c.im]).collect();
-        let kfull_buf = self.storage_ro("lp_kfull", &kfull_host);
-        let lpids: Vec<u32> = grids.lpids.iter().map(|&x| x as u32).collect();
-        let wids: Vec<u32> = grids.wids.iter().map(|&x| x as u32).collect();
-        let cids: Vec<u32> = grids.cids.iter().map(|&x| x as u32).collect();
-        let lpids_buf = self.storage_ro_u32("lp_lpids", &lpids);
-        let wids_buf = self.storage_ro_u32("lp_wids", &wids);
-        let cids_buf = self.storage_ro_u32("lp_cids", &cids);
 
         let mk = |npts: usize| {
             self.uniform(
@@ -1211,28 +1304,31 @@ impl LpRecReconstruct for WgpuBackend {
         self.dispatch1d(LPREC_WGSL, "prefilter_cols", &[&g, &p0], (nz * n) as u32);
 
         self.zero_buffer(&f);
-        for k in 0..grids.lp2p1.len() {
+        for span in &grids.spans {
             self.zero_buffer(&fl);
 
             // 1. gather polar → log-polar (main set, then wrapping set).
-            let p_main = mk(lpids.len());
-            let xs_main = self.storage_ro("lp_xs", &grids.lp2p2[k]);
-            let ys_main = self.storage_ro("lp_ys", &grids.lp2p1[k]);
+            let p_main = mk(grids.lpids_len);
             self.dispatch1d(
                 LPREC_WGSL,
                 "gather",
-                &[&g, &fl, &lpids_buf, &xs_main, &ys_main, &p_main],
-                (nz * lpids.len()) as u32,
+                &[
+                    &g,
+                    &fl,
+                    &grids.lpids_buf,
+                    &span.xs_main,
+                    &span.ys_main,
+                    &p_main,
+                ],
+                (nz * grids.lpids_len) as u32,
             );
-            if !wids.is_empty() {
-                let p_w = mk(wids.len());
-                let xs_w = self.storage_ro("lp_xsw", &grids.lp2p2w[k]);
-                let ys_w = self.storage_ro("lp_ysw", &grids.lp2p1w[k]);
+            if let Some((xs_w, ys_w)) = &span.wrap {
+                let p_w = mk(grids.wids_len);
                 self.dispatch1d(
                     LPREC_WGSL,
                     "gather",
-                    &[&g, &fl, &wids_buf, &xs_w, &ys_w, &p_w],
-                    (nz * wids.len()) as u32,
+                    &[&g, &fl, &grids.wids_buf, xs_w, ys_w, &p_w],
+                    (nz * grids.wids_len) as u32,
                 );
             }
 
@@ -1249,7 +1345,12 @@ impl LpRecReconstruct for WgpuBackend {
             self.fft_transpose(&flc, &scratch, nrho, ntheta, nz);
             self.fft_passes(&scratch, nrho, ntheta * nz, false);
             self.fft_transpose(&scratch, &flc, ntheta, nrho, nz);
-            self.dispatch1d(LPREC_WGSL, "cmul", &[&flc, &kfull_buf, &p0], grid_threads);
+            self.dispatch1d(
+                LPREC_WGSL,
+                "cmul",
+                &[&flc, &grids.kfull_buf, &p0],
+                grid_threads,
+            );
             self.fft_passes(&flc, ntheta, nrho * nz, true);
             self.fft_transpose(&flc, &scratch, nrho, ntheta, nz);
             self.fft_passes(&scratch, nrho, ntheta * nz, true);
@@ -1257,14 +1358,12 @@ impl LpRecReconstruct for WgpuBackend {
             self.dispatch1d(LPREC_WGSL, "take_re", &[&flc, &flcre, &p0], grid_threads);
 
             // 3. scatter log-polar → Cartesian disk (accumulates across spans).
-            let p_c = mk(cids.len());
-            let xs_c = self.storage_ro("lp_xsc", &grids.c2lp1[k]);
-            let ys_c = self.storage_ro("lp_ysc", &grids.c2lp2[k]);
+            let p_c = mk(grids.cids_len);
             self.dispatch1d(
                 LPREC_WGSL,
                 "scatter",
-                &[&flcre, &f, &cids_buf, &xs_c, &ys_c, &p_c],
-                (nz * cids.len()) as u32,
+                &[&flcre, &f, &grids.cids_buf, &span.xs_c, &span.ys_c, &p_c],
+                (nz * grids.cids_len) as u32,
             );
         }
 
@@ -1272,6 +1371,20 @@ impl LpRecReconstruct for WgpuBackend {
         let arr = Array3::from_shape_vec((nz, n, n), host)
             .expect("out buffer length nz*n*n matches the volume shape");
         Ok(Volume::new(arr))
+    }
+}
+
+impl LpRecReconstruct for WgpuBackend {
+    /// Device-resident log-polar reconstruction (tomocupy `lprec`) — the cubic
+    /// B-spline prefilter, the polar↔log-polar↔Cartesian gather/scatter, and the
+    /// 2-D FFT convolution all run on the GPU, mirroring [`crate::recon::lprec`]
+    /// step-for-step. Composes the once-per-call grid precompute
+    /// ([`WgpuBackend::build_lprec_grids`]) with the per-chunk core
+    /// ([`WgpuBackend::lprec_run`]); the streaming path reuses the same two pieces
+    /// but caches the grids across chunks.
+    fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>> {
+        let grids = self.build_lprec_grids(geom, n)?;
+        self.lprec_run(filtered, &grids)
     }
 }
 
@@ -1340,10 +1453,12 @@ impl crate::backend::AnalyticReconstruct for WgpuBackend {
     /// Build a handle-reusing streaming reconstructor for the analytic methods
     /// this backend fuses (fbp / linerec / fourierrec), so the CLI's overlapped
     /// streaming pipeline drives wgpu instead of falling back to whole-volume.
-    /// Returns `None` for every other algorithm (e.g. lprec, which has its own
-    /// dispatch and no `AnalyticReconstruct` path) so the caller uses per-chunk
-    /// `recon`. `ncols`/`max_nz` are not needed: the reconstructor recomputes its
-    /// (cheap) filter/geometry per chunk, so it handles any `nz ≤ max_nz`.
+    /// Covers fbp / linerec / fourierrec (fused `AnalyticReconstruct` path) and
+    /// lprec (its own dispatch; the stream caches the log-polar grids across
+    /// chunks). Returns `None` for every other algorithm so the caller uses
+    /// per-chunk `recon`. `ncols`/`max_nz` are not needed: the reconstructor
+    /// recomputes its (cheap) filter/geometry per chunk, so it handles any
+    /// `nz ≤ max_nz`; the lprec grids are (re)built lazily on the first chunk.
     fn streaming(
         &self,
         algorithm: crate::params::Algorithm,
@@ -1355,7 +1470,7 @@ impl crate::backend::AnalyticReconstruct for WgpuBackend {
         use crate::params::Algorithm;
         if !matches!(
             algorithm,
-            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec | Algorithm::Lprec
         ) {
             return Ok(None);
         }
