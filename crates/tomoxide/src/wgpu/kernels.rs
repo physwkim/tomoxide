@@ -314,12 +314,14 @@ impl ForwardProject for WgpuBackend {
             _pad3: 0,
         };
         let param_buf = self.uniform("fp_params", &params);
-        // One thread per (row, angle); each owns a disjoint sinogram column span.
+        // One thread per object voxel; voxels atomic-splat onto the sinogram
+        // (the exact transpose of the voxel-driven back-projector). sino_buf was
+        // zero-initialised above, which the accumulating kernel requires.
         self.dispatch1d(
             PROJECT_WGSL,
             "project",
             &[&vol_buf, &cossin_buf, &center_buf, &sino_buf, &param_buf],
-            (nz * nang) as u32,
+            (nz * ny * nx) as u32,
         );
         let result = self.download_f32(&sino_buf, total);
         let array = Array3::from_shape_vec((nz, nang, ncols), result).expect("len matches dims");
@@ -1338,7 +1340,7 @@ impl crate::backend::AnalyticReconstruct for WgpuBackend {
 
 impl WgpuBackend {
     /// Forward-project `vol_buf` into `sino_buf` (both device-resident), zeroing
-    /// `sino_buf` first (the column-scatter kernel accumulates). `cossin_buf` /
+    /// `sino_buf` first (the per-voxel atomic-splat kernel accumulates). `cossin_buf` /
     /// `center_buf` are the geometry buffers uploaded once by the iterative solver
     /// so the per-iteration projection reuses them. Matched adjoint gain π/nproj.
     #[allow(clippy::too_many_arguments)]
@@ -1365,11 +1367,12 @@ impl WgpuBackend {
             _pad3: 0,
         };
         let pbuf = self.uniform("fp_params", &params);
+        // One thread per object voxel (atomic-splat); sino zeroed above.
         self.dispatch1d(
             PROJECT_WGSL,
             "project",
             &[vol_buf, cossin_buf, center_buf, sino_buf, &pbuf],
-            (nz * nang) as u32,
+            (nz * ny * nx) as u32,
         );
     }
 

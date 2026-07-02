@@ -1,14 +1,20 @@
-// Parallel-beam pixel-driven forward projection (the Radon transform) — port of
-// the CpuBackend ForwardProject impl (tomopy `libtomo/recon/project.c`), the
-// exact linear-interp adjoint of backproject.wgsl.
+// Parallel-beam forward projection (the Radon transform) — port of the
+// CpuBackend ForwardProject impl (tomopy `libtomo/recon/project.c`), the exact
+// linear-interp adjoint of backproject.wgsl.
 //
-// Forward projection is a SCATTER: each object pixel splats its value across the
-// two nearest detector columns. To stay race-free on the GPU we map one thread
-// per (row, angle): a thread owns the detector-column span [sbase, sbase+ncols)
-// of exactly one (row, angle), which is disjoint from every other thread's, and
-// iterates the pixels in the same (iy, ix) order as the CPU — so the per-column
-// accumulation order matches the reference and the only GPU/CPU divergence is
-// multiply-accumulate rounding (callers compare with a tolerance).
+// Forward projection is a SCATTER: each object voxel splats its value across the
+// two nearest detector columns of every angle. This kernel is the exact
+// TRANSPOSE of the voxel-driven back-projector — one thread per object voxel
+// (flat index over [nz, ny, nx]), the same trig/interp, read↔write swapped — so
+// {A, Aᵀ} is a matched pair by construction (the iterative solvers rely on this).
+// Voxels of different (iy, ix) splat onto the same detector column, so the
+// accumulation uses an emulated f32 atomic add (WGSL has only integer atomics: a
+// compare-exchange loop on the bit-cast lane). The atomic resolves collisions in
+// a nondeterministic order, so the result matches the CPU reference only to a
+// tolerance (accumulation-order rounding), not bit-for-bit — the same contract as
+// the rest of the GPU recon path. This one-thread-per-voxel mapping gives
+// nz·ny·nx-way parallelism, unlike the old one-thread-per-(row,angle) design
+// (nz·nproj threads each looping the whole n² grid) it replaces.
 
 struct Params {
     nproj : u32,
@@ -21,53 +27,62 @@ struct Params {
     _pad3 : u32,
 };
 
-@group(0) @binding(0) var<storage, read>       vol    : array<f32>; // [nz, ny, nx]
-@group(0) @binding(1) var<storage, read>       cossin : array<f32>; // [nproj*2] (c, sn)
-@group(0) @binding(2) var<storage, read>       center : array<f32>; // [nz]
-@group(0) @binding(3) var<storage, read_write> sino   : array<f32>; // [nz, nproj, ncols]
+@group(0) @binding(0) var<storage, read>       vol    : array<f32>;         // [nz, ny, nx]
+@group(0) @binding(1) var<storage, read>       cossin : array<f32>;         // [nproj*2] (c, sn)
+@group(0) @binding(2) var<storage, read>       center : array<f32>;         // [nz]
+@group(0) @binding(3) var<storage, read_write> sino   : array<atomic<u32>>; // [nz, nproj, ncols]
 @group(0) @binding(4) var<uniform>             params : Params;
+
+// Emulated f32 atomic add on lane `idx` of `sino` (compare-exchange on the
+// bit-cast integer). Inlined semantics of tomocupy's atomicAdd; naga forbids a
+// storage pointer parameter, so the loop is written where it is called.
+fn atomic_add_sino(idx : u32, add : f32) {
+    var old = atomicLoad(&sino[idx]);
+    loop {
+        let r = atomicCompareExchangeWeak(&sino[idx], old, bitcast<u32>(bitcast<f32>(old) + add));
+        if (r.exchanged) { break; }
+        old = r.old_value;
+    }
+}
 
 @compute @workgroup_size(WG)
 fn project(@builtin(global_invocation_id) gid : vec3<u32>,
            @builtin(num_workgroups) nwg : vec3<u32>) {
-    let lane = gid.y * nwg.x * WG + gid.x; // flat over (nz * nproj)
+    let flat = gid.y * nwg.x * WG + gid.x; // flat over (nz * ny * nx)
+    let plane = params.ny * params.nx;
     let nz = arrayLength(&center);
-    if (lane >= nz * params.nproj) { return; }
+    if (flat >= nz * plane) { return; }
 
-    let row = lane / params.nproj;
-    let ia = lane % params.nproj;
-    let c = cossin[ia * 2u];
-    let sn = cossin[ia * 2u + 1u];
-    let ctr = center[row];
+    // Zero-valued voxels contribute nothing — skip the whole angle loop and its
+    // atomics (a large fraction of a reconstruction's grid is background).
+    let f = vol[flat];
+    if (f == 0.0) { return; }
+    let fs = f * params.scale;
+
+    let iz = flat / plane;
+    let rem = flat % plane;
+    let iy = rem / params.nx;
+    let ix = rem % params.nx;
+
     let cx = f32(params.nx) * 0.5;
     let cy = f32(params.ny) * 0.5;
-    let vbase = row * params.ny * params.nx;
-    let sbase = (row * params.nproj + ia) * params.ncols;
+    let gx = f32(ix) - cx;
+    let gy = f32(iy) - cy;
+    let ctr = center[iz];
+    let base = iz * params.nproj * params.ncols;
 
-    for (var iy = 0u; iy < params.ny; iy = iy + 1u) {
-        let gy = f32(iy) - cy;
-        for (var ix = 0u; ix < params.nx; ix = ix + 1u) {
-            let f = vol[vbase + iy * params.nx + ix];
-            if (f == 0.0) { continue; }
-            let gx = f32(ix) - cx;
-            let t = gx * c + gy * sn + ctr;
-            let t0 = floor(t);
-            let i0 = i32(t0);
-            // && short-circuits, so u32(i0) is only evaluated when i0 >= 0.
-            if (i0 >= 0 && u32(i0) + 1u < params.ncols) {
-                let frac = t - t0;
-                let off = sbase + u32(i0);
-                sino[off] = sino[off] + f * (1.0 - frac);
-                sino[off + 1u] = sino[off + 1u] + f * frac;
-            }
+    for (var ia = 0u; ia < params.nproj; ia = ia + 1u) {
+        let c = cossin[ia * 2u];
+        let sn = cossin[ia * 2u + 1u];
+        let t = gx * c + gy * sn + ctr;
+        let t0 = floor(t);
+        let i0 = i32(t0);
+        // && short-circuits, so u32(i0) is only evaluated when i0 >= 0.
+        if (i0 >= 0 && u32(i0) + 1u < params.ncols) {
+            let frac = t - t0;
+            let off = base + ia * params.ncols + u32(i0);
+            atomic_add_sino(off, fs * (1.0 - frac));
+            atomic_add_sino(off + 1u, fs * frac);
         }
-    }
-
-    // Scale by π/nproj so the forward projector is the true adjoint of the
-    // back-projector (which carries the same gain). This thread uniquely owns the
-    // detector-column span [sbase, sbase+ncols) of its (row, angle), so scaling it
-    // here is race-free — mirroring how backproject.wgsl bakes its scale in-kernel.
-    for (var j = 0u; j < params.ncols; j = j + 1u) {
-        sino[sbase + j] = sino[sbase + j] * params.scale;
     }
 }
