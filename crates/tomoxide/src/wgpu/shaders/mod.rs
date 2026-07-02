@@ -22,3 +22,5 @@ pub const FFT_TRANSPOSE_WGSL: &str = include_str!("fft_transpose.wgsl");
 pub const BLUESTEIN_WGSL: &str = include_str!("bluestein.wgsl");
 /// Device-resident Gaussian-USFFT gridding (tomocupy `cfunc_fourierrec`).
 pub const FOURIERREC_WGSL: &str = include_str!("fourierrec.wgsl");
+/// Device-resident log-polar (lprec) gather/scatter runtime (tomocupy `lprec`).
+pub const LPREC_WGSL: &str = include_str!("lprec.wgsl");

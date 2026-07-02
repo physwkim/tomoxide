@@ -143,6 +143,14 @@ impl Backend for WgpuBackend {
     fn fourier_reconstruct(&self) -> Option<&dyn crate::backend::FourierReconstruct> {
         Some(self)
     }
+
+    /// Device-resident log-polar (lprec) — the cubic-B-spline prefilter,
+    /// gather/scatter interpolation, and FFT convolution run on the GPU,
+    /// replacing the host-interpolation + FFT-round-trip fallback.
+    #[cfg(feature = "gpu-wgpu")]
+    fn lprec_reconstruct(&self) -> Option<&dyn crate::backend::LpRecReconstruct> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 

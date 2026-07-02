@@ -35,6 +35,17 @@ impl WgpuBackend {
             })
     }
 
+    /// A read-only storage buffer initialised from a `u32` index array (lprec
+    /// gather/scatter targets bind as `array<u32>`).
+    pub(crate) fn storage_ro_u32(&self, label: &str, data: &[u32]) -> wgpu::Buffer {
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+    }
+
     /// An uninitialised read/write storage buffer of `len` f32s, usable as a
     /// `copy` source (readback) and destination (clear / upload). The caller must
     /// fully write it before reading, or [`Self::zero_buffer`] it first for

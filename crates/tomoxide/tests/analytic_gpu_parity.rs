@@ -242,12 +242,13 @@ fn fourierrec_multi_slice_matches_cpu_on_gpu() {
 
 #[test]
 fn lprec_recon_matches_cpu_on_gpu() {
-    // lprec (log-polar method) needs only the Fft capability: the precompute
-    // 1-D FFTs (lengths ntheta=128, nrho=256, Nthetalarge=512) and the runtime
-    // 2-D convolution (256×128) are all power-of-two at n=128, so the radix-2 GPU
-    // path runs the whole reconstruction with no extra kernels — only the FFT
-    // backend (wgpu vs rustfft) differs from CPU. The cubic prefilter / gather /
-    // resample are host code shared by both backends.
+    // lprec on wgpu now runs the device-resident log-polar path (the
+    // `LpRecReconstruct` capability + lprec.wgsl: cubic-B-spline prefilter →
+    // gather (polar→log-polar, float-atomic CAS) → 2-D FFT convolution ×kfull →
+    // scatter (log-polar→Cartesian), all on-GPU). The geometry grids are
+    // precomputed once on the host (`build_grids`) and uploaded. At n=128 every
+    // transform is power-of-two (ntheta=128, nrho=256), so the device radix-2
+    // path drives the whole reconstruction.
     let n = 128;
     let (sg, sc, phantom) = recon_both(Algorithm::Lprec, n, 180);
 
@@ -262,12 +263,79 @@ fn lprec_recon_matches_cpu_on_gpu() {
     // in precompute plus the 256×128 2-D convolution per span), so GPU↔CPU agree
     // to f32-FFT tolerance. The 1e-4 bar matches the other analytic GPU tests and
     // is far tighter than any wiring bug (wrong FFT size/direction/layout).
+    // Two-part parity check. Unlike fbp/gridrec/fourierrec (NRMSE ~1e-6), lprec's
+    // device↔CPU residual is ~4e-3: the ONLY backend difference is the runtime 2-D
+    // FFT (wgpu radix-2 vs rustfft), but lprec runs 6 of them per slice (forward +
+    // inverse × 3 angular spans) on a log-polar buffer whose magnitude is inflated
+    // by the cubic-B-spline prefilter's IIR gain (λ=(1−pole)(1−1/pole)≈6, with
+    // oscillating-sign coefficients), so absolute f32 FFT roundoff (~eps·large)
+    // survives the inverse + scatter into the small-valued Cartesian output. The
+    // prefilter / gather / scatter are FFT-free and identical between backends.
+    //
+    // (1) structural identity — pearson(gpu,cpu) to ~5 nines (measured 0.999979);
+    //     an index/weight/layout bug in the port would collapse this well below
+    //     0.9995, so it is the real correctness gate.
+    let pgc = pearson_disk(&sg, &sc, n, 0.8);
+    eprintln!("GPU vs CPU lprec: pearson(gpu,cpu) = {pgc:.6}");
+    assert!(
+        pgc > 0.9995,
+        "GPU vs CPU lprec correlation too low (structural divergence): r = {pgc:.6}"
+    );
+    // (2) magnitude — NRMSE within the f32-FFT-roundoff bar for this pipeline
+    //     (measured 4.4e-3; the 8e-3 bar leaves ~2× headroom yet is far tighter
+    //     than any scale/normalization bug, which would blow past 1e-1).
     let (nrmse, maxabs) = disk_nrmse(&sg, &sc, n, 0.8);
     eprintln!("GPU vs CPU lprec: NRMSE = {nrmse:.3e}, max|Δ| = {maxabs:.3e}");
     assert!(
-        nrmse < 1e-4,
+        nrmse < 8e-3,
         "GPU vs CPU lprec NRMSE too large: {nrmse:.3e}"
     );
+}
+
+#[test]
+fn lprec_multi_slice_matches_cpu_on_gpu() {
+    // The device-resident lprec batches all z-slices through one prefilter /
+    // gather / FFT / scatter chain, so a z-indexing bug (wrong stride into g, fl,
+    // flc, flcre or the output f) would corrupt some slices while leaving others
+    // correct. Reconstruct three *distinct* slices (scaled phantoms) and require
+    // every slice to match the CPU reconstruction structurally — a per-slice check
+    // the nz=1 test above cannot catch.
+    let n = 128;
+    let nz = 3;
+    let nang = 180;
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(
+        ndarray::stack![Axis(0), phantom, &phantom * 0.5, &phantom * 1.3]
+            .into_dimensionality()
+            .unwrap(),
+    );
+    let cpu = CpuBackend::new();
+    let gpu = WgpuBackend::new().expect("wgpu adapter");
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let params = ReconParams {
+        num_gridx: Some(n),
+        filter_name: FilterName::Ramp,
+        ..Default::default()
+    };
+    let rc = recon::recon(&sino, &geom, Algorithm::Lprec, &params, &cpu).unwrap();
+    let rg = recon::recon(&sino, &geom, Algorithm::Lprec, &params, &gpu).unwrap();
+    assert_eq!(rg.array.dim(), (nz, n, n));
+    for z in 0..nz {
+        let sg = rg.array.index_axis(Axis(0), z).to_owned();
+        let sc = rc.array.index_axis(Axis(0), z).to_owned();
+        let pgc = pearson_disk(&sg, &sc, n, 0.8);
+        let (nrmse, _) = disk_nrmse(&sg, &sc, n, 0.8);
+        eprintln!("GPU vs CPU lprec slice {z}: pearson = {pgc:.6}, NRMSE = {nrmse:.3e}");
+        assert!(
+            pgc > 0.9995,
+            "GPU vs CPU lprec slice {z} correlation too low: r = {pgc:.6}"
+        );
+        assert!(
+            nrmse < 8e-3,
+            "GPU vs CPU lprec slice {z} NRMSE too large: {nrmse:.3e}"
+        );
+    }
 }
 
 #[test]

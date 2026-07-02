@@ -7,7 +7,7 @@
 
 use crate::backend::{
     make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject,
-    FourierReconstruct, RampShape, RankFilter,
+    FourierReconstruct, LpRecReconstruct, RampShape, RankFilter,
 };
 use crate::data::{Frames, Layout, Tomo, Volume};
 use crate::dtype::Complex32;
@@ -19,7 +19,7 @@ use ndarray::{Array3, Axis};
 
 use crate::wgpu::shaders::{
     BACKPROJECT_WGSL, BLUESTEIN_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_SHARED_WGSL,
-    FFT_TRANSPOSE_WGSL, FFT_WGSL, FOURIERREC_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
+    FFT_TRANSPOSE_WGSL, FFT_WGSL, FOURIERREC_WGSL, LPREC_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
 };
 use crate::wgpu::WgpuBackend;
 
@@ -1036,6 +1036,174 @@ impl FourierReconstruct for WgpuBackend {
         self.dispatch1d(&src, "deapodize", &[&inner, &out, &p], (nz * n * n) as u32);
 
         let host = self.download_f32(&out, nz * n * n);
+        let arr = Array3::from_shape_vec((nz, n, n), host)
+            .expect("out buffer length nz*n*n matches the volume shape");
+        Ok(Volume::new(arr))
+    }
+}
+
+/// Uniform block for the device-resident lprec kernels. 48 bytes (16-aligned).
+/// Mirrors `LpParams` in `lprec.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LpParams {
+    nz: u32,
+    nang: u32,
+    n: u32,
+    ntheta: u32,
+    nrho: u32,
+    npts: u32,
+    _p0: u32,
+    _p1: u32,
+    scale: f32,
+    _p2: f32,
+    _p3: f32,
+    _p4: f32,
+}
+
+impl LpRecReconstruct for WgpuBackend {
+    /// Device-resident log-polar reconstruction (tomocupy `lprec`) — the cubic
+    /// B-spline prefilter, the polar↔log-polar↔Cartesian gather/scatter, and the
+    /// 2-D FFT convolution all run on the GPU, mirroring [`crate::recon::lprec`]
+    /// step-for-step. The geometry grids are precomputed once on the host
+    /// (`build_grids`) and uploaded; this replaces the host-interpolation +
+    /// per-call FFT-round-trip fallback that dominated wgpu lprec wall time.
+    fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>> {
+        let b = filtered.as_layout(Layout::Sinogram);
+        let nz = b.n_rows();
+        let nang = b.n_angles();
+        let nd = b.n_cols();
+
+        // Same geometry guards as the CPU port (recon/lprec.rs): square geometry
+        // with equally spaced angles spanning [0, π).
+        if nang < 2 || nd != n {
+            return Err(Error::InvalidParam(format!(
+                "lprec requires square geometry with detector width == grid size (got n={n}, ncols={nd})"
+            )));
+        }
+        let angles = &geom.angles.0;
+        let dth = (angles[1] - angles[0]).abs();
+        let nproj_test = (std::f32::consts::PI / dth).round() as usize;
+        if nproj_test != nang {
+            return Err(Error::InvalidParam(
+                "lprec requires equally spaced angles spanning [0, π)".into(),
+            ));
+        }
+
+        // Precompute the log-polar grids on the host (angle-independent), reusing
+        // the CPU port's builder with this backend's Fft for the precompute FFTs.
+        let grids = crate::recon::lprec::build_grids(n, nang, self)?;
+        let ntheta = grids.ntheta;
+        let nrho = grids.nrho;
+        let scale = 2.0 / (nrho as f32 * ntheta as f32);
+
+        let bdata = b
+            .array
+            .as_slice()
+            .expect("contiguous sinogram (as_layout yields a standard-layout copy)");
+
+        let g = self.storage_rw("lp_g", bdata);
+        let fl = self.storage_empty("lp_fl", nz * nrho * ntheta);
+        let flc = self.storage_empty("lp_flc", nz * nrho * ntheta * 2);
+        let scratch = self.storage_empty("lp_scratch", nz * nrho * ntheta * 2);
+        let flcre = self.storage_empty("lp_flcre", nz * nrho * ntheta);
+        let f = self.storage_empty("lp_f", nz * n * n);
+
+        let kfull_host: Vec<f32> = grids.kfull.iter().flat_map(|c| [c.re, c.im]).collect();
+        let kfull_buf = self.storage_ro("lp_kfull", &kfull_host);
+        let lpids: Vec<u32> = grids.lpids.iter().map(|&x| x as u32).collect();
+        let wids: Vec<u32> = grids.wids.iter().map(|&x| x as u32).collect();
+        let cids: Vec<u32> = grids.cids.iter().map(|&x| x as u32).collect();
+        let lpids_buf = self.storage_ro_u32("lp_lpids", &lpids);
+        let wids_buf = self.storage_ro_u32("lp_wids", &wids);
+        let cids_buf = self.storage_ro_u32("lp_cids", &cids);
+
+        let mk = |npts: usize| {
+            self.uniform(
+                "lp_p",
+                &LpParams {
+                    nz: nz as u32,
+                    nang: nang as u32,
+                    n: n as u32,
+                    ntheta: ntheta as u32,
+                    nrho: nrho as u32,
+                    npts: npts as u32,
+                    _p0: 0,
+                    _p1: 0,
+                    scale,
+                    _p2: 0.0,
+                    _p3: 0.0,
+                    _p4: 0.0,
+                },
+            )
+        };
+        // npts=0 uniform shared by the whole-grid kernels (prefilter, r2c, cmul,
+        // take_re); they read only nz/nang/n/ntheta/nrho/scale.
+        let p0 = mk(0);
+
+        // Cubic-B-spline prefilter: detector axis then angle axis.
+        self.dispatch1d(LPREC_WGSL, "prefilter_rows", &[&g, &p0], (nz * nang) as u32);
+        self.dispatch1d(LPREC_WGSL, "prefilter_cols", &[&g, &p0], (nz * n) as u32);
+
+        self.zero_buffer(&f);
+        for k in 0..grids.lp2p1.len() {
+            self.zero_buffer(&fl);
+
+            // 1. gather polar → log-polar (main set, then wrapping set).
+            let p_main = mk(lpids.len());
+            let xs_main = self.storage_ro("lp_xs", &grids.lp2p2[k]);
+            let ys_main = self.storage_ro("lp_ys", &grids.lp2p1[k]);
+            self.dispatch1d(
+                LPREC_WGSL,
+                "gather",
+                &[&g, &fl, &lpids_buf, &xs_main, &ys_main, &p_main],
+                (nz * lpids.len()) as u32,
+            );
+            if !wids.is_empty() {
+                let p_w = mk(wids.len());
+                let xs_w = self.storage_ro("lp_xsw", &grids.lp2p2w[k]);
+                let ys_w = self.storage_ro("lp_ysw", &grids.lp2p1w[k]);
+                self.dispatch1d(
+                    LPREC_WGSL,
+                    "gather",
+                    &[&g, &fl, &wids_buf, &xs_w, &ys_w, &p_w],
+                    (nz * wids.len()) as u32,
+                );
+            }
+
+            // 2. 2-D FFT convolution: fl → complex, forward, ×kfull, inverse,
+            //    take real × scale.
+            let grid_threads = (nz * nrho * ntheta) as u32;
+            self.dispatch1d(
+                LPREC_WGSL,
+                "real_to_complex",
+                &[&fl, &flc, &p0],
+                grid_threads,
+            );
+            self.fft_passes(&flc, ntheta, nrho * nz, false);
+            self.fft_transpose(&flc, &scratch, nrho, ntheta, nz);
+            self.fft_passes(&scratch, nrho, ntheta * nz, false);
+            self.fft_transpose(&scratch, &flc, ntheta, nrho, nz);
+            self.dispatch1d(LPREC_WGSL, "cmul", &[&flc, &kfull_buf, &p0], grid_threads);
+            self.fft_passes(&flc, ntheta, nrho * nz, true);
+            self.fft_transpose(&flc, &scratch, nrho, ntheta, nz);
+            self.fft_passes(&scratch, nrho, ntheta * nz, true);
+            self.fft_transpose(&scratch, &flc, ntheta, nrho, nz);
+            self.dispatch1d(LPREC_WGSL, "take_re", &[&flc, &flcre, &p0], grid_threads);
+
+            // 3. scatter log-polar → Cartesian disk (accumulates across spans).
+            let p_c = mk(cids.len());
+            let xs_c = self.storage_ro("lp_xsc", &grids.c2lp1[k]);
+            let ys_c = self.storage_ro("lp_ysc", &grids.c2lp2[k]);
+            self.dispatch1d(
+                LPREC_WGSL,
+                "scatter",
+                &[&flcre, &f, &cids_buf, &xs_c, &ys_c, &p_c],
+                (nz * cids.len()) as u32,
+            );
+        }
+
+        let host = self.download_f32(&f, nz * n * n);
         let arr = Array3::from_shape_vec((nz, n, n), host)
             .expect("out buffer length nz*n*n matches the volume shape");
         Ok(Volume::new(arr))
