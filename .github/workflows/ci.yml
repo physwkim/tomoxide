@@ -1,0 +1,92 @@
+name: CI
+
+# Runs on every branch push (and every PR). The workspace default build is
+# pure-CPU with no system dependencies, so it is exercised on all three
+# platforms; the optional GPU/cuda paths are compile-checked only (no runner
+# has a GPU or an nvcc toolkit).
+on:
+  push:
+  pull_request:
+
+# One in-flight run per ref; a new push cancels the previous run on that branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # --- formatting: fast, platform-independent, run once ---------------------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # --- default (CPU) build: clippy + tests, per platform -------------------
+  # macOS is arm64 only (aarch64-apple-darwin); Windows and Linux are x86_64
+  # only. The explicit --target pins the arch so a runner-image change cannot
+  # silently move it.
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@nextest
+
+      - name: clippy (default features)
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: test (default features)
+        run: cargo nextest run --workspace --target ${{ matrix.target }}
+
+      - name: doctests (default features)
+        run: cargo test --doc --workspace --target ${{ matrix.target }}
+
+      # wgpu is the portable GPU backend (Metal / DX12 / Vulkan). No CI runner
+      # has a usable GPU, so it is compile-checked (clippy) on every platform
+      # but never executed.
+      - name: clippy (gpu-wgpu, compile-check only)
+        run: cargo clippy --workspace --all-targets --features gpu-wgpu --target ${{ matrix.target }} -- -D warnings
+
+  # --- cuda backend: FFI type-check only (no nvcc on the runner) ------------
+  # TOMOXIDE_CUDA_SKIP_BUILD makes build.rs skip the nvcc compile and the link
+  # directives, so `cargo check` type-checks the CUDA FFI bindings without a
+  # CUDA toolkit. Linux/x86_64 only — the cuda path targets Linux.
+  cuda-typecheck:
+    name: cuda FFI type-check
+    runs-on: ubuntu-latest
+    env:
+      TOMOXIDE_CUDA_SKIP_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda-typecheck
+      - run: cargo check --workspace --features cuda --target x86_64-unknown-linux-gnu
