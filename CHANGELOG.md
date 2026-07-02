@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-02
+
+Headline: the **wgpu (portable GPU) backend becomes device-resident end to end**,
+closing most of the gap to CUDA — analytic recon, streaming, SIRT and the
+gridding recons now keep their data on the GPU across the pipeline, and the
+scatter kernels use native `f32` atomics (wgpu 30). The workspace is also now
+**self-contained** (all dependencies resolve from crates.io) and gains
+**CI on every branch push** across Linux, Windows and macOS.
+
 ### Added
 
 - **CGLS reconstruction (`--algorithm cgls`).** Conjugate-gradient least squares
@@ -24,6 +33,44 @@ All notable changes to this project are documented here. The format is based on
   `--num_iter`. Analytic stages reject the suffix. Lets a chain spend, say, 30
   SIRT iterations then 10 TV iterations in one run — previously every stage shared
   a single `--num_iter`.
+- **Continuous integration (GitHub Actions).** Runs on every branch push and
+  every pull request: `rustfmt`, then a per-platform matrix — Linux/x86_64,
+  Windows/x86_64, macOS/arm64 — each running `clippy -D warnings`, the test
+  suite and doctests on the default (CPU) build plus a `gpu-wgpu` compile-check,
+  and a Linux job that type-checks the CUDA FFI bindings without an nvcc toolkit.
+
+### Changed
+
+- **wgpu backend upgraded to wgpu 30** (from 23). Enables `SHADER_FLOAT32_ATOMIC`
+  (Vulkan `VK_EXT_shader_atomic_float`); devices without it fall back to the
+  portable compare-exchange emulation automatically.
+- **wgpu reconstruction is now device-resident.** A fused analytic path keeps the
+  filtered sinogram on-GPU (fbp/linerec/fourierrec); device-resident streaming
+  reconstructs chunk-by-chunk (fbp/linerec/fourierrec and lprec, the latter
+  caching its log-polar grids across chunks); SIRT keeps volume/sinogram resident
+  across iterations; the FBP filter and the fourierrec/lprec gridding run on the
+  GPU. The scatter kernels (forward projection, fourierrec gather/wrap, lprec
+  gather) use native `f32` `atomicAdd`, replacing the CAS-emulation penalty —
+  forward projection ~6.6× and SIRT ~6.4× faster (same-build A/B). Net effect:
+  fbp/linerec reach CUDA parity, SIRT and lprec beat CUDA on this hardware.
+- **Shared host precompute sped up.** lprec precomputes its FFTs on the CPU
+  (rustfft) instead of a GPU round-trip (wgpu and CUDA), `build_grids` coordinate
+  loops are parallelised with rayon, and the CPU `minus_log` prep is parallelised
+  across the projection volume.
+- **`xraylib` (the optional `beam-hardening` dependency) is now sourced from
+  crates.io** instead of an out-of-repo path dependency, so a fresh clone / CI
+  resolves the workspace without a sibling checkout. Local development against a
+  sibling checkout can override via `[patch.crates-io]`.
+
+### Fixed
+
+- **wgpu forward projection** now applies the `π/nproj` adjoint gain, so the
+  `{A, Aᵀ}` pair is matched — fixes `forward_project` output scale and the
+  iterative solvers built on it (SIRT).
+- **stripe TI block-size division** uses `checked_div` (satisfies
+  `clippy::manual_checked_ops`, new on stable Rust 1.96).
+- **HDF5 test fixtures** were swallowed by the repo-wide `*.h5` gitignore and
+  never committed; they are now tracked so the test suite runs on a fresh clone.
 
 ## [0.4.0] - 2026-07-01
 
@@ -261,6 +308,9 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/physwkim/tomoxide/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/physwkim/tomoxide/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/physwkim/tomoxide/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/physwkim/tomoxide/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/physwkim/tomoxide/releases/tag/v0.1.0
