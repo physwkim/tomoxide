@@ -176,10 +176,11 @@ fn gridrec_recon_matches_cpu_on_gpu() {
 
 #[test]
 fn fourierrec_recon_matches_cpu_on_gpu() {
-    // fourierrec needs only the Fft capability (FBP filter then Gaussian-USFFT
-    // gridding, all host code shared by both backends). At n=128 the radial 1-D
-    // FFT is length 128 and the 2-D inverse FFT is 256×256 — both power-of-two,
-    // so the radix-2 GPU path runs it for free, only the FFT backend differs.
+    // fourierrec on wgpu now runs the device-resident Gaussian-USFFT gridding
+    // (the `FourierReconstruct` capability: build_radial → 1-D FFT → gather →
+    // wrap → 2-D FFT → deapodize, all on-GPU with float-atomic CAS gather). At
+    // n=128 the radial 1-D FFT is length 128 and the 2-D inverse FFT is 256×256,
+    // both power-of-two, so the on-device radix-2 path drives the whole chain.
     let n = 128;
     let (sg, sc, phantom) = recon_both(Algorithm::Fourierrec, n, 180);
 
@@ -196,6 +197,47 @@ fn fourierrec_recon_matches_cpu_on_gpu() {
         nrmse < 1e-4,
         "GPU vs CPU fourierrec NRMSE too large: {nrmse:.3e}"
     );
+}
+
+#[test]
+fn fourierrec_multi_slice_matches_cpu_on_gpu() {
+    // The device-resident fourierrec batches all z-slices through one gather /
+    // wrap / FFT chain, so a z-indexing bug (wrong stride into the sino, grid,
+    // inner or output buffer) would corrupt some slices while leaving others
+    // correct. Reconstruct three *distinct* slices (scaled phantoms) and require
+    // every slice to match the CPU reconstruction — a per-slice check the nz=1
+    // tests above cannot catch.
+    let n = 128;
+    let nz = 3;
+    let nang = 180;
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(
+        ndarray::stack![Axis(0), phantom, &phantom * 0.5, &phantom * 1.3]
+            .into_dimensionality()
+            .unwrap(),
+    );
+    let cpu = CpuBackend::new();
+    let gpu = WgpuBackend::new().expect("wgpu adapter");
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let params = ReconParams {
+        num_gridx: Some(n),
+        filter_name: FilterName::Ramp,
+        ..Default::default()
+    };
+    let rc = recon::recon(&sino, &geom, Algorithm::Fourierrec, &params, &cpu).unwrap();
+    let rg = recon::recon(&sino, &geom, Algorithm::Fourierrec, &params, &gpu).unwrap();
+    assert_eq!(rg.array.dim(), (nz, n, n));
+    for z in 0..nz {
+        let sg = rg.array.index_axis(Axis(0), z).to_owned();
+        let sc = rc.array.index_axis(Axis(0), z).to_owned();
+        let (nrmse, _) = disk_nrmse(&sg, &sc, n, 0.8);
+        eprintln!("GPU vs CPU fourierrec slice {z}: NRMSE = {nrmse:.3e}");
+        assert!(
+            nrmse < 1e-4,
+            "GPU vs CPU fourierrec slice {z} NRMSE too large: {nrmse:.3e}"
+        );
+    }
 }
 
 #[test]

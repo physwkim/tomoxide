@@ -20,3 +20,5 @@ pub const FFT_SHARED_WGSL: &str = include_str!("fft_shared.wgsl");
 pub const FFT_TRANSPOSE_WGSL: &str = include_str!("fft_transpose.wgsl");
 /// Bluestein chirp-z spectral multiply (arbitrary-length FFT via radix-2).
 pub const BLUESTEIN_WGSL: &str = include_str!("bluestein.wgsl");
+/// Device-resident Gaussian-USFFT gridding (tomocupy `cfunc_fourierrec`).
+pub const FOURIERREC_WGSL: &str = include_str!("fourierrec.wgsl");

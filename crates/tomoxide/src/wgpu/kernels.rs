@@ -6,8 +6,8 @@
 //! tolerance, not Δ=0 — see the `gpu_tests` in [`crate`].
 
 use crate::backend::{
-    make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject, RampShape,
-    RankFilter,
+    make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject,
+    FourierReconstruct, RampShape, RankFilter,
 };
 use crate::data::{Frames, Layout, Tomo, Volume};
 use crate::dtype::Complex32;
@@ -19,7 +19,7 @@ use ndarray::{Array3, Axis};
 
 use crate::wgpu::shaders::{
     BACKPROJECT_WGSL, BLUESTEIN_WGSL, ELEMENTWISE_WGSL, FBP_FILTER_WGSL, FFT_SHARED_WGSL,
-    FFT_TRANSPOSE_WGSL, FFT_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
+    FFT_TRANSPOSE_WGSL, FFT_WGSL, FOURIERREC_WGSL, MEDFILT3D_WGSL, PROJECT_WGSL,
 };
 use crate::wgpu::WgpuBackend;
 
@@ -890,5 +890,154 @@ impl FbpFilter for WgpuBackend {
             }
         }
         Ok(())
+    }
+}
+
+/// Uniform block for the device-resident fourierrec kernels. 64 bytes (all
+/// scalars, so 16-byte-aligned as WGSL uniforms require). Mirrors `FrParams` in
+/// `fourierrec.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FrParams {
+    nz: u32,
+    nang: u32,
+    nd: u32,
+    n: u32,
+    ng: u32,
+    nf: u32,
+    crop: u32,
+    _p0: u32,
+    mu: f32,
+    coeff0: f32,
+    coeff1: f32,
+    gscale: f32,
+    phi_sign: f32,
+    inv_nf2: f32,
+    _p1: f32,
+    _p2: f32,
+}
+
+impl FourierReconstruct for WgpuBackend {
+    /// Device-resident Gaussian-USFFT (tomocupy `cfunc_fourierrec`) — the whole
+    /// gather / wrap / FFT / deapodize chain runs on the GPU, mirroring
+    /// [`crate::recon::fourierrec`] step-for-step. Only the filtered sinogram is
+    /// uploaded and the volume downloaded, replacing the host-gridding + per-call
+    /// FFT-round-trip path that dominated wgpu fourierrec wall time.
+    fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>> {
+        let b = filtered.as_layout(Layout::Sinogram);
+        let nz = b.n_rows();
+        let nang = b.n_angles();
+        let nd = b.n_cols();
+
+        // The device path drives the radix-2 `fft_passes` directly, so both the
+        // length-`nd` 1-D FFT and the `2*nd` 2-D FFT must be power-of-two. For a
+        // non-power-of-two detector width, delegate to the generic host gridding
+        // (which selects Bluestein per length through the `Fft` capability).
+        if !nd.is_power_of_two() {
+            return Ok(Volume::new(crate::recon::fourierrec::fourierrec(
+                filtered, geom, n, self,
+            )?));
+        }
+
+        // Gaussian-kernel parameters — identical arithmetic to the CPU port so
+        // the grids coincide (recon/fourierrec.rs).
+        const EPS: f64 = 1e-3;
+        let ndf = nd as f64;
+        let neg_log_eps = -EPS.ln();
+        let mu = neg_log_eps / (2.0 * ndf * ndf);
+        let inside = mu * neg_log_eps + (mu * ndf) * (mu * ndf) / 4.0;
+        let m = (2.0 * ndf / std::f64::consts::PI * inside.sqrt()).ceil() as usize;
+
+        let ng = 2 * nd + 2 * m;
+        let nf = 2 * nd;
+        let crop = (nd - n.min(nd)) / 2;
+        let mu32 = mu as f32;
+        let ndf32 = nd as f32;
+        let params = FrParams {
+            nz: nz as u32,
+            nang: nang as u32,
+            nd: nd as u32,
+            n: n as u32,
+            ng: ng as u32,
+            nf: nf as u32,
+            crop: crop as u32,
+            _p0: 0,
+            mu: mu32,
+            coeff0: std::f32::consts::PI / (mu32 * 4.0 * ndf32 * ndf32),
+            coeff1: -std::f32::consts::PI * std::f32::consts::PI / mu32,
+            gscale: 4.0 / ndf32,
+            phi_sign: 1.0 - (nd % 4) as f32,
+            inv_nf2: 1.0 / (nf as f32 * nf as f32),
+            _p1: 0.0,
+            _p2: 0.0,
+        };
+
+        // (cos θ, sin θ) per angle — the +sin gather convention of the CPU port.
+        let trig: Vec<f32> = geom
+            .angles
+            .0
+            .iter()
+            .flat_map(|&a| {
+                let (s, c) = a.sin_cos();
+                [c, s]
+            })
+            .collect();
+
+        let bdata = b
+            .array
+            .as_slice()
+            .expect("contiguous sinogram (as_layout yields a standard-layout copy)");
+
+        // Inject the Gaussian half-width `m` as a `const` so `array<f32, 2m+1>`
+        // is sized exactly (dispatch1d injects `WG` on top of this).
+        let src = format!("const M : u32 = {m}u;\n{FOURIERREC_WGSL}");
+
+        let sino_buf = self.storage_ro("fr_sino", bdata);
+        let trig_buf = self.storage_ro("fr_trig", &trig);
+        let radial = self.storage_empty("fr_radial", nz * nang * nd * 2);
+        let grid = self.storage_empty("fr_grid", nz * ng * ng * 2);
+        let inner = self.storage_empty("fr_inner", nz * nf * nf * 2);
+        let scratch = self.storage_empty("fr_scratch", nz * nf * nf * 2);
+        let out = self.storage_empty("fr_out", nz * n * n);
+        let p = self.uniform("fr_p", &params);
+
+        // Zero the accumulation grid before the atomic gather/wrap.
+        self.zero_buffer(&grid);
+
+        let radial_threads = (nz * nang * nd) as u32;
+        // 1. complex radial buffer with pre-FFT shift modulation.
+        self.dispatch1d(
+            &src,
+            "build_radial",
+            &[&sino_buf, &radial, &p],
+            radial_threads,
+        );
+        // 2. centred 1-D FFT of every projection (length nd), then post-modulate.
+        self.fft_passes(&radial, nd, nz * nang, false);
+        self.dispatch1d(&src, "postmod", &[&radial, &p], radial_threads);
+        // 3. Gaussian gather onto the oversampled grid; fold borders.
+        self.dispatch1d(
+            &src,
+            "gather",
+            &[&radial, &grid, &trig_buf, &p],
+            radial_threads,
+        );
+        self.dispatch1d(&src, "wrap", &[&grid, &p], (nz * ng * ng) as u32);
+        // 4. extract the 2*nd interior with the pre-inverse-FFT shift.
+        self.dispatch1d(&src, "extract", &[&grid, &inner, &p], (nz * nf * nf) as u32);
+        // 5. centred inverse 2-D FFT (row pass, transpose, row pass, transpose);
+        //    the 1/nf^2 normalisation is folded into deapodize.
+        self.fft_passes(&inner, nf, nf * nz, true);
+        self.fft_transpose(&inner, &scratch, nf, nf, nz);
+        self.fft_passes(&scratch, nf, nf * nz, true);
+        self.fft_transpose(&scratch, &inner, nf, nf, nz);
+        self.dispatch1d(&src, "fftshift", &[&inner, &p], (nz * nf * nf) as u32);
+        // 6. deapodize, central crop, unit-disk mask → real output.
+        self.dispatch1d(&src, "deapodize", &[&inner, &out, &p], (nz * n * n) as u32);
+
+        let host = self.download_f32(&out, nz * n * n);
+        let arr = Array3::from_shape_vec((nz, n, n), host)
+            .expect("out buffer length nz*n*n matches the volume shape");
+        Ok(Volume::new(arr))
     }
 }

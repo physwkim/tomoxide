@@ -35,6 +35,33 @@ impl WgpuBackend {
             })
     }
 
+    /// An uninitialised read/write storage buffer of `len` f32s, usable as a
+    /// `copy` source (readback) and destination (clear / upload). The caller must
+    /// fully write it before reading, or [`Self::zero_buffer`] it first for
+    /// accumulation targets (the atomic gather/wrap grid).
+    pub(crate) fn storage_empty(&self, label: &str, len: usize) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (len * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Zero a storage buffer on-device — cheaper than uploading a host zero
+    /// vector for the MB-scale accumulation grid.
+    pub(crate) fn zero_buffer(&self, buf: &wgpu::Buffer) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zero_buffer"),
+            });
+        enc.clear_buffer(buf, 0, None);
+        self.queue.submit(Some(enc.finish()));
+    }
+
     /// A uniform buffer holding a single `Pod` value (pad it to a multiple of 16
     /// bytes so it satisfies the WGSL uniform layout rules).
     pub(crate) fn uniform<T: Pod>(&self, label: &str, value: &T) -> wgpu::Buffer {

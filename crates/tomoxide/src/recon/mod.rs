@@ -15,7 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod center;
-mod fourierrec;
+pub(crate) mod fourierrec;
 mod gridrec;
 pub mod lamino;
 pub(crate) mod lprec;

@@ -136,6 +136,13 @@ impl Backend for WgpuBackend {
     fn fbp_filter(&self) -> Option<&dyn crate::backend::FbpFilter> {
         Some(self)
     }
+
+    /// Device-resident Gaussian-USFFT (fourierrec) — the whole gridding + FFT
+    /// chain runs on the GPU, replacing the host-gridding fallback.
+    #[cfg(feature = "gpu-wgpu")]
+    fn fourier_reconstruct(&self) -> Option<&dyn crate::backend::FourierReconstruct> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 
