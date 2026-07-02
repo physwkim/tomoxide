@@ -505,14 +505,27 @@ const MULTI_GPU_MIN_NX: usize = 2048;
 ///
 /// `Gridrec` does a host gather/deapodize per reconstruct call, so chunking
 /// multiplies that host round-trip and makes the pipeline *slower* than
-/// whole-volume — it stays on the whole-volume path. CPU/wgpu backends have no
-/// device-resident path either, so they also stay whole-volume.
+/// whole-volume — it stays on the whole-volume path. The CPU backend has no
+/// device-resident streaming path, so it also stays whole-volume.
+///
+/// wgpu streams fbp/linerec/fourierrec (its `AnalyticReconstruct::streaming`
+/// reconstructor normalizes each chunk on the CPU + fuses the device recon,
+/// killing the whole-volume path's GPU minus-log round-trip and full-volume host
+/// transpose, and bounding the working set so large-`n` fourierrec no longer
+/// overflows the wgpu max-buffer limit). wgpu lprec has no `AnalyticReconstruct`
+/// path, so it stays whole-volume.
 fn pipelines_well(engine: &Engine, algo: Algorithm) -> bool {
-    engine.name() == "cuda"
-        && matches!(
+    match engine.name() {
+        "cuda" => matches!(
             algo,
             Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec | Algorithm::Lprec
-        )
+        ),
+        "wgpu" => matches!(
+            algo,
+            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+        ),
+        _ => false,
+    }
 }
 
 fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {

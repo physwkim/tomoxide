@@ -1336,6 +1336,35 @@ impl crate::backend::AnalyticReconstruct for WgpuBackend {
             ))),
         }
     }
+
+    /// Build a handle-reusing streaming reconstructor for the analytic methods
+    /// this backend fuses (fbp / linerec / fourierrec), so the CLI's overlapped
+    /// streaming pipeline drives wgpu instead of falling back to whole-volume.
+    /// Returns `None` for every other algorithm (e.g. lprec, which has its own
+    /// dispatch and no `AnalyticReconstruct` path) so the caller uses per-chunk
+    /// `recon`. `ncols`/`max_nz` are not needed: the reconstructor recomputes its
+    /// (cheap) filter/geometry per chunk, so it handles any `nz ≤ max_nz`.
+    fn streaming(
+        &self,
+        algorithm: crate::params::Algorithm,
+        params: &crate::params::ReconParams,
+        _geom: &Geometry,
+        _ncols: usize,
+        _max_nz: usize,
+    ) -> Result<Option<Box<dyn crate::backend::StreamingAnalytic>>> {
+        use crate::params::Algorithm;
+        if !matches!(
+            algorithm,
+            Algorithm::Fbp | Algorithm::Linerec | Algorithm::Fourierrec
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(super::streaming::WgpuFbpStream::new(
+            self.share(),
+            algorithm,
+            params.clone(),
+        ))))
+    }
 }
 
 impl WgpuBackend {

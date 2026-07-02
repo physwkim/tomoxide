@@ -17,6 +17,8 @@ pub mod shaders;
 mod compute;
 #[cfg(feature = "gpu-wgpu")]
 mod kernels;
+#[cfg(feature = "gpu-wgpu")]
+mod streaming;
 
 use crate::backend::{Backend, DeviceKind};
 use crate::dtype::Dtype;
@@ -25,10 +27,12 @@ use crate::error::{Error, Result};
 /// Handle to the portable GPU backend.
 #[cfg(feature = "gpu-wgpu")]
 pub struct WgpuBackend {
-    /// The logical device.
-    pub device: wgpu::Device,
-    /// The command queue.
-    pub queue: wgpu::Queue,
+    /// The logical device. `Arc` so a streaming reconstructor
+    /// ([`AnalyticReconstruct::streaming`](crate::backend::AnalyticReconstruct::streaming))
+    /// can share the same GPU device (wgpu's `Device`/`Queue` are not `Clone`).
+    pub device: std::sync::Arc<wgpu::Device>,
+    /// The command queue (shared via `Arc`, see [`Self::device`]).
+    pub queue: std::sync::Arc<wgpu::Queue>,
     /// Compiled compute-pipeline cache, keyed by a hash of `(shader source,
     /// entry point)`. Every `dispatch1d` / `fft_shared_pass` call used to
     /// `create_shader_module` + `create_compute_pipeline` from scratch — i.e.
@@ -97,8 +101,8 @@ impl WgpuBackend {
             .await
             .map_err(|e| Error::BackendUnavailable(format!("wgpu request_device: {e}")))?;
         Ok(Self {
-            device,
-            queue,
+            device: std::sync::Arc::new(device),
+            queue: std::sync::Arc::new(queue),
             pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
