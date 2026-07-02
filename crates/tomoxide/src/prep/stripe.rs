@@ -412,7 +412,7 @@ fn ti_ringb(sino: &Array2<f32>, m: usize, n: usize, step: usize) -> Array2<f32> 
         }
     }
     let h = ti_kernel(m, n);
-    let nblock = if step == 0 { 0 } else { nn / step };
+    let nblock = nn.checked_div(step).unwrap_or(0);
     // new[col][angle], initialized to ones (tomopy `np.ones((R, N))`).
     let mut newm = vec![vec![1.0f64; nn]; r];
     for k in 0..nblock {
@@ -467,7 +467,7 @@ fn remove_stripe_ti(data: &mut Tomo<f32>, beta: f32, nblock: usize) -> Result<()
     }
     // tomopy `_remove_stripe_ti`: nblock==0 → `_ring`, else `_ringb` with
     // block size `int(nproj / nblock)` (the transposed N axis).
-    let step = if nblock == 0 { 0 } else { nproj / nblock };
+    let step = nproj.checked_div(nblock).unwrap_or(0);
     for m in 0..nrows {
         let mut sino = Array2::<f32>::zeros((nproj, ncol));
         for p in 0..nproj {
