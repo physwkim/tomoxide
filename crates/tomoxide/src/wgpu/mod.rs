@@ -176,6 +176,16 @@ impl Backend for WgpuBackend {
     fn analytic_reconstruct(&self) -> Option<&dyn crate::backend::AnalyticReconstruct> {
         Some(self)
     }
+
+    /// Device-resident iterative reconstruction (SIRT): the whole
+    /// forward/back-projection loop and its weight setup run on the GPU with the
+    /// volume/sinogram resident across all iterations — one upload, one download —
+    /// instead of the generic host solver's per-iteration round-trip. Returns
+    /// `None` for algorithms without a device path so they fall back to host.
+    #[cfg(feature = "gpu-wgpu")]
+    fn iterative_reconstruct(&self) -> Option<&dyn crate::backend::IterativeReconstruct> {
+        Some(self)
+    }
     // Remaining capability accessors stay `None` until their WGSL kernels land.
 }
 

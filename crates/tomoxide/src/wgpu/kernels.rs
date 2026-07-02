@@ -1335,3 +1335,233 @@ impl crate::backend::AnalyticReconstruct for WgpuBackend {
         }
     }
 }
+
+impl WgpuBackend {
+    /// Forward-project `vol_buf` into `sino_buf` (both device-resident), zeroing
+    /// `sino_buf` first (the column-scatter kernel accumulates). `cossin_buf` /
+    /// `center_buf` are the geometry buffers uploaded once by the iterative solver
+    /// so the per-iteration projection reuses them. Matched adjoint gain π/nproj.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_into_dev(
+        &self,
+        vol_buf: &wgpu::Buffer,
+        cossin_buf: &wgpu::Buffer,
+        center_buf: &wgpu::Buffer,
+        sino_buf: &wgpu::Buffer,
+        dims: (usize, usize, usize), // (nz, ny, nx)
+        nang: usize,
+        ncols: usize,
+    ) {
+        let (nz, ny, nx) = dims;
+        self.zero_buffer(sino_buf);
+        let params = FpParams {
+            nproj: nang as u32,
+            ncols: ncols as u32,
+            ny: ny as u32,
+            nx: nx as u32,
+            scale: std::f32::consts::PI / nang as f32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let pbuf = self.uniform("fp_params", &params);
+        self.dispatch1d(
+            PROJECT_WGSL,
+            "project",
+            &[vol_buf, cossin_buf, center_buf, sino_buf, &pbuf],
+            (nz * nang) as u32,
+        );
+    }
+
+    /// Back-project `sino_buf` into `vol_buf` (both device-resident; the voxel
+    /// kernel overwrites, so no pre-zero). Matched adjoint gain π/nproj. Shares
+    /// the geometry buffers with [`Self::forward_into_dev`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn backproject_into_dev(
+        &self,
+        sino_buf: &wgpu::Buffer,
+        cossin_buf: &wgpu::Buffer,
+        center_buf: &wgpu::Buffer,
+        vol_buf: &wgpu::Buffer,
+        dims: (usize, usize, usize), // (nz, ny, nx)
+        nang: usize,
+        ncols: usize,
+    ) {
+        let (nz, ny, nx) = dims;
+        let params = BpParams {
+            nproj: nang as u32,
+            ncols: ncols as u32,
+            ny: ny as u32,
+            nx: nx as u32,
+            scale: std::f32::consts::PI / nang as f32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let pbuf = self.uniform("bp_params", &params);
+        self.dispatch1d(
+            BACKPROJECT_WGSL,
+            "backproject",
+            &[sino_buf, cossin_buf, center_buf, vol_buf, &pbuf],
+            (nz * ny * nx) as u32,
+        );
+    }
+
+    /// Device-resident SIRT (tomopy `sirt`): keep the volume, measured sinogram,
+    /// and the R/C weights resident on the GPU across every iteration — one
+    /// upload, one download — instead of the generic host solver's per-iteration
+    /// forward/back-projection round-trips. Mirrors the CUDA `sirt_device`
+    /// arithmetic (matched π/nproj projector pair, R = 1/A(1), C = 1/Aᵀ(1),
+    /// x += C∘Aᵀ(R∘(b−Ax))), so the result matches the host SIRT within GPU ULPs.
+    fn sirt_device(
+        &self,
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        params: &crate::params::ReconParams,
+    ) -> Result<Volume<f32>> {
+        let s = sino.as_layout(Layout::Sinogram);
+        let nz = s.n_rows();
+        let nang = s.n_angles();
+        let ncols = s.n_cols();
+        let n = params.num_gridx.unwrap_or(ncols);
+        let nvol = nz * n * n;
+        let nsino = nz * nang * ncols;
+
+        // Geometry buffers uploaded once, reused every iteration.
+        let (cossin, center) = cossin_center(geom, nz);
+        let cossin_buf = self.storage_ro("sirt_cossin", &cossin);
+        let center_buf = self.storage_ro("sirt_center", &center);
+
+        // Measured sinogram b (device-resident for the whole solve).
+        let sino_std = s.array.as_standard_layout();
+        let b_buf = self.storage_ro(
+            "sirt_b",
+            sino_std
+                .as_slice()
+                .expect("as_standard_layout yields a contiguous slice"),
+        );
+
+        // Seed x: warm-start `init` (validated [nz, n, n]) or zeros.
+        let vol_buf = match &params.init {
+            Some(v) => {
+                if v.dims() != (nz, n, n) {
+                    return Err(Error::ShapeMismatch {
+                        expected: format!("init volume [{nz}, {n}, {n}]"),
+                        found: format!("{:?}", v.dims()),
+                    });
+                }
+                let vstd = v.array.as_standard_layout();
+                self.storage_rw(
+                    "sirt_vol",
+                    vstd.as_slice().expect("standard layout init volume"),
+                )
+            }
+            None => self.storage_rw("sirt_vol", &vec![0.0f32; nvol]),
+        };
+
+        let ax_buf = self.storage_empty("sirt_ax", nsino); // A x, reused as residual
+        let corr_buf = self.storage_empty("sirt_corr", nvol); // Aᵀ(…)
+        let rw_buf = self.storage_empty("sirt_rw", nsino); // R = 1/A(1)
+        let cw_buf = self.storage_empty("sirt_cw", nvol); // C = 1/Aᵀ(1)
+        let ones_v = self.storage_ro("sirt_ones_v", &vec![1.0f32; nvol]);
+        let ones_s = self.storage_ro("sirt_ones_s", &vec![1.0f32; nsino]);
+
+        let dims = (nz, n, n);
+        // R = 1 / A(1)
+        self.forward_into_dev(
+            &ones_v,
+            &cossin_buf,
+            &center_buf,
+            &ax_buf,
+            dims,
+            nang,
+            ncols,
+        );
+        self.dispatch1d(
+            ELEMENTWISE_WGSL,
+            "iter_recip",
+            &[&ax_buf, &rw_buf],
+            nsino as u32,
+        );
+        // C = 1 / Aᵀ(1)
+        self.backproject_into_dev(
+            &ones_s,
+            &cossin_buf,
+            &center_buf,
+            &corr_buf,
+            dims,
+            nang,
+            ncols,
+        );
+        self.dispatch1d(
+            ELEMENTWISE_WGSL,
+            "iter_recip",
+            &[&corr_buf, &cw_buf],
+            nvol as u32,
+        );
+
+        for _ in 0..params.num_iter.max(1) {
+            // ax = A x
+            self.forward_into_dev(
+                &vol_buf,
+                &cossin_buf,
+                &center_buf,
+                &ax_buf,
+                dims,
+                nang,
+                ncols,
+            );
+            // ax = (b − ax) ∘ R
+            self.dispatch1d(
+                ELEMENTWISE_WGSL,
+                "iter_residual",
+                &[&ax_buf, &b_buf, &rw_buf],
+                nsino as u32,
+            );
+            // corr = Aᵀ(ax)
+            self.backproject_into_dev(
+                &ax_buf,
+                &cossin_buf,
+                &center_buf,
+                &corr_buf,
+                dims,
+                nang,
+                ncols,
+            );
+            // x += C ∘ corr
+            self.dispatch1d(
+                ELEMENTWISE_WGSL,
+                "iter_update",
+                &[&vol_buf, &cw_buf, &corr_buf],
+                nvol as u32,
+            );
+        }
+
+        let host = self.download_f32(&vol_buf, nvol);
+        let array = Array3::from_shape_vec((nz, n, n), host)
+            .expect("out buffer length nz*n*n matches the volume shape");
+        Ok(Volume::new(array))
+    }
+}
+
+impl crate::backend::IterativeReconstruct for WgpuBackend {
+    /// SIRT runs device-resident; every other iterative algorithm returns `None`
+    /// so recon::recon falls back to the generic host solver.
+    fn solve(
+        &self,
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        algorithm: crate::params::Algorithm,
+        params: &crate::params::ReconParams,
+    ) -> Result<Option<Volume<f32>>> {
+        // The device forward/back-projectors are parallel-beam only; anything else
+        // falls back to the host solver.
+        if geom.beam != Beam::Parallel {
+            return Ok(None);
+        }
+        match algorithm {
+            crate::params::Algorithm::Sirt => self.sirt_device(sino, geom, params).map(Some),
+            _ => Ok(None),
+        }
+    }
+}
