@@ -4265,7 +4265,7 @@ mod cuda_impl {
             // Build + upload the lprec grids once for the whole stream (the chunk
             // loop reuses them); other methods carry no grids.
             let lprec = if is_lprec {
-                Some(LpRecDev::new(n, geom.angles.0.len(), self)?)
+                Some(LpRecDev::new(n, geom.angles.0.len())?)
             } else {
                 None
             };
@@ -5050,9 +5050,16 @@ mod cuda_impl {
         /// Precompute the log-polar grids on the host (`fft` backs the small
         /// precompute transforms — the CUDA backend's own Fft is fine) and upload
         /// them.
-        fn new(n: usize, nproj: usize, fft: &dyn crate::backend::Fft) -> Result<Self> {
+        fn new(n: usize, nproj: usize) -> Result<Self> {
             use crate::recon::lprec::{build_grids, LP_NSPAN};
-            let grids = build_grids(n, nproj, fft)?;
+            // build_grids' handful of small setup FFTs (adjoint zeta kernel + two
+            // 1-D B-spline transforms) are one-time HOST precompute whose result
+            // feeds the device kernels; running them on the CUDA backend round-trips
+            // each to the GPU (the batched nthetalarge×nrho transform alone is a
+            // large buffer). Use the in-process CPU rustfft instead — no PCIe
+            // traffic, and the precompute FFT backend is output-neutral (see the
+            // wgpu lprec precompute change). Cuts ~45ms off build_grids at 1024².
+            let grids = build_grids(n, nproj, &crate::cpu::CpuBackend::new())?;
             let kfull_f32: &[f32] = unsafe {
                 std::slice::from_raw_parts(
                     grids.kfull.as_ptr() as *const f32,
@@ -5305,8 +5312,7 @@ mod cuda_impl {
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
 
             // Precompute + upload the geometry grids once (shared device runtime).
-            let fft: &dyn crate::backend::Fft = self;
-            let lp = LpRecDev::new(n, nproj, fft)?;
+            let lp = LpRecDev::new(n, nproj)?;
             let (nrho, ntheta) = (lp.nrho, lp.ntheta);
 
             // z-tile so the [tile, nrho, ntheta] complex work buffer (plus the g
