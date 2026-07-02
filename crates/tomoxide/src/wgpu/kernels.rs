@@ -283,7 +283,10 @@ impl ForwardProject for WgpuBackend {
             ncols: ncols as u32,
             ny: ny as u32,
             nx: nx as u32,
-            _pad0: 0,
+            // π/nproj — the adjoint gain matching the back-projector, so {A, Aᵀ}
+            // is a matched pair (the iterative solvers rely on this) and the
+            // forward output matches the CPU/CUDA convention.
+            scale: std::f32::consts::PI / nang as f32,
             _pad1: 0,
             _pad2: 0,
             _pad3: 0,
@@ -312,7 +315,7 @@ struct FpParams {
     ncols: u32,
     ny: u32,
     nx: u32,
-    _pad0: u32,
+    scale: f32,
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,

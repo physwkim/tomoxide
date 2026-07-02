@@ -15,7 +15,7 @@ struct Params {
     ncols : u32,
     ny    : u32,
     nx    : u32,
-    _pad0 : u32,
+    scale : f32, // π/nproj — the adjoint gain matching the back-projector
     _pad1 : u32,
     _pad2 : u32,
     _pad3 : u32,
@@ -61,5 +61,13 @@ fn project(@builtin(global_invocation_id) gid : vec3<u32>,
                 sino[off + 1u] = sino[off + 1u] + f * frac;
             }
         }
+    }
+
+    // Scale by π/nproj so the forward projector is the true adjoint of the
+    // back-projector (which carries the same gain). This thread uniquely owns the
+    // detector-column span [sbase, sbase+ncols) of its (row, angle), so scaling it
+    // here is race-free — mirroring how backproject.wgsl bakes its scale in-kernel.
+    for (var j = 0u; j < params.ncols; j = j + 1u) {
+        sino[sbase + j] = sino[sbase + j] * params.scale;
     }
 }
