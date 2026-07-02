@@ -27,6 +27,8 @@
 use ndarray::{Array3, ArrayViewMut2};
 use std::f32::consts::PI;
 
+use rayon::prelude::*;
+
 use crate::backend::Fft;
 use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
@@ -220,16 +222,19 @@ fn fzeta_loop_weights_adj(
     }
 
     let log_cos: Vec<f32> = thsplarge.iter().map(|&t| t.cos().ln()).collect();
-    // fcosa[j,k] = exp(2πi·krho[j]/rhos · log_cos[k]) (a = 0).
+    // fcosa[j,k] = exp(2πi·krho[j]/rhos · log_cos[k]) (a = 0). This nrho×nthetalarge
+    // fill (≈8.4M complex exps at 1024²) is the single largest build_grids cost;
+    // parallelise it one krho-row per task.
     let mut buf = vec![Complex32::new(0.0, 0.0); nrho * nthetalarge];
-    for (j, &kr) in krho.iter().enumerate() {
-        let scale = 2.0 * PI * kr / rhos;
-        let base = j * nthetalarge;
-        for (k, &lc) in log_cos.iter().enumerate() {
-            let ph = scale * lc;
-            buf[base + k] = Complex32::new(ph.cos(), ph.sin()) * h[k];
-        }
-    }
+    buf.par_chunks_mut(nthetalarge)
+        .zip(krho.par_iter())
+        .for_each(|(row, &kr)| {
+            let scale = 2.0 * PI * kr / rhos;
+            for (k, &lc) in log_cos.iter().enumerate() {
+                let ph = scale * lc;
+                row[k] = Complex32::new(ph.cos(), ph.sin()) * h[k];
+            }
+        });
     // Batched 1-D FFT over each krho row, length nthetalarge.
     fft.fft_1d(&mut buf, nthetalarge, nrho, false)?;
     // Apply s multiplier, crop columns to ntheta, scale by dthsplarge.
@@ -338,31 +343,36 @@ pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGri
     let halft = ntheta / 2 + 1;
     // fZ_half[r, t] = fZ[r,t] / B3com[r,t] * const, t in [0, ntheta/2].
     let mut fz_half = vec![Complex32::new(0.0, 0.0); nrho * halft];
-    for r in 0..nrho {
-        for t in 0..halft {
-            let b = b3rho[r] * b3th[t];
-            let denom = b.norm_sqr();
-            let q = if denom > 0.0 {
-                fz[r * ntheta + t] * b.conj() / denom
-            } else {
-                Complex32::new(0.0, 0.0)
-            };
-            fz_half[r * halft + t] = q * konst;
-        }
-    }
+    fz_half
+        .par_chunks_mut(halft)
+        .enumerate()
+        .for_each(|(r, row)| {
+            for (t, slot) in row.iter_mut().enumerate() {
+                let b = b3rho[r] * b3th[t];
+                let denom = b.norm_sqr();
+                let q = if denom > 0.0 {
+                    fz[r * ntheta + t] * b.conj() / denom
+                } else {
+                    Complex32::new(0.0, 0.0)
+                };
+                *slot = q * konst;
+            }
+        });
     // Build the full Hermitian kernel for C2C FFT convolution.
     let mut kfull = vec![Complex32::new(0.0, 0.0); nrho * ntheta];
-    for r in 0..nrho {
-        for t in 0..ntheta {
-            let v = if t <= ntheta / 2 {
-                fz_half[r * halft + t]
-            } else {
-                let rm = (nrho - r) % nrho;
-                fz_half[rm * halft + (ntheta - t)].conj()
-            };
-            kfull[r * ntheta + t] = v;
-        }
-    }
+    kfull
+        .par_chunks_mut(ntheta)
+        .enumerate()
+        .for_each(|(r, row)| {
+            for (t, slot) in row.iter_mut().enumerate() {
+                *slot = if t <= ntheta / 2 {
+                    fz_half[r * halft + t]
+                } else {
+                    let rm = (nrho - r) % nrho;
+                    fz_half[rm * halft + (ntheta - t)].conj()
+                };
+            }
+        });
 
     // ---- C2lp: Cartesian -> log-polar, per span (over the unit disk) ----
     let lin: Vec<f32> = (0..n)
@@ -399,16 +409,22 @@ pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGri
     for (k, (c1s, c2s)) in c2lp1.iter_mut().zip(c2lp2.iter_mut()).enumerate() {
         let ang = k as f32 * beta + hb;
         let (sa, ca) = ang.sin_cos();
-        let mut v1 = Vec::with_capacity(cids.len());
-        let mut v2 = Vec::with_capacity(cids.len());
-        for &id in &cids {
-            let z1 = a_r * (x1[id] * ca + x2[id] * sa) + (1.0 - a_r);
-            let z2 = a_r * (-x1[id] * sa + x2[id] * ca);
-            let c1 = z2.atan2(z1);
-            let c2 = (z1 * z1 + z2 * z2).sqrt().ln();
-            v1.push((c1 - th0) / th_span * (ntheta as f32 - 1.0));
-            v2.push((c2 - rh0) / rh_span * (nrho as f32 - 1.0));
-        }
+        // Per-point atan2/ln/sqrt over the ~π/4·n² disk points is the dominant
+        // build_grids cost; parallelise across points (NSPAN=3 is too small to
+        // parallelise the outer loop). `par_iter().unzip()` preserves order.
+        let (v1, v2): (Vec<f32>, Vec<f32>) = cids
+            .par_iter()
+            .map(|&id| {
+                let z1 = a_r * (x1[id] * ca + x2[id] * sa) + (1.0 - a_r);
+                let z2 = a_r * (-x1[id] * sa + x2[id] * ca);
+                let c1 = z2.atan2(z1);
+                let c2 = (z1 * z1 + z2 * z2).sqrt().ln();
+                (
+                    (c1 - th0) / th_span * (ntheta as f32 - 1.0),
+                    (c2 - rh0) / rh_span * (nrho as f32 - 1.0),
+                )
+            })
+            .unzip();
         *c1s = v1;
         *c2s = v2;
     }
@@ -443,15 +459,13 @@ pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGri
     let projp = (nproj as f32 - 1.0) / (proj0[NSPAN - 1] + projl[NSPAN - 1] - proj0[0]);
 
     // main set: z2n = (z2 - (1-aR)cos(z1))/aR ; select |z2n|<=1 & z1 in [-b/2,b/2)
-    let mut lpids = Vec::new();
-    let mut z2n_main = Vec::new();
-    for k in 0..nrho * ntheta {
-        let z2n = (z2[k] - (1.0 - a_r) * z1[k].cos()) / a_r;
-        if z1[k] >= -hb && z1[k] < hb && z2n.abs() <= 1.0 {
-            lpids.push(k);
-            z2n_main.push(z2n);
-        }
-    }
+    let (lpids, z2n_main): (Vec<usize>, Vec<f32>) = (0..nrho * ntheta)
+        .into_par_iter()
+        .filter_map(|k| {
+            let z2n = (z2[k] - (1.0 - a_r) * z1[k].cos()) / a_r;
+            (z1[k] >= -hb && z1[k] < hb && z2n.abs() <= 1.0).then_some((k, z2n))
+        })
+        .unzip();
     let scale_lp = |k: usize, z1k: f32, z2n: f32| -> (f32, f32) {
         let p1 = (z1k + k as f32 * beta - proj0[k]) / projl[k] * (pid_len[k] as f32 - 1.0)
             + (proj0[k] - proj0[0]) * projp;
@@ -461,13 +475,11 @@ pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGri
     let mut lp2p1: [Vec<f32>; NSPAN] = Default::default();
     let mut lp2p2: [Vec<f32>; NSPAN] = Default::default();
     for k in 0..NSPAN {
-        let mut v1 = Vec::with_capacity(lpids.len());
-        let mut v2 = Vec::with_capacity(lpids.len());
-        for (idx, &id) in lpids.iter().enumerate() {
-            let (p1, p2) = scale_lp(k, z1[id], z2n_main[idx]);
-            v1.push(p1);
-            v2.push(p2);
-        }
+        let (v1, v2): (Vec<f32>, Vec<f32>) = lpids
+            .par_iter()
+            .enumerate()
+            .map(|(idx, &id)| scale_lp(k, z1[id], z2n_main[idx]))
+            .unzip();
         lp2p1[k] = v1;
         lp2p2[k] = v2;
     }
@@ -476,28 +488,35 @@ pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGri
     let am_eg = am * (-g).exp();
     let eg_am = g.exp() / am;
     let drho_step = rhosp[1] - rhosp[0];
-    let mut wids = Vec::new();
-    let mut z2n_w = Vec::new();
-    // right side
-    for k in 0..nrho * ntheta {
-        if z2[k].ln() > g {
-            let z2n = (z2[k] * am_eg - (1.0 - a_r) * z1[k].cos()) / a_r;
-            if z1[k] >= -hb && z1[k] < hb && z2n.abs() <= 1.0 {
-                wids.push(k);
-                z2n_w.push(z2n);
+    // right side, then left side — concatenated in the same order the two
+    // sequential loops produced (each ascending in k).
+    let (mut wids, mut z2n_w): (Vec<usize>, Vec<f32>) = (0..nrho * ntheta)
+        .into_par_iter()
+        .filter_map(|k| {
+            if z2[k].ln() > g {
+                let z2n = (z2[k] * am_eg - (1.0 - a_r) * z1[k].cos()) / a_r;
+                if z1[k] >= -hb && z1[k] < hb && z2n.abs() <= 1.0 {
+                    return Some((k, z2n));
+                }
             }
-        }
-    }
-    // left side
-    for k in 0..nrho * ntheta {
-        if z2[k].ln() < am.ln() - g + drho_step {
-            let z2n = (z2[k] * eg_am - (1.0 - a_r) * z1[k].cos()) / a_r;
-            if z1[k] >= -hb && z1[k] < hb && z2n.abs() <= 1.0 {
-                wids.push(k);
-                z2n_w.push(z2n);
+            None
+        })
+        .unzip();
+    let am_ln = am.ln();
+    let (wids_l, z2n_l): (Vec<usize>, Vec<f32>) = (0..nrho * ntheta)
+        .into_par_iter()
+        .filter_map(|k| {
+            if z2[k].ln() < am_ln - g + drho_step {
+                let z2n = (z2[k] * eg_am - (1.0 - a_r) * z1[k].cos()) / a_r;
+                if z1[k] >= -hb && z1[k] < hb && z2n.abs() <= 1.0 {
+                    return Some((k, z2n));
+                }
             }
-        }
-    }
+            None
+        })
+        .unzip();
+    wids.extend(wids_l);
+    z2n_w.extend(z2n_l);
     // Angle coordinate of each wrapping point. The reference indexes `z1` by the
     // *position within the wrapping subset* (`z1[lpidsw]`) rather than the grid
     // index — an apparent upstream off-by-population bug. tomoxide uses the
@@ -508,13 +527,11 @@ pub(crate) fn build_grids(n: usize, nproj: usize, fft: &dyn Fft) -> Result<LpGri
     let mut lp2p1w: [Vec<f32>; NSPAN] = Default::default();
     let mut lp2p2w: [Vec<f32>; NSPAN] = Default::default();
     for k in 0..NSPAN {
-        let mut v1 = Vec::with_capacity(wids.len());
-        let mut v2 = Vec::with_capacity(wids.len());
-        for (idx, &id) in wids.iter().enumerate() {
-            let (p1, p2) = scale_lp(k, z1[id], z2n_w[idx]);
-            v1.push(p1);
-            v2.push(p2);
-        }
+        let (v1, v2): (Vec<f32>, Vec<f32>) = wids
+            .par_iter()
+            .enumerate()
+            .map(|(idx, &id)| scale_lp(k, z1[id], z2n_w[idx]))
+            .unzip();
         lp2p1w[k] = v1;
         lp2p2w[k] = v2;
     }
