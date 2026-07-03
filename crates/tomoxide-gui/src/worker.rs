@@ -518,6 +518,21 @@ mod tests {
         assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
     }
 
+    /// SIFT center runs end-to-end — the pin is the OpenCV dynamic-linkage
+    /// call chain (now a default feature), not the estimate: the synthetic
+    /// fixture may legitimately give SIFT too few keypoint matches, so a
+    /// clean `Err` is acceptable; a panic/abort or non-finite `Ok` is not.
+    #[cfg(feature = "sift-center")]
+    #[test]
+    fn find_center_sift_links_and_runs() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let meta = probe(&fixture()).unwrap();
+        match run_find_center(&engine, &fixture(), CenterMethod::Sift, meta.nz / 2, None) {
+            Ok(c) => assert!(c.is_finite(), "sift center returned non-finite {c}"),
+            Err(e) => eprintln!("sift center errored on the synthetic fixture (acceptable): {e}"),
+        }
+    }
+
     /// Vo and Entropy run on one normalized sinogram row of the fixture and
     /// land near the detector midline (the fixture is centered).
     #[test]

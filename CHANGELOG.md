@@ -54,6 +54,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **`tomoxide-gui` builds with `sift-center` on by default** (alongside
+  `cuda`), so the Center screen's SIFT method is always available. Building
+  the GUI now needs the OpenCV dev stack (`libopencv-dev`, plus
+  `libclang-dev` and `clang` for the bindings generator). The tomoxide
+  *library* default stays featureless — CI builds it on runners without
+  OpenCV; only the GUI opts in. A feature-gated smoke test pins the OpenCV
+  call chain end-to-end.
 - **HDF5/TIFF writers are zero-copy** — `H5Writer`/`TiffWriter` handed each
   chunk through an elementwise gather copy before writing; a standard C-layout
   chunk (what every driver produces) is now passed straight to the write call

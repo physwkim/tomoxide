@@ -129,7 +129,7 @@ impl CenterView {
                 jobs,
                 CenterMethod::Sift,
                 "SIFT",
-                "SIFT registration of the 0°/180° pair — needs the sift-center build feature; \
+                "SIFT registration of the 0°/180° pair (sift-center feature, on by default); \
                  reads the whole dataset",
             );
             if let Some(m) = self.pending {
