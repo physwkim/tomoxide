@@ -841,6 +841,25 @@ impl H5Writer {
 
     /// Create `{path}.h5` with an `exchange/data` dataset of shape `(nz, ny, nx)`.
     fn create_dataset(&self, nz: usize, ny: usize, nx: usize) -> Result<H5WriteState> {
+        // Unlink a stale output first so the create always lands on a fresh
+        // inode. Creating over an existing output would otherwise truncate
+        // real content, which arms ext4 `auto_da_alloc`
+        // (replace-via-truncate protection) and turns the final `close(2)`
+        // into an implicit ~325 ms writeback — re-paying exactly the sync the
+        // non-durable `finalize` (`close_no_sync`) skips. The unlink trades
+        // away rust-hdf5's lock-before-truncate protection for this one file;
+        // that is acceptable here because the reconstruction output is
+        // regenerable and a concurrent reader of the old file keeps its inode.
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Io(format!(
+                    "remove stale {}: {e}",
+                    self.path.display()
+                )))
+            }
+        }
         let file = H5File::create(&self.path)
             .map_err(|e| Error::Io(format!("create {}: {e}", self.path.display())))?;
         let group = file

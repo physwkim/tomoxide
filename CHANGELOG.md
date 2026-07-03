@@ -26,6 +26,12 @@ All notable changes to this project are documented here. The format is based on
   `ftruncate`s a brand-new empty file — that truncate armed ext4
   `auto_da_alloc`, whose implicit writeback inside the final `close(2)`
   (~325 ms at 512³) silently defeated `close_no_sync`.
+- **The HDF5 writer unlinks a stale output before creating** — re-running a
+  reconstruction over an existing `.h5` output now lands on a fresh inode
+  instead of truncating the old file, so the overwrite rerun no longer pays
+  the `auto_da_alloc` writeback either (was +0.44 s end-to-end at 512³). The
+  unlink trades away rust-hdf5's lock-before-truncate protection for this one
+  regenerable output file.
 
 ## [0.5.1] - 2026-07-02
 

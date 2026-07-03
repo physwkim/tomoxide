@@ -64,6 +64,34 @@ fn write_then_read_back_bit_exact() {
 }
 
 #[test]
+fn rewrite_over_existing_output_round_trips() {
+    // Re-running a reconstruction over an existing `.h5` output: the writer
+    // unlinks the stale file before creating (fresh inode — see
+    // `H5Writer::create_dataset`), so the second write must land on a clean
+    // file and round-trip bit-exact with the *new* contents.
+    let (nz, ny, nx) = (2usize, 3usize, 3usize);
+    let dir = scratch("rewrite");
+    let base = dir.join("recon");
+    for pass in 0..2u32 {
+        let vol = Volume::new(Array3::from_shape_fn((nz, ny, nx), |(z, y, x)| {
+            (pass * 1000 + (z * 100 + y * 10 + x) as u32) as f32 + 0.5
+        }));
+        {
+            let mut w = create_writer(base.to_str().unwrap(), SaveFormat::H5).unwrap();
+            w.reserve(nz).unwrap();
+            w.write_chunk(&vol, 0, nz).unwrap();
+            w.finalize().unwrap();
+        }
+        let file = H5File::open(dir.join("recon.h5").to_str().unwrap()).unwrap();
+        let ds = file.dataset("exchange/data").unwrap();
+        let got: Vec<f32> = ds.read_raw::<f32>().unwrap();
+        let expect: Vec<f32> = vol.array.iter().copied().collect();
+        assert_eq!(got, expect, "pass {pass} not bit-exact");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn write_chunk_range_is_validated() {
     let vol = Volume::new(Array3::<f32>::zeros((2, 3, 3)));
     let dir = scratch("oob");
