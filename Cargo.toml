@@ -68,7 +68,10 @@ toml = "0.8"
 # fourierrec gather/wrap, lprec gather); falls back to CAS where unsupported.
 wgpu = "30"
 pollster = "0.4"
-bytemuck = { version = "1", features = ["derive"] }
+# bytemuck core is proc-macro-free and also used unconditionally (the Zarr
+# writer's safe `<f4` byte cast); the heavier `derive` feature is enabled only
+# by tomoxide's `gpu-wgpu` feature, which needs `#[derive(Pod, Zeroable)]`.
+bytemuck = "1"
 
 [profile.release]
 opt-level = 3

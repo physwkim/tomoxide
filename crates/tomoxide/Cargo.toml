@@ -17,8 +17,9 @@ exclude = ["tests/fixtures"]
 default = []
 # CUDA backend (nvcc-compiled vendored kernels; build.rs gates on this feature).
 cuda = []
-# Portable GPU backend (wgpu / Metal).
-gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Portable GPU backend (wgpu / Metal). Adds bytemuck's derive (proc-macro) for
+# the `#[derive(Pod, Zeroable)]` uniform structs; bytemuck core is always on.
+gpu-wgpu = ["dep:wgpu", "dep:pollster", "bytemuck/derive"]
 # Beam-hardening correction (pulls xraylib; its build runs bindgen → needs libclang).
 beam-hardening = ["dep:xraylib"]
 # SIFT center finding (pulls the opencv crate; links OpenCV, bindgen at build).
@@ -60,7 +61,10 @@ tiff = "0.11"
 # optional GPU (wgpu / Metal) — only with `gpu-wgpu`
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
-bytemuck = { workspace = true, optional = true }
+# unconditional (not gpu-gated): the Zarr writer emits `<f4` chunk bytes via
+# bytemuck's safe Pod cast — io/mod.rs forbids `unsafe`, so the zero-copy
+# reinterpret needs it. Core only; `gpu-wgpu` adds the derive feature.
+bytemuck.workspace = true
 # optional x-ray physics (beam hardening) / computer vision (SIFT center)
 xraylib = { workspace = true, optional = true }
 opencv = { workspace = true, optional = true }

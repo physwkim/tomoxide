@@ -32,6 +32,11 @@ All notable changes to this project are documented here. The format is based on
   the `auto_da_alloc` writeback either (was +0.44 s end-to-end at 512³). The
   unlink trades away rust-hdf5's lock-before-truncate protection for this one
   regenerable output file.
+- **The Zarr writer emits `<f4` chunk bytes zero-copy** on little-endian
+  targets (bytemuck safe Pod cast — bytemuck core is now an unconditional
+  dependency, its `derive` feature still gated behind `gpu-wgpu`); the
+  per-element `to_le_bytes` gather remains only for big-endian targets and
+  non-contiguous callers.
 
 ## [0.5.1] - 2026-07-02
 

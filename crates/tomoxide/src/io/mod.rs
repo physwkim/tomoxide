@@ -1131,13 +1131,24 @@ impl VolumeWriter for ZarrWriter {
         for local in 0..cz {
             let slice = vol.array.index_axis(Axis(0), local);
             // C-order (y-major, x fastest) little-endian f32 — exactly `<f4`.
-            let mut bytes = Vec::with_capacity(ny * nx * 4);
-            for &v in slice.iter() {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
+            // On a little-endian target the bytes of a contiguous slice already
+            // are `<f4`, so reinterpret them in place (bytemuck's safe Pod
+            // cast); gather elementwise only on a big-endian target or for a
+            // non-contiguous caller.
+            let gathered;
+            let bytes: &[u8] = match slice.as_slice() {
+                Some(s) if cfg!(target_endian = "little") => bytemuck::cast_slice(s),
+                _ => {
+                    gathered = slice
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>();
+                    &gathered
+                }
+            };
             let global = start + local;
             let chunk = data_dir.join(format!("{global}.0.0"));
-            std::fs::write(&chunk, &bytes)
+            std::fs::write(&chunk, bytes)
                 .map_err(|e| Error::Io(format!("write {}: {e}", chunk.display())))?;
         }
         Ok(())
