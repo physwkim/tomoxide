@@ -4087,6 +4087,31 @@ mod cuda_impl {
                 ));
             }
 
+            // Kernel batch-domain minimums, same rule as `streaming()`: the
+            // z-bilinear back-projection samples slice pairs (vr, vr+1), so a
+            // 1-slice stack back-projects to zero (kernels_linerec.cuh
+            // `vr < nz-1`), and Fourierrec packs slice pairs (s, s+nz/2) for
+            // the real-FFT path, so it needs an even count. Pad the sinogram
+            // (and its per-row filter weights) with zero rows and drop the pad
+            // rows from the output volume.
+            let nz_out = nz;
+            let mut nz = nz.max(2);
+            if matches!(algorithm, Algorithm::Fourierrec) && nz % 2 != 0 {
+                nz += 1;
+            }
+            let padded: Vec<f32>;
+            let raw = if nz != nz_out {
+                let mut v = Vec::with_capacity(nz * nproj * ncols);
+                v.extend_from_slice(raw);
+                v.resize(nz * nproj * ncols, 0.0);
+                padded = v;
+                &padded[..]
+            } else {
+                raw
+            };
+            let mut w = w;
+            w.resize(nz * nfreq2, 0.0);
+
             // Half-precision path (tomocupy `--dtype float16`): single GPU, whole
             // stack in one chunk. The half cuFFT filter needs a power-of-two
             // transform width, so `pad` must be a power of two. f16 tiling, the
@@ -4107,11 +4132,7 @@ mod cuda_impl {
                         analytic_fbp_stream_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     Algorithm::Fourierrec => {
-                        if nz % 2 != 0 {
-                            return Err(Error::InvalidParam(format!(
-                                "cuda fourierrec needs an even slice count; got nz={nz}"
-                            )));
-                        }
+                        // nz is even here by the batch-domain pad above.
                         analytic_fourierrec_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     other => {
@@ -4120,8 +4141,10 @@ mod cuda_impl {
                         )))
                     }
                 };
+                let mut vol = vol;
+                vol.truncate(nz_out * n * n);
                 return Ok(Volume::new(
-                    Array3::from_shape_vec((nz, n, n), vol)
+                    Array3::from_shape_vec((nz_out, n, n), vol)
                         .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
                 ));
             }
@@ -4192,11 +4215,7 @@ mod cuda_impl {
                     }
                 }
                 Algorithm::Fourierrec => {
-                    if nz % 2 != 0 {
-                        return Err(Error::InvalidParam(format!(
-                            "cuda fourierrec needs an even slice count; got nz={nz}"
-                        )));
-                    }
+                    // nz is even here by the batch-domain pad above.
                     let devices = selected_devices();
                     unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
                     analytic_fourierrec_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
@@ -4208,8 +4227,10 @@ mod cuda_impl {
                 }
             };
 
+            let mut vol = vol;
+            vol.truncate(nz_out * n * n);
             Ok(Volume::new(
-                Array3::from_shape_vec((nz, n, n), vol)
+                Array3::from_shape_vec((nz_out, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
             ))
         }
@@ -4245,11 +4266,18 @@ mod cuda_impl {
             let f16 = params.dtype == crate::dtype::Dtype::F16;
             let fourier = matches!(algorithm, Algorithm::Fourierrec);
             let is_lprec = matches!(algorithm, Algorithm::Lprec);
-            // Fourierrec packs slice pairs (s, s+max_nz/2) for the real-FFT path, so
-            // it needs an even chunk (f32 and f16 both have a device-resident tail;
-            // see `finish_recon`'s fourier branch). An odd chunk → per-chunk fallback.
+            // The device kernels have batch-domain minimums the stream capacity
+            // must respect: the z-bilinear back-projection samples slice pairs
+            // (vr, vr+1), so a 1-slice batch back-projects to zero
+            // (kernels_linerec.cuh `vr < nz-1`), and Fourierrec packs slice
+            // pairs (s, s+max_nz/2) for the real-FFT path, so it needs an even
+            // count. Allocate the stream at the padded capacity; chunks smaller
+            // than capacity go through the existing partial-chunk path (zeroed
+            // sino tail in `reconstruct_chunk*`, tail rows dropped in
+            // `finish_recon`), which never reads the pad rows as data.
+            let mut max_nz = max_nz.max(2);
             if fourier && max_nz % 2 != 0 {
-                return Ok(None);
+                max_nz += 1;
             }
             // lprec's gather/scatter + spline runtime is f32-only (no f16 port);
             // f16 lprec falls back to the per-chunk host-interp path.
@@ -4499,8 +4527,9 @@ mod cuda_impl {
     /// or the memory/index tile count for single-GPU streaming), returns a count
     /// that keeps an even split at ≥2 slices per chunk — capped at `nz/2`, floored
     /// at 1. `nz < 4` collapses to a single whole-stack chunk (two ≥2 chunks don't
-    /// fit); `nz < 2` is the kernel's own single-slice degenerate case, which no
-    /// chunking can rescue.
+    /// fit); `nz < 2` is the kernel's own single-slice degenerate case, closed by
+    /// the batch-domain zero-pad in `reconstruct`/`streaming` (both hand the
+    /// kernels ≥2 slices).
     fn linerec_chunk_count(nz: usize, want: usize) -> usize {
         want.min(nz / 2).max(1)
     }
@@ -4932,14 +4961,13 @@ mod cuda_impl {
             n: usize,
         ) -> Result<Volume<f32>> {
             let s = filtered.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
-            let nz = s.n_rows();
+            let nz_out = s.n_rows();
             let nproj = s.n_angles();
             let ncols = s.n_cols();
-            if nz % 2 != 0 {
-                return Err(Error::InvalidParam(format!(
-                    "cuda fourierrec needs an even slice count (complex pairing); got nz={nz}"
-                )));
-            }
+            // The complex pairing needs an even slice count; pad an odd stack
+            // with one zero slice (same batch-domain rule as the analytic
+            // paths) and drop the pad row from the output.
+            let nz = nz_out + nz_out % 2;
             if n != ncols {
                 return Err(Error::InvalidParam(format!(
                     "cuda fourierrec needs a square grid = detector width {ncols}; got {n}"
@@ -4960,13 +4988,21 @@ mod cuda_impl {
             // Pack slice pairs (s, s+nz/2) into interleaved complex: for each
             // complex element [s, p, x], re = filtered[s], im = filtered[s+nz/2].
             let half = nz / 2;
+            // Rows at or past `nz_out` are the zero pad of an odd stack.
+            let at = |row: usize, p: usize, x: usize| {
+                if row < nz_out {
+                    src[row * nproj * ncols + p * ncols + x]
+                } else {
+                    0.0
+                }
+            };
             let mut g = vec![0.0f32; nz * nproj * ncols];
             for sp in 0..half {
                 for p in 0..nproj {
                     for x in 0..ncols {
                         let idx = sp * nproj * ncols + p * ncols + x;
-                        g[2 * idx] = src[sp * nproj * ncols + p * ncols + x];
-                        g[2 * idx + 1] = src[(sp + half) * nproj * ncols + p * ncols + x];
+                        g[2 * idx] = at(sp, p, x);
+                        g[2 * idx + 1] = at(sp + half, p, x);
                     }
                 }
             }
@@ -5011,8 +5047,9 @@ mod cuda_impl {
                     }
                 }
             }
+            vol.truncate(nz_out * n * n);
             Ok(Volume::new(
-                Array3::from_shape_vec((nz, n, n), vol)
+                Array3::from_shape_vec((nz_out, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda fourierrec shape: {e}")))?,
             ))
         }

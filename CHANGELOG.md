@@ -75,6 +75,21 @@ All notable changes to this project are documented here. The format is based on
   per-element `to_le_bytes` gather remains only for big-endian targets and
   non-contiguous callers.
 
+### Fixed
+
+- **CUDA analytic reconstruction of a single slice was silently all-zero**
+  (and an odd Fourierrec slice count a hard error). The z-bilinear
+  back-projection kernel samples slice pairs, so it needs a ≥2-slice batch,
+  and `cfunc_fourierrec` packs slice pairs, so it needs an even one — but a
+  1-slice job (GUI preview, `recon --start_row R --end_row R+1`) built the
+  streaming handle at capacity 1 and the one-shot path handed the kernels the
+  raw count. Both now pad the batch with zero rows up to the kernel domain
+  (≥2, even for Fourierrec) and drop the pad rows from the output, reusing
+  the existing partial-chunk machinery; `FourierReconstruct::reconstruct`
+  likewise zero-pads an odd stack instead of erroring. Multi-slice outputs
+  are unchanged (single-row CLI recon is bit-identical to the same row of a
+  multi-row run).
+
 ## [0.5.1] - 2026-07-02
 
 ### Changed
