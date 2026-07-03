@@ -960,7 +960,7 @@ struct FrParams {
     coeff1: f32,
     gscale: f32,
     phi_sign: f32,
-    inv_nf2: f32,
+    norm: f32,
     _p1: f32,
     _p2: f32,
 }
@@ -1042,7 +1042,10 @@ impl WgpuBackend {
             coeff1: -std::f32::consts::PI * std::f32::consts::PI / mu32,
             gscale: 4.0 / ndf32,
             phi_sign: 1.0 - (nd % 4) as f32,
-            inv_nf2: 1.0 / (nf as f32 * nf as f32),
+            // Unified amplitude: 1/nf² normalizes the unnormalized device
+            // inverse FFT, ×π·nd² lifts to the fbp/tomopy scale (see
+            // recon/fourierrec.rs `phi_amp`); nf = 2·nd folds the two to π/4.
+            norm: std::f32::consts::FRAC_PI_4,
             _p1: 0.0,
             _p2: 0.0,
         };

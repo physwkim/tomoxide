@@ -79,6 +79,46 @@ fn fourierrec_reconstructs_shepp_logan_phantom() {
     );
 }
 
+/// Best-fit scale `a` minimizing `‖x − a·y‖` over the centered disk.
+fn fit_scale(x: &Array2<f32>, y: &Array2<f32>, n: usize, radius_frac: f32) -> f64 {
+    let c = (n as f32 - 1.0) / 2.0;
+    let r = radius_frac * (n as f32 / 2.0);
+    let r2 = r * r;
+    let (mut sxy, mut syy) = (0.0f64, 0.0f64);
+    for iy in 0..n {
+        for ix in 0..n {
+            let dy = iy as f32 - c;
+            let dx = ix as f32 - c;
+            if dx * dx + dy * dy <= r2 {
+                sxy += (x[[iy, ix]] as f64) * (y[[iy, ix]] as f64);
+                syy += (y[[iy, ix]] as f64) * (y[[iy, ix]] as f64);
+            }
+        }
+    }
+    sxy / syy
+}
+
+#[test]
+fn fourierrec_matches_fbp_amplitude() {
+    // AMPLITUDE pin — every check above is Pearson (scale-invariant), which is
+    // exactly how a π·nd²-sized scale defect hid in fourierrec: its output was
+    // uniformly ~2×10⁶× smaller than fbp on 800-wide data (read as "all zeros")
+    // while every parity test passed. All methods emit the tomopy/fbp amplitude
+    // (Phase 2 scale convention), so the best-fit fbp/fourierrec scale must be ≈1;
+    // the residual is the ramp-shape + USFFT-deapodization spectral gap.
+    let n = 128;
+    let nang = 180;
+    let (fr, _) = recon_slice(Algorithm::Fourierrec, n, nang);
+    let (fbp, _) = recon_slice(Algorithm::Fbp, n, nang);
+    let scale = fit_scale(&fbp, &fr, n, 0.85);
+    eprintln!("fbp/fourierrec amplitude scale = {scale:.5}");
+    assert!(
+        (scale - 1.0).abs() < 0.05,
+        "fourierrec amplitude differs from fbp: fbp/fourierrec = {scale:.5} \
+         (expected ≈ 1; a fourierrec normalization/quadrature factor regressed)"
+    );
+}
+
 #[test]
 fn fourierrec_agrees_with_gridrec() {
     // Both are central-slice-theorem direct methods; on the same forward-projected

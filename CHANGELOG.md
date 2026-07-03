@@ -108,6 +108,16 @@ All notable changes to this project are documented here. The format is based on
   weights sum to 1 on identical rows, and EM ratios stay finite where zero-pad
   rows would 0/0) and drop the duplicate; the 1-slice solve equals the same
   slice of a multi-slice solve.
+- **fourierrec output was uniformly π·nd² smaller than every other method**
+  (read as "all zeros" on real data — ~10⁻⁸ at nd = 800) on all three
+  backends: the deapodization missed the Δθ = π/nang angular quadrature
+  weight and compensated the inverse-FFT normalization against the wrong
+  reference amplitude. Invisible to every parity test because they compare
+  Pearson-style (scale-invariant) or fourierrec-to-fourierrec; the best-fit
+  fbp/fourierrec amplitude is now pinned ≈1 by a regression test. Host
+  (`phi_amp = π·nd²/nang`), CUDA (`divphi` ×π/4 over the unnormalized cuFFT
+  inverse), and wgpu (deapodize `norm = π/4`) all land on the unified
+  fbp/tomopy scale; cross-backend ratios are unchanged.
 - **`recon --start_row/--end_row` was silently ignored by the whole-volume
   paths** (algorithms without a streaming handle — gridrec and the iterative
   set, everything on CPU/wgpu — plus `--algorithm` chains): a 1-row request
