@@ -12,6 +12,21 @@ mod worker;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // `tomoxide-gui [FILE] [--mode data|tune|center|run|output|live]`:
+    // optionally open a DXchange .h5 and/or start on a specific mode.
+    let mut open: Option<std::path::PathBuf> = None;
+    let mut mode: Option<app::Mode> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--mode" {
+            match args.next().as_deref().map(app::Mode::from_name) {
+                Some(Some(m)) => mode = Some(m),
+                _ => log::warn!("--mode: expected data|tune|center|run|output|live"),
+            }
+        } else {
+            open = Some(std::path::PathBuf::from(arg));
+        }
+    }
     let options = eframe::NativeOptions {
         // siplot widgets require the wgpu renderer (cc.wgpu_render_state).
         renderer: eframe::Renderer::Wgpu,
@@ -23,6 +38,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "tomoxide",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)) as Box<dyn eframe::App>)),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, open, mode)) as Box<dyn eframe::App>)),
     )
 }

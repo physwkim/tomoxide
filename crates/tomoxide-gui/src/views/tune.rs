@@ -126,7 +126,9 @@ impl TuneView {
         self.current = None;
         self.pinned = None;
         self.pending = false;
-        self.dirty = false;
+        // A fresh dataset makes any shown preview stale; with no preview at
+        // all this also fires the initial one (see ui()).
+        self.dirty = true;
     }
 
     pub fn on_preview(
@@ -428,7 +430,9 @@ impl TuneView {
         };
 
         // Auto-recon loop: one preview in flight; re-issue when params moved.
-        if self.auto_recon && self.dirty && !self.pending {
+        // The very first preview of a dataset fires without the auto toggle,
+        // so entering Tune shows a slice instead of an empty panel.
+        if (self.auto_recon || self.current.is_none()) && self.dirty && !self.pending {
             self.request(jobs, log);
         }
 

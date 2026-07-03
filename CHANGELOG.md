@@ -41,7 +41,10 @@ All notable changes to this project are documented here. The format is based on
   with auto-recon, A/B pin compare), **Center** (Vo / entropy /
   phase-correlation / SIFT auto methods, ±0.5/±0.25 px tweak, hand-off to
   Tune), and recipe save/load (recipe file = CLI config TOML plus a `[gui]`
-  table the CLI ignores).
+  table the CLI ignores). `tomoxide-gui [FILE] [--mode <mode>]` opens a
+  dataset and/or picks the starting mode from the command line, and Tune
+  fires the first preview of a fresh dataset by itself (the auto toggle
+  still gates re-runs on parameter changes).
 - **GUI design document** (`docs/GUI.md`) — design for a `tomoxide-gui`
   desktop application built on siplot (egui + wgpu) and sidm (EPICS PVA):
   offline workflow (dataset browsing, single-slice tune loop with A/B

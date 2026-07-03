@@ -41,6 +41,13 @@ impl Mode {
             Mode::Live => "Live",
         }
     }
+
+    /// Parse a `--mode` command-line value.
+    pub fn from_name(name: &str) -> Option<Mode> {
+        Mode::ALL
+            .into_iter()
+            .find(|m| m.label().eq_ignore_ascii_case(name))
+    }
 }
 
 /// One session-log line with its wall-clock timestamp.
@@ -78,7 +85,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        open: Option<std::path::PathBuf>,
+        start_mode: Option<Mode>,
+    ) -> Self {
         // Every siplot widget constructor needs this; fail loudly at startup
         // rather than per-view if the renderer is misconfigured.
         let render_state = cc
@@ -87,11 +98,16 @@ impl App {
             .expect("eframe must use the wgpu renderer (NativeOptions.renderer = Wgpu)");
         let mut log = SessionLog::default();
         log.push(format!("tomoxide-gui {}", env!("CARGO_PKG_VERSION")));
+        let worker = crate::worker::Worker::spawn(cc.egui_ctx.clone());
+        if let Some(path) = open {
+            log.push(format!("opening {} (command line)", path.display()));
+            let _ = worker.jobs.send(crate::worker::Job::OpenDataset(path));
+        }
         App {
-            mode: Mode::Data,
+            mode: start_mode.unwrap_or(Mode::Data),
             log,
             log_open: true,
-            worker: crate::worker::Worker::spawn(cc.egui_ctx.clone()),
+            worker,
             backend: None,
             meta: None,
             data: crate::views::data::DataView::new(render_state),
