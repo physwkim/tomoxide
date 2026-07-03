@@ -71,6 +71,22 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Iterative reconstructions now converge to the physical μ** — the
+  forward/back-projector pair used by the iterative solvers is the plain
+  line-integral Radon transform `W` and its pure adjoint `Wᵀ` on every
+  backend (CPU, CUDA, wgpu); the `π/nproj` FBP angular-quadrature weight
+  previously baked into both operators is now passed by the *analytic* FBP
+  call sites only, where it belongs. A converged SIRT/CGLS/MLEM/… solve of
+  `W x = p` therefore lands on the attenuation per pixel-unit (pinned by the
+  new `tests/iterative_amplitude.rs` against an analytic disk sinogram)
+  instead of `(nproj/π)·μ` — e.g. ≈ 143× smaller at 450 projections —
+  matching ART/BART, which always solved the ungained ray equations. Iterate
+  trajectories are unchanged up to that overall scale for the self-scaling
+  methods (SIRT/CGLS/MLEM/OSEM/PML/OSPML); for `grad`/`tikh`/`tv` the fixed
+  step and regularization now act on the physical scale, so hand-tuned
+  `reg_par` values from before may need retuning. The grad/tv host and CUDA
+  gain-compensation machinery (`adj_scale`/`fwd_gain_inv`) is deleted.
+  Analytic (FBP/gridrec/…) outputs are unchanged.
 - **GUI preview autoscale is percentile-robust** — image colormaps scale to
   the 0.5–99.5 % range instead of the absolute min/max, so a handful of
   extreme pixels (e.g. the FOV-edge ring iterative methods produce on

@@ -146,14 +146,16 @@ struct BpParams {
 }
 
 impl FilteredBackproject for WgpuBackend {
-    /// Parallel-beam voxel-driven back-projection on the GPU.
+    /// Parallel-beam voxel-driven back-projection on the GPU — the pure adjoint
+    /// `Wᵀ` (gain 1; the analytic dispatcher applies the FBP `π/nang` dθ weight
+    /// itself).
     ///
     /// Mirrors [`CpuBackend::backproject`](../../tomoxide_cpu): one GPU thread
     /// per output voxel sums the (already filtered) sinogram along all angles by
-    /// linear interpolation and scales by `π / n_angles`. The per-angle
-    /// `(cosθ, sinθ)` and the per-row `center` are computed host-side with the
-    /// same `sin_cos` as the CPU path, so the only GPU/CPU divergence is the
-    /// multiply-accumulate rounding — callers compare with a tolerance, not Δ=0.
+    /// linear interpolation, unweighted. The per-angle `(cosθ, sinθ)` and the
+    /// per-row `center` are computed host-side with the same `sin_cos` as the
+    /// CPU path, so the only GPU/CPU divergence is the multiply-accumulate
+    /// rounding — callers compare with a tolerance, not Δ=0.
     fn backproject(&self, sino: &Tomo<f32>, geom: &Geometry, out: &mut Volume<f32>) -> Result<()> {
         if geom.beam != Beam::Parallel {
             return Err(Error::InvalidParam(
@@ -181,19 +183,22 @@ impl FilteredBackproject for WgpuBackend {
 
         let sino_std = s.array.as_standard_layout();
         let sino_buf = self.storage_ro("bp_sino", sino_std.as_slice().expect("standard layout"));
-        out.array = self.backproject_from_dev(&sino_buf, nz, nang, ncols, geom, (ny, nx))?;
+        out.array = self.backproject_from_dev(&sino_buf, nz, nang, ncols, geom, (ny, nx), 1.0)?;
         Ok(())
     }
 }
 
 impl WgpuBackend {
-    /// Device-resident filtered back-projection from an already-uploaded
-    /// (filtered) sinogram buffer (`[nz·nang, ncols]`, sinogram C-order),
-    /// returning the reconstructed volume as `[nz, ny, nx]`. Shared by
+    /// Device-resident back-projection from an already-uploaded (filtered)
+    /// sinogram buffer (`[nz·nang, ncols]`, sinogram C-order), returning the
+    /// reconstructed volume as `[nz, ny, nx]`. Shared by
     /// [`FilteredBackproject::backproject`] (which uploads the host sinogram
-    /// first) and the fused [`AnalyticReconstruct`] path for fbp/linerec (which
-    /// passes the filter's on-device output straight in). `geom` carries the
-    /// per-row centre and angles used for the sampling.
+    /// first and passes `gain = 1.0` — the pure adjoint) and the fused
+    /// [`AnalyticReconstruct`] path for fbp/linerec (which passes the filter's
+    /// on-device output straight in with `gain = π/nang`, the FBP
+    /// angular-quadrature dθ weight). `geom` carries the per-row centre and
+    /// angles used for the sampling.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn backproject_from_dev(
         &self,
         sino_buf: &wgpu::Buffer,
@@ -202,10 +207,10 @@ impl WgpuBackend {
         ncols: usize,
         geom: &Geometry,
         out_dims: (usize, usize),
+        gain: f32,
     ) -> Result<Array3<f32>> {
         let (ny, nx) = out_dims;
         let (cossin, center) = cossin_center(geom, nz);
-        let scale = std::f32::consts::PI / nang as f32;
 
         let cossin_buf = self.storage_ro("bp_cossin", &cossin);
         let center_buf = self.storage_ro("bp_center", &center);
@@ -216,7 +221,7 @@ impl WgpuBackend {
             ncols: ncols as u32,
             ny: ny as u32,
             nx: nx as u32,
-            scale,
+            scale: gain,
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -268,10 +273,12 @@ fn transpose_images(buf: &mut [Complex32], d0: usize, d1: usize, batch: usize) {
 }
 
 impl ForwardProject for WgpuBackend {
-    /// Parallel-beam pixel-driven forward projection (the Radon transform).
+    /// Parallel-beam pixel-driven forward projection — the plain line-integral
+    /// Radon transform (no gain).
     ///
     /// Mirrors [`CpuBackend::project`](../../tomoxide_cpu) — the exact linear-
-    /// interp adjoint of [`Self::backproject`]. Forward projection is a scatter
+    /// interp adjoint of [`Self::backproject`] (both unweighted, so a converged
+    /// iterative solve yields the physical μ). Forward projection is a scatter
     /// (each pixel splats onto two detector columns); the GPU maps one thread
     /// per object voxel and resolves the detector-column collisions with an
     /// atomic f32 accumulate (native `atomicAdd` where the device supports it,
@@ -306,10 +313,7 @@ impl ForwardProject for WgpuBackend {
             ncols: ncols as u32,
             ny: ny as u32,
             nx: nx as u32,
-            // π/nproj — the adjoint gain matching the back-projector, so {A, Aᵀ}
-            // is a matched pair (the iterative solvers rely on this) and the
-            // forward output matches the CPU/CUDA convention.
-            scale: std::f32::consts::PI / nang as f32,
+            _pad0: 0,
             _pad1: 0,
             _pad2: 0,
             _pad3: 0,
@@ -343,7 +347,7 @@ struct FpParams {
     ncols: u32,
     ny: u32,
     nx: u32,
-    scale: f32,
+    _pad0: u32,
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
@@ -1447,8 +1451,15 @@ impl crate::backend::AnalyticReconstruct for WgpuBackend {
                     center: crate::geometry::Center::Scalar(ncols as f32 / 2.0),
                     ..geom.clone()
                 };
-                let arr =
-                    self.backproject_from_dev(&filt_dev, nz, nang, ncols, &centered, (n, n))?;
+                let arr = self.backproject_from_dev(
+                    &filt_dev,
+                    nz,
+                    nang,
+                    ncols,
+                    &centered,
+                    (n, n),
+                    std::f32::consts::PI / nang as f32, // FBP angular quadrature dθ
+                )?;
                 Ok(Volume::new(arr))
             }
             // recon::recon only routes these three algorithms here.
@@ -1494,7 +1505,9 @@ impl WgpuBackend {
     /// Forward-project `vol_buf` into `sino_buf` (both device-resident), zeroing
     /// `sino_buf` first (the per-voxel atomic-splat kernel accumulates). `cossin_buf` /
     /// `center_buf` are the geometry buffers uploaded once by the iterative solver
-    /// so the per-iteration projection reuses them. Matched adjoint gain π/nproj.
+    /// so the per-iteration projection reuses them. Unweighted (the plain
+    /// line-integral Radon transform), matching [`Self::backproject_into_dev`]'s
+    /// gain-1 adjoint.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_into_dev(
         &self,
@@ -1513,7 +1526,7 @@ impl WgpuBackend {
             ncols: ncols as u32,
             ny: ny as u32,
             nx: nx as u32,
-            scale: std::f32::consts::PI / nang as f32,
+            _pad0: 0,
             _pad1: 0,
             _pad2: 0,
             _pad3: 0,
@@ -1530,8 +1543,10 @@ impl WgpuBackend {
     }
 
     /// Back-project `sino_buf` into `vol_buf` (both device-resident; the voxel
-    /// kernel overwrites, so no pre-zero). Matched adjoint gain π/nproj. Shares
-    /// the geometry buffers with [`Self::forward_into_dev`].
+    /// kernel overwrites, so no pre-zero). Gain 1 — the pure adjoint of
+    /// [`Self::forward_into_dev`]'s unweighted scatter (the FBP π/nproj dθ
+    /// weight belongs to the analytic paths only). Shares the geometry buffers
+    /// with [`Self::forward_into_dev`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn backproject_into_dev(
         &self,
@@ -1549,7 +1564,7 @@ impl WgpuBackend {
             ncols: ncols as u32,
             ny: ny as u32,
             nx: nx as u32,
-            scale: std::f32::consts::PI / nang as f32,
+            scale: 1.0, // pure adjoint Wᵀ — no angular-quadrature gain
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -1567,7 +1582,7 @@ impl WgpuBackend {
     /// and the R/C weights resident on the GPU across every iteration — one
     /// upload, one download — instead of the generic host solver's per-iteration
     /// forward/back-projection round-trips. Mirrors the CUDA `sirt_device`
-    /// arithmetic (matched π/nproj projector pair, R = 1/A(1), C = 1/Aᵀ(1),
+    /// arithmetic (unweighted matched projector pair, R = 1/A(1), C = 1/Aᵀ(1),
     /// x += C∘Aᵀ(R∘(b−Ax))), so the result matches the host SIRT within GPU ULPs.
     fn sirt_device(
         &self,

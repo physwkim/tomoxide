@@ -112,7 +112,12 @@ fn ext_pad_recovers_truncated_projections() {
     let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
     let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
     let mut sino = sim::project(&vol, &geom, &cpu).unwrap();
-    sino.array += 0.5;
+    // Offset comparable to the sinogram's own peak — the discriminating
+    // regime (a much smaller offset barely rings and ext_pad has nothing to
+    // fix). `0.5` was that peak back when the forward projector carried a
+    // π/nang gain; in today's ungained line-integral units the same relative
+    // inconsistency is 0.5·nang/π.
+    sino.array += 0.5 * nang as f32 / std::f32::consts::PI;
 
     let p = |ext_pad| ReconParams {
         num_gridx: Some(n),

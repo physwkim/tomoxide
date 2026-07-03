@@ -425,14 +425,18 @@ impl Fft for CpuBackend {
 }
 
 impl FilteredBackproject for CpuBackend {
-    /// Parallel-beam voxel-driven back-projection.
+    /// Parallel-beam voxel-driven back-projection — the pure adjoint `Wᵀ`.
     ///
     /// For each output pixel `(iy, ix)` and angle θ the detector coordinate is
     /// `t = (ix − cx)·cosθ + (iy − cy)·sinθ + center`; the (already filtered, for
-    /// FBP) sinogram is sampled there by linear interpolation and summed, then
-    /// scaled by `π / n_angles`. Slices (`z` rows) are independent and run in
-    /// parallel via rayon; `center` is taken per row. The mapping matches the
-    /// forward projector so phantom → project → FBP round-trips.
+    /// FBP) sinogram is sampled there by linear interpolation and summed over
+    /// angles — no gain. The FBP angular-quadrature weight `π / n_angles` (the
+    /// dθ of the back-projection integral) is applied by the analytic dispatcher
+    /// (`recon::analytic`), NOT here, so the iterative solvers get the exact
+    /// unweighted adjoint of [`ForwardProject::project`]. Slices (`z` rows) are
+    /// independent and run in parallel via rayon; `center` is taken per row. The
+    /// mapping matches the forward projector so phantom → project → FBP
+    /// round-trips.
     ///
     /// Ports the parallel-beam back-projection of tomopy `libtomo/recon/fbp.c`.
     fn backproject(&self, sino: &Tomo<f32>, geom: &Geometry, out: &mut Volume<f32>) -> Result<()> {
@@ -469,7 +473,6 @@ impl FilteredBackproject for CpuBackend {
             .collect();
         let cx = nx as f32 / 2.0;
         let cy = ny as f32 / 2.0;
-        let scale = std::f32::consts::PI / nang as f32;
 
         let sino_slice = s
             .array
@@ -501,7 +504,7 @@ impl FilteredBackproject for CpuBackend {
                                 acc += sino_slice[off] * (1.0 - frac) + sino_slice[off + 1] * frac;
                             }
                         }
-                        slab[iy * nx + ix] = acc * scale;
+                        slab[iy * nx + ix] = acc;
                     }
                 }
             });
@@ -510,14 +513,19 @@ impl FilteredBackproject for CpuBackend {
 }
 
 impl ForwardProject for CpuBackend {
-    /// Parallel-beam pixel-driven forward projection (the Radon transform).
+    /// Parallel-beam pixel-driven forward projection — the plain line-integral
+    /// Radon transform `W` (unit pixel spacing, no gain), the exact unweighted
+    /// adjoint of [`FilteredBackproject::backproject`]'s `Wᵀ`.
     ///
     /// Each object pixel `(iy, ix)` with value `f` splats onto detector column
     /// `t = (ix − cx)·cosθ + (iy − cy)·sinθ + center` for every angle, splitting
-    /// `f` linearly between the two nearest columns. This is the exact adjoint
-    /// of the back-projector's linear interpolation (same boundary rule), so the
-    /// two round-trip. `out` is overwritten with a fresh `[row, angle, col]`
-    /// sinogram; slices run in parallel with a per-row `center`.
+    /// `f` linearly between the two nearest columns — the exact adjoint of the
+    /// back-projector's linear interpolation (same boundary rule), so the two
+    /// round-trip and any consistent solve of `W x = p` converges to the
+    /// physical μ (matching ART/BART and tomopy `project.c`, whose output is
+    /// likewise the true line integral). `out` is overwritten with a fresh
+    /// `[row, angle, col]` sinogram; slices run in parallel with a per-row
+    /// `center`.
     ///
     /// Ports tomopy `libtomo/recon/project.c`.
     fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
@@ -578,14 +586,6 @@ impl ForwardProject for CpuBackend {
                     }
                 }
             });
-        // Scale by π/n_angles so the forward projector is the true adjoint of the
-        // back-projector (which carries the same `PI/nang`, see the recon path). The
-        // raw geometry scatter above is `W`; the back-projector is `(π/nang)·Wᵀ`, so
-        // the forward must be `(π/nang)·W` for {A, Aᵀ} to be a matched adjoint pair.
-        // The iterative solvers rely on this; it also matches the CUDA projector pair
-        // (both π/nproj) so iterative recon is scale-consistent across backends.
-        let scale = std::f32::consts::PI / nang as f32;
-        data.par_iter_mut().for_each(|v| *v *= scale);
         let array = ndarray::Array3::from_shape_vec((nz, nang, ncols), data)
             .map_err(|e| Error::InvalidParam(format!("forward-projection shape: {e}")))?;
         *out = Tomo::new(array, Layout::Sinogram);
@@ -814,7 +814,9 @@ mod tests {
     #[test]
     fn backproject_single_angle_smears_along_ray() {
         // θ = 0, center = width/2 ⇒ t = ix; column 1 of the sinogram smears
-        // across every output row at output column 1.
+        // across every output row at output column 1. The back-projector is the
+        // pure adjoint Wᵀ (no angular-quadrature gain — the analytic dispatcher
+        // applies π/nang itself), so the unit sample lands as 1.0.
         let mut sarr = Array3::<f32>::zeros((1, 1, 4)); // [row, angle, col]
         sarr[[0, 0, 1]] = 1.0;
         let s = Tomo::new(sarr, Layout::Sinogram);
@@ -822,7 +824,7 @@ mod tests {
         let mut out = Volume::new(Array3::<f32>::zeros((1, 4, 4)));
         CpuBackend.backproject(&s, &geom, &mut out).unwrap();
         for iy in 0..4 {
-            assert!((out.array[[0, iy, 1]] - PI).abs() < 1e-4, "iy={iy}");
+            assert!((out.array[[0, iy, 1]] - 1.0).abs() < 1e-4, "iy={iy}");
             assert!(out.array[[0, iy, 0]].abs() < 1e-6);
             assert!(out.array[[0, iy, 2]].abs() < 1e-6);
         }
@@ -832,20 +834,19 @@ mod tests {
     fn forward_project_center_pixel_hits_center_column() {
         // A single pixel at the grid center (cx = cy = 2) projects to t = center
         // = width/2 = 2 for every angle, so column 2 holds the value everywhere.
-        // The projector carries the adjoint gain π/n_angles (see `project`), so the
-        // unit pixel lands as π/nang, not 1.0.
+        // The projector is the plain line-integral Radon transform (no gain —
+        // see `project`), so the unit pixel lands as exactly 1.0 per angle.
         let mut varr = Array3::<f32>::zeros((1, 4, 4));
         varr[[0, 2, 2]] = 1.0;
         let v = Volume::new(varr);
         let nang = 4;
-        let scale = PI / nang as f32;
         let geom = Geometry::parallel(Angles::uniform(nang, 0.0, PI), 4, 1, 1.0);
         let mut s = Tomo::new(Array3::<f32>::zeros((1, 4, 4)), Layout::Sinogram);
         CpuBackend.project(&v, &geom, &mut s).unwrap();
         assert_eq!(s.layout, Layout::Sinogram);
         assert_eq!(s.array.dim(), (1, 4, 4));
         for ia in 0..4 {
-            assert!((s.array[[0, ia, 2]] - scale).abs() < 1e-4, "ia={ia}");
+            assert!((s.array[[0, ia, 2]] - 1.0).abs() < 1e-4, "ia={ia}");
             assert!(s.array[[0, ia, 0]].abs() < 1e-6);
         }
     }

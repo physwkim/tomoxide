@@ -251,11 +251,13 @@ backend ports **tomocupy**, and the unification target is tomopy):
    forward-projectors were flipped together, so they remain a discrete transpose.
 2. **Filter amplitude** — the CUDA-only `½` in `build_filter_w` (tomocupy's net
    FBP gain) was dropped; the gain is now `1/pad`, matching tomopy.
-3. **Back-projection scale** — `cfunc_linerec`'s `c = 4/nproj` (tomocupy) became
-   `π/nproj` (tomopy). The CPU forward projector (`sim::project`) was scaled by the
-   same `π/nproj` so the CPU `{A, Aᵀ}` pair is a true adjoint at one scale, and the
-   CUDA forward projector matches — keeping the iterative solvers well-posed on both
-   backends (see `recon/mod.rs` grad/tv gain-normalization).
+3. **Back-projection scale** — `cfunc_linerec`'s baked-in `c = 4/nproj`
+   (tomocupy) became a caller-supplied gain: the analytic FBP call sites pass the
+   `π/nproj` angular-quadrature dθ weight (tomopy scale), while the iterative
+   solvers pass `1.0` — the back-projector itself is the *pure* adjoint `Wᵀ` of
+   the unweighted line-integral forward projector `W` on every backend, so a
+   converged iterative solve yields the physical μ (pinned absolutely by
+   `tests/iterative_amplitude.rs`).
 4. **fourierrec normalization** — cuFFT does not normalize its inverse transform
    and `plan2d` is `(2n)²`, so the CUDA fourierrec ran `(2n)²`× hot; `divphi` now
    divides by `(2n)²` to match the CPU's normalized inverse FFT.

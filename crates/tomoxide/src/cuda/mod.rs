@@ -534,14 +534,17 @@ mod cuda_impl {
 
     impl FilteredBackproject for CudaBackend {
         /// Parallel-beam voxel-driven back-projection via the vendored
-        /// `cfunc_linerec` kernel (phi = π/2). The sinogram must already be filtered
-        /// and centred on the detector midpoint (`recon` does this through the
-        /// shared FBP filter), so the kernel assumes centre `n/2`. Output is
+        /// `cfunc_linerec` kernel (phi = π/2, gain 1). The sinogram must already be
+        /// filtered and centred on the detector midpoint (`recon` does this through
+        /// the shared FBP filter), so the kernel assumes centre `n/2`. Output is
         /// `[nz, n, n]` in the **CPU/tomopy convention**: the kernel's tomocupy
-        /// y-flip and `4/nproj` gain have been unified to the CPU handedness and
-        /// `π/nproj` scale (Phase 1/2 cross-backend unification), so CUDA back-
-        /// projection matches the CPU back-projector directly (see
-        /// `tests/cuda_cpu_convention_parity.rs` and `docs/ARCHITECTURE.md §4.1`).
+        /// y-flip has been unified to the CPU handedness (Phase 1/2 cross-backend
+        /// unification), so CUDA back-projection matches the CPU back-projector
+        /// directly (see `tests/cuda_cpu_convention_parity.rs` and
+        /// `docs/ARCHITECTURE.md §4.1`). Like every `FilteredBackproject`, this is
+        /// the *pure* adjoint `Wᵀ` (no angular-quadrature gain): the analytic
+        /// dispatcher applies the FBP `π/nproj` dθ weight itself, and the iterative
+        /// solvers consume `Wᵀ` directly.
         fn backproject(
             &self,
             sino: &Tomo<f32>,
@@ -616,6 +619,7 @@ mod cuda_impl {
                     g.ptr,
                     theta_d.ptr as *const f32,
                     phi,
+                    1.0, // pure adjoint Wᵀ — no angular-quadrature gain
                     0,
                     std::ptr::null_mut(),
                 );
@@ -638,14 +642,15 @@ mod cuda_impl {
     impl ForwardProject for CudaBackend {
         /// Parallel-beam forward projection (`forwardprojection_ker`), the exact
         /// discrete transpose of [`FilteredBackproject::backproject`]
-        /// (`cfunc_linerec`, phi = π/2): same handedness, centre `n/2`, and matching
-        /// `π/nproj` scale (both unified off tomocupy's y-flip/`4/nproj` to the
-        /// CPU/tomopy convention). The two therefore form a symmetric `{A, Aᵀ}` pair
-        /// at the SAME scale — matching the now-adjoint CPU projector pair — which is
-        /// what the generic iterative solvers (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV)
-        /// require. Like the back-projector, the kernel hard-wires
-        /// centre `n/2` (it ignores `geom.center`) and assumes the detector width
-        /// equals the grid `n`. Output is `[nz, nproj, n]` in `Sinogram` layout.
+        /// (`cfunc_linerec`, phi = π/2, gain 1): same handedness, centre `n/2`, and
+        /// both unweighted, so the two form a true `{A, Aᵀ}` pair — matching the
+        /// CPU projector pair — which is what the generic iterative solvers
+        /// (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV) require. `A` is the plain
+        /// line-integral Radon transform (unit pixel spacing), so a converged
+        /// solve of `A x = p` yields the physical μ. Like the back-projector, the
+        /// kernel hard-wires centre `n/2` (it ignores `geom.center`) and assumes
+        /// the detector width equals the grid `n`. Output is `[nz, nproj, n]` in
+        /// `Sinogram` layout.
         fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
             if geom.beam != Beam::Parallel {
                 return Err(Error::InvalidParam(
@@ -771,7 +776,9 @@ mod cuda_impl {
 
     /// On-device back projection `f = Aᵀ g` (parallel beam) via a reused
     /// `cfunc_linerec` handle: zero `f` (the kernel accumulates) then launch.
-    /// `vbytes` = byte size of `f`.
+    /// Gain 1 — the pure adjoint of [`dev_forward`], no angular-quadrature
+    /// weight (that π/nproj belongs to the analytic FBP paths only). `vbytes` =
+    /// byte size of `f`.
     ///
     /// # Safety
     /// `handle` from [`ffi::tomoxide_linerec_new`]; `f`/`g`/`theta` valid device
@@ -792,6 +799,7 @@ mod cuda_impl {
             g,
             theta,
             std::f32::consts::FRAC_PI_2,
+            1.0,
             0,
             null,
         );
@@ -1084,7 +1092,7 @@ mod cuda_impl {
 
     /// Device-resident least-squares gradient descent (`grad`) and its Tikhonov
     /// variant (`tikh`). The iterate lives on the GPU in the r-scaled domain
-    /// (init 0); each iteration computes `grad = 2r·adj·Rᵀ(r·R x − b)` (+ the
+    /// (init 0); each iteration computes `grad = 2r·Rᵀ(r·R x − b)` (+ the
     /// Tikhonov term `2·reg1·(x − prior)` when `tikh` is `Some`), a per-slice step
     /// `λ` (fixed if `reg_par[0] ≥ 0`, else Barzilai–Borwein via on-device
     /// reductions), and `x ← x − λ g`, then unscales by `r`. `recon0`/`grad0`
@@ -1118,12 +1126,7 @@ mod cuda_impl {
         let null = std::ptr::null_mut::<c_void>();
 
         let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
-        let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
-                                                             // Divide the forward projector's adjoint gain π/nproj back out of the data
-                                                             // gradient (folded into `coef`, since grad = coef·Rᵀ(r·R x − b)) so the
-                                                             // conditioning is invariant to that gain — matching the host `gradient_descent`.
-        let fwd_gain_inv = nproj as f32 / std::f32::consts::PI;
-        let coef = 2.0 * r * adj_scale * fwd_gain_inv;
+        let coef = 2.0 * r; // grad = 2r·Rᵀ(r·R x − b), {R, Rᵀ} the unweighted pair
         let fixed_step = reg_par.first().copied().unwrap_or(1.0);
         let two_reg1 = tikh.as_ref().map(|(r1, _)| 2.0 * r1).unwrap_or(0.0);
 
@@ -1154,7 +1157,7 @@ mod cuda_impl {
                 dev_forward(ax_d.ptr, vol_d.ptr, tp, nz, n, nproj, sbytes); // ax = R x
                 ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null); // r·R x − b
                 dev_backproject(handle, bpv_d.ptr, ax_d.ptr, tp, vbytes); // Rᵀ(…)
-                ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·adj·Rᵀ
+                ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·Rᵀ
                 if let Some(pd) = &prior_d {
                     ffi::tomoxide_iter_grad_tikh(
                         grad_d.ptr, vol_d.ptr, pd.ptr, two_reg1, nvol, null,
@@ -1351,11 +1354,6 @@ mod cuda_impl {
         );
         let null = std::ptr::null_mut::<c_void>();
         let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
-        let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
-                                                             // Divide the forward projector's adjoint gain π/nproj back out of the data
-                                                             // residual so the fixed Chambolle–Pock step stays well-conditioned regardless
-                                                             // of that gain (matches the host `tv`).
-        let fwd_gain_inv = nproj as f32 / std::f32::consts::PI;
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
@@ -1378,23 +1376,13 @@ mod cuda_impl {
         unsafe {
             for _ in 0..num_iter.max(1) {
                 dev_forward(ax_d.ptr, xbar_d.ptr, tp, nz, n, nproj, sbytes); // R x̄
-                ffi::tomoxide_iter_tv_datadual(
-                    pd_d.ptr,
-                    ax_d.ptr,
-                    b_d.ptr,
-                    C,
-                    r,
-                    fwd_gain_inv,
-                    nsino,
-                    null,
-                );
-                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, vbytes); // (π/nproj)·Rᵀ(pd)
+                ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null);
+                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, vbytes); // Rᵀ(pd)
                 ffi::tomoxide_iter_tv_dual(
                     p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
                 );
                 ffi::tomoxide_iter_tv_primal(
-                    x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, adj_scale, n, nz,
-                    null,
+                    x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, n, nz, null,
                 );
             }
             ffi::tomoxide_iter_scale_inplace(xbar_d.ptr, r, nvol, null); // back to physical domain
@@ -1423,7 +1411,8 @@ mod cuda_impl {
         /// assume detector width = grid `n`). Reuses the same `A`/`Aᵀ` kernels as
         /// the generic solvers, so results match the host to the atomic-add floor
         /// (since the orientation/scale unification the CUDA projectors share the
-        /// CPU handedness and `π/nproj` scale — no volume-space y-flip).
+        /// CPU handedness — no volume-space y-flip; the projector pair is the
+        /// unweighted `{Wᵀ, W}`, so every solver converges to the physical μ).
         fn solve(
             &self,
             sino: &Tomo<f32>,
@@ -1577,8 +1566,9 @@ mod cuda_impl {
     /// (Phase 2) targets CPU/tomopy — whose filter carries no such ½ — so it was
     /// dropped. The gain lives only here, so this single site sets the filter scale
     /// for every CUDA analytic method (fbp/linerec/fourierrec f32 + f16, one-shot +
-    /// streaming). fbp/linerec additionally need the back-projector `c` change
-    /// (`4/nproj → π/nproj`, `cfunc_linerec.cu`) to reach CPU scale; fourierrec
+    /// streaming). fbp/linerec additionally need the `π/nproj` dθ weight the
+    /// analytic call sites pass to `cfunc_linerec` (was tomocupy's baked-in
+    /// `4/nproj`) to reach CPU scale; fourierrec
     /// additionally normalizes its unnormalized cuFFT inverse by `(2n)²`. The
     /// laminography path also reads this filter but is a *different algorithm* from
     /// CPU USFFT lamino and is excluded from the unification (its cuda/cpu scale +
@@ -1598,7 +1588,8 @@ mod cuda_impl {
         // CUDA analytic amplitude to match tomocupy; the cross-backend convention
         // unification (Phase 2) targets CPU/tomopy instead, whose filter carries no
         // such ½ — so drop it. This alone brings lprec to cpu scale (k ½→1); fbp/
-        // linerec additionally need the back-projector `c` change (4/nproj→π/nproj).
+        // linerec additionally need the π/nproj dθ weight passed at the analytic
+        // back-projection call sites (was tomocupy's baked-in 4/nproj).
         let inv_pad = 1.0f32 / pad as f32;
         let mut w = vec![0.0f32; nz * nfreq * 2];
         for z in 0..nz {
@@ -1681,6 +1672,7 @@ mod cuda_impl {
                 gf.ptr,
                 theta_dev.ptr as *const f32,
                 std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                 0,
                 null,
             );
@@ -1770,6 +1762,7 @@ mod cuda_impl {
                 gf.ptr,
                 theta_dev.ptr as *const f32,
                 phi,
+                std::f32::consts::PI / nproj as f32, // analytic angular quadrature dθ
                 sz,
                 null,
             );
@@ -1859,6 +1852,7 @@ mod cuda_impl {
                 gf.ptr,
                 theta_dev.ptr as *const f32,
                 std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                 0,
                 null,
             );
@@ -3190,6 +3184,7 @@ mod cuda_impl {
                             self.gf.ptr,
                             self.theta.ptr as *const f32,
                             std::f32::consts::FRAC_PI_2,
+                            std::f32::consts::PI / nproj as f32, // FBP dθ weight
                             0,
                             null,
                         );
@@ -3343,6 +3338,7 @@ mod cuda_impl {
                         self.gf.ptr,
                         self.theta.ptr as *const f32,
                         std::f32::consts::FRAC_PI_2,
+                        std::f32::consts::PI / nproj as f32, // FBP dθ weight
                         0,
                         null,
                     );
@@ -3520,6 +3516,7 @@ mod cuda_impl {
                     slots[s].gf.ptr,
                     theta_dev.ptr as *const f32,
                     std::f32::consts::FRAC_PI_2,
+                    std::f32::consts::PI / nproj as f32, // FBP dθ weight
                     0,
                     st,
                 );
@@ -3777,6 +3774,7 @@ mod cuda_impl {
                     slots[s].gf.ptr,
                     theta_dev.ptr as *const f32,
                     std::f32::consts::FRAC_PI_2,
+                    std::f32::consts::PI / nproj as f32, // FBP dθ weight
                     0,
                     st,
                 );

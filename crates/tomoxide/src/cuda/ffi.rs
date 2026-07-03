@@ -84,13 +84,17 @@ unsafe extern "C" {
         ncproj: usize,
         ncz: usize,
     ) -> *mut c_void;
-    /// `backprojection(f, g, theta, phi, sz, stream)` (phi = π/2 for parallel beam).
+    /// `backprojection(f, g, theta, phi, gain, sz, stream)` (phi = π/2 for
+    /// parallel beam). `gain` is the caller's angular quadrature weight:
+    /// π/nproj for the analytic FBP paths (the dθ weight), 1.0 for the
+    /// iterative solvers (pure adjoint of `tomoxide_forwardproject`).
     pub fn tomoxide_linerec_backproject(
         handle: *mut c_void,
         f: *mut c_void,
         g: *const c_void,
         theta: *const f32,
         phi: f32,
+        gain: f32,
         sz: i32,
         stream: *mut c_void,
     );
@@ -174,7 +178,6 @@ unsafe extern "C" {
         b: *const c_void,
         c: f32,
         r: f32,
-        g: f32,
         n: usize,
         stream: *mut c_void,
     ) -> i32;
@@ -190,7 +193,7 @@ unsafe extern "C" {
         nz: usize,
         stream: *mut c_void,
     ) -> i32;
-    /// TV primal step + over-relaxation: `x ← x − c·r·adj·Rᵀ(pd) + c·div(pᵀᵛ)`,
+    /// TV primal step + over-relaxation: `x ← x − c·r·Rᵀ(pd) + c·div(pᵀᵛ)`,
     /// `xbar ← 2x − x_old`. 3-D grid `[nz,n,n]`.
     pub fn tomoxide_iter_tv_primal(
         x: *mut c_void,
@@ -200,7 +203,6 @@ unsafe extern "C" {
         p0y: *const c_void,
         c: f32,
         r: f32,
-        adj_scale: f32,
         n: usize,
         nz: usize,
         stream: *mut c_void,
@@ -773,6 +775,7 @@ unsafe extern "C" {
         g: *const c_void,
         theta: *const f32,
         phi: f32,
+        gain: f32,
         sz: i32,
         stream: *mut c_void,
     );

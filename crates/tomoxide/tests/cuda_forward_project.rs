@@ -223,12 +223,13 @@ fn cuda_forward_matches_cpu() {
     let r_ok = pearson(&g, &interior(&cpu_sino));
     let r_wrong = pearson(&g, &interior(&cpu_sino_flip));
 
-    // Best-fit scale cuda/cpu over the interior. Since the Phase-2 convention
-    // unification the CUDA forward carries the same π/nproj adjoint gain as the
-    // CPU forward (baked into forwardproj.cu's `c`), so this is ≈ 1.0, not the
-    // pre-unification 4/nproj. Asserted below so a scale regression (e.g. dropping
-    // `c` from the kernel) is caught — the r-check above is Pearson, which is
-    // scale-invariant and would silently pass such a regression.
+    // Best-fit scale cuda/cpu over the interior. Both forwards are the plain
+    // line-integral Radon transform (no gain — the iterative-pair convention;
+    // tests/iterative_amplitude.rs pins the CPU side absolutely), so this is
+    // ≈ 1.0, not the pre-unification 4/nproj. Asserted below so a scale
+    // regression (a gain reintroduced in forwardproj.cu) is caught — the
+    // r-check above is Pearson, which is scale-invariant and would silently
+    // pass such a regression.
     let p = interior(&cpu_sino);
     let (num, den): (f64, f64) = g
         .iter()
@@ -251,12 +252,13 @@ fn cuda_forward_matches_cpu() {
         r_wrong < 0.99,
         "orientation pin ineffective: wrong-handedness r = {r_wrong:.6} (expected < 0.99)"
     );
-    // Absolute-scale invariant: CUDA forward must match the CPU forward's π/nproj
-    // gain, not merely correlate. Pearson alone is scale-blind, so without this a
-    // reintroduced 4/nproj (or a dropped `c`) would pass unnoticed.
+    // Absolute-scale invariant: CUDA forward must match the CPU forward's
+    // ungained line-integral convention, not merely correlate. Pearson alone is
+    // scale-blind, so without this a reintroduced 4/nproj or π/nproj gain would
+    // pass unnoticed.
     assert!(
         (scale - 1.0).abs() < 0.02,
-        "CUDA forward scale drifted from the CPU/adjoint π/nproj convention: \
+        "CUDA forward scale drifted from the CPU line-integral convention: \
          cuda/cpu = {scale:.6} (expected ≈ 1.0)"
     );
 }

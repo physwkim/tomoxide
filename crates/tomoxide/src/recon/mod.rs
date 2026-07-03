@@ -160,6 +160,13 @@ fn analytic(
     };
     let mut vol = Volume::new(Array3::zeros((nz, n, n)));
     bp.backproject(&filtered, &centered, &mut vol)?;
+    // FBP angular quadrature: the back-projection integral ∫₀^π … dθ discretizes
+    // to a sum weighted by dθ = π/nang. `FilteredBackproject` is the *pure*
+    // adjoint Wᵀ (the iterative solvers need it unweighted), so the analytic
+    // path owns this weight — matching the fused CUDA/wgpu analytic paths, which
+    // pass the same π/nproj gain to their kernels.
+    let dtheta = std::f32::consts::PI / sino.n_angles() as f32;
+    vol.array.mapv_inplace(|v| v * dtheta);
     Ok(vol)
 }
 
@@ -727,10 +734,9 @@ fn ospml(
 /// is either fixed (`reg_par[0] ≥ 0`) or Barzilai–Borwein adaptive
 /// (`reg_par[0] < 0`, `λ = ⟨Δx, Δg⟩ / ⟨Δg, Δg⟩`, first step `1e-3`). `x` iterates
 /// in the r-scaled domain (tomopy scales the initial guess by `1/r`; from a zero
-/// start that is a no-op) and is multiplied by `r` on return. `R` = forward
-/// projector, `Rᵀ` = its *raw* adjoint — the back-projector bakes in a `π/nang`
-/// factor (for FBP), which is divided back out here so the `r` normalization
-/// holds. Unlike the EM methods this imposes no positivity.
+/// start that is a no-op) and is multiplied by `r` on return. `R` = the plain
+/// line-integral forward projector, `Rᵀ` = the back-projector, its exact
+/// unweighted adjoint. Unlike the EM methods this imposes no positivity.
 ///
 /// `tikhonov = Some((reg1, prior))` adds the Tikhonov gradient
 /// `2·reg1·(x − prior)` (penalizing ‖x − prior‖², a ridge term pulling the
@@ -760,12 +766,6 @@ fn gradient_descent(
     let ncols = b.n_cols();
 
     let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
-    let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
-                                                        // The forward projector now carries the adjoint gain π/nang (see `CpuBackend::
-                                                        // project`); divide it back out of the data residual so the fixed-step/BB
-                                                        // conditioning is invariant to that gain (identical to the pre-adjoint-unification
-                                                        // behaviour, and matched by the CUDA device-resident solver).
-    let fwd_gain_inv = nang as f32 / std::f32::consts::PI;
     let fixed_step = params.reg_par.first().copied().unwrap_or(1.0);
 
     // r-scaled domain (physical = r · iterate); a warm-start seed enters as init / r.
@@ -782,9 +782,9 @@ fn gradient_descent(
         let mut prox1 = ax.array.clone();
         ndarray::Zip::from(&mut prox1)
             .and(&b.array)
-            .for_each(|p, &d| *p = (*p * r - d) * fwd_gain_inv); // (r·R x − b)/gain
+            .for_each(|p, &d| *p = *p * r - d); // r·R x − b
         bp.backproject(&Tomo::new(prox1, Layout::Sinogram), geom, &mut bpv)?;
-        let mut grad = bpv.array.mapv(|v| 2.0 * r * adj_scale * v); // 2r·Rᵀ(…)
+        let mut grad = bpv.array.mapv(|v| 2.0 * r * v); // 2r·Rᵀ(…)
 
         // Tikhonov gradient 2·reg1·(x − prior), added in the scaled domain.
         if let Some((reg1, ref prior)) = tikhonov {
@@ -989,11 +989,11 @@ fn cgls(
 /// `pᵈ ← (pᵈ + c(r·R x̄ − b))/(1+c)` — then a primal step
 /// `xₙ ← x_old − c·r·Rᵀ(pᵈ) + c·div(pᵀᵛ)` and the θ=1 over-relaxation
 /// `x̄ ← 2xₙ − x_old`. `λ = reg_par[0]` is the TV strength; `c = 0.35` is tomopy's
-/// fixed primal–dual step. As in `grad`, `x` lives in the r-scaled domain
-/// (`r = 1/√(ncols·nang/2)`) and is rescaled by `r` on return, the back-projector's
-/// `π/nang` factor is divided back out for the raw adjoint, and the result is the
-/// final extrapolated point `x̄` (matching tomopy, which returns `recon`). No
-/// positivity constraint.
+/// fixed primal–dual step. As in `grad`, `R`/`Rᵀ` are the unweighted
+/// line-integral pair, `x` lives in the r-scaled domain
+/// (`r = 1/√(ncols·nang/2)`) and is rescaled by `r` on return, and the result is
+/// the final extrapolated point `x̄` (matching tomopy, which returns `recon`).
+/// No positivity constraint.
 ///
 /// The projector-model caveat from `grad` applies: tomopy's `r` and the hardcoded
 /// `c = 0.35` (the Chambolle–Pock step, where convergence wants `c²·‖K‖² ≤ 1` for
@@ -1015,12 +1015,6 @@ fn tv(
     let ncols = b.n_cols();
 
     let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
-    let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
-                                                        // Divide the forward projector's adjoint gain π/nang back out of the data term
-                                                        // (see `gradient_descent`) so the fixed Chambolle–Pock step stays well-
-                                                        // conditioned regardless of that gain; keeps the CP data operator norm — and
-                                                        // thus the convergence rate and the TV/data balance — invariant to it.
-    let fwd_gain_inv = nang as f32 / std::f32::consts::PI;
     let lambda = params.reg_par.first().copied().unwrap_or(1.0); // TV strength
     const C: f32 = 0.35; // tomopy's fixed primal–dual step
 
@@ -1042,8 +1036,8 @@ fn tv(
         ndarray::Zip::from(&mut pd.array)
             .and(&ax.array)
             .and(&b.array)
-            .for_each(|q, &a, &d| *q = (*q + fwd_gain_inv * (C * r * a - C * d)) / (1.0 + C));
-        bp.backproject(&pd, geom, &mut bpv)?; // (π/nang)·Rᵀ(pᵈ)
+            .for_each(|q, &a, &d| *q = (*q + C * r * a - C * d) / (1.0 + C));
+        bp.backproject(&pd, geom, &mut bpv)?; // Rᵀ(pᵈ)
 
         for z in 0..nz {
             // TV dual ascent on x̄, then project onto the λ-ball (interior stencil;
@@ -1062,7 +1056,7 @@ fn tv(
             for iy in 0..n {
                 for ix in 0..n {
                     let x_old = x[[z, iy, ix]];
-                    let mut u = x_old - C * r * adj_scale * bpv.array[[z, iy, ix]];
+                    let mut u = x_old - C * r * bpv.array[[z, iy, ix]];
                     u += if ix == 0 {
                         C * p0x[[z, iy, 0]]
                     } else {
