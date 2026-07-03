@@ -279,6 +279,39 @@ pub fn open_dxchange(path: &str) -> Result<Box<dyn DatasetReader>> {
     Ok(Box::new(H5DxchangeReader::open(path)?))
 }
 
+/// Read frame `index` of a 3-D `[n, ny, nx]` HDF5 dataset as
+/// `(ny, nx, row-major f32)`, converting from any numeric on-disk dtype (the
+/// same dispatch the DXchange readers use — real beamline stacks are usually
+/// `uint16`). One hyperslab read per call: the lazy entry point for
+/// projection/volume frame browsers. `data_path` may be absolute
+/// (`/exchange/data`) or relative.
+pub fn read_h5_frame(
+    path: &str,
+    data_path: &str,
+    index: usize,
+) -> Result<(usize, usize, Vec<f32>)> {
+    let file = H5File::open(path).map_err(|e| Error::Io(format!("open {path}: {e}")))?;
+    // rust-hdf5 keys nested datasets without a leading slash.
+    let key = data_path.strip_prefix('/').unwrap_or(data_path);
+    let ds = file
+        .dataset(key)
+        .map_err(|e| Error::Io(format!("dataset {data_path}: {e}")))?;
+    let shape = ds.shape();
+    let [n, ny, nx] = shape[..] else {
+        return Err(Error::ShapeMismatch {
+            expected: "[n, ny, nx] (3-D stack)".into(),
+            found: format!("{shape:?}"),
+        });
+    };
+    if index >= n {
+        return Err(Error::InvalidParam(format!(
+            "frame {index} out of range (stack has {n})"
+        )));
+    }
+    let data = read_f32_slice(&ds, &[index, 0, 0], &[1, ny, nx])?;
+    Ok((ny, nx, data))
+}
+
 /// DXchange HDF5 reader over a pure-Rust [`H5File`].
 struct H5DxchangeReader {
     file: H5File,
@@ -1290,6 +1323,40 @@ mod tests {
             open_dxchange("definitely-not-a-real-file.h5"),
             Err(Error::Io(_))
         ));
+    }
+
+    #[test]
+    fn read_h5_frame_reads_one_u16_frame() {
+        // Beamline stacks are typically uint16; the frame read must convert
+        // via the dtype dispatch, not byte-copy. 2 frames × 2 rows × 3 cols.
+        let path = std::env::temp_dir().join("tomoxide_read_h5_frame_test.h5");
+        let _ = std::fs::remove_file(&path);
+        {
+            let file = H5File::create(&path).unwrap();
+            let group = file.create_group("exchange").unwrap();
+            let ds = group
+                .new_dataset::<u16>()
+                .shape([2, 2, 3])
+                .create("data")
+                .unwrap();
+            let vals: Vec<u16> = (0..12).collect();
+            ds.write_raw(&vals).unwrap();
+        }
+        let p = path.to_str().unwrap();
+
+        // Absolute and relative dataset paths both resolve.
+        let (ny, nx, f1) = read_h5_frame(p, "/exchange/data", 1).unwrap();
+        assert_eq!((ny, nx), (2, 3));
+        assert_eq!(f1, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+        let (_, _, f0) = read_h5_frame(p, "exchange/data", 0).unwrap();
+        assert_eq!(f0, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        // Out-of-range frame and non-3-D dataset are rejected.
+        assert!(matches!(
+            read_h5_frame(p, "/exchange/data", 2),
+            Err(Error::InvalidParam(_))
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

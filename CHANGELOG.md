@@ -25,6 +25,10 @@ All notable changes to this project are documented here. The format is based on
   suffix). The CLI gained the matching `--output` flag, `--config` now feeds
   all three, and the multi-GPU z-shard fan-out forwards the resolved output
   path to its children.
+- **`io::read_h5_frame`** — read one `[ny, nx]` frame of a 3-D HDF5 stack as
+  `f32` through the reader's full dtype dispatch (u8/i8/u16/i16/u32/i32/f32/
+  f64). Real beamline stacks are usually `uint16`; the GUI projection browser
+  reads through this (siplot's own HDF5 loader handles 4/8-byte floats only).
 - **`tomoxide-gui` M1 (offline preview loop)** — new repo-internal but
   workspace-`exclude`d crate (siplot is edition-2024/rust-1.92; workspace
   membership would raise the repo's effective MSRV above 1.82) implementing
