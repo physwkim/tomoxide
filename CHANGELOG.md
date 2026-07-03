@@ -13,6 +13,19 @@ All notable changes to this project are documented here. The format is based on
   chunk (what every driver produces) is now passed straight to the write call
   (`as_slice`), with the gather kept only as a non-contiguous fallback. The
   gather was the H5 writer's dominant cost (~2× the raw file write at 512³).
+- **The HDF5 reconstruction output is finalized without `fsync`** — new
+  `VolumeWriter::finalize` hook (called once by every driver on the success
+  path); `H5Writer` implements it with rust-hdf5 0.3.1's `close_no_sync`
+  (complete, valid HDF5; durability left to OS page-cache writeback, matching
+  the TIFF/Zarr writers). Dropping the writer without `finalize` (error paths)
+  still closes durably. Also removes the H5 writer's per-chunk `flush()`
+  (a documented no-op in rust-hdf5) and its stale "durable partial output"
+  doc claim. Combined effect on a 512³ fbp streaming recon (1 GPU): h5 output
+  1.61 s → 0.84 s, on par with tiff (0.83 s), bit-identical output.
+  rust-hdf5 0.3.2 supplies the second half of that win: its `create` no longer
+  `ftruncate`s a brand-new empty file — that truncate armed ext4
+  `auto_da_alloc`, whose implicit writeback inside the final `close(2)`
+  (~325 ms at 512³) silently defeated `close_no_sync`.
 
 ## [0.5.1] - 2026-07-02
 

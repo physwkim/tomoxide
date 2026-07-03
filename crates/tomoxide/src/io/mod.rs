@@ -105,6 +105,23 @@ pub trait VolumeWriter {
     /// not the whole reconstruction. `start <= end` and the volume's slice count
     /// must equal `end - start`, mirroring the streaming driver's per-chunk call.
     fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()>;
+
+    /// Finish the output after the last [`write_chunk`](Self::write_chunk).
+    ///
+    /// Every streaming/whole-volume driver calls this exactly once on the
+    /// success path, before the writer is dropped. Single-container writers
+    /// (H5) finalize the container here with a **non-durable** close
+    /// (`close_no_sync`: writes all headers + the superblock, so the file is a
+    /// complete, valid HDF5 on return, but skips the `fsync` that otherwise
+    /// dominates close latency — bytes are handed to the OS, durability is left
+    /// to page-cache writeback, matching the TIFF/Zarr writers, which never
+    /// `fsync`). If a driver drops the writer *without* calling `finalize`
+    /// (an error/panic path), the container is still finalized **durably** on
+    /// drop — so `finalize` only trades that durability for speed on the
+    /// success path. Per-file writers (TIFF) keep the default no-op.
+    fn finalize(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Output container format (tomocupy `--save-format`).
@@ -772,9 +789,12 @@ impl VolumeWriter for TiffWriter {
 /// `axes`/`description`/`units` attributes. The dataset is sized to the
 /// `reserve(total_nz)` slice count (the cross-section `(ny, nx)` comes from the
 /// first per-chunk volume); each `write_chunk` lands its chunk's slices in the
-/// global `[start, end)` rows via an HDF5 hyperslab, and the file is flushed so
-/// a streaming caller's partial output is durable. `path` is the output base —
-/// `.h5` is appended if absent (mirroring tomocupy `fnameout += '.h5'`).
+/// global `[start, end)` rows via an HDF5 hyperslab — `rust-hdf5` `pwrite`s the
+/// bytes immediately, but the container (headers + superblock) is only written
+/// when the writer is finalized. [`finalize`](VolumeWriter::finalize) closes it
+/// non-durably (`close_no_sync`); dropping without finalize closes it durably.
+/// `path` is the output base — `.h5` is appended if absent (mirroring tomocupy
+/// `fnameout += '.h5'`).
 ///
 /// Contiguous (not chunked) layout is required: `write_slice` hyperslabs are
 /// only valid on contiguous datasets, and `h5nolinks` output is uncompressed.
@@ -903,6 +923,9 @@ impl VolumeWriter for H5Writer {
         }
         // The whole chunk (local rows `0..cz`, C-order `[cz, ny, nx]`) is written
         // into global rows `[start, end)` (tomocupy `dset[st:end] = rec`).
+        // `write_slice` `pwrite`s the chunk to the OS immediately; there is no
+        // per-chunk flush (`H5File::flush` is a documented no-op). The container
+        // is finalized once, in `finalize`.
         //
         // Every in-tree driver hands a standard C-layout chunk volume, whose
         // backing slice is already the C-order `[cz, ny, nx]` slab `write_slice`
@@ -922,10 +945,27 @@ impl VolumeWriter for H5Writer {
                 write(&slab)?;
             }
         }
-        state
-            .file
-            .flush()
-            .map_err(|e| Error::Io(format!("flush {}: {e}", self.path.display())))?;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        // Close non-durably: writes all object headers + the superblock (so the
+        // file is a complete, valid HDF5 on return) but skips the finalize-path
+        // `fsync`, which otherwise dominates close latency. Durability is left to
+        // OS page-cache writeback, matching the TIFF/Zarr writers. Taking `state`
+        // leaves the writer spent; a later `write_chunk` would recreate the file,
+        // but the driver contract calls `finalize` exactly once, last.
+        //
+        // If this is never reached (an error/panic path drops the writer with
+        // `state` still `Some`), the inner `H5File`'s own `Drop` finalizes the
+        // file *durably* — a safe, slower fallback, never a corrupt file.
+        if let Some(state) = self.state.take() {
+            let H5WriteState { file, dataset, .. } = state;
+            // Release the dataset handle before closing the file it belongs to.
+            drop(dataset);
+            file.close_no_sync()
+                .map_err(|e| Error::Io(format!("close {}: {e}", self.path.display())))?;
+        }
         Ok(())
     }
 }

@@ -33,7 +33,11 @@ fn write_then_read_back_bit_exact() {
         let mut w = create_writer(base.to_str().unwrap(), SaveFormat::H5).unwrap();
         w.reserve(nz).unwrap();
         w.write_chunk(&vol, 0, nz).unwrap();
-    } // drop the writer; the file was flushed after the chunk write.
+        // Exercise the success-path finalize (`close_no_sync`): it must produce a
+        // complete, valid HDF5 file even though it skips the durability `fsync`.
+        // The bit-exact read-back below proves the non-durable close is correct.
+        w.finalize().unwrap();
+    } // drop the (now spent) writer.
 
     // The writer appends `.h5` to the base.
     let path = dir.join("recon.h5");
@@ -89,7 +93,7 @@ fn write_chunks_fill_disjoint_ranges() {
         let c1 = Volume::new(vol.array.slice_axis(Axis(0), Slice::from(1..nz)).to_owned());
         w.write_chunk(&c0, 0, 1).unwrap();
         w.write_chunk(&c1, 1, nz).unwrap();
-    }
+    } // drop without finalize: exercises the durable Drop fallback path.
 
     let file = H5File::open(dir.join("recon.h5").to_str().unwrap()).unwrap();
     let ds = file.dataset("exchange/data").unwrap();

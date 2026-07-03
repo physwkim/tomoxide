@@ -131,6 +131,7 @@ impl ReconSteps {
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
+        writer.finalize()?;
         Ok(())
     }
 }
@@ -191,6 +192,7 @@ impl ReconSteps {
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
+        writer.finalize()?;
         Ok(())
     }
 }
@@ -412,6 +414,7 @@ impl ReconSteps {
                     // is a move, not a copy — the volume is standard C-layout here.
                     let _ = out_free_tx.send(vol.array.into_raw_vec_and_offset().0);
                 }
+                writer.finalize()?;
                 Ok(())
             });
 

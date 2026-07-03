@@ -627,6 +627,7 @@ fn main() -> anyhow::Result<()> {
                 let nz = vol.dims().0;
                 writer.reserve(nz)?;
                 writer.write_chunk(&vol, 0, nz)?;
+                writer.finalize()?;
             } else if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
@@ -712,6 +713,7 @@ fn main() -> anyhow::Result<()> {
                 let nz = vol.dims().0;
                 writer.reserve(nz)?;
                 writer.write_chunk(&vol, 0, nz)?;
+                writer.finalize()?;
             }
             println!("wrote reconstruction to {out}");
         }
