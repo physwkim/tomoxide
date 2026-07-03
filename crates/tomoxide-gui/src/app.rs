@@ -179,7 +179,57 @@ impl App {
         }
     }
 
+    /// Save the current parameters as a recipe TOML (= CLI config + `[gui]`).
+    fn save_recipe(&mut self, path: &std::path::Path) {
+        let mut recipe = crate::project::Recipe::default();
+        if let Some(meta) = &self.meta {
+            recipe.config.file_name = meta.path.display().to_string();
+        }
+        if let Err(e) = self.tune.write_config(&mut recipe.config) {
+            self.log.push(format!("recipe not saved: {e}"));
+            return;
+        }
+        recipe.gui.slice = self.tune.slice;
+        match recipe.save(path) {
+            Ok(()) => self.log.push(format!("recipe saved: {}", path.display())),
+            Err(e) => self
+                .log
+                .push(format!("FAILED recipe save {}: {e}", path.display())),
+        }
+    }
+
+    /// Load a recipe (or plain CLI config) and apply it to the Tune screen;
+    /// opens the recipe's dataset when it names a different file.
+    fn load_recipe(&mut self, path: &std::path::Path) {
+        let recipe = match crate::project::Recipe::load(path) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log
+                    .push(format!("FAILED recipe load {}: {e}", path.display()));
+                return;
+            }
+        };
+        self.tune.apply_config(&recipe.config);
+        self.tune.slice = recipe.gui.slice;
+        self.log.push(format!("recipe loaded: {}", path.display()));
+        if !recipe.config.file_name.is_empty()
+            && self
+                .meta
+                .as_ref()
+                .is_none_or(|m| m.path.display().to_string() != recipe.config.file_name)
+        {
+            let _ =
+                self.worker
+                    .jobs
+                    .send(crate::worker::Job::OpenDataset(std::path::PathBuf::from(
+                        &recipe.config.file_name,
+                    )));
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut save_to: Option<std::path::PathBuf> = None;
+        let mut load_from: Option<std::path::PathBuf> = None;
         ui.horizontal(|ui| {
             ui.label(format!("mode: {}", self.mode.label()));
             ui.separator();
@@ -195,8 +245,34 @@ impl App {
                     .unwrap_or_else(|| "no dataset".into()),
             );
             ui.separator();
+            if ui
+                .button("save recipe")
+                .on_hover_text("write the current parameters as a CLI-compatible config TOML")
+                .clicked()
+            {
+                save_to = rfd::FileDialog::new()
+                    .add_filter("TOML", &["toml"])
+                    .set_file_name("recipe.toml")
+                    .save_file();
+            }
+            if ui
+                .button("load recipe")
+                .on_hover_text("apply a recipe / CLI config TOML to the Tune screen")
+                .clicked()
+            {
+                load_from = rfd::FileDialog::new()
+                    .add_filter("TOML", &["toml"])
+                    .pick_file();
+            }
+            ui.separator();
             ui.toggle_value(&mut self.log_open, "log");
         });
+        if let Some(path) = save_to {
+            self.save_recipe(&path);
+        }
+        if let Some(path) = load_from {
+            self.load_recipe(&path);
+        }
     }
 
     fn log_pane(&mut self, ui: &mut egui::Ui) {

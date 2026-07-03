@@ -6,6 +6,7 @@
 //! Output, and Live are placeholders until M2/M3.
 
 mod app;
+mod project;
 mod views;
 mod worker;
 

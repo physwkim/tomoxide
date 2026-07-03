@@ -8,6 +8,34 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Cooperative cancellation for the chunked drivers** — new
+  `pipeline::CancelToken` (`Clone`-able atomic flag) attachable via
+  `ReconSteps::with_cancel`; all three drivers (`run`, `run_streaming`,
+  `run_streaming_pipelined_range`) check it at chunk boundaries and stop with
+  the new `Error::Cancelled`. Cancellation truncates: chunks already written
+  stay on disk and the writer finalizes the partial output.
+- **`io::InMemoryWriter`** — a `VolumeWriter` that collects the reconstruction
+  into a shared in-memory `InMemoryVolume` (the `Arc<Mutex<…>>` handle
+  survives the pipelined driver consuming the writer) with an optional
+  `on_chunk` progress callback. Backing store for GUI previews.
+- **`tomoxide::config` (feature `config`)** — the CLI's TOML `Config` moved
+  into the library behind a default-off feature (optional `serde`/`toml`
+  deps) so GUI recipes and CLI configs are one format. Gains three fields:
+  `lamino_angle`, `dtype`, and `output` (base path; each writer adds its own
+  suffix). The CLI gained the matching `--output` flag, `--config` now feeds
+  all three, and the multi-GPU z-shard fan-out forwards the resolved output
+  path to its children.
+- **`tomoxide-gui` M1 (offline preview loop)** — new repo-internal but
+  workspace-`exclude`d crate (siplot is edition-2024/rust-1.92; workspace
+  membership would raise the repo's effective MSRV above 1.82) implementing
+  docs/GUI.md M1: a single worker thread owns the `Engine` and all HDF5
+  handles (`!Send`); **Data** (DXchange open + metadata, projection browser,
+  theta plot, raw sinogram inspector), **Tune** (single-slice preview through
+  `run_streaming_pipelined_range` into `io::InMemoryWriter`, parameter panel
+  with auto-recon, A/B pin compare), **Center** (Vo / entropy /
+  phase-correlation / SIFT auto methods, ±0.5/±0.25 px tweak, hand-off to
+  Tune), and recipe save/load (recipe file = CLI config TOML plus a `[gui]`
+  table the CLI ignores).
 - **GUI design document** (`docs/GUI.md`) — design for a `tomoxide-gui`
   desktop application built on siplot (egui + wgpu) and sidm (EPICS PVA):
   offline workflow (dataset browsing, single-slice tune loop with A/B

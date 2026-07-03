@@ -65,7 +65,7 @@ pub struct TuneView {
     pub vo_la_size: usize,
     pub vo_sm_size: usize,
 
-    slice: usize,
+    pub slice: usize,
     auto_recon: bool,
     /// Parameters changed since the last issued preview.
     dirty: bool,
@@ -204,17 +204,58 @@ impl TuneView {
         )
     }
 
+    /// Fill the shared CLI config with this panel's parameters (recipe save).
+    pub fn write_config(&self, cfg: &mut tomoxide::config::Config) -> Result<(), String> {
+        cfg.algorithm = self.algorithm.clone();
+        cfg.filter_name = self.filter.clone();
+        cfg.rotation_axis = (!self.center_auto).then_some(self.center);
+        cfg.num_iter = self.num_iter;
+        cfg.reg_par = parse_reg_par(&self.reg_par)?;
+        cfg.remove_stripe_method = self.stripe.clone();
+        cfg.fw_sigma = self.fw_sigma;
+        cfg.fw_level = self.fw_level;
+        cfg.ti_nblock = self.ti_nblock;
+        cfg.ti_beta = self.ti_beta;
+        cfg.sf_size = self.sf_size;
+        cfg.vo_snr = self.vo_snr;
+        cfg.vo_la_size = self.vo_la_size;
+        cfg.vo_sm_size = self.vo_sm_size;
+        Ok(())
+    }
+
+    /// Adopt a loaded recipe's parameters (recipe load). Marks the panel
+    /// dirty so an enabled auto-recon refreshes the preview.
+    pub fn apply_config(&mut self, cfg: &tomoxide::config::Config) {
+        self.algorithm = cfg.algorithm.clone();
+        self.filter = cfg.filter_name.clone();
+        self.center_auto = cfg.rotation_axis.is_none();
+        if let Some(c) = cfg.rotation_axis {
+            self.center = c;
+        }
+        self.num_iter = cfg.num_iter.max(1);
+        self.reg_par = cfg
+            .reg_par
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.stripe = cfg.remove_stripe_method.clone();
+        self.fw_sigma = cfg.fw_sigma;
+        self.fw_level = cfg.fw_level;
+        self.ti_nblock = cfg.ti_nblock;
+        self.ti_beta = cfg.ti_beta;
+        self.sf_size = cfg.sf_size;
+        self.vo_snr = cfg.vo_snr;
+        self.vo_la_size = cfg.vo_la_size;
+        self.vo_sm_size = cfg.vo_sm_size;
+        self.dirty = true;
+    }
+
     /// Resolve the panel state into a fully-typed spec (errors → session log).
     fn build_spec(&self) -> Result<PreviewSpec, String> {
         let algorithm: Algorithm = self.algorithm.parse().map_err(|e| format!("{e}"))?;
         let filter = self.filter.parse().map_err(|e| format!("{e}"))?;
-        let reg_par = self
-            .reg_par
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<f32>().map_err(|e| format!("reg_par: {e}")))
-            .collect::<Result<Vec<f32>, String>>()?;
+        let reg_par = parse_reg_par(&self.reg_par)?;
         let stripe = match self.stripe.as_str() {
             "none" => StripeMethod::None,
             "fw" => StripeMethod::Fw {
@@ -465,6 +506,15 @@ impl TuneView {
             }
         }
     }
+}
+
+/// Parse a comma-separated `reg_par` list (empty entries skipped).
+fn parse_reg_par(s: &str) -> Result<Vec<f32>, String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<f32>().map_err(|e| format!("reg_par: {e}")))
+        .collect()
 }
 
 fn combo(ui: &mut egui::Ui, label: &str, value: &mut String, options: &[&str]) -> bool {
