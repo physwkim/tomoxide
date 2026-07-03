@@ -466,6 +466,40 @@ mod tests {
         assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
     }
 
+    /// The user-visible defect behind tomoxide's CUDA batch-domain padding: an
+    /// iterative Tune preview (sirt, one slice, chunk = 1) on the CUDA backend
+    /// came out garbage because the device solve forward-projected a 1-slice
+    /// problem to zero. Skips itself when no CUDA device answers.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn preview_iterative_cuda_is_finite_and_nonzero() {
+        if tomoxide::CudaBackend::new().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        let engine = Engine::new(BackendKind::Cuda).unwrap();
+        if engine.name() != "cuda" {
+            eprintln!("skipping: engine resolved to {}", engine.name());
+            return;
+        }
+        let spec = PreviewSpec {
+            slice: 3,
+            algorithm: Algorithm::Sirt,
+            center: None,
+            filter: FilterName::Parzen,
+            num_iter: 10,
+            reg_par: Vec::new(),
+            stripe: StripeMethod::None,
+        };
+        let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
+        assert_eq!(data.len(), ny * nx);
+        assert!(
+            data.iter().all(|v| v.is_finite()),
+            "non-finite values in iterative preview"
+        );
+        assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
+    }
+
     /// Stripe removal and an out-of-range slice (clamped) still reconstruct.
     #[test]
     fn preview_clamps_slice_and_applies_stripe() {

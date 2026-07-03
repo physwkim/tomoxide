@@ -98,6 +98,16 @@ All notable changes to this project are documented here. The format is based on
   likewise zero-pads an odd stack instead of erroring. Multi-slice outputs
   are unchanged (single-row CLI recon is bit-identical to the same row of a
   multi-row run).
+- **CUDA iterative reconstruction of a single slice was garbage** (the same
+  batch-domain family as the analytic fix above, via the other kernel pair):
+  the device-resident solvers and the `FilteredBackproject`/`ForwardProject`
+  wrappers share the z-bilinear projection kernels, so a 1-slice problem
+  forward-projected to zero and the solve iterated on nothing — a GUI Tune
+  preview of sirt/tv showed garbage. `IterativeReconstruct::solve` and both
+  wrappers now duplicate the slice into a 2-slice problem (exact: the z-interp
+  weights sum to 1 on identical rows, and EM ratios stay finite where zero-pad
+  rows would 0/0) and drop the duplicate; the 1-slice solve equals the same
+  slice of a multi-slice solve.
 
 ## [0.5.1] - 2026-07-02
 

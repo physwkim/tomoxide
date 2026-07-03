@@ -584,14 +584,27 @@ mod cuda_impl {
             let sino_slice = sino_std
                 .as_slice()
                 .expect("as_standard_layout is C-contiguous");
+            // Batch-domain minimum (same family as `IterativeReconstruct::
+            // solve`): the kernel's z-bilinear sampling needs ≥2 slices — a
+            // 1-slice batch back-projects to zero. Duplicate the row (the
+            // interpolation weights sum to 1 on identical rows, so the result
+            // is exact) and drop the duplicate after download.
+            let nz_run = nz.max(2);
+            let dup;
+            let sino_slice = if nz_run != nz {
+                dup = [sino_slice, sino_slice].concat();
+                &dup[..]
+            } else {
+                sino_slice
+            };
 
             // Device buffers: filtered sinogram, theta, output volume.
             let g = DevBuf::from_host_f32(sino_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
-            let f = DevBuf::zeroed(nz * ncols * ncols * std::mem::size_of::<f32>())?;
+            let f = DevBuf::zeroed(nz_run * ncols * ncols * std::mem::size_of::<f32>())?;
 
             // cfunc_linerec(nproj, nz, n, ncproj=nproj, ncz=nz): whole stack at once.
-            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz_run, ncols, nproj, nz_run) };
             if handle.is_null() {
                 return Err(Error::Backend("cfunc_linerec allocation failed".into()));
             }
@@ -613,8 +626,9 @@ mod cuda_impl {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
 
-            let mut host = vec![0.0f32; nz * ncols * ncols];
+            let mut host = vec![0.0f32; nz_run * ncols * ncols];
             f.to_host_f32(&mut host)?;
+            host.truncate(nz * ncols * ncols);
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
             Ok(())
@@ -667,12 +681,25 @@ mod cuda_impl {
             let vol_slice = vol_std
                 .as_slice()
                 .expect("as_standard_layout is C-contiguous");
+            // Batch-domain minimum (same family as `IterativeReconstruct::
+            // solve`): the kernel's z-bilinear scatter needs ≥2 slices — a
+            // 1-slice volume forward-projects to zero. Duplicate the slice
+            // (exact: the interpolation weights sum to 1 on identical rows)
+            // and drop the duplicate after download.
+            let nz_run = nz.max(2);
+            let dup;
+            let vol_slice = if nz_run != nz {
+                dup = [vol_slice, vol_slice].concat();
+                &dup[..]
+            } else {
+                vol_slice
+            };
 
             // Device buffers: input volume, theta, zeroed output sinogram (the
             // kernel only atomic-adds into it).
             let f = DevBuf::from_host_f32(vol_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
-            let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
+            let g = DevBuf::zeroed(nz_run * nproj * n * std::mem::size_of::<f32>())?;
 
             let phi = std::f32::consts::FRAC_PI_2; // parallel beam
             unsafe {
@@ -681,7 +708,7 @@ mod cuda_impl {
                     f.ptr,
                     theta_d.ptr as *const f32,
                     phi,
-                    nz as i32,
+                    nz_run as i32,
                     n as i32,
                     nproj as i32,
                     std::ptr::null_mut(),
@@ -692,8 +719,9 @@ mod cuda_impl {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
 
-            let mut host = vec![0.0f32; nz * nproj * n];
+            let mut host = vec![0.0f32; nz_run * nproj * n];
             g.to_host_f32(&mut host)?;
+            host.truncate(nz * nproj * n);
             let array = Array3::from_shape_vec((nz, nproj, n), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda sinogram shape: {e}")))?;
             *out = Tomo::new(array, Layout::Sinogram);
@@ -1433,8 +1461,34 @@ mod cuda_impl {
                 }
                 None => None,
             };
+            // Batch-domain minimum, same family as the analytic paths: the
+            // z-bilinear forward/back-projection kernel pair samples slice
+            // pairs (vr, vr+1), so a 1-slice problem forward-projects to zero
+            // and never converges. Duplicate the slice into a 2-slice problem
+            // — identical neighbouring rows make the z-interpolation exact
+            // (the weights sum to 1) and the duplicated blocks are independent
+            // copies of the same problem, so every solver's iterates (incl.
+            // the global dot products of GRAD/TIKH/CGLS: numerator and
+            // denominator both double) match the single-slice solve — and
+            // drop the duplicate row from the output.
+            let padded = nz == 1;
+            let sino2: Tomo<f32>;
+            let sino: &Tomo<f32> = if padded {
+                let a = ndarray::concatenate(ndarray::Axis(0), &[s.array.view(), s.array.view()])
+                    .map_err(|e| Error::InvalidParam(format!("pad 1-slice sinogram: {e}")))?;
+                sino2 = Tomo::new(a, Layout::Sinogram);
+                &sino2
+            } else {
+                sino
+            };
+            let init_host = init_host.map(|mut v| {
+                if padded {
+                    v.extend_from_within(..);
+                }
+                v
+            });
             let init = init_host.as_deref();
-            match algorithm {
+            let solved = match algorithm {
                 Algorithm::Sirt => sirt_device(sino, geom, n, it, init).map(Some),
                 Algorithm::Mlem => {
                     em_device(sino, geom, n, it, vec![(0..nproj).collect()], init).map(Some)
@@ -1472,13 +1526,16 @@ mod cuda_impl {
                     // Tikhonov prior: reg_data ([nz,n,n] flat) or zeros. Wrong-sized
                     // reg_data ⇒ fall back so the host raises the shape error.
                     let reg1 = params.reg_par.get(1).copied().unwrap_or(0.0);
-                    let prior = if params.reg_data.is_empty() {
+                    let mut prior = if params.reg_data.is_empty() {
                         vec![0.0f32; nz * n * n]
                     } else if params.reg_data.len() == nz * n * n {
                         params.reg_data.clone()
                     } else {
                         return Ok(None);
                     };
+                    if padded {
+                        prior.extend_from_within(..);
+                    }
                     grad_device(
                         sino,
                         geom,
@@ -1496,6 +1553,14 @@ mod cuda_impl {
                 }
                 Algorithm::Cgls => cgls_device(sino, geom, n, it, init).map(Some),
                 _ => Ok(None),
+            };
+            match solved {
+                Ok(Some(v)) if padded => Ok(Some(Volume::new(v.array.slice_move(ndarray::s![
+                    0..1,
+                    ..,
+                    ..
+                ])))),
+                other => other,
             }
         }
     }

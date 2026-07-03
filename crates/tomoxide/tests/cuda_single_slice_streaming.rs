@@ -88,6 +88,9 @@ fn fixture() -> Fixture {
         geom: Geometry::parallel(Angles(theta), nx, nz, 1.0),
         params: ReconParams {
             num_gridx: Some(nx),
+            // Ignored by the analytic methods; used by the iterative test.
+            num_iter: 10,
+            reg_par: vec![0.001],
             ..Default::default()
         },
         prep: PrepOptions::default(),
@@ -169,6 +172,57 @@ fn cuda_fourierrec_single_slice_matches_whole() {
 #[test]
 fn cuda_lprec_single_slice_matches_whole() {
     check_single_slice_matches_whole(Algorithm::Lprec, 0.999);
+}
+
+/// Iterative single slice: the device-resident solvers share the z-bilinear
+/// forward/back-projection kernel pair, so a 1-slice problem forward-projected
+/// to zero and never converged (a GUI Tune preview of sirt/tv showed garbage).
+/// `IterativeReconstruct::solve` now duplicates the slice into a 2-slice
+/// problem (exact: interpolation weights sum to 1 on identical rows) and drops
+/// the duplicate. Slices are independent in parallel beam, so the 1-slice
+/// solve must match the same slice of a multi-slice solve.
+#[test]
+fn cuda_iterative_single_slice_matches_multi() {
+    let Some(engine) = cuda_engine() else { return };
+    let fx = fixture();
+    let z = fx.nz / 2;
+    for algorithm in [Algorithm::Sirt, Algorithm::Tv] {
+        let mut rd = io::open_dxchange(&fx.path).unwrap();
+        let ds = rd.read_all().unwrap();
+        let whole =
+            tomoxide::reconstruct(ds, &fx.geom, algorithm, &fx.params, &fx.prep, &engine).unwrap();
+
+        let mut rd = io::open_dxchange(&fx.path).unwrap();
+        let ds1 = rd.read_chunk(z, z + 1).unwrap();
+        let geom1 = Geometry::parallel(fx.geom.angles.clone(), fx.nx, 1, 1.0);
+        let one =
+            tomoxide::reconstruct(ds1, &geom1, algorithm, &fx.params, &fx.prep, &engine).unwrap();
+        assert_eq!(one.array.dim(), (1, fx.nx, fx.nx));
+        let a = one.array.index_axis(Axis(0), 0).to_owned();
+        assert!(
+            a.iter().all(|v| v.is_finite()),
+            "{algorithm:?}: single-slice iterative produced non-finite values"
+        );
+        assert!(
+            a.iter().any(|&v| v != 0.0),
+            "{algorithm:?}: single-slice iterative reconstructed all zeros"
+        );
+        let r = pearson(&a, &whole.array.index_axis(Axis(0), z).to_owned());
+        assert!(
+            r > 0.99,
+            "{algorithm:?}: single-slice iterative disagrees with multi-slice: r = {r:.6}"
+        );
+
+        // The GUI Tune preview shape: the same one slice through the streaming
+        // pipeline with chunk = 1 (iterative methods have no streaming handle,
+        // so the per-chunk fallback funnels into the same padded solve).
+        let streamed = single_slice(&engine, &fx, algorithm, z);
+        let r = pearson(&streamed, &a);
+        assert!(
+            r > 0.999,
+            "{algorithm:?}: streamed single-slice disagrees with one-shot: r = {r:.6}"
+        );
+    }
 }
 
 /// The one-shot `reconstruct` path (library API, no streaming): a 1-slice
