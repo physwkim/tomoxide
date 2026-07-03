@@ -141,13 +141,14 @@ below by dependency and value — the first three close the end-to-end pipeline.
   golden from `tools/gen_tomopy_write_center_golden.py`.
 - ✅ **`find_center_sift`** — `crates/tomoxide-recon/src/center.rs` (`sift`
   module, **`sift-center`** feature). Ports tomocupy `find_center.py`
-  `_register_shift_sift` (OpenCV SIFT via the `opencv` crate → BFMatcher knn +
-  Lowe ratio test → mean keypoint shift) and the `n/2 − shift_x/2` center. The
-  uint8 normalization replicates numpy's `histogram`-based robust min/max
-  bit-exact; with the same OpenCV linked on both sides the shifts match cv2 to
-  ~5e-7. Build needs OpenCV (conda `libopencv`) + clang/libclang (the `opencv`
-  crate runs bindgen); set `PKG_CONFIG_PATH`, `LIBCLANG_PATH`, and
-  `LD_LIBRARY_PATH` to the OpenCV env, with a `clang` binary on `PATH`.
+  `_register_shift_sift` (SIFT detect+describe → exact-NN matching with
+  Lowe's ratio test → mean keypoint shift) and the `n/2 − shift_x/2` center.
+  The SIFT stage is the pure-Rust `lowe-sift` crate — no system OpenCV or
+  clang; the feature needs rustc ≥ 1.92 (above the workspace MSRV, which is
+  unchanged for default builds). The uint8 normalization replicates numpy's
+  `histogram`-based robust min/max bit-exact; being an independent SIFT
+  implementation, the recovered shifts land within ~0.034 px and the center
+  within 0.008 px of the cv2 golden (`sift_center_parity.rs`).
 
 ### B3. Stripe removal — `tomoxide-prep::stripe`  (ring-artifact prevention)
 

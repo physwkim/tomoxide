@@ -22,8 +22,9 @@ cuda = []
 gpu-wgpu = ["dep:wgpu", "dep:pollster", "bytemuck/derive"]
 # Beam-hardening correction (pulls xraylib; its build runs bindgen → needs libclang).
 beam-hardening = ["dep:xraylib"]
-# SIFT center finding (pulls the opencv crate; links OpenCV, bindgen at build).
-sift-center = ["dep:opencv"]
+# SIFT center finding (pure-Rust lowe-sift; needs rustc ≥ 1.92 — see the
+# workspace manifest note).
+sift-center = ["dep:lowe-sift"]
 # Reconstruction Config (TOML): shared by the CLI (`--config`/`tomoxide init`)
 # and GUI recipes. Off by default so the core library stays serde-free.
 config = ["dep:serde", "dep:toml"]
@@ -70,7 +71,7 @@ pollster = { workspace = true, optional = true }
 bytemuck.workspace = true
 # optional x-ray physics (beam hardening) / computer vision (SIFT center)
 xraylib = { workspace = true, optional = true }
-opencv = { workspace = true, optional = true }
+lowe-sift = { workspace = true, optional = true }
 # optional config-file support — only with `config`
 serde = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }

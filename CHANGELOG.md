@@ -54,12 +54,17 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **`sift-center` is pure Rust** — `find_center_sift` now runs on the
+  `lowe-sift` crate instead of the `opencv` binding, dropping the system
+  OpenCV + clang build requirement entirely. The uint8 normalization stays
+  bit-exact vs numpy; the SIFT stage is an independent implementation of
+  Lowe's paper, so recovered shifts land within ~0.034 px and the center
+  within 0.008 px of the cv2 golden (tolerances in `sift_center_parity`
+  updated from float-noise to algorithmic bounds). The feature now needs
+  rustc ≥ 1.92 (above the 1.82 MSRV, which is unchanged for default builds).
 - **`tomoxide-gui` builds with `sift-center` on by default** (alongside
-  `cuda`), so the Center screen's SIFT method is always available. Building
-  the GUI now needs the OpenCV dev stack (`libopencv-dev`, plus
-  `libclang-dev` and `clang` for the bindings generator). The tomoxide
-  *library* default stays featureless — CI builds it on runners without
-  OpenCV; only the GUI opts in. A feature-gated smoke test pins the OpenCV
+  `cuda`), so the Center screen's SIFT method is always available with no
+  extra system packages. A feature-gated smoke test pins the SIFT center
   call chain end-to-end.
 - **HDF5/TIFF writers are zero-copy** — `H5Writer`/`TiffWriter` handed each
   chunk through an elementwise gather copy before writing; a standard C-layout

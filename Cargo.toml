@@ -44,8 +44,12 @@ tomoxide = { path = "crates/tomoxide", version = "0.5.1" }
 xraylib = "0.1"
 
 # --- computer vision (SIFT center finding; optional, `sift-center` feature).
-# Links a system/conda OpenCV (≥4.x); its build runs bindgen → needs clang. ---
-opencv = { version = "0.98", default-features = false, features = ["features2d", "imgproc"] }
+# Pure-Rust Lowe SIFT — no system OpenCV or clang. Its rust-version is 1.92,
+# above the workspace MSRV 1.82: the dep is optional and resolver = "2" does
+# not enforce rust-version, so only builds that ENABLE `sift-center` need the
+# newer toolchain. `default-features = false` drops its `image`-crate
+# conversion helpers (tomoxide builds `GrayImage` buffers directly). ---
+lowe-sift = { version = "0.2.1", default-features = false }
 
 # --- numerics ---
 ndarray = "0.16"

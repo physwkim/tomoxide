@@ -18,9 +18,9 @@ description = "tomoxide desktop GUI (siplot/egui)"
 [features]
 # CUDA on by default: the GUI targets the same beamline machines as the CLI.
 # sift-center on by default so the Center screen's SIFT method is always
-# there — building needs the OpenCV dev stack (`libopencv-dev` plus
-# `libclang-dev` for bindgen). The tomoxide LIBRARY default stays
-# featureless (CI builds it on runners without OpenCV); only the GUI opts in.
+# there — pure-Rust lowe-sift, no system packages. The tomoxide LIBRARY
+# default stays featureless (the feature needs rustc ≥ 1.92, above the
+# library workspace's 1.82 MSRV; this crate already pins 1.92).
 # gpu-wgpu stays off — tomoxide's wgpu backend duplicates a second wgpu stack
 # next to siplot's egui-wgpu and buys the GUI nothing (docs/GUI.md §3.2).
 default = ["cuda", "sift-center"]

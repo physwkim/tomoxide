@@ -202,8 +202,8 @@ pub fn find_center_pc(
 
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
 ///
-/// Available only with the **`sift-center`** feature (it links OpenCV via the
-/// `opencv` crate). See [`sift`] for the implementation.
+/// Available only with the **`sift-center`** feature (pure-Rust `lowe-sift`).
+/// See [`sift`] for the implementation.
 #[cfg(not(feature = "sift-center"))]
 pub fn find_center_sift(
     _proj0: &Array2<f32>,
@@ -225,10 +225,8 @@ pub use sift::{find_center_sift, register_shift_sift};
 #[cfg(feature = "sift-center")]
 pub mod sift {
     use super::{fliplr, Error, Result};
+    use lowe_sift::{match_descriptors, GrayImage, Sift};
     use ndarray::Array2;
-    use opencv::core::{DMatch, KeyPoint, Mat, Vector, CV_8UC1, NORM_L2};
-    use opencv::features2d::{BFMatcher, SIFT};
-    use opencv::prelude::*;
 
     /// numpy `np.histogram(data, 1000)` peak-thresholded robust min/max
     /// (`_find_min_max`): 1000 uniform bins over `[min, max]`, keep bins whose
@@ -285,30 +283,19 @@ pub mod sift {
         (edges[st] as f32, edges[end + 1] as f32)
     }
 
-    /// `(img - mmin)/(mmax-mmin)*255`, clipped to 0–255, as a `CV_8UC1` Mat
-    /// (numpy f32 arithmetic then `astype(uint8)` truncation).
-    fn to_u8_mat(img: &Array2<f32>, mmin: f32, mmax: f32) -> Result<Mat> {
+    /// `(img - mmin)/(mmax-mmin)*255`, clipped to 0–255 and `astype(uint8)`-
+    /// truncated (tomocupy's numpy pipeline), then rescaled to the `[0, 1]`
+    /// f32 pixels [`GrayImage`] expects. The u8 quantization is deliberately
+    /// kept so the detector sees the same image content the cv2 golden did.
+    fn to_gray(img: &Array2<f32>, mmin: f32, mmax: f32) -> Result<GrayImage> {
         let (rows, cols) = img.dim();
         let scale = mmax - mmin;
-        let mut buf = Vec::with_capacity(rows * cols);
-        for &v in img.iter() {
+        let data = img
+            .iter()
             // numpy clips >255→255 then <0→0; clamp is equivalent for finite v.
-            let t = ((v - mmin) / scale * 255.0).clamp(0.0, 255.0);
-            buf.push(t as u8);
-        }
-        let mut m = Mat::new_rows_cols_with_default(
-            rows as i32,
-            cols as i32,
-            CV_8UC1,
-            opencv::core::Scalar::all(0.0),
-        )
-        .map_err(cv_err)?;
-        m.data_bytes_mut().map_err(cv_err)?.copy_from_slice(&buf);
-        Ok(m)
-    }
-
-    fn cv_err(e: opencv::Error) -> Error {
-        Error::Backend(format!("opencv: {e}"))
+            .map(|&v| (((v - mmin) / scale * 255.0).clamp(0.0, 255.0) as u8) as f32 / 255.0)
+            .collect();
+        GrayImage::new(cols, rows, data).map_err(|e| Error::Backend(format!("lowe-sift: {e}")))
     }
 
     /// `(img normalized by its own robust min/max) → uint8` (tomocupy's
@@ -323,11 +310,13 @@ pub mod sift {
     }
 
     /// Per-pair SIFT shift estimate (tomocupy `_register_shift_sift`): SIFT
-    /// detect+describe on the normalized `datap2`/`datap1` images, BFMatcher
-    /// knn (k=2) with Lowe ratio test (`threshold`), and the mean keypoint
-    /// displacement, returned as `[dy, dx]` per pair. min/max for normalization
-    /// come from `datap1` (matching upstream). Also returns the number of good
-    /// matches in the last pair.
+    /// detect+describe on the normalized `datap2`/`datap1` images (pure-Rust
+    /// `lowe-sift`), exact nearest-neighbor matching with Lowe's ratio test
+    /// (`threshold` — `distance < threshold·second_distance`, the same test
+    /// tomocupy runs on the cv2 knn(k=2) pairs), and the mean keypoint
+    /// displacement, returned as `[dy, dx]` per pair. min/max for
+    /// normalization come from `datap1` (matching upstream). Also returns the
+    /// number of good matches in the last pair.
     pub fn register_shift_sift(
         datap1: &[Array2<f32>],
         datap2: &[Array2<f32>],
@@ -338,40 +327,23 @@ pub mod sift {
                 "register_shift_sift: need equal, non-empty datap1/datap2".into(),
             ));
         }
-        let mut sift = SIFT::create_def().map_err(cv_err)?;
+        let sift = Sift::default();
         let mut shifts = Array2::<f32>::zeros((datap1.len(), 2));
         let mut ngood = 0usize;
         for (id, (p1, p2)) in datap1.iter().zip(datap2).enumerate() {
             let (mmin, mmax) = find_min_max(p1.as_slice().expect("contiguous datap1"));
-            let tmp1 = to_u8_mat(p2, mmin, mmax)?; // datap2 → query
-            let tmp2 = to_u8_mat(p1, mmin, mmax)?; // datap1 → train
-            let no_mask = Mat::default();
-            let (mut kp1, mut des1) = (Vector::<KeyPoint>::new(), Mat::default());
-            let (mut kp2, mut des2) = (Vector::<KeyPoint>::new(), Mat::default());
-            sift.detect_and_compute(&tmp1, &no_mask, &mut kp1, &mut des1, false)
-                .map_err(cv_err)?;
-            sift.detect_and_compute(&tmp2, &no_mask, &mut kp2, &mut des2, false)
-                .map_err(cv_err)?;
-
-            let bf = BFMatcher::new(NORM_L2, false).map_err(cv_err)?;
-            let mut knn = Vector::<Vector<DMatch>>::new();
-            bf.knn_train_match(&des1, &des2, &mut knn, 2, &no_mask, false)
-                .map_err(cv_err)?;
+            let f1 = sift.detect_and_compute(&to_gray(p2, mmin, mmax)?); // datap2 → query
+            let f2 = sift.detect_and_compute(&to_gray(p1, mmin, mmax)?); // datap1 → train
+            let d1: Vec<_> = f1.iter().map(|f| f.descriptor.clone()).collect();
+            let d2: Vec<_> = f2.iter().map(|f| f.descriptor.clone()).collect();
 
             let (mut sum_x, mut sum_y, mut n) = (0.0f64, 0.0f64, 0usize);
-            for pair in knn.iter() {
-                if pair.len() < 2 {
-                    continue;
-                }
-                let m = pair.get(0).map_err(cv_err)?;
-                let nn = pair.get(1).map_err(cv_err)?;
-                if m.distance < threshold * nn.distance {
-                    let src = kp1.get(m.query_idx as usize).map_err(cv_err)?.pt();
-                    let dst = kp2.get(m.train_idx as usize).map_err(cv_err)?.pt();
-                    sum_x += (src.x - dst.x) as f64;
-                    sum_y += (src.y - dst.y) as f64;
-                    n += 1;
-                }
+            for m in match_descriptors(&d1, &d2, threshold) {
+                let src = &f1[m.query_index].keypoint;
+                let dst = &f2[m.train_index].keypoint;
+                sum_x += (src.x - dst.x) as f64;
+                sum_y += (src.y - dst.y) as f64;
+                n += 1;
             }
             if n == 0 {
                 return Err(Error::InvalidParam(format!(
