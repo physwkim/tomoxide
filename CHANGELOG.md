@@ -54,6 +54,11 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **GUI preview autoscale is percentile-robust** — image colormaps scale to
+  the 0.5–99.5 % range instead of the absolute min/max, so a handful of
+  extreme pixels (e.g. the FOV-edge ring iterative methods produce on
+  truncated-FOV data) no longer own the whole gray range and flatten the
+  interior structure.
 - **`sift-center` is pure Rust** — `find_center_sift` now runs on the
   `lowe-sift` crate instead of the `opencv` binding, dropping the system
   OpenCV + clang build requirement entirely. The uint8 normalization stays
