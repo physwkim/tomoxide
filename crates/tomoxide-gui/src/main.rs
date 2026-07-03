@@ -6,6 +6,8 @@
 //! Output, and Live are placeholders until M2/M3.
 
 mod app;
+mod views;
+mod worker;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

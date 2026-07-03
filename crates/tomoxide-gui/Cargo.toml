@@ -35,6 +35,8 @@ eframe = { version = "0.34", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+# native file-open dialog; same version siplot uses so it builds once
+rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"

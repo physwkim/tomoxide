@@ -68,13 +68,18 @@ pub struct App {
     mode: Mode,
     log: SessionLog,
     log_open: bool,
+    worker: crate::worker::Worker,
+    /// Backend name reported by the worker's Engine (`cpu`/`cuda`/…).
+    backend: Option<String>,
+    dataset: Option<String>,
+    data: crate::views::data::DataView,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Every siplot widget constructor needs this; fail loudly at startup
         // rather than per-view if the renderer is misconfigured.
-        let _render_state = cc
+        let render_state = cc
             .wgpu_render_state
             .as_ref()
             .expect("eframe must use the wgpu renderer (NativeOptions.renderer = Wgpu)");
@@ -84,6 +89,46 @@ impl App {
             mode: Mode::Data,
             log,
             log_open: true,
+            worker: crate::worker::Worker::spawn(cc.egui_ctx.clone()),
+            backend: None,
+            dataset: None,
+            data: crate::views::data::DataView::new(render_state),
+        }
+    }
+
+    /// Drain worker events and route them to the log / owning view.
+    fn handle_events(&mut self) {
+        use crate::worker::Event;
+        let events: Vec<Event> = self.worker.events.try_iter().collect();
+        for event in events {
+            match event {
+                Event::BackendReady(name) => {
+                    self.log.push(format!("backend: {name}"));
+                    self.backend = Some(name);
+                }
+                Event::DatasetOpened(meta) => {
+                    self.log.push(format!(
+                        "opened {} — {}×{}×{} (proj×rows×cols), {} flat / {} dark",
+                        meta.path.display(),
+                        meta.nproj,
+                        meta.nz,
+                        meta.nx,
+                        meta.nflat,
+                        meta.ndark
+                    ));
+                    self.dataset = Some(meta.path.display().to_string());
+                    self.data.on_dataset(meta);
+                }
+                Event::Sinogram {
+                    row,
+                    nproj,
+                    nx,
+                    data,
+                } => self.data.on_sinogram(row, nproj, nx, &data),
+                Event::JobFailed { what, error } => {
+                    self.log.push(format!("FAILED {what}: {error}"));
+                }
+            }
         }
     }
 
@@ -103,6 +148,13 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(format!("mode: {}", self.mode.label()));
+            ui.separator();
+            ui.label(format!(
+                "backend: {}",
+                self.backend.as_deref().unwrap_or("starting…")
+            ));
+            ui.separator();
+            ui.label(self.dataset.as_deref().unwrap_or("no dataset"));
             ui.separator();
             ui.toggle_value(&mut self.log_open, "log");
         });
@@ -129,7 +181,8 @@ impl App {
 
     fn central(&mut self, ui: &mut egui::Ui) {
         match self.mode {
-            Mode::Data | Mode::Tune | Mode::Center => {
+            Mode::Data => self.data.ui(ui, &self.worker.jobs),
+            Mode::Tune | Mode::Center => {
                 ui.heading(self.mode.label());
                 ui.label("(under construction — M1)");
             }
@@ -147,6 +200,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_events();
         egui::Panel::left("mode_rail")
             .resizable(false)
             .default_size(84.0)
