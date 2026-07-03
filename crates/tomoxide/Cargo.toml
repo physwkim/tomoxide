@@ -24,6 +24,9 @@ gpu-wgpu = ["dep:wgpu", "dep:pollster", "bytemuck/derive"]
 beam-hardening = ["dep:xraylib"]
 # SIFT center finding (pulls the opencv crate; links OpenCV, bindgen at build).
 sift-center = ["dep:opencv"]
+# Reconstruction Config (TOML): shared by the CLI (`--config`/`tomoxide init`)
+# and GUI recipes. Off by default so the core library stays serde-free.
+config = ["dep:serde", "dep:toml"]
 
 [dependencies]
 # numerics
@@ -68,6 +71,9 @@ bytemuck.workspace = true
 # optional x-ray physics (beam hardening) / computer vision (SIFT center)
 xraylib = { workspace = true, optional = true }
 opencv = { workspace = true, optional = true }
+# optional config-file support — only with `config`
+serde = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndarray.workspace = true

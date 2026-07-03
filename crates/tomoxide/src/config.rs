@@ -1,16 +1,21 @@
 //! Reconstruction configuration (a subset of tomocupy's `config.py` groups),
-//! serializable to/from TOML for `tomoxide init`.
+//! serializable to/from TOML. Behind the `config` feature.
 //!
-//! `recon` and `recon_steps` load this via `--config` and use it as the default
-//! for `backend`/`algorithm`/`rotation_axis`/`filter_name`/`remove_stripe_method`/
-//! `retrieve_phase_method`/`num_iter`/`nsino_per_chunk`/`save_format`; any explicit
-//! CLI flag overrides its config value. `file_name` is informational — the input
-//! file is passed positionally on the command line. Stripe/phase methods are
-//! selected by name; their per-method parameters (`fw_*`/`ti_*`/`sf_*`/`vo_*` and
-//! the phase physics `pixel_size`/`propagation_distance`/`energy`/`alpha`/`db`/`w`)
-//! live here too and are equally overridable by the matching CLI flag. Only the
-//! selected method's parameters are consulted.
+//! This is the file format shared by the CLI (`tomoxide init` writes the
+//! template; `recon`/`recon_steps` load it via `--config`) and by GUI recipes.
+//! The CLI uses it as the default for `backend`/`algorithm`/`rotation_axis`/
+//! `filter_name`/`remove_stripe_method`/`retrieve_phase_method`/`num_iter`/
+//! `nsino_per_chunk`/`save_format`; any explicit CLI flag overrides its config
+//! value. `file_name` is informational — the input file is passed positionally
+//! on the command line. Stripe/phase methods are selected by name; their
+//! per-method parameters (`fw_*`/`ti_*`/`sf_*`/`vo_*` and the phase physics
+//! `pixel_size`/`propagation_distance`/`energy`/`alpha`/`db`/`w`) live here too
+//! and are equally overridable by the matching CLI flag. Only the selected
+//! method's parameters are consulted. Unknown keys are ignored on load, so a
+//! file may carry extra tables (e.g. a GUI's own state) without breaking the
+//! CLI.
 
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -113,19 +118,22 @@ impl Default for Config {
 
 impl Config {
     /// Serialize to a TOML string.
-    pub fn to_toml(&self) -> anyhow::Result<String> {
-        Ok(toml::to_string_pretty(self)?)
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(self)
+            .map_err(|e| Error::InvalidParam(format!("config serialize: {e}")))
     }
 
     /// Write the config to `path`.
-    pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, self.to_toml()?)?;
-        Ok(())
+    pub fn write(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, self.to_toml()?)
+            .map_err(|e| Error::Io(format!("writing config {}: {e}", path.display())))
     }
 
     /// Load a config from `path`.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Io(format!("reading config {}: {e}", path.display())))?;
+        toml::from_str(&text)
+            .map_err(|e| Error::InvalidParam(format!("config parse {}: {e}", path.display())))
     }
 }

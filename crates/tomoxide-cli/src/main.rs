@@ -2,7 +2,6 @@
 //! `init` / `recon` / `recon_steps` / `status`).
 
 mod chunk_cache;
-mod config;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -17,7 +16,7 @@ use tomoxide::{
     ReconParams, StripeMethod,
 };
 
-use crate::config::Config;
+use tomoxide::config::Config;
 
 /// GPU/CPU tomographic reconstruction (tomopy + tomocupy, in Rust).
 #[derive(Parser, Debug)]

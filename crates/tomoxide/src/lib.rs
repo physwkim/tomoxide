@@ -21,6 +21,8 @@
 
 // Foundational layer (was tomoxide-core).
 pub mod backend;
+#[cfg(feature = "config")]
+pub mod config;
 pub mod data;
 pub mod dtype;
 pub mod error;

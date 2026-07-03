@@ -1652,8 +1652,10 @@ dependencies = [
  "rayon",
  "rust-hdf5",
  "rustfft",
+ "serde",
  "thiserror",
  "tiff",
+ "toml",
  "wgpu",
  "xraylib",
 ]
