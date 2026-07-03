@@ -25,6 +25,9 @@ sift-center = ["tomoxide/sift-center"]
 
 [dependencies]
 tomoxide = { path = "../tomoxide", features = ["config"] }
+# Same major as tomoxide's workspace pin — its public API leaks ndarray types
+# (Tomo.array, find_center_pc's Array2), so both must resolve to one ndarray.
+ndarray = "0.16"
 # siplot re-exports its egui/egui-wgpu, so widget code never version-skews;
 # pinned to a rev because the GUI tracks siplot's API, not its main branch.
 siplot = { git = "https://github.com/physwkim/siplot.git", rev = "45c14a6e12612045190be7af136dc75141ec0503" }

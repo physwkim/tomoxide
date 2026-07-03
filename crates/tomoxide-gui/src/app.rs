@@ -74,6 +74,7 @@ pub struct App {
     meta: Option<std::sync::Arc<crate::worker::DatasetMeta>>,
     data: crate::views::data::DataView,
     tune: crate::views::tune::TuneView,
+    center: crate::views::center::CenterView,
 }
 
 impl App {
@@ -95,6 +96,7 @@ impl App {
             meta: None,
             data: crate::views::data::DataView::new(render_state),
             tune: crate::views::tune::TuneView::new(render_state),
+            center: crate::views::center::CenterView::default(),
         }
     }
 
@@ -119,6 +121,7 @@ impl App {
                         meta.ndark
                     ));
                     self.tune.on_dataset(&meta);
+                    self.center.on_dataset(&meta);
                     self.meta = Some(meta.clone());
                     self.data.on_dataset(meta);
                 }
@@ -139,10 +142,24 @@ impl App {
                     self.log.push(format!("preview slice {slice}: {millis} ms"));
                     self.tune.on_preview(generation, ny, nx, data, millis);
                 }
+                Event::CenterFound {
+                    method,
+                    center,
+                    millis,
+                } => {
+                    self.log.push(format!(
+                        "center ({}): {center:.3} — {millis} ms",
+                        method.label()
+                    ));
+                    self.center.on_center(method, center, millis);
+                }
                 Event::JobFailed { what, error } => {
                     self.log.push(format!("FAILED {what}: {error}"));
                     if what.starts_with("preview") {
                         self.tune.on_preview_failed();
+                    }
+                    if what.starts_with("center") {
+                        self.center.on_failed();
                     }
                 }
             }
@@ -213,8 +230,12 @@ impl App {
                 }
             }
             Mode::Center => {
-                ui.heading(self.mode.label());
-                ui.label("(under construction — M1)");
+                self.center.ui(ui, &self.worker.jobs, self.meta.as_ref());
+                if let Some(c) = self.center.take_accepted() {
+                    self.tune.center = c;
+                    self.tune.center_auto = false;
+                    self.log.push(format!("center {c:.3} → Tune"));
+                }
             }
             Mode::Run | Mode::Output => {
                 ui.heading(self.mode.label());

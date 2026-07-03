@@ -3218,6 +3218,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "log",
+ "ndarray",
  "rfd",
  "serde",
  "siplot",

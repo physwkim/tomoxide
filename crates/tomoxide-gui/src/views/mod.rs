@@ -5,6 +5,7 @@
 //! `PlotId` allocation convention (siplot ids must not collide; some widgets
 //! reserve a small range): Data 0–29, Tune 30–49, Center 50–69.
 
+pub mod center;
 pub mod data;
 pub mod tune;
 

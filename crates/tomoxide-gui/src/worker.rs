@@ -44,6 +44,30 @@ pub struct PreviewSpec {
     pub stripe: StripeMethod,
 }
 
+/// Rotation-axis auto-detection method (docs/GUI.md §2 Center).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CenterMethod {
+    /// Nghia Vo's sinogram-domain Fourier method (`find_center_vo`).
+    Vo,
+    /// Entropy of trial gridrec reconstructions (`find_center`).
+    Entropy,
+    /// Phase correlation of the 0°/mirrored-180° projections (`find_center_pc`).
+    Pc,
+    /// SIFT registration of the 0°/180° pair (needs the `sift-center` feature).
+    Sift,
+}
+
+impl CenterMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            CenterMethod::Vo => "vo",
+            CenterMethod::Entropy => "entropy",
+            CenterMethod::Pc => "pc",
+            CenterMethod::Sift => "sift",
+        }
+    }
+}
+
 /// Work requests from the UI thread.
 pub enum Job {
     /// Probe a DXchange file: sizes + theta → [`Event::DatasetOpened`].
@@ -53,6 +77,13 @@ pub enum Job {
     /// Reconstruct one slice in memory → [`Event::Preview`]. `generation` is
     /// echoed back so the UI can drop results that were superseded meanwhile.
     Preview { generation: u64, spec: PreviewSpec },
+    /// Auto-detect the rotation axis → [`Event::CenterFound`]. `row` picks the
+    /// sinogram for Vo/Entropy; `init` seeds the Entropy search.
+    FindCenter {
+        method: CenterMethod,
+        row: usize,
+        init: Option<f32>,
+    },
     /// Exit the worker loop.
     Shutdown,
 }
@@ -69,6 +100,12 @@ pub enum Event {
         nproj: usize,
         nx: usize,
         data: Vec<f32>,
+    },
+    /// A rotation-axis estimate (detector-column units).
+    CenterFound {
+        method: CenterMethod,
+        center: f32,
+        millis: u128,
     },
     /// A finished single-slice preview: `[ny, nx]` row-major reconstruction.
     Preview {
@@ -166,6 +203,23 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                     }),
                     Err(e) => send(Event::JobFailed {
                         what: format!("sinogram row {row}"),
+                        error: e.to_string(),
+                    }),
+                }
+            }
+            Job::FindCenter { method, row, init } => {
+                let Some(path) = &current else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match run_find_center(&engine, path, method, row, init) {
+                    Ok(center) => send(Event::CenterFound {
+                        method,
+                        center,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    Err(e) => send(Event::JobFailed {
+                        what: format!("center ({})", method.label()),
                         error: e.to_string(),
                     }),
                 }
@@ -273,6 +327,72 @@ fn run_preview(
     Ok((ny, nxo, guard.data().to_vec()))
 }
 
+/// Auto-detect the rotation axis with the chosen method.
+///
+/// Vo/Entropy read + normalize only the one selected sinogram row; Pc/Sift
+/// need whole projections, so they read + normalize the FULL dataset (logged
+/// cost: acceptable at tuning time, a row-band reader is the M2 fix).
+fn run_find_center(
+    engine: &Engine,
+    path: &std::path::Path,
+    method: CenterMethod,
+    row: usize,
+    init: Option<f32>,
+) -> tomoxide::Result<f32> {
+    let backend = engine.backend();
+    let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
+    match method {
+        CenterMethod::Vo | CenterMethod::Entropy => {
+            let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+            let row = row.min(nz.saturating_sub(1));
+            let mut ds = reader.read_chunk(row, row + 1)?;
+            tomoxide::prep::normalize_dataset(&mut ds, backend)?;
+            match method {
+                // tomopy find_center_vo defaults (smin/smax ±50, srad 6,
+                // step 0.25, ratio 0.5, drop 20), as in the parity tests.
+                CenterMethod::Vo => tomoxide::recon::center::find_center_vo(
+                    &ds.data, backend, None, -50.0, 50.0, 6.0, 0.25, 0.5, 20,
+                ),
+                _ => tomoxide::recon::center::find_center(
+                    &ds.data, &ds.theta, backend, None, init, 0.5,
+                ),
+            }
+        }
+        CenterMethod::Pc | CenterMethod::Sift => {
+            let mut ds = reader.read_all()?;
+            tomoxide::prep::normalize_dataset(&mut ds, backend)?;
+            let proj = ds.data.to_layout(tomoxide::Layout::Projection);
+            let nproj = proj.array.dim().0;
+            if nproj < 2 {
+                return Err(tomoxide::Error::InvalidParam(
+                    "center pc/sift needs at least two projections".into(),
+                ));
+            }
+            // Partner of the first projection: the angle closest to θ₀ + 180°.
+            let theta0 = ds.theta[0];
+            let i180 = ds
+                .theta
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da = ((**a - theta0).abs() - std::f32::consts::PI).abs();
+                    let db = ((**b - theta0).abs() - std::f32::consts::PI).abs();
+                    da.total_cmp(&db)
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(nproj - 1);
+            let proj0 = proj.array.index_axis(ndarray::Axis(0), 0).to_owned();
+            let proj180 = proj.array.index_axis(ndarray::Axis(0), i180).to_owned();
+            match method {
+                CenterMethod::Pc => {
+                    tomoxide::recon::center::find_center_pc(&proj0, &proj180, backend, 0.25, init)
+                }
+                _ => tomoxide::recon::center::find_center_sift(&proj0, &proj180, 0.5),
+            }
+        }
+    }
+}
+
 fn probe(path: &std::path::Path) -> tomoxide::Result<DatasetMeta> {
     let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
     let (nproj, nz, nx, nflat, ndark) = reader.read_sizes()?;
@@ -344,6 +464,35 @@ mod tests {
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
         assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
+    }
+
+    /// Vo and Entropy run on one normalized sinogram row of the fixture and
+    /// land near the detector midline (the fixture is centered).
+    #[test]
+    fn find_center_vo_and_entropy_run() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let meta = probe(&fixture()).unwrap();
+        let mid = meta.nx as f32 / 2.0;
+        for method in [CenterMethod::Vo, CenterMethod::Entropy] {
+            let c = run_find_center(&engine, &fixture(), method, meta.nz / 2, None).unwrap();
+            assert!(
+                (c - mid).abs() < meta.nx as f32 / 4.0,
+                "{}: center {c} implausibly far from midline {mid}",
+                method.label()
+            );
+        }
+    }
+
+    /// Phase correlation runs on the fixture's 0°/180° projection pair.
+    #[test]
+    fn find_center_pc_runs() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let meta = probe(&fixture()).unwrap();
+        let c = run_find_center(&engine, &fixture(), CenterMethod::Pc, 0, None).unwrap();
+        assert!(
+            c > 0.0 && c < meta.nx as f32,
+            "pc center {c} outside the detector"
+        );
     }
 
     /// Probing the fixture yields its known dimensions.
