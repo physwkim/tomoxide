@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **HDF5/TIFF writers are zero-copy** — `H5Writer`/`TiffWriter` handed each
+  chunk through an elementwise gather copy before writing; a standard C-layout
+  chunk (what every driver produces) is now passed straight to the write call
+  (`as_slice`), with the gather kept only as a non-contiguous fallback. The
+  gather was the H5 writer's dominant cost (~2× the raw file write at 512³).
+
 ## [0.5.1] - 2026-07-02
 
 ### Changed

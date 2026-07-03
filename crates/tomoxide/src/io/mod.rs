@@ -737,9 +737,19 @@ impl VolumeWriter for TiffWriter {
         }
         for local in 0..cz {
             // Slice is [y, x], contiguous row-major (x fastest) in z-major
-            // Volume storage — exactly TIFF's width=nx, height=ny order.
+            // Volume storage — exactly TIFF's width=nx, height=ny order. A
+            // z-slice of a standard C-layout volume is itself contiguous, so
+            // hand its backing slice to the encoder zero-copy; gather into a
+            // temporary only for a non-contiguous caller.
             let slice = vol.array.index_axis(Axis(0), local);
-            let buf: Vec<f32> = slice.iter().copied().collect();
+            let gathered;
+            let buf: &[f32] = match slice.as_slice() {
+                Some(s) => s,
+                None => {
+                    gathered = slice.iter().copied().collect::<Vec<f32>>();
+                    &gathered
+                }
+            };
 
             let global = start + local;
             let fname = format!("{}_{global:05}.tiff", self.prefix);
@@ -747,7 +757,7 @@ impl VolumeWriter for TiffWriter {
                 File::create(&fname).map_err(|e| Error::Io(format!("create {fname}: {e}")))?;
             let mut enc = TiffEncoder::new(BufWriter::new(file))
                 .map_err(|e| Error::Io(format!("tiff encoder {fname}: {e}")))?;
-            enc.write_image::<Gray32Float>(nx as u32, ny as u32, &buf)
+            enc.write_image::<Gray32Float>(nx as u32, ny as u32, buf)
                 .map_err(|e| Error::Io(format!("tiff write {fname}: {e}")))?;
         }
         Ok(())
@@ -893,11 +903,25 @@ impl VolumeWriter for H5Writer {
         }
         // The whole chunk (local rows `0..cz`, C-order `[cz, ny, nx]`) is written
         // into global rows `[start, end)` (tomocupy `dset[st:end] = rec`).
-        let slab: Vec<f32> = vol.array.iter().copied().collect();
-        state
-            .dataset
-            .write_slice(&[start, 0, 0], &[cz, ny, nx], &slab)
-            .map_err(|e| Error::Io(format!("write /exchange/data[{start}..{end}]: {e}")))?;
+        //
+        // Every in-tree driver hands a standard C-layout chunk volume, whose
+        // backing slice is already the C-order `[cz, ny, nx]` slab `write_slice`
+        // expects — pass it zero-copy. The elementwise gather this replaces was
+        // the H5 writer's dominant cost (~2× the raw file write for a 512³
+        // volume); it remains only as the fallback for a non-contiguous caller.
+        let write = |slab: &[f32]| {
+            state
+                .dataset
+                .write_slice(&[start, 0, 0], &[cz, ny, nx], slab)
+                .map_err(|e| Error::Io(format!("write /exchange/data[{start}..{end}]: {e}")))
+        };
+        match vol.array.as_slice() {
+            Some(slab) => write(slab)?,
+            None => {
+                let slab: Vec<f32> = vol.array.iter().copied().collect();
+                write(&slab)?;
+            }
+        }
         state
             .file
             .flush()
