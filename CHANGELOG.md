@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **GUI design document** (`docs/GUI.md`) — design for a `tomoxide-gui`
+  desktop application built on siplot (egui + wgpu) and sidm (EPICS PVA):
+  offline workflow (dataset browsing, single-slice tune loop with A/B
+  compare, center finding with a `write_center` sweep montage, subprocess
+  full-volume runs, output browsing) plus a tomostream-style live streaming
+  mode, with the prioritized list of library additions it requires.
+
 ### Changed
 
 - **HDF5/TIFF writers are zero-copy** — `H5Writer`/`TiffWriter` handed each
