@@ -179,6 +179,14 @@ fn iterative(
         ));
     }
 
+    // Truncated-projection support extension: solve on an edge-replicate
+    // extended lane + wider grid, return the central crop. Sits above the
+    // backend dispatch so CPU, CUDA, and wgpu all see the identical extended
+    // problem (see `ReconParams::ext_pad`).
+    if params.ext_pad {
+        return ext_pad_solve(sino, geom, algorithm, params, backend);
+    }
+
     // ART/BART are row-action (Kaczmarz) — they consume the single-ray rows, not
     // the whole-sinogram forward/back-projectors the other methods compose.
     if matches!(algorithm, Algorithm::Art | Algorithm::Bart) {
@@ -252,6 +260,99 @@ fn iterative(
         // Art/Bart by the ray-projector path above, so they never reach here.
         _ => unreachable!("non-iterative algorithm reached iterative dispatch"),
     }
+}
+
+/// Truncated-projection support extension (`ReconParams::ext_pad`).
+///
+/// Edge-replicate extends every projection by `pad = ncols/4` columns per
+/// side, shifts the rotation center by `pad`, solves the same algorithm on
+/// the `n + 2·pad` grid, and returns the central `n × n` crop. The extension
+/// gives out-of-view mass a support region to land in, so the least-squares
+/// fit stops dumping the truncation inconsistency into a FOV-edge ring — the
+/// iterative analog of the edge-replicate padding the analytic filter step
+/// (`FbpFilter::apply`) and gridrec already apply. A warm-start `init` and a
+/// Tikhonov `reg_data` prior are embedded centered (zero ring); the pad-ring
+/// state is not part of the caller-visible volume, so a split warm-started
+/// run is *approximately* — not bit — equal to a continuous one under
+/// `ext_pad`.
+fn ext_pad_solve(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    backend: &dyn Backend,
+) -> Result<Volume<f32>> {
+    let b = sino.as_layout(Layout::Sinogram);
+    let (nz, nang, ncols) = (b.n_rows(), b.n_angles(), b.n_cols());
+    let n = grid_size(sino, params);
+    let pad = (ncols / 4).max(1);
+    let ncols_ext = ncols + 2 * pad;
+    let n_ext = n + 2 * pad;
+
+    // Edge-replicate extended sinogram, [nz, nang, ncols_ext].
+    let mut ext = Array3::<f32>::zeros((nz, nang, ncols_ext));
+    for iz in 0..nz {
+        for ia in 0..nang {
+            let src = b.array.index_axis(Axis(0), iz);
+            let row = src.index_axis(Axis(0), ia);
+            let mut dst = ext.index_axis_mut(Axis(0), iz);
+            let mut dst = dst.index_axis_mut(Axis(0), ia);
+            let (first, last) = (row[0], row[ncols - 1]);
+            for j in 0..pad {
+                dst[j] = first;
+                dst[pad + ncols + j] = last;
+            }
+            for j in 0..ncols {
+                dst[pad + j] = row[j];
+            }
+        }
+    }
+    let sino_ext = Tomo::new(ext, Layout::Sinogram);
+
+    // Same geometry on the wider lane: rotation center shifts with the pad.
+    let mut geom_ext = geom.clone();
+    geom_ext.detector.width = ncols_ext;
+    geom_ext.center = match &geom.center {
+        Center::Scalar(c) => Center::Scalar(c + pad as f32),
+        Center::PerRow(v) => Center::PerRow(v.iter().map(|c| c + pad as f32).collect()),
+    };
+
+    // Embed an `[nz, n, n]` volume centered in the `[nz, n_ext, n_ext]` grid.
+    // (`slice_axis`, not the `s![]` macro — the macro expands with an
+    // `allow(unsafe_code)` that this module's `forbid` rejects.)
+    let core = ndarray::Slice::from(pad..pad + n);
+    let embed = |src: &Array3<f32>| -> Array3<f32> {
+        let mut out = Array3::<f32>::zeros((nz, n_ext, n_ext));
+        let mut view = out.slice_axis_mut(Axis(1), core);
+        view.slice_axis_mut(Axis(2), core).assign(src);
+        out
+    };
+    let mut params_ext = params.clone();
+    params_ext.ext_pad = false; // solve the extended problem plainly
+    params_ext.num_gridx = Some(n_ext);
+    params_ext.num_gridy = params.num_gridy.map(|_| n_ext);
+    if let Some(v) = &params.init {
+        if v.dims() != (nz, n, n) {
+            return Err(Error::ShapeMismatch {
+                expected: format!("init volume [{nz}, {n}, {n}]"),
+                found: format!("{:?}", v.dims()),
+            });
+        }
+        params_ext.init = Some(Volume::new(embed(&v.array)));
+    }
+    if params.reg_data.len() == nz * n * n {
+        let prior =
+            Array3::from_shape_vec((nz, n, n), params.reg_data.clone()).expect("len checked above");
+        params_ext.reg_data = embed(&prior).into_raw_vec_and_offset().0;
+    }
+
+    let vol = iterative(&sino_ext, &geom_ext, algorithm, &params_ext, backend)?;
+    Ok(Volume::new(
+        vol.array
+            .slice_axis(Axis(1), core)
+            .slice_axis(Axis(2), core)
+            .to_owned(),
+    ))
 }
 
 /// Simultaneous Iterative Reconstruction Technique.

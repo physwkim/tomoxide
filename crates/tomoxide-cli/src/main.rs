@@ -166,6 +166,13 @@ struct CommonRecon {
     /// comma-separated f32 list (e.g. `--reg_par 0.5,0.01`).
     #[arg(long)]
     reg_par: Option<String>,
+    /// Truncated-projection support extension for iterative methods: solve on
+    /// an edge-replicate widened lane (+`ncols/4` per side) and return the
+    /// central crop, so samples overhanging the field of view stop producing a
+    /// FOV-edge ring. `--ext_pad` alone enables it; `--ext_pad false` disables
+    /// a config-file setting. Ignored by analytic methods. ~2.25x cost/iter.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    ext_pad: Option<bool>,
     /// Stripe removal (`fw`): damping factor `sigma` [default: 2.0].
     #[arg(long)]
     fw_sigma: Option<f32>,
@@ -239,6 +246,7 @@ struct ReconPlan {
     filter_str: String,
     num_iter: usize,
     reg_par: Vec<f32>,
+    ext_pad: bool,
     prep: PrepOptions,
     stripe_str: String,
     phase_str: String,
@@ -429,6 +437,7 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         Some(s) => parse_f32_list(s)?,
         None => cfg.reg_par.clone(),
     };
+    let ext_pad = c.ext_pad.unwrap_or(cfg.ext_pad);
     let stripe_str = c
         .remove_stripe
         .clone()
@@ -481,6 +490,7 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
             filter_str,
             num_iter,
             reg_par,
+            ext_pad,
             prep,
             stripe_str,
             phase_str,
@@ -716,6 +726,7 @@ fn main() -> anyhow::Result<()> {
                         plan.filter,
                         plan.num_iter,
                         plan.reg_par.clone(),
+                        plan.ext_pad,
                         plan.prep,
                         &engine,
                     )?;
@@ -733,6 +744,7 @@ fn main() -> anyhow::Result<()> {
                     plan.filter,
                     plan.num_iter,
                     plan.reg_par.clone(),
+                    plan.ext_pad,
                 );
                 if let Some(deg) = lamino_angle {
                     use std::f32::consts::PI;
@@ -815,6 +827,7 @@ fn main() -> anyhow::Result<()> {
                 plan.filter,
                 plan.num_iter,
                 plan.reg_par,
+                plan.ext_pad,
                 plan.prep,
                 &engine,
             )?;
@@ -864,6 +877,7 @@ fn run_pipelined(
     filter: FilterName,
     num_iter: usize,
     reg_par: Vec<f32>,
+    ext_pad: bool,
     prep: PrepOptions,
     engine: &Engine,
 ) -> anyhow::Result<()> {
@@ -873,7 +887,7 @@ fn run_pipelined(
     let mut probe = tomoxide::io::open_dxchange(&path)?;
     let geom = geometry_from_reader(probe.as_mut(), center)?;
     drop(probe);
-    let params = recon_params(&geom, dtype, filter, num_iter, reg_par);
+    let params = recon_params(&geom, dtype, filter, num_iter, reg_par, ext_pad);
     let read_path = path;
     let write_path = out.to_string();
     // Reconstruct only `[start_row, end_row)` (a z-shard); both omitted ⇒ the
@@ -956,6 +970,9 @@ fn run_sharded_subprocesses(
             // reaches every shard (children never see the parent's `--config`).
             .arg("--output")
             .arg(out);
+        if plan.ext_pad {
+            cmd.arg("--ext_pad").arg("true");
+        }
         if !plan.reg_par.is_empty() {
             let csv = plan
                 .reg_par
@@ -1332,6 +1349,7 @@ fn recon_params(
     filter_name: FilterName,
     num_iter: usize,
     reg_par: Vec<f32>,
+    ext_pad: bool,
 ) -> ReconParams {
     ReconParams {
         num_gridx: Some(geom.detector.width),
@@ -1339,6 +1357,7 @@ fn recon_params(
         filter_name,
         num_iter,
         reg_par,
+        ext_pad,
         ..Default::default()
     }
 }
@@ -1377,6 +1396,7 @@ fn reconstruct_chain(
             plan.filter,
             stage.num_iter,
             plan.reg_par.clone(),
+            plan.ext_pad,
         );
         params.lamino_rh = lamino_rh;
         params.init = init.take();

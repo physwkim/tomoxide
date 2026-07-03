@@ -55,6 +55,11 @@ pub struct TuneView {
     pub num_iter: usize,
     /// Comma-separated reg_par list, parsed on request.
     pub reg_par: String,
+    /// Truncated-projection support extension for iterative methods
+    /// (`ReconParams::ext_pad`). On by default: real beamline samples routinely
+    /// overhang the FOV, and without it the iterative preview is swamped by
+    /// the truncation edge ring.
+    pub ext_pad: bool,
     pub stripe: String,
     pub fw_sigma: f32,
     pub fw_level: usize,
@@ -96,6 +101,7 @@ impl TuneView {
             center: 0.0,
             num_iter: 10,
             reg_par: String::new(),
+            ext_pad: true,
             stripe: "none".into(),
             fw_sigma: 2.0,
             fw_level: 0,
@@ -187,6 +193,9 @@ impl TuneView {
         let mut s = self.algorithm.clone();
         if self.is_iterative() {
             s.push_str(&format!(":{}", self.num_iter));
+            if self.ext_pad {
+                s.push_str("+pad");
+            }
         } else {
             s.push_str(&format!("/{}", self.filter));
         }
@@ -212,6 +221,7 @@ impl TuneView {
         cfg.filter_name = self.filter.clone();
         cfg.rotation_axis = (!self.center_auto).then_some(self.center);
         cfg.num_iter = self.num_iter;
+        cfg.ext_pad = self.ext_pad;
         cfg.reg_par = parse_reg_par(&self.reg_par)?;
         cfg.remove_stripe_method = self.stripe.clone();
         cfg.fw_sigma = self.fw_sigma;
@@ -235,6 +245,7 @@ impl TuneView {
             self.center = c;
         }
         self.num_iter = cfg.num_iter.max(1);
+        self.ext_pad = cfg.ext_pad;
         self.reg_par = cfg
             .reg_par
             .iter()
@@ -283,6 +294,7 @@ impl TuneView {
             filter,
             num_iter: self.num_iter,
             reg_par,
+            ext_pad: self.ext_pad,
             stripe,
         })
     }
@@ -353,6 +365,14 @@ impl TuneView {
                             )
                             .changed();
                     });
+                    changed |= ui
+                        .checkbox(&mut self.ext_pad, "extend FOV")
+                        .on_hover_text(
+                            "solve on an edge-extended lane and crop back, so samples \
+                             overhanging the field of view don't produce an edge ring \
+                             (truncated projections); ~2.25\u{d7} slower per iteration",
+                        )
+                        .changed();
                 });
                 self.dirty |= changed;
             });

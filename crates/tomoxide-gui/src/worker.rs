@@ -45,6 +45,9 @@ pub struct PreviewSpec {
     pub filter: FilterName,
     pub num_iter: usize,
     pub reg_par: Vec<f32>,
+    /// Truncated-projection support extension (iterative methods; see
+    /// `ReconParams::ext_pad`).
+    pub ext_pad: bool,
     pub stripe: StripeMethod,
 }
 
@@ -296,6 +299,7 @@ fn run_preview(
         filter_name: spec.filter,
         num_iter: spec.num_iter,
         reg_par: spec.reg_par.clone(),
+        ext_pad: spec.ext_pad,
         ..Default::default()
     };
     let prep = PrepOptions {
@@ -459,6 +463,7 @@ mod tests {
             filter: FilterName::Parzen,
             num_iter: 1,
             reg_par: Vec::new(),
+            ext_pad: false,
             stripe: StripeMethod::None,
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
@@ -489,6 +494,8 @@ mod tests {
             filter: FilterName::Parzen,
             num_iter: 10,
             reg_par: Vec::new(),
+            // The Tune panel default: iterative previews run support-extended.
+            ext_pad: true,
             stripe: StripeMethod::None,
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
@@ -511,6 +518,7 @@ mod tests {
             filter: FilterName::Shepp,
             num_iter: 1,
             reg_par: Vec::new(),
+            ext_pad: false,
             stripe: StripeMethod::Sf { size: 3 },
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();

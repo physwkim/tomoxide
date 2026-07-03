@@ -52,6 +52,23 @@ All notable changes to this project are documented here. The format is based on
   full-volume runs, output browsing) plus a tomostream-style live streaming
   mode, with the prioritized list of library additions it requires.
 
+### Added
+
+- **`ext_pad` — truncated-projection support extension for iterative
+  methods.** Real samples routinely overhang the field of view, so the
+  projections don't end at zero; an iterative forward model whose support is
+  the detector-width grid then dumps that inconsistency into a huge FOV-edge
+  ring and background offset that swamp the (intact) interior — on real
+  800-wide data a 10-iteration CGLS correlated only 0.56 with fbp full-frame
+  while agreeing 0.99 in the interior. With `ReconParams::ext_pad` (CLI
+  `--ext_pad`, config `ext_pad`, GUI Tune "extend FOV" — on by default in the
+  GUI) the sinogram is edge-replicate extended by `ncols/4` per side, the
+  solve runs on the wider grid, and the central crop is returned; the wrapper
+  sits above the backend dispatch so CPU/CUDA/wgpu see the identical extended
+  problem. Real-data result: CGLS-10 full-frame correlation with fbp 0.56 →
+  0.996, interior display contrast restored to fbp's level. Off by default in
+  the library (tomopy-parity semantics unchanged; ~2.25× cost per iteration).
+
 ### Changed
 
 - **GUI preview autoscale is percentile-robust** — image colormaps scale to

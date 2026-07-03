@@ -95,6 +95,70 @@ fn sirt_reconstructs_and_converges() {
 }
 
 #[test]
+fn ext_pad_recovers_truncated_projections() {
+    // Real projections don't end at zero (sample overhanging the FOV /
+    // absorbance background). An iterative forward model whose support is the
+    // detector-width grid then dumps the inconsistency into a FOV-edge ring
+    // and background offset that decorrelate the frame from the phantom even
+    // though the interior structure is intact (measured on nca 800² real
+    // data: interior r = 0.99 vs fbp while the frame was ~1 % contrast).
+    // Model the truncation with a constant sinogram offset; `ext_pad` must
+    // restore full-disk agreement with the phantom.
+    let n = 96;
+    let nang = 150;
+    let cpu = CpuBackend::new();
+
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let mut sino = sim::project(&vol, &geom, &cpu).unwrap();
+    sino.array += 0.5;
+
+    let p = |ext_pad| ReconParams {
+        num_gridx: Some(n),
+        num_iter: 100,
+        ext_pad,
+        ..Default::default()
+    };
+    let plain = recon::recon(&sino, &geom, Algorithm::Sirt, &p(false), &cpu).unwrap();
+    let padded = recon::recon(&sino, &geom, Algorithm::Sirt, &p(true), &cpu).unwrap();
+    assert_eq!(padded.dims(), (1, n, n), "ext_pad must crop back to n×n");
+    let plain = plain.array.index_axis(Axis(0), 0).to_owned();
+    let padded = padded.array.index_axis(Axis(0), 0).to_owned();
+
+    let r_plain = pearson_disk(&plain, &phantom, n, 0.98);
+    let r_padded = pearson_disk(&padded, &phantom, n, 0.98);
+    eprintln!(
+        "SIRT on offset sinogram, full-disk r vs phantom: plain = {r_plain:.4}, ext_pad = {r_padded:.4}"
+    );
+    assert!(
+        r_padded > 0.9,
+        "ext_pad SIRT still disagrees with the phantom on truncated data: r = {r_padded:.4}"
+    );
+    assert!(
+        r_padded > r_plain + 0.05,
+        "ext_pad did not improve over the plain solve: {r_plain:.4} -> {r_padded:.4}"
+    );
+
+    // Consistent (in-view) data must be essentially unaffected. Shepp-Logan's
+    // outer ellipse reaches the FOV edge, so its sinogram borders are small
+    // but not exactly zero and the replicated lane carries a little mass —
+    // measured plain-vs-padded r = 0.991 on the clean sinogram (vs 0.79/0.92
+    // phantom agreement on the offset one); bound that residual.
+    let clean = sim::project(&vol, &geom, &cpu).unwrap();
+    let a = recon::recon(&clean, &geom, Algorithm::Sirt, &p(false), &cpu).unwrap();
+    let b = recon::recon(&clean, &geom, Algorithm::Sirt, &p(true), &cpu).unwrap();
+    let a = a.array.index_axis(Axis(0), 0).to_owned();
+    let b = b.array.index_axis(Axis(0), 0).to_owned();
+    let r_clean = pearson_disk(&a, &b, n, 0.98);
+    eprintln!("SIRT clean sinogram, plain vs ext_pad r = {r_clean:.4}");
+    assert!(
+        r_clean > 0.98,
+        "ext_pad distorts consistent data: r = {r_clean:.4}"
+    );
+}
+
+#[test]
 fn mlem_reconstructs_nonnegative_phantom() {
     let n = 96;
     let nang = 150;

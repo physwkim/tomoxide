@@ -185,6 +185,19 @@ pub struct ReconParams {
     /// methods ignore it. Consumed on both the host and the CUDA device-resident
     /// path.
     pub init: Option<crate::data::Volume<f32>>,
+    /// Lateral support extension for truncated projections (iterative methods).
+    /// Real samples often overhang the field of view, so the projections do not
+    /// end at zero; an iterative forward model that assumes the object fits in
+    /// the detector-width disk then dumps the inconsistency into a huge FOV-edge
+    /// ring and background offset that swamp the (otherwise intact) interior.
+    /// With `ext_pad` the sinogram columns are edge-replicate extended by
+    /// `ncols/4` per side, the solve runs on the correspondingly wider grid, and
+    /// the central `n × n` region is returned — the out-of-view mass gets
+    /// support to land in, the same boundary treatment the analytic methods
+    /// apply in their filter step. Costs ~2.25× per iteration; off by default
+    /// so consistent (in-view) data and tomopy-parity semantics are unchanged.
+    /// Ignored by analytic methods.
+    pub ext_pad: bool,
 }
 
 impl Default for ReconParams {
@@ -203,6 +216,7 @@ impl Default for ReconParams {
             dtype: crate::dtype::Dtype::F32,
             lamino_rh: None,
             init: None,
+            ext_pad: false,
         }
     }
 }

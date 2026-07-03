@@ -43,6 +43,10 @@ pub struct Config {
     pub retrieve_phase_method: String,
     /// Iterations for iterative algorithms.
     pub num_iter: usize,
+    /// Lateral support extension for truncated projections (iterative methods):
+    /// edge-replicate extend each projection by `ncols/4` per side, solve on the
+    /// wider grid, return the central crop. See `ReconParams::ext_pad`.
+    pub ext_pad: bool,
     /// Regularization parameters for iterative methods (`reg_par`).
     pub reg_par: Vec<f32>,
     /// Slices per reconstruction chunk (streaming).
@@ -104,6 +108,7 @@ impl Default for Config {
             remove_stripe_method: "none".into(),
             retrieve_phase_method: "none".into(),
             num_iter: 1,
+            ext_pad: false,
             reg_par: Vec::new(),
             nsino_per_chunk: 8,
             save_format: "tiff".into(),
