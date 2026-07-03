@@ -120,6 +120,70 @@ fn fourierrec_matches_fbp_amplitude() {
 }
 
 #[test]
+fn gridrec_matches_fbp_amplitude() {
+    // Same amplitude pin as fourierrec's, for gridrec: its samples are now
+    // polar-density-compensated (2π·|ρ|/nang) and the deapodization carries
+    // the Kaiser–Bessel pair's W/I₀(β) constant, so it must land on the
+    // unified fbp/tomopy amplitude (it previously sat on an arbitrary,
+    // size-dependent scale — ×2600 at n=128 — hidden by Pearson-only tests).
+    // Two geometries on purpose: n=128 has pad == 2·ncols exactly, n=100 has
+    // pad = 2.56·ncols — the normalization must not depend on the pad ratio
+    // or the angle count.
+    for (n, nang) in [(128, 180), (100, 90)] {
+        let (gr, _) = recon_slice(Algorithm::Gridrec, n, nang);
+        let (fbp, _) = recon_slice(Algorithm::Fbp, n, nang);
+        let scale = fit_scale(&fbp, &gr, n, 0.85);
+        eprintln!("n={n} nang={nang}: fbp/gridrec amplitude scale = {scale:.5}");
+        assert!(
+            (scale - 1.0).abs() < 0.05,
+            "gridrec amplitude differs from fbp at n={n} nang={nang}: \
+             fbp/gridrec = {scale:.5} (expected ≈ 1; the normalization regressed)"
+        );
+    }
+}
+
+#[test]
+fn gridrec_tolerates_truncated_projections() {
+    // Real projections don't end at zero (object crossing the field of view /
+    // absorbance background). gridrec used to zero-pad its radial FFT, so a
+    // nonzero projection border became a hard step that rang across the
+    // FOV-edge annulus — on real 800-wide data gridrec correlated only 0.42
+    // with fbp while agreeing 0.97 inside a 0.9-radius disk. It now
+    // edge-replicates the padding exactly like FbpFilter::apply. Model the
+    // truncation with a constant sinogram offset (nonzero at both borders)
+    // and require gridrec ≈ ramp-fbp over the full frame, not just the core.
+    let n = 128;
+    let nang = 180;
+    let cpu = CpuBackend::new();
+    let phantom = sim::shepp2d(n).unwrap();
+    let vol = Volume::new(phantom.clone().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let mut sino = sim::project(&vol, &geom, &cpu).unwrap();
+    sino.array += 0.5;
+    let params = ReconParams {
+        num_gridx: Some(n),
+        filter_name: FilterName::Ramp,
+        ..Default::default()
+    };
+    let gr = recon::recon(&sino, &geom, Algorithm::Gridrec, &params, &cpu).unwrap();
+    let fbp = recon::recon(&sino, &geom, Algorithm::Fbp, &params, &cpu).unwrap();
+    let gr = gr.array.index_axis(Axis(0), 0).to_owned();
+    let fbp = fbp.array.index_axis(Axis(0), 0).to_owned();
+    let r = pearson_disk(&gr, &fbp, n, 0.98);
+    let scale = fit_scale(&fbp, &gr, n, 0.98);
+    eprintln!("truncated: gridrec vs ramp-fbp r = {r:.4}, fbp/gridrec scale = {scale:.5}");
+    assert!(
+        r > 0.95,
+        "gridrec disagrees with fbp on nonzero-border data: r = {r:.4} \
+         (the edge-replicate padding regressed to a ringing zero-pad)"
+    );
+    assert!(
+        (scale - 1.0).abs() < 0.1,
+        "gridrec amplitude off on nonzero-border data: fbp/gridrec = {scale:.5}"
+    );
+}
+
+#[test]
 fn fourierrec_agrees_with_gridrec() {
     // Both are central-slice-theorem direct methods; on the same forward-projected
     // phantom their reconstructions must be nearly identical (only the gridding

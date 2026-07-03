@@ -118,6 +118,21 @@ All notable changes to this project are documented here. The format is based on
   (`phi_amp = π·nd²/nang`), CUDA (`divphi` ×π/4 over the unnormalized cuFFT
   inverse), and wgpu (deapodize `norm = π/4`) all land on the unified
   fbp/tomopy scale; cross-backend ratios are unchanged.
+- **gridrec disagreed with fbp/fourierrec on real data and sat on an
+  arbitrary amplitude.** Three defects in one method: (1) its output was
+  never masked to the detector-width disk, so gridding leakage outside the
+  field of view dominated the frame (corr vs fbp 0.36 on real 800-wide data
+  while agreeing 0.97 inside a 0.9-radius disk); (2) its radial FFT was
+  zero-padded, so the nonzero borders of real (truncated-FOV/absorbance)
+  projections became a hard step that rang across the FOV-edge annulus — it
+  now edge-replicates the padding exactly like `FbpFilter::apply`; (3) its
+  ramp weight and deapodization were unnormalized (the Kaiser–Bessel pair's
+  W/I₀(β) constant was dropped and no polar density compensation applied),
+  leaving a size-dependent scale (~2600× below fbp at n=128) — samples now
+  carry `2π·|ρ|/nang` and the true KB constant, landing on the unified
+  fbp/tomopy amplitude. Pinned by amplitude and truncated-projection
+  regression tests; real 800-wide data now: gridrec↔fourierrec corr 0.992,
+  gridrec↔ramp-fbp corr 0.963, scales within 3 %.
 - **`recon --start_row/--end_row` was silently ignored by the whole-volume
   paths** (algorithms without a streaming handle — gridrec and the iterative
   set, everything on CPU/wgpu — plus `--algorithm` chains): a 1-row request

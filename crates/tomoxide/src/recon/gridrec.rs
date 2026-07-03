@@ -15,9 +15,13 @@
 //! tomopy numeric parity is gated on a tomopy install (offline-unavailable).
 //!
 //! The pure ramp `|ρ|` weight (the polar→Cartesian density compensation,
-//! mandatory for DFI) is always applied; additional apodization windows
-//! (`shepp`, `hann`, …) are a follow-up — `params.filter_name` is not yet read
-//! here.
+//! mandatory for DFI) is always applied, scaled to the unified fbp/tomopy
+//! amplitude (`2π|ρ|/nang`, pinned by `gridrec_matches_fbp_amplitude`);
+//! additional apodization windows (`shepp`, `hann`, …) are a follow-up —
+//! `params.filter_name` is not yet read here. Projections are edge-replicate
+//! padded (like [`FbpFilter::apply`](crate::backend::FbpFilter)) so truncated
+//! fields of view don't ring, and the output is masked to the detector-width
+//! disk like every other analytic method.
 
 use ndarray::{Array3, ArrayViewMut2};
 
@@ -117,8 +121,20 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
             }
         })
         .collect();
-    // Precompute the deapodization profile (separable).
-    let deapod: Vec<f32> = (0..m).map(|i| apod(i, m)).collect();
+    // Unified amplitude (the fbp/tomopy scale every method emits, pinned by
+    // `gridrec_matches_fbp_amplitude`): each polar sample is density-
+    // compensated by its polar area element over the Cartesian cell area,
+    // |f|·Δθ·Δf / (Δu·Δv) = |ρ|·π/nang (the Cartesian Δu·Δv quadrature itself
+    // is the 1/m² the `fft_2d` inverse normalization applies), times an
+    // empirical constant 2 (constant across sizes/angle counts/pad ratios —
+    // see the amplitude pin test) absorbed from the Kaiser–Bessel pair.
+    let ramp_scale = 2.0 * std::f32::consts::PI / nang as f32;
+    // Precompute the deapodization profile (separable). `apod` is only the
+    // sinc-form shape; the true Kaiser–Bessel Fourier pair carries a
+    // W/I₀(β) constant per axis (Jackson et al.) — without it the division
+    // leaves gridrec on an arbitrary amplitude.
+    let kb_ft_norm = 2.0 * KW / i0_beta;
+    let deapod: Vec<f32> = (0..m).map(|i| apod(i, m) * kb_ft_norm).collect();
 
     let bdata = b
         .array
@@ -131,27 +147,44 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
     // only shared immutable state (`bdata`, `trig`, `rho`, `deapod`, `geom`, `fft`),
     // so slices are independent and produce bit-identical output whether run
     // serially or fanned across host threads.
+    // Centre the width-`ncols` lane in the `pad`-wide buffer and edge-
+    // replicate the borders — the same treatment as `FbpFilter::apply`
+    // (tomocupy `fbp_filter_center`). Real projections don't end at zero
+    // (truncated field of view), and zero-fill puts a hard step at the
+    // projection borders that rings across the FOV-edge annulus of the
+    // reconstruction; edge replication suppresses it.
+    let pad_side = pad / 2 - ncols / 2;
     let process_row = |row: usize, mut slab: ArrayViewMut2<f32>| -> Result<()> {
-        // 1. Radial 1-D FFTs of all projections (zero-padded from index 0).
+        // 1. Radial 1-D FFTs of all projections (edge-replicate-padded).
         let mut radial = vec![Complex32::new(0.0, 0.0); nang * pad];
         for ia in 0..nang {
             let src = row * nang * ncols + ia * ncols;
+            let dst = ia * pad;
+            let first = bdata[src];
+            let last = bdata[src + ncols - 1];
+            for slot in radial[dst..dst + pad_side].iter_mut() {
+                *slot = Complex32::new(first, 0.0);
+            }
             for j in 0..ncols {
-                radial[ia * pad + j] = Complex32::new(bdata[src + j], 0.0);
+                radial[dst + pad_side + j] = Complex32::new(bdata[src + j], 0.0);
+            }
+            for slot in radial[dst + pad_side + ncols..dst + pad].iter_mut() {
+                *slot = Complex32::new(last, 0.0);
             }
         }
         fft.fft_1d(&mut radial, pad, nang, false)?;
 
-        // 2. Recenter (rotation axis at `center`) and apply the ramp |ρ|, then
-        //    grid onto the centered 2-D Fourier plane with the KB kernel.
-        let center = geom.center.at(row);
+        // 2. Recenter (rotation axis at `center`, shifted by the pad_side
+        //    placement offset) and apply the ramp |ρ|, then grid onto the
+        //    centered 2-D Fourier plane with the KB kernel.
+        let center = geom.center.at(row) + pad_side as f32;
         let mut grid = vec![Complex32::new(0.0, 0.0); m * m];
         let half = m as f32 / 2.0;
         for ia in 0..nang {
             let (c, s) = trig[ia];
             for k in 0..pad {
                 let r = rho[k];
-                let ramp = r.abs();
+                let ramp = r.abs() * ramp_scale;
                 if ramp == 0.0 {
                     continue;
                 }
@@ -199,14 +232,29 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
         fft.fft_2d(&mut grid, m, m, 1, true)?;
         quadrant_swap(&mut grid, m);
 
-        // 4. Deapodize and crop the central n×n.
+        // 4. Deapodize, crop the central n×n, and zero outside the
+        //    ncols-wide disk — the same `circ` mask fbp/linerec/fourierrec
+        //    apply. Outside the detector's field of view the padded grid
+        //    holds gridding leakage, not signal; unmasked it dominated the
+        //    frame and made gridrec look uncorrelated with fbp on real data.
+        let r2max = (ncols as f32 / 2.0) * (ncols as f32 / 2.0);
         for iy in 0..n {
             let gy = off + iy;
+            let dy = gy as f32 - m as f32 / 2.0;
             for ix in 0..n {
                 let gx = off + ix;
-                let de = deapod[gy] * deapod[gx];
-                let v = grid[gy * m + gx].re;
-                slab[[iy, ix]] = if de.abs() > 1e-6 { v / de } else { v };
+                let dx = gx as f32 - m as f32 / 2.0;
+                slab[[iy, ix]] = if dx * dx + dy * dy < r2max {
+                    let de = deapod[gy] * deapod[gx];
+                    let v = grid[gy * m + gx].re;
+                    if de.abs() > 1e-6 {
+                        v / de
+                    } else {
+                        v
+                    }
+                } else {
+                    0.0
+                };
             }
         }
         Ok(())
