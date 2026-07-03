@@ -13,6 +13,13 @@ members = [
     "crates/tomoxide",
     "crates/tomoxide-cli",
 ]
+# The GUI lives in the repo but OUTSIDE this workspace (own [workspace], own
+# lock): it depends on siplot (edition 2024, rust 1.92), and cargo parses every
+# member manifest on every command — as a member it would silently raise the
+# whole repo's effective MSRV from 1.82 to 1.92 (`default-members` does not
+# avoid the parse). Fold it in when the workspace MSRV reaches 1.92+.
+# See docs/GUI.md §3.1.
+exclude = ["crates/tomoxide-gui"]
 
 [workspace.package]
 version = "0.5.1"

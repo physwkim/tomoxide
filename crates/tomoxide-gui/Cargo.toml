@@ -1,0 +1,46 @@
+# tomoxide-gui — desktop GUI for tomoxide, built on siplot (egui + wgpu).
+#
+# NOT a member of the repo workspace (root Cargo.toml `exclude`): siplot is
+# edition-2024 / rust 1.92 while the library workspace holds MSRV 1.82, and a
+# workspace member's manifest is parsed by every cargo invocation. Own
+# [workspace] + own Cargo.lock; build from this directory. See docs/GUI.md §3.1.
+[package]
+name = "tomoxide-gui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "BSD-3-Clause"
+repository = "https://github.com/physwkim/tomoxide"
+description = "tomoxide desktop GUI (siplot/egui)"
+
+[workspace]
+
+[features]
+# CUDA on by default: the GUI targets the same beamline machines as the CLI.
+# gpu-wgpu stays off — tomoxide's wgpu backend duplicates a second wgpu stack
+# next to siplot's egui-wgpu and buys the GUI nothing (docs/GUI.md §3.2).
+default = ["cuda"]
+cuda = ["tomoxide/cuda"]
+sift-center = ["tomoxide/sift-center"]
+
+[dependencies]
+tomoxide = { path = "../tomoxide", features = ["config"] }
+# siplot re-exports its egui/egui-wgpu, so widget code never version-skews;
+# pinned to a rev because the GUI tracks siplot's API, not its main branch.
+siplot = { git = "https://github.com/physwkim/siplot.git", rev = "45c14a6e12612045190be7af136dc75141ec0503" }
+# eframe must run the wgpu renderer (siplot widgets need cc.wgpu_render_state).
+eframe = { version = "0.34", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Local development against the sibling checkout (uncomment; do not commit):
+# [patch."https://github.com/physwkim/siplot.git"]
+# siplot = { path = "../../../siplot" }
