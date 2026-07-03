@@ -33,8 +33,10 @@ All notable changes to this project are documented here. The format is based on
   workspace-`exclude`d crate (siplot is edition-2024/rust-1.92; workspace
   membership would raise the repo's effective MSRV above 1.82) implementing
   docs/GUI.md M1: a single worker thread owns the `Engine` and all HDF5
-  handles (`!Send`); **Data** (DXchange open + metadata, projection browser,
-  theta plot, raw sinogram inspector), **Tune** (single-slice preview through
+  handles (`!Send`); **Data** (DXchange open + metadata, projection browser —
+  frames load through `io::read_h5_frame` so `uint16` beamline stacks render,
+  with the colormap scaled to the stack's raw-count range — theta plot, raw
+  sinogram inspector), **Tune** (single-slice preview through
   `run_streaming_pipelined_range` into `io::InMemoryWriter`, parameter panel
   with auto-recon, A/B pin compare), **Center** (Vo / entropy /
   phase-correlation / SIFT auto methods, ±0.5/±0.25 px tweak, hand-off to

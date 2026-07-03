@@ -5,9 +5,32 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use siplot::egui_wgpu::RenderState;
-use siplot::{CurveData, Hdf5FrameLoader, ImageStack, ItemHandle, Plot1D, Plot2D, egui};
+use siplot::{CurveData, Frame, FrameLoader, ImageStack, ItemHandle, Plot1D, Plot2D, egui};
 
 use crate::worker::{DatasetMeta, Job};
+
+/// Projection-browser loader: same `"file::dataset::index"` source format as
+/// siplot's `Hdf5FrameLoader`, but reading through tomoxide's dtype-dispatching
+/// HDF5 frame read — real beamline stacks are usually `uint16`, which siplot's
+/// own loader rejects (it reads only 4/8-byte float datasets).
+struct DxFrameLoader;
+
+impl FrameLoader for DxFrameLoader {
+    fn load(&self, source: &str) -> Option<Frame> {
+        let parts: Vec<&str> = source.split("::").collect();
+        let [path, data_path, index] = parts.as_slice() else {
+            return None;
+        };
+        let index = index.parse::<usize>().ok()?;
+        let (ny, nx, data) = tomoxide::io::read_h5_frame(path, data_path, index).ok()?;
+        Some(Frame::new(
+            nx as u32,
+            ny as u32,
+            data,
+            Some(source.to_string()),
+        ))
+    }
+}
 
 pub struct DataView {
     path_input: String,
@@ -30,7 +53,7 @@ pub struct DataView {
 impl DataView {
     pub fn new(render_state: &RenderState) -> Self {
         let mut stack = ImageStack::new(render_state, 0);
-        stack.set_loader(Arc::new(Hdf5FrameLoader));
+        stack.set_loader(Arc::new(DxFrameLoader));
         stack.set_n_prefetch(2);
         stack.set_table_visible(false);
         let mut theta_plot = Plot1D::new(render_state, 10);
@@ -66,6 +89,11 @@ impl DataView {
             })
             .collect();
         self.stack.set_sources(sources);
+        // Raw-count display range from frame 0 (the stack has no autoscale).
+        self.stack.set_colormap(siplot::Colormap::viridis(
+            meta.data_range.0 as f64,
+            meta.data_range.1 as f64,
+        ));
         // Theta curve in degrees over the projection index.
         let x: Vec<f64> = (0..meta.theta.len()).map(|i| i as f64).collect();
         let y: Vec<f64> = meta

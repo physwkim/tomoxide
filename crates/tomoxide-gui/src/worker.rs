@@ -27,6 +27,10 @@ pub struct DatasetMeta {
     pub ndark: usize,
     /// Projection angles in radians (generated uniformly if absent).
     pub theta: Vec<f32>,
+    /// Finite min/max of projection frame 0 — the display range for the
+    /// projection browser (raw-count stacks need it; the default 0..1
+    /// colormap saturates them).
+    pub data_range: (f32, f32),
 }
 
 /// Everything a single-slice preview reconstruction needs, fully resolved to
@@ -397,6 +401,19 @@ fn probe(path: &std::path::Path) -> tomoxide::Result<DatasetMeta> {
     let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
     let (nproj, nz, nx, nflat, ndark) = reader.read_sizes()?;
     let theta = reader.read_theta()?;
+    let (_ny, _nx, frame0) =
+        tomoxide::io::read_h5_frame(&path.to_string_lossy(), tomoxide::io::dxchange::DATA, 0)?;
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &v in &frame0 {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+        (lo, hi) = (0.0, 1.0);
+    }
     Ok(DatasetMeta {
         path: path.to_path_buf(),
         nproj,
@@ -405,6 +422,7 @@ fn probe(path: &std::path::Path) -> tomoxide::Result<DatasetMeta> {
         nflat,
         ndark,
         theta,
+        data_range: (lo, hi),
     })
 }
 
