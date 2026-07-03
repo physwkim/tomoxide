@@ -117,8 +117,9 @@ struct CommonRecon {
     /// Input DXchange HDF5 file.
     file: PathBuf,
     /// Optional TOML config (from `tomoxide init`). Supplies defaults for
-    /// algorithm/center/filter/stripe/phase/num_iter/save_format/chunk; any flag
-    /// below overrides its config value.
+    /// algorithm/center/dtype/filter/stripe/phase/num_iter/save_format/output/
+    /// chunk (and, for `recon`, lamino_angle); any flag below overrides its
+    /// config value.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …). A
@@ -133,12 +134,18 @@ struct CommonRecon {
     /// Rotation-axis column (omit to auto-find / use the detector midline).
     #[arg(long)]
     center: Option<f32>,
-    /// Reconstruction precision: float32 | float16 (CUDA analytic paths only).
-    #[arg(long, default_value = "float32")]
-    dtype: String,
+    /// Reconstruction precision: float32 | float16 (CUDA analytic paths only)
+    /// [default: float32].
+    #[arg(long)]
+    dtype: Option<String>,
     /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
     #[arg(long)]
     save_format: Option<String>,
+    /// Output base path — each writer adds its own suffix (tiff:
+    /// `<base>_NNNNN.tiff` per slice; h5: `<base>.h5`; zarr: `<base>.zarr`)
+    /// [default: <input-without-extension>_rec].
+    #[arg(long)]
+    output: Option<PathBuf>,
     /// Apodization filter (none|ramp|shepp|cosine|cosine2|hamming|hann|parzen).
     #[arg(long)]
     filter: Option<String>,
@@ -223,6 +230,9 @@ struct ReconPlan {
     algo: Algorithm,
     center: Option<f32>,
     dtype: Dtype,
+    /// Output base path override (`--output`/config); `None` ⇒ derive
+    /// `<input-without-extension>_rec` from the input file.
+    out: Option<String>,
     save_format: tomoxide::io::SaveFormat,
     save_format_str: String,
     filter: FilterName,
@@ -393,7 +403,17 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         .ok_or_else(|| anyhow!("no algorithm given (empty --algorithm)"))?
         .algo;
     let center = c.center.or(cfg.rotation_axis);
-    let dtype: Dtype = c.dtype.parse().map_err(|e| anyhow!("{e}"))?;
+    let dtype: Dtype = c
+        .dtype
+        .clone()
+        .unwrap_or_else(|| cfg.dtype.clone())
+        .parse()
+        .map_err(|e| anyhow!("{e}"))?;
+    let out = c
+        .output
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| cfg.output.clone().filter(|s| !s.is_empty()));
     let save_format_str = c
         .save_format
         .clone()
@@ -454,6 +474,7 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
             algo,
             center,
             dtype,
+            out,
             save_format,
             save_format_str,
             filter,
@@ -585,6 +606,7 @@ fn main() -> anyhow::Result<()> {
             let (plan, cfg) = resolve(&common)?;
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
             let file = common.file.clone();
+            let lamino_angle = lamino_angle.or(cfg.lamino_angle);
             let dtype = plan.dtype;
             let save_format = plan.save_format;
             println!(
@@ -604,7 +626,7 @@ fn main() -> anyhow::Result<()> {
                 plan.num_iter,
                 plan.reg_par
             );
-            let out = recon_out_path(&file);
+            let out = plan.out.clone().unwrap_or_else(|| recon_out_path(&file));
             // Algorithm chaining (`--algorithm a,b`) warm-starts each stage from the
             // previous stage's volume, which needs the whole prior volume — so it
             // takes the whole-volume path and never the per-slice pipeline/shard.
@@ -663,7 +685,7 @@ fn main() -> anyhow::Result<()> {
                     && nz > devices.len()
                     && nx >= MULTI_GPU_MIN_NX;
                 if shardable {
-                    run_sharded_subprocesses(&file, &plan, chunk, nz, &devices)?;
+                    run_sharded_subprocesses(&file, &out, &plan, chunk, nz, &devices)?;
                 } else {
                     // Overlapped streaming path: same output as the whole-volume
                     // path (cuFFT-floor identical, Pearson 1.0), lower peak memory,
@@ -726,6 +748,12 @@ fn main() -> anyhow::Result<()> {
                     plan.algorithm
                 ));
             }
+            if cfg.lamino_angle.is_some() {
+                return Err(anyhow!(
+                    "lamino_angle (from config) needs the whole-volume path; it is \
+                     supported only by `recon`, not the streaming `recon_steps`"
+                ));
+            }
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
             let file = common.file.clone();
             let chunk = chunk.unwrap_or(cfg.nsino_per_chunk);
@@ -747,7 +775,7 @@ fn main() -> anyhow::Result<()> {
                 plan.num_iter,
                 plan.reg_par
             );
-            let out = recon_out_path(&file);
+            let out = plan.out.clone().unwrap_or_else(|| recon_out_path(&file));
             run_pipelined(
                 &file,
                 &out,
@@ -856,6 +884,7 @@ fn run_pipelined(
 /// The call fails if any child fails.
 fn run_sharded_subprocesses(
     file: &Path,
+    out: &str,
     plan: &ReconPlan,
     chunk: usize,
     nz: usize,
@@ -896,7 +925,11 @@ fn run_sharded_subprocesses(
             .arg("--start_row")
             .arg(z0.to_string())
             .arg("--end_row")
-            .arg(z1.to_string());
+            .arg(z1.to_string())
+            // The parent's resolved output path, so a `--output`/config override
+            // reaches every shard (children never see the parent's `--config`).
+            .arg("--output")
+            .arg(out);
         if !plan.reg_par.is_empty() {
             let csv = plan
                 .reg_par

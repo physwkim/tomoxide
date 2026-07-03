@@ -33,6 +33,10 @@ pub struct Config {
     pub filter_name: String,
     /// Rotation-axis column; `None` ⇒ auto-find.
     pub rotation_axis: Option<f32>,
+    /// Laminography tilt angle (degrees); `None` ⇒ tomographic reconstruction.
+    /// Whole-volume only (the tilt couples all detector rows), so the CLI
+    /// honors it in `recon` and rejects it in the streaming `recon_steps`.
+    pub lamino_angle: Option<f32>,
     /// Stripe-removal method: `none` | `fw` | `ti` | `sf` | `vo-all`.
     pub remove_stripe_method: String,
     /// Phase-retrieval method: `none` | `paganin` | `Gpaganin` | `farago`.
@@ -45,6 +49,12 @@ pub struct Config {
     pub nsino_per_chunk: usize,
     /// Output format: `tiff` | `h5` | `zarr`.
     pub save_format: String,
+    /// Reconstruction precision: `float32` | `float16` (CUDA analytic paths only).
+    pub dtype: String,
+    /// Output base path — each writer adds its own suffix (tiff:
+    /// `<base>_NNNNN.tiff` per slice; h5: `<base>.h5`; zarr: `<base>.zarr`);
+    /// `None`/empty ⇒ `<input-without-extension>_rec`.
+    pub output: Option<String>,
 
     // --- Stripe-removal parameters (used when the matching method is selected) ---
     /// `fw` damping factor `sigma`.
@@ -90,12 +100,15 @@ impl Default for Config {
             algorithm: "fbp".into(),
             filter_name: "parzen".into(),
             rotation_axis: None,
+            lamino_angle: None,
             remove_stripe_method: "none".into(),
             retrieve_phase_method: "none".into(),
             num_iter: 1,
             reg_par: Vec::new(),
             nsino_per_chunk: 8,
             save_format: "tiff".into(),
+            dtype: "float32".into(),
+            output: None,
 
             fw_sigma: 2.0,
             fw_level: 0,
