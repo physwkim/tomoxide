@@ -784,7 +784,10 @@ mod tests {
         assert_eq!(f[0], 0.0); // DC zeroed by the ramp
                                // Rises monotonically to the Nyquist bin (k = 16), then mirrors down.
         assert!(f[16] > f[8] && f[8] > f[4] && f[4] > f[2] && f[2] > f[1]);
-        assert!((f[16] - 1.0).abs() < 1e-6); // pure ramp == 1 at Nyquist
+        // Physical |ω| ramp in cycles/pixel: 0.5 at Nyquist (k = 16 = pad/2),
+        // i.e. k/pad. tomopy/tomocupy's doubled ramp would read 1.0 here and put
+        // analytic output at 2×μ.
+        assert!((f[16] - 0.5).abs() < 1e-6);
         for k in 1..16 {
             assert!((f[k] - f[32 - k]).abs() < 1e-6, "asymmetry at {k}");
         }

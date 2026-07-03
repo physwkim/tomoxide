@@ -121,14 +121,17 @@ pub fn gridrec(sino: &Tomo<f32>, geom: &Geometry, n: usize, fft: &dyn Fft) -> Re
             }
         })
         .collect();
-    // Unified amplitude (the fbp/tomopy scale every method emits, pinned by
+    // Unified amplitude (the fbp scale every method emits, pinned by
     // `gridrec_matches_fbp_amplitude`): each polar sample is density-
     // compensated by its polar area element over the Cartesian cell area,
     // |f|·Δθ·Δf / (Δu·Δv) = |ρ|·π/nang (the Cartesian Δu·Δv quadrature itself
-    // is the 1/m² the `fft_2d` inverse normalization applies), times an
-    // empirical constant 2 (constant across sizes/angle counts/pad ratios —
-    // see the amplitude pin test) absorbed from the Kaiser–Bessel pair.
-    let ramp_scale = 2.0 * std::f32::consts::PI / nang as f32;
+    // is the 1/m² the `fft_2d` inverse normalization applies). This lands
+    // gridrec on the physical attenuation μ — the same scale the other analytic
+    // methods reach now that `make_fbp_filter` uses the un-doubled `|ω|` ramp.
+    // (Before that ramp fix both gridrec and fbp sat at 2×μ, so this scale
+    // carried a matching empirical ×2; removing the ramp doubling let it go too,
+    // keeping the fbp/gridrec pin at ≈1 while both drop to μ.)
+    let ramp_scale = std::f32::consts::PI / nang as f32;
     // Precompute the deapodization profile (separable). `apod` is only the
     // sinc-form shape; the true Kaiser–Bessel Fourier pair carries a
     // W/I₀(β) constant per axis (Jackson et al.) — without it the division

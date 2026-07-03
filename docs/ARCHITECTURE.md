@@ -237,7 +237,7 @@ reconstruction now matches the CPU/wgpu output in **both orientation and scale**
 
 | algorithm | image orientation | amplitude scale (cuda / cpu) |
 |-----------|-------------------|------------------------------|
-| `fbp`, `linerec`      | same as CPU | `≈ 1` (back-projection unified `4/nproj → π/nproj`, filter `½` removed) |
+| `fbp`, `linerec`      | same as CPU | `≈ 1` (back-projection dθ weight `4/nproj → π/nproj` at the analytic call sites, filter `½` removed) |
 | `fourierrec`          | same as CPU | `≈ 1` (filter `½` removed, unnormalized cuFFT inverse normalized by `(2n)²`) |
 | `lprec`               | same as CPU | `≈ 1` (filter `½` removed; log-polar back-projection already matched the CPU port) |
 | `gridrec`             | same as CPU | `1` (backend-agnostic `recon::gridrec` over the `Fft` capability; never used `build_filter_w`) |
@@ -262,10 +262,23 @@ backend ports **tomocupy**, and the unification target is tomopy):
    and `plan2d` is `(2n)²`, so the CUDA fourierrec ran `(2n)²`× hot; `divphi` now
    divides by `(2n)²` to match the CPU's normalized inverse FFT.
 
-**Ramp shape (the remaining residual).** The base ramp still differs per backend:
-CPU/wgpu build tomopy's plain linear ramp (`2·k/pad`), CUDA builds tomocupy's
-degree-12 `_wint` quadrature ramp, selected via `backend::RampShape` (`Linear`
-for CPU/wgpu, `Wint` for CUDA) in the single shared `make_fbp_filter`. This leaves
+**Absolute scale = physical μ.** Beyond cuda/cpu *agreement*, the analytic output
+is anchored to an absolute scale: the `make_fbp_filter` base ramp is the physical
+`|ω|` inversion filter (peak `0.5` at Nyquist), not tomopy/tomocupy's doubled
+ramp (peak `1`), and `recon::gridrec`'s `ramp_scale` is `π/nang` with no matching
+empirical `×2`. So every analytic method reconstructs the attenuation μ per
+pixel-unit rather than `2×μ` — the same scale the iterative solvers and
+`recon::lamino`'s own `|f|/ne` ramp converge to, which makes fbp→iterative
+warm-starts scale-consistent. Pinned by `tests/analytic_amplitude.rs` (a unit
+disk reconstructs to core mean ≈ 1.0). This is a deliberate departure from both
+upstreams, whose absolute analytic amplitude is itself convention-dependent
+(tomopy gridrec ≈ 1.16×μ via an empirical `winv` fudge; tomocupy ≈ 4/π×μ).
+
+**Ramp shape (the remaining cuda/cpu residual).** The base ramp still differs per
+backend: CPU/wgpu build tomopy's plain linear ramp (`k/pad`), CUDA builds
+tomocupy's degree-12 `_wint` quadrature ramp (`pad·wint(t)`), selected via
+`backend::RampShape` (`Linear` for CPU/wgpu, `Wint` for CUDA) in the single
+shared `make_fbp_filter`. This leaves
 a deterministic **~1.6%** amplitude residual on the unified paths (the measured
 `cuda/cpu` scale is ≈1.016, not exactly 1); Pearson stays ≈1.0 because the shape
 difference is small and smooth. This is a shape convention, not a numerical error.

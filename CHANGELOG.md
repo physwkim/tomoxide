@@ -71,6 +71,20 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Analytic reconstructions now emit the physical μ** — the shared
+  `make_fbp_filter` base ramp is the physical `|ω|` inversion filter (peak
+  `0.5` at Nyquist) instead of tomopy/tomocupy's doubled ramp (peak `1`), and
+  `recon::gridrec`'s `ramp_scale` drops its matching empirical `×2`. Every
+  analytic method (FBP, linerec, fourierrec, lprec, gridrec, on all backends)
+  therefore reconstructs the attenuation μ per pixel-unit rather than `2×μ` —
+  the same scale the iterative solvers converge to, so fbp→iterative
+  warm-starts are now scale-consistent. **All analytic output amplitudes are
+  halved**; downstream code that hard-coded the old scale (rescale windows,
+  8/16-bit export ranges) must adjust. Cross-method and cross-backend ratios
+  are unchanged (both sides halve). Pinned by `tests/analytic_amplitude.rs` (a
+  unit disk reconstructs to core mean ≈ 1.0). This is a deliberate departure
+  from both upstreams, whose absolute analytic amplitude is itself
+  convention-dependent (tomopy gridrec ≈ 1.16×μ, tomocupy ≈ 4/π×μ).
 - **Iterative reconstructions now converge to the physical μ** — the
   forward/back-projector pair used by the iterative solvers is the plain
   line-integral Radon transform `W` and its pure adjoint `Wᵀ` on every
