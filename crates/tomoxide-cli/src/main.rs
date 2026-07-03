@@ -635,6 +635,8 @@ fn main() -> anyhow::Result<()> {
             if plan.chain.len() > 1 {
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
+                let (z0, z1, banded) =
+                    row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
                 if let Some(deg) = lamino_angle {
                     use std::f32::consts::PI;
                     geom.beam = tomoxide::Beam::Laminography {
@@ -642,12 +644,23 @@ fn main() -> anyhow::Result<()> {
                     };
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
-                let ds = reader.read_all()?;
+                let nz_total = geom.detector.height;
+                let ds = if banded {
+                    geom.detector.height = z1 - z0;
+                    reader.read_chunk(z0, z1)?
+                } else {
+                    reader.read_all()?
+                };
                 let vol = reconstruct_chain(ds, &geom, &plan, lamino_rh, &engine)?;
                 let mut writer = tomoxide::io::create_writer(&out, save_format)?;
                 let nz = vol.dims().0;
-                writer.reserve(nz)?;
-                writer.write_chunk(&vol, 0, nz)?;
+                if banded {
+                    writer.reserve(nz_total)?;
+                    writer.write_chunk(&vol, z0, z0 + nz)?;
+                } else {
+                    writer.reserve(nz)?;
+                    writer.write_chunk(&vol, 0, nz)?;
+                }
                 writer.finalize()?;
             } else if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
@@ -712,6 +725,8 @@ fn main() -> anyhow::Result<()> {
                 // laminography).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
+                let (z0, z1, banded) =
+                    row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
                 let mut params = recon_params(
                     &geom,
                     dtype,
@@ -727,13 +742,24 @@ fn main() -> anyhow::Result<()> {
                     params.lamino_rh = lamino_rh;
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
-                let ds = reader.read_all()?;
+                let nz_total = geom.detector.height;
+                let ds = if banded {
+                    geom.detector.height = z1 - z0;
+                    reader.read_chunk(z0, z1)?
+                } else {
+                    reader.read_all()?
+                };
                 let vol =
                     tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
                 let mut writer = tomoxide::io::create_writer(&out, save_format)?;
                 let nz = vol.dims().0;
-                writer.reserve(nz)?;
-                writer.write_chunk(&vol, 0, nz)?;
+                if banded {
+                    writer.reserve(nz_total)?;
+                    writer.write_chunk(&vol, z0, z0 + nz)?;
+                } else {
+                    writer.reserve(nz)?;
+                    writer.write_chunk(&vol, 0, nz)?;
+                }
                 writer.finalize()?;
             }
             println!("wrote reconstruction to {out}");
@@ -1257,6 +1283,33 @@ fn tune_chunk(
 
 /// Build a parallel-beam geometry from the reader's sizes/angles, optionally
 /// overriding the rotation center (else the detector midline).
+/// Resolve an explicit `--start_row/--end_row` against the dataset's row count
+/// for the whole-volume paths: clamp the end, reject an empty band, and reject
+/// banding under laminography (the tilt couples every detector row into every
+/// output voxel, so a row band is not a unit of work there). Returns
+/// `(z0, z1, banded)`; both flags omitted ⇒ the full `[0, nz)` un-banded.
+fn row_band(
+    start: Option<usize>,
+    end: Option<usize>,
+    nz: usize,
+    lamino_angle: Option<f32>,
+) -> anyhow::Result<(usize, usize, bool)> {
+    let banded = start.is_some() || end.is_some();
+    if banded && lamino_angle.is_some() {
+        return Err(anyhow!(
+            "laminography reconstructs the whole stack; --start_row/--end_row are unsupported"
+        ));
+    }
+    let z0 = start.unwrap_or(0);
+    let z1 = end.unwrap_or(nz).min(nz);
+    if z0 >= z1 {
+        return Err(anyhow!(
+            "row range [{z0}, {z1}) is empty (dataset has {nz} rows)"
+        ));
+    }
+    Ok((z0, z1, banded))
+}
+
 fn geometry_from_reader(
     reader: &mut dyn DatasetReader,
     center: Option<f32>,

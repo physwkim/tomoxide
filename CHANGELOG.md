@@ -108,6 +108,13 @@ All notable changes to this project are documented here. The format is based on
   weights sum to 1 on identical rows, and EM ratios stay finite where zero-pad
   rows would 0/0) and drop the duplicate; the 1-slice solve equals the same
   slice of a multi-slice solve.
+- **`recon --start_row/--end_row` was silently ignored by the whole-volume
+  paths** (algorithms without a streaming handle — gridrec and the iterative
+  set, everything on CPU/wgpu — plus `--algorithm` chains): a 1-row request
+  read and wrote all rows. Both whole-volume branches now read only the
+  requested detector-row band and write it at its global slice offset
+  (matching the streaming/shard semantics); an explicit row range under
+  laminography is rejected (the tilt couples all rows) instead of dropped.
 
 ## [0.5.1] - 2026-07-02
 
