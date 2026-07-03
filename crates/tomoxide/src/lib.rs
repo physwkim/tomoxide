@@ -43,7 +43,7 @@ pub mod engine;
 pub mod pipeline;
 
 pub use engine::Engine;
-pub use pipeline::{reconstruct, PrepOptions, ReconSteps};
+pub use pipeline::{reconstruct, CancelToken, PrepOptions, ReconSteps};
 
 // Flat re-exports of the common building blocks (was tomoxide-core's root).
 pub use backend::{

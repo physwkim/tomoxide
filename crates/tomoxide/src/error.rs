@@ -51,6 +51,11 @@ pub enum Error {
     /// A device/driver-level failure inside a backend.
     #[error("backend error: {0}")]
     Backend(String),
+
+    /// The operation was cancelled cooperatively via
+    /// [`CancelToken`](crate::pipeline::CancelToken).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl Error {
