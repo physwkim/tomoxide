@@ -152,6 +152,123 @@ impl std::str::FromStr for SaveFormat {
     }
 }
 
+/// The volume assembled in memory by [`InMemoryWriter`].
+///
+/// Sized by [`VolumeWriter::reserve`] (slice count) plus the first chunk's
+/// cross-section; zero-filled until the corresponding chunk lands, so a
+/// cancelled run leaves the unwritten tail at `0.0`.
+#[derive(Debug, Default)]
+pub struct InMemoryVolume {
+    total_nz: usize,
+    dims: Option<(usize, usize)>,
+    data: Vec<f32>,
+}
+
+impl InMemoryVolume {
+    /// Full output shape `(nz, ny, nx)`, known once the first chunk arrived.
+    pub fn dims(&self) -> Option<(usize, usize, usize)> {
+        self.dims.map(|(ny, nx)| (self.total_nz, ny, nx))
+    }
+
+    /// The flat row-major `[nz, ny, nx]` buffer (empty before the first chunk).
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Clone the buffer into a [`Volume`] (`None` before the first chunk).
+    pub fn to_volume(&self) -> Option<Volume<f32>> {
+        let (nz, ny, nx) = self.dims()?;
+        let array = Array3::from_shape_vec((nz, ny, nx), self.data.clone())
+            .expect("data length is kept at nz*ny*nx by write_chunk");
+        Some(Volume::new(array))
+    }
+}
+
+/// A [`VolumeWriter`] that assembles the reconstruction in memory instead of
+/// on disk — the GUI/preview counterpart of the TIFF/H5/Zarr writers.
+///
+/// The buffer lives behind a shared handle ([`buffer`](Self::buffer)) so the
+/// caller keeps access after the writer is consumed — the pipelined driver
+/// constructs and drops its writer on the writer thread. An optional
+/// [`on_chunk`](Self::with_on_chunk) callback fires after each chunk lands and
+/// doubles as a progress signal.
+#[derive(Default)]
+pub struct InMemoryWriter {
+    vol: std::sync::Arc<std::sync::Mutex<InMemoryVolume>>,
+    on_chunk: Option<Box<dyn FnMut(usize, usize) + Send>>,
+}
+
+impl InMemoryWriter {
+    /// An empty writer; shape is fixed by `reserve` + the first chunk.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Shared handle to the assembled volume; stays valid after the writer is
+    /// dropped (e.g. by the pipelined driver's writer thread).
+    pub fn buffer(&self) -> std::sync::Arc<std::sync::Mutex<InMemoryVolume>> {
+        std::sync::Arc::clone(&self.vol)
+    }
+
+    /// Invoke `on_chunk(start, end)` after each chunk is copied in — a
+    /// progress signal for the global slice range that just completed.
+    pub fn with_on_chunk(mut self, on_chunk: impl FnMut(usize, usize) + Send + 'static) -> Self {
+        self.on_chunk = Some(Box::new(on_chunk));
+        self
+    }
+}
+
+impl VolumeWriter for InMemoryWriter {
+    fn reserve(&mut self, total_nz: usize) -> Result<()> {
+        let mut vol = self.vol.lock().expect("InMemoryVolume lock poisoned");
+        vol.total_nz = total_nz;
+        Ok(())
+    }
+
+    fn write_chunk(&mut self, chunk: &Volume<f32>, start: usize, end: usize) -> Result<()> {
+        let (cz, ny, nx) = chunk.array.dim();
+        {
+            let mut vol = self.vol.lock().expect("InMemoryVolume lock poisoned");
+            if cz != end - start || end > vol.total_nz {
+                return Err(Error::ShapeMismatch {
+                    expected: format!(
+                        "chunk of {} slices within [0, {})",
+                        end.saturating_sub(start),
+                        vol.total_nz
+                    ),
+                    found: format!("{cz} slices at [{start}, {end})"),
+                });
+            }
+            match vol.dims {
+                None => {
+                    vol.dims = Some((ny, nx));
+                    let total = vol.total_nz;
+                    vol.data = vec![0.0; total * ny * nx];
+                }
+                Some(d) if d != (ny, nx) => {
+                    return Err(Error::ShapeMismatch {
+                        expected: format!("cross-section {:?} (from first chunk)", d),
+                        found: format!("({ny}, {nx})"),
+                    });
+                }
+                Some(_) => {}
+            }
+            let dst = &mut vol.data[start * ny * nx..end * ny * nx];
+            if let Some(src) = chunk.array.as_slice() {
+                dst.copy_from_slice(src);
+            } else {
+                for (d, s) in dst.iter_mut().zip(chunk.array.iter()) {
+                    *d = *s;
+                }
+            }
+        }
+        if let Some(cb) = &mut self.on_chunk {
+            cb(start, end);
+        }
+        Ok(())
+    }
+}
+
 /// Open a DXchange HDF5 file for reading.
 ///
 /// Backed by the pure-Rust `rust-hdf5` crate (no libhdf5). Reads the standard
