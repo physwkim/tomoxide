@@ -71,8 +71,9 @@ pub struct App {
     worker: crate::worker::Worker,
     /// Backend name reported by the worker's Engine (`cpu`/`cuda`/…).
     backend: Option<String>,
-    dataset: Option<String>,
+    meta: Option<std::sync::Arc<crate::worker::DatasetMeta>>,
     data: crate::views::data::DataView,
+    tune: crate::views::tune::TuneView,
 }
 
 impl App {
@@ -91,8 +92,9 @@ impl App {
             log_open: true,
             worker: crate::worker::Worker::spawn(cc.egui_ctx.clone()),
             backend: None,
-            dataset: None,
+            meta: None,
             data: crate::views::data::DataView::new(render_state),
+            tune: crate::views::tune::TuneView::new(render_state),
         }
     }
 
@@ -116,7 +118,8 @@ impl App {
                         meta.nflat,
                         meta.ndark
                     ));
-                    self.dataset = Some(meta.path.display().to_string());
+                    self.tune.on_dataset(&meta);
+                    self.meta = Some(meta.clone());
                     self.data.on_dataset(meta);
                 }
                 Event::Sinogram {
@@ -125,8 +128,22 @@ impl App {
                     nx,
                     data,
                 } => self.data.on_sinogram(row, nproj, nx, &data),
+                Event::Preview {
+                    generation,
+                    slice,
+                    ny,
+                    nx,
+                    data,
+                    millis,
+                } => {
+                    self.log.push(format!("preview slice {slice}: {millis} ms"));
+                    self.tune.on_preview(generation, ny, nx, data, millis);
+                }
                 Event::JobFailed { what, error } => {
                     self.log.push(format!("FAILED {what}: {error}"));
+                    if what.starts_with("preview") {
+                        self.tune.on_preview_failed();
+                    }
                 }
             }
         }
@@ -154,7 +171,12 @@ impl App {
                 self.backend.as_deref().unwrap_or("starting…")
             ));
             ui.separator();
-            ui.label(self.dataset.as_deref().unwrap_or("no dataset"));
+            ui.label(
+                self.meta
+                    .as_ref()
+                    .map(|m| m.path.display().to_string())
+                    .unwrap_or_else(|| "no dataset".into()),
+            );
             ui.separator();
             ui.toggle_value(&mut self.log_open, "log");
         });
@@ -182,7 +204,15 @@ impl App {
     fn central(&mut self, ui: &mut egui::Ui) {
         match self.mode {
             Mode::Data => self.data.ui(ui, &self.worker.jobs),
-            Mode::Tune | Mode::Center => {
+            Mode::Tune => {
+                let mut msgs = Vec::new();
+                self.tune
+                    .ui(ui, &self.worker.jobs, self.meta.as_ref(), &mut msgs);
+                for m in msgs {
+                    self.log.push(m);
+                }
+            }
+            Mode::Center => {
                 ui.heading(self.mode.label());
                 ui.label("(under construction — M1)");
             }

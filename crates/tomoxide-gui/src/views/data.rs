@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use siplot::egui_wgpu::RenderState;
-use siplot::{Colormap, CurveData, Hdf5FrameLoader, ImageStack, ItemHandle, Plot1D, Plot2D, egui};
+use siplot::{CurveData, Hdf5FrameLoader, ImageStack, ItemHandle, Plot1D, Plot2D, egui};
 
 use crate::worker::{DatasetMeta, Job};
 
@@ -98,7 +98,7 @@ impl DataView {
     pub fn on_sinogram(&mut self, row: usize, nproj: usize, nx: usize, data: &[f32]) {
         self.sino_pending = None;
         self.sino_shown = Some(row);
-        let cmap = autoscale_viridis(data);
+        let cmap = super::autoscale_viridis(data);
         match self.sino_image {
             Some(h) => {
                 let _ = self
@@ -216,25 +216,4 @@ impl DataView {
         // Remaining central space: the projection browser.
         self.stack.ui(ui);
     }
-}
-
-/// Viridis scaled to the finite min/max of `data` (fallback 0..1).
-fn autoscale_viridis(data: &[f32]) -> Colormap {
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &v in data {
-        if v.is_finite() {
-            let v = v as f64;
-            if v < lo {
-                lo = v;
-            }
-            if v > hi {
-                hi = v;
-            }
-        }
-    }
-    if !(lo.is_finite() && hi.is_finite() && lo < hi) {
-        (lo, hi) = (0.0, 1.0);
-    }
-    Colormap::viridis(lo, hi)
 }

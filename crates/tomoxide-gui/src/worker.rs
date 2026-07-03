@@ -11,7 +11,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use siplot::egui;
-use tomoxide::{BackendKind, Engine};
+use tomoxide::io::{InMemoryWriter, VolumeWriter};
+use tomoxide::{
+    Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PrepOptions, ReconParams,
+    ReconSteps, StripeMethod, Volume,
+};
 
 /// Metadata of the opened DXchange dataset (read once per open).
 pub struct DatasetMeta {
@@ -25,12 +29,30 @@ pub struct DatasetMeta {
     pub theta: Vec<f32>,
 }
 
+/// Everything a single-slice preview reconstruction needs, fully resolved to
+/// tomoxide types on the UI side (parse errors surface in the panel, not here).
+#[derive(Clone)]
+pub struct PreviewSpec {
+    /// Detector row (slice) to reconstruct.
+    pub slice: usize,
+    pub algorithm: Algorithm,
+    /// Rotation-axis column; `None` ⇒ detector midline.
+    pub center: Option<f32>,
+    pub filter: FilterName,
+    pub num_iter: usize,
+    pub reg_par: Vec<f32>,
+    pub stripe: StripeMethod,
+}
+
 /// Work requests from the UI thread.
 pub enum Job {
     /// Probe a DXchange file: sizes + theta → [`Event::DatasetOpened`].
     OpenDataset(PathBuf),
     /// Read the raw sinogram at detector row `row` → [`Event::Sinogram`].
     ReadSinogram { row: usize },
+    /// Reconstruct one slice in memory → [`Event::Preview`]. `generation` is
+    /// echoed back so the UI can drop results that were superseded meanwhile.
+    Preview { generation: u64, spec: PreviewSpec },
     /// Exit the worker loop.
     Shutdown,
 }
@@ -47,6 +69,15 @@ pub enum Event {
         nproj: usize,
         nx: usize,
         data: Vec<f32>,
+    },
+    /// A finished single-slice preview: `[ny, nx]` row-major reconstruction.
+    Preview {
+        generation: u64,
+        slice: usize,
+        ny: usize,
+        nx: usize,
+        data: Vec<f32>,
+        millis: u128,
     },
     /// A job failed; `what` names the job for the session log.
     JobFailed { what: String, error: String },
@@ -91,7 +122,7 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     };
 
     // Auto picks CUDA when built with it and a device answers, else CPU.
-    let _engine = match Engine::new(BackendKind::Auto) {
+    let engine = match Engine::new(BackendKind::Auto) {
         Ok(engine) => {
             send(Event::BackendReady(engine.name().to_string()));
             engine
@@ -139,8 +170,107 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                     }),
                 }
             }
+            Job::Preview { generation, spec } => {
+                let Some(path) = &current else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match run_preview(&engine, path, &spec) {
+                    Ok((ny, nx, data)) => send(Event::Preview {
+                        generation,
+                        slice: spec.slice,
+                        ny,
+                        nx,
+                        data,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    Err(e) => send(Event::JobFailed {
+                        what: format!("preview slice {}", spec.slice),
+                        error: e.to_string(),
+                    }),
+                }
+            }
         }
     }
+}
+
+/// Adapts a z-shard to [`InMemoryWriter`]: the pipelined range driver still
+/// calls `reserve` with the *full* dataset slice count and writes chunks at
+/// global offsets, which for a one-slice preview would allocate the whole
+/// volume — so reserve only the window and shift chunks back by its start.
+struct WindowWriter {
+    inner: InMemoryWriter,
+    z0: usize,
+    rows: usize,
+}
+
+impl VolumeWriter for WindowWriter {
+    fn reserve(&mut self, _total_nz: usize) -> tomoxide::Result<()> {
+        self.inner.reserve(self.rows)
+    }
+
+    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> tomoxide::Result<()> {
+        self.inner.write_chunk(vol, start - self.z0, end - self.z0)
+    }
+
+    fn finalize(&mut self) -> tomoxide::Result<()> {
+        self.inner.finalize()
+    }
+}
+
+/// One-slice reconstruction through the streaming pipeline into memory.
+fn run_preview(
+    engine: &Engine,
+    path: &std::path::Path,
+    spec: &PreviewSpec,
+) -> tomoxide::Result<(usize, usize, Vec<f32>)> {
+    let mut probe = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
+    let (_nproj, nz, nx, _nflat, _ndark) = probe.read_sizes()?;
+    let theta = probe.read_theta()?;
+    drop(probe);
+
+    let mut geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
+    if let Some(c) = spec.center {
+        geom.center = Center::Scalar(c);
+    }
+    let params = ReconParams {
+        num_gridx: Some(nx),
+        filter_name: spec.filter,
+        num_iter: spec.num_iter,
+        reg_par: spec.reg_par.clone(),
+        ..Default::default()
+    };
+    let prep = PrepOptions {
+        stripe: spec.stripe,
+        ..Default::default()
+    };
+
+    let slice = spec.slice.min(nz.saturating_sub(1));
+    let mem = InMemoryWriter::new();
+    let buf = mem.buffer();
+    let mut writer = Some(WindowWriter {
+        inner: mem,
+        z0: slice,
+        rows: 1,
+    });
+    let p = path.to_path_buf();
+    ReconSteps::new(1).run_streaming_pipelined_range(
+        slice,
+        slice + 1,
+        move || tomoxide::io::open_dxchange(&p.to_string_lossy()),
+        move || Ok(Box::new(writer.take().expect("writer built once")) as Box<dyn VolumeWriter>),
+        &geom,
+        spec.algorithm,
+        &params,
+        &prep,
+        engine,
+    )?;
+
+    let guard = buf.lock().expect("preview buffer lock");
+    let (_nz1, ny, nxo) = guard
+        .dims()
+        .ok_or_else(|| tomoxide::Error::Backend("preview produced no chunk".into()))?;
+    Ok((ny, nxo, guard.data().to_vec()))
 }
 
 fn probe(path: &std::path::Path) -> tomoxide::Result<DatasetMeta> {
@@ -166,4 +296,61 @@ fn read_sinogram(path: &std::path::Path, row: usize) -> tomoxide::Result<(usize,
     let (nproj, _rows, nx) = ds.data.array.dim();
     let flat: Vec<f32> = ds.data.array.iter().copied().collect();
     Ok((nproj, nx, flat))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tomoxide/tests/fixtures/streaming_dxchange.h5"
+        ))
+    }
+
+    /// The whole preview path (probe → geometry → pipelined range recon →
+    /// window-shifted in-memory volume) runs headlessly on the CPU backend.
+    #[test]
+    fn preview_reconstructs_one_slice() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let spec = PreviewSpec {
+            slice: 3,
+            algorithm: Algorithm::Fbp,
+            center: None,
+            filter: FilterName::Parzen,
+            num_iter: 1,
+            reg_par: Vec::new(),
+            stripe: StripeMethod::None,
+        };
+        let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
+        assert_eq!(data.len(), ny * nx);
+        assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
+    }
+
+    /// Stripe removal and an out-of-range slice (clamped) still reconstruct.
+    #[test]
+    fn preview_clamps_slice_and_applies_stripe() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let spec = PreviewSpec {
+            slice: usize::MAX,
+            algorithm: Algorithm::Fbp,
+            center: Some(16.0),
+            filter: FilterName::Shepp,
+            num_iter: 1,
+            reg_par: Vec::new(),
+            stripe: StripeMethod::Sf { size: 3 },
+        };
+        let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
+        assert_eq!(data.len(), ny * nx);
+        assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
+    }
+
+    /// Probing the fixture yields its known dimensions.
+    #[test]
+    fn probe_reads_sizes_and_theta() {
+        let meta = probe(&fixture()).unwrap();
+        assert!(meta.nproj > 0 && meta.nz > 0 && meta.nx > 0);
+        assert_eq!(meta.theta.len(), meta.nproj);
+    }
 }
