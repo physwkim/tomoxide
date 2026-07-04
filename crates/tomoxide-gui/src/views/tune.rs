@@ -35,7 +35,18 @@ const ALGORITHMS: &[&str] = &[
 const FILTERS: &[&str] = &[
     "none", "ramp", "shepp", "cosine", "cosine2", "hamming", "hann", "parzen",
 ];
-const STRIPES: &[&str] = &["none", "fw", "ti", "sf", "vo-all"];
+const STRIPES: &[&str] = &[
+    "none",
+    "fw",
+    "ti",
+    "sf",
+    "vo-all",
+    "vo-sort",
+    "vo-filter",
+    "vo-large",
+    "vo-dead",
+    "vo-fit",
+];
 const PHASES: &[&str] = &["none", "paganin", "Gpaganin", "farago"];
 
 /// One finished preview kept for display / pinning.
@@ -70,6 +81,22 @@ pub struct TuneView {
     pub vo_snr: f32,
     pub vo_la_size: usize,
     pub vo_sm_size: usize,
+    /// `vo-sort`/`vo-filter` median size: 0 = tomopy auto (fw_level convention).
+    pub vo_sort_size: usize,
+    pub vo_sort_dim: u8,
+    pub vo_filter_sigma: f32,
+    pub vo_filter_size: usize,
+    pub vo_filter_dim: u8,
+    pub vo_large_snr: f32,
+    pub vo_large_size: usize,
+    pub vo_large_drop_ratio: f32,
+    pub vo_large_norm: bool,
+    pub vo_dead_snr: f32,
+    pub vo_dead_size: usize,
+    pub vo_dead_norm: bool,
+    pub vo_fit_order: usize,
+    pub vo_fit_sigma_x: f32,
+    pub vo_fit_sigma_y: f32,
     /// Phase-retrieval method (Config spelling: `none`/`paganin`/`Gpaganin`/
     /// `farago`). Previews read a row band sized by the kernel support.
     pub phase: String,
@@ -121,6 +148,22 @@ impl TuneView {
             vo_snr: 3.0,
             vo_la_size: 61,
             vo_sm_size: 21,
+            // tomopy defaults = Config::default() for the Vo 2018 variants.
+            vo_sort_size: 0,
+            vo_sort_dim: 1,
+            vo_filter_sigma: 3.0,
+            vo_filter_size: 0,
+            vo_filter_dim: 1,
+            vo_large_snr: 3.0,
+            vo_large_size: 51,
+            vo_large_drop_ratio: 0.1,
+            vo_large_norm: true,
+            vo_dead_snr: 3.0,
+            vo_dead_size: 51,
+            vo_dead_norm: true,
+            vo_fit_order: 3,
+            vo_fit_sigma_x: 5.0,
+            vo_fit_sigma_y: 20.0,
             // Physics defaults = Config::default() (the CLI template).
             phase: "none".into(),
             pixel_size: 1e-4,
@@ -287,6 +330,21 @@ impl TuneView {
         cfg.vo_snr = self.vo_snr;
         cfg.vo_la_size = self.vo_la_size;
         cfg.vo_sm_size = self.vo_sm_size;
+        cfg.vo_sort_size = self.vo_sort_size;
+        cfg.vo_sort_dim = self.vo_sort_dim;
+        cfg.vo_filter_sigma = self.vo_filter_sigma;
+        cfg.vo_filter_size = self.vo_filter_size;
+        cfg.vo_filter_dim = self.vo_filter_dim;
+        cfg.vo_large_snr = self.vo_large_snr;
+        cfg.vo_large_size = self.vo_large_size;
+        cfg.vo_large_drop_ratio = self.vo_large_drop_ratio;
+        cfg.vo_large_norm = self.vo_large_norm;
+        cfg.vo_dead_snr = self.vo_dead_snr;
+        cfg.vo_dead_size = self.vo_dead_size;
+        cfg.vo_dead_norm = self.vo_dead_norm;
+        cfg.vo_fit_order = self.vo_fit_order;
+        cfg.vo_fit_sigma_x = self.vo_fit_sigma_x;
+        cfg.vo_fit_sigma_y = self.vo_fit_sigma_y;
         cfg.retrieve_phase_method = self.phase.clone();
         cfg.pixel_size = self.pixel_size as f64;
         cfg.propagation_distance = self.propagation_distance as f64;
@@ -323,6 +381,21 @@ impl TuneView {
         self.vo_snr = cfg.vo_snr;
         self.vo_la_size = cfg.vo_la_size;
         self.vo_sm_size = cfg.vo_sm_size;
+        self.vo_sort_size = cfg.vo_sort_size;
+        self.vo_sort_dim = cfg.vo_sort_dim;
+        self.vo_filter_sigma = cfg.vo_filter_sigma;
+        self.vo_filter_size = cfg.vo_filter_size;
+        self.vo_filter_dim = cfg.vo_filter_dim;
+        self.vo_large_snr = cfg.vo_large_snr;
+        self.vo_large_size = cfg.vo_large_size;
+        self.vo_large_drop_ratio = cfg.vo_large_drop_ratio;
+        self.vo_large_norm = cfg.vo_large_norm;
+        self.vo_dead_snr = cfg.vo_dead_snr;
+        self.vo_dead_size = cfg.vo_dead_size;
+        self.vo_dead_norm = cfg.vo_dead_norm;
+        self.vo_fit_order = cfg.vo_fit_order;
+        self.vo_fit_sigma_x = cfg.vo_fit_sigma_x;
+        self.vo_fit_sigma_y = cfg.vo_fit_sigma_y;
         self.phase = cfg.retrieve_phase_method.clone();
         self.pixel_size = cfg.pixel_size as f32;
         self.propagation_distance = cfg.propagation_distance as f32;
@@ -353,6 +426,30 @@ impl TuneView {
                 snr: self.vo_snr,
                 la_size: self.vo_la_size,
                 sm_size: self.vo_sm_size,
+            },
+            "vo-sort" => StripeMethod::VoSort {
+                size: (self.vo_sort_size != 0).then_some(self.vo_sort_size),
+                dim: self.vo_sort_dim,
+            },
+            "vo-filter" => StripeMethod::VoFilter {
+                sigma: self.vo_filter_sigma,
+                size: (self.vo_filter_size != 0).then_some(self.vo_filter_size),
+                dim: self.vo_filter_dim,
+            },
+            "vo-large" => StripeMethod::VoLarge {
+                snr: self.vo_large_snr,
+                size: self.vo_large_size,
+                drop_ratio: self.vo_large_drop_ratio,
+                norm: self.vo_large_norm,
+            },
+            "vo-dead" => StripeMethod::VoDead {
+                snr: self.vo_dead_snr,
+                size: self.vo_dead_size,
+                norm: self.vo_dead_norm,
+            },
+            "vo-fit" => StripeMethod::VoFit {
+                order: self.vo_fit_order,
+                sigma: (self.vo_fit_sigma_x, self.vo_fit_sigma_y),
             },
             other => return Err(format!("unknown stripe method '{other}'")),
         };
@@ -493,6 +590,33 @@ impl TuneView {
                         changed |= drag(ui, "snr", &mut self.vo_snr, 0.1);
                         changed |= drag_usize(ui, "la_size", &mut self.vo_la_size);
                         changed |= drag_usize(ui, "sm_size", &mut self.vo_sm_size);
+                    }
+                    "vo-sort" => {
+                        changed |= drag_usize(ui, "size (0=auto)", &mut self.vo_sort_size);
+                        changed |= drag_dim(ui, &mut self.vo_sort_dim);
+                    }
+                    "vo-filter" => {
+                        changed |= drag(ui, "sigma", &mut self.vo_filter_sigma, 0.1);
+                        changed |= drag_usize(ui, "size (0=auto)", &mut self.vo_filter_size);
+                        changed |= drag_dim(ui, &mut self.vo_filter_dim);
+                    }
+                    "vo-large" => {
+                        changed |= drag(ui, "snr", &mut self.vo_large_snr, 0.1);
+                        changed |= drag_usize(ui, "size", &mut self.vo_large_size);
+                        changed |= drag(ui, "drop_ratio", &mut self.vo_large_drop_ratio, 0.01);
+                        changed |= ui.checkbox(&mut self.vo_large_norm, "normalize").changed();
+                    }
+                    "vo-dead" => {
+                        changed |= drag(ui, "snr", &mut self.vo_dead_snr, 0.1);
+                        changed |= drag_usize(ui, "size", &mut self.vo_dead_size);
+                        changed |= ui
+                            .checkbox(&mut self.vo_dead_norm, "residual large-stripe pass")
+                            .changed();
+                    }
+                    "vo-fit" => {
+                        changed |= drag_usize(ui, "order", &mut self.vo_fit_order);
+                        changed |= drag(ui, "sigma_x", &mut self.vo_fit_sigma_x, 0.5);
+                        changed |= drag(ui, "sigma_y", &mut self.vo_fit_sigma_y, 0.5);
                     }
                     _ => {}
                 }
@@ -673,6 +797,17 @@ fn drag_usize(ui: &mut egui::Ui, label: &str, value: &mut usize) -> bool {
     ui.horizontal(|ui| {
         ui.label(label);
         changed = ui.add(egui::DragValue::new(value)).changed();
+    });
+    changed
+}
+
+/// Median-window dimensionality selector for the Vo sort/filter methods:
+/// `1` → `(size, 1)` footprint, `2` → `(size, size)`.
+fn drag_dim(ui: &mut egui::Ui, value: &mut u8) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("dim");
+        changed = ui.add(egui::DragValue::new(value).range(1..=2)).changed();
     });
     changed
 }
