@@ -189,6 +189,12 @@ impl TuneView {
         self.pending = false;
     }
 
+    /// Wall time of the last finished preview — the Run screen's pre-flight
+    /// panel extrapolates its full-volume time estimate from it.
+    pub fn last_preview_millis(&self) -> Option<u128> {
+        self.last_millis
+    }
+
     fn summary(&self) -> String {
         let mut s = self.algorithm.clone();
         if self.is_iterative() {

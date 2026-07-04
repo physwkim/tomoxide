@@ -82,6 +82,7 @@ pub struct App {
     data: crate::views::data::DataView,
     tune: crate::views::tune::TuneView,
     center: crate::views::center::CenterView,
+    run: crate::views::run::RunView,
 }
 
 impl App {
@@ -113,6 +114,7 @@ impl App {
             data: crate::views::data::DataView::new(render_state),
             tune: crate::views::tune::TuneView::new(render_state),
             center: crate::views::center::CenterView::default(),
+            run: crate::views::run::RunView::new(render_state),
         }
     }
 
@@ -138,6 +140,7 @@ impl App {
                     ));
                     self.tune.on_dataset(&meta);
                     self.center.on_dataset(&meta);
+                    self.run.on_dataset(&meta);
                     self.meta = Some(meta.clone());
                     self.data.on_dataset(meta);
                 }
@@ -329,9 +332,16 @@ impl App {
                     self.log.push(format!("center {c:.3} → Tune"));
                 }
             }
-            Mode::Run | Mode::Output => {
-                ui.heading(self.mode.label());
-                ui.label("Planned for M2 (docs/GUI.md §7): full-volume runs are spawned as tomoxide-cli subprocesses; results browse via StackView.");
+            Mode::Run => {
+                let mut msgs = Vec::new();
+                self.run.ui(ui, &self.tune, self.meta.as_ref(), &mut msgs);
+                for m in msgs {
+                    self.log.push(m);
+                }
+            }
+            Mode::Output => {
+                ui.heading("Output");
+                ui.label("Planned for M2 (docs/GUI.md §7): results browse via StackView.");
             }
             Mode::Live => {
                 ui.heading("Live");

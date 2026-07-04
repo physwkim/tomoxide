@@ -3,10 +3,11 @@
 //! routed by the app shell.
 //!
 //! `PlotId` allocation convention (siplot ids must not collide; some widgets
-//! reserve a small range): Data 0–29, Tune 30–49, Center 50–69.
+//! reserve a small range): Data 0–29, Tune 30–49, Center 50–69, Run 70–89.
 
 pub mod center;
 pub mod data;
+pub mod run;
 pub mod tune;
 
 /// Viridis scaled to the robust 0.5–99.5 percentile range of `data`

@@ -45,10 +45,17 @@ eframe = { version = "0.34", default-features = false, features = [
 # native file-open dialog; same version siplot uses so it builds once
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
+# Run screen: parse the CLI's `--progress_json` chunk lines.
+serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+# Run screen latest-slice live view; same major as the tomoxide writer so the
+# GUI can always decode what the CLI just wrote.
+tiff = "0.11"
+# Run screen pre-flight: free-space check for the disk estimate.
+fs4 = "0.13"
 
 # Local development against the sibling checkout (uncomment; do not commit):
 # [patch."https://github.com/physwkim/siplot.git"]
