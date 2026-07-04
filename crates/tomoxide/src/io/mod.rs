@@ -83,6 +83,82 @@ pub struct ChunkAux {
     pub theta: Vec<f32>,
 }
 
+/// Restrict any [`DatasetReader`] to the detector-row band `[r0, r1)`.
+///
+/// Wrapped, the dataset appears to be `r1 − r0` rows tall: `read_sizes`
+/// reports the band height, and `read_all` / `read_chunk` / `read_chunk_into`
+/// address rows relative to `r0` (a chunk `[a, b)` reads the underlying rows
+/// `[r0+a, r0+b)`). `theta` passes through; flat/dark frames are sliced to the
+/// same rows by the inner reader's own chunk reads.
+///
+/// This is the banded-preview adapter (docs/GUI.md §6 #5): row-coupled prep
+/// (phase retrieval) needs detector rows around the slice of interest, so a
+/// preview reconstructs the band `[z − m, z + m]` through this wrapper and
+/// displays the center row — without reading the whole file. `m` comes from
+/// [`crate::prep::phase::margin_rows`].
+pub struct RowBandReader {
+    inner: Box<dyn DatasetReader>,
+    r0: usize,
+    r1: usize,
+}
+
+impl RowBandReader {
+    /// Wrap `inner`, restricting it to rows `[r0, r1)` (`r1` clamped to the
+    /// dataset height). Errors when the clamped band is empty.
+    pub fn new(mut inner: Box<dyn DatasetReader>, r0: usize, r1: usize) -> Result<Self> {
+        let (_nproj, nz, _nx, _nflat, _ndark) = inner.read_sizes()?;
+        let r1 = r1.min(nz);
+        if r0 >= r1 {
+            return Err(Error::InvalidParam(format!(
+                "RowBandReader: empty row band [{r0}, {r1}) in a {nz}-row dataset"
+            )));
+        }
+        Ok(RowBandReader { inner, r0, r1 })
+    }
+
+    /// Map band-relative rows `[row0, row1)` to underlying dataset rows,
+    /// rejecting ranges that leave the band.
+    fn to_inner(&self, row0: usize, row1: usize) -> Result<(usize, usize)> {
+        let nz = self.r1 - self.r0;
+        if row0 > row1 || row1 > nz {
+            return Err(Error::InvalidParam(format!(
+                "RowBandReader: chunk [{row0}, {row1}) outside the band height {nz}"
+            )));
+        }
+        Ok((self.r0 + row0, self.r0 + row1))
+    }
+}
+
+impl DatasetReader for RowBandReader {
+    fn read_sizes(&mut self) -> Result<(usize, usize, usize, usize, usize)> {
+        let (nproj, _nz, nx, nflat, ndark) = self.inner.read_sizes()?;
+        Ok((nproj, self.r1 - self.r0, nx, nflat, ndark))
+    }
+
+    fn read_theta(&mut self) -> Result<Vec<f32>> {
+        self.inner.read_theta()
+    }
+
+    fn read_all(&mut self) -> Result<Dataset<f32>> {
+        self.inner.read_chunk(self.r0, self.r1)
+    }
+
+    fn read_chunk(&mut self, row0: usize, row1: usize) -> Result<Dataset<f32>> {
+        let (row0, row1) = self.to_inner(row0, row1)?;
+        self.inner.read_chunk(row0, row1)
+    }
+
+    fn read_chunk_into(
+        &mut self,
+        row0: usize,
+        row1: usize,
+        data_out: &mut [f32],
+    ) -> Result<ChunkAux> {
+        let (row0, row1) = self.to_inner(row0, row1)?;
+        self.inner.read_chunk_into(row0, row1, data_out)
+    }
+}
+
 /// A reconstruction writer (port of tomocupy `dataio/writer.py:73`).
 pub trait VolumeWriter {
     /// Declare the full output slice count `total_nz` before the first chunk.
