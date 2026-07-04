@@ -37,7 +37,8 @@ pub struct Config {
     /// Whole-volume only (the tilt couples all detector rows), so the CLI
     /// honors it in `recon` and rejects it in the streaming `recon_steps`.
     pub lamino_angle: Option<f32>,
-    /// Stripe-removal method: `none` | `fw` | `ti` | `sf` | `vo-all`.
+    /// Stripe-removal method: `none` | `fw` | `ti` | `sf` | `vo-all` |
+    /// `vo-sort` | `vo-filter` | `vo-large` | `vo-dead` | `vo-fit`.
     pub remove_stripe_method: String,
     /// Phase-retrieval method: `none` | `paganin` | `Gpaganin` | `farago`.
     pub retrieve_phase_method: String,
@@ -77,6 +78,41 @@ pub struct Config {
     pub vo_la_size: usize,
     /// `vo-all` small-stripe window size.
     pub vo_sm_size: usize,
+    /// `vo-sort` median window size (`0` = tomopy auto: `max(5, 0.01·ncol)`,
+    /// `21` for `ncol > 2000`).
+    pub vo_sort_size: usize,
+    /// `vo-sort` median-window dimensionality (`1` → `(size, 1)`, `2` →
+    /// `(size, size)`).
+    pub vo_sort_dim: u8,
+    /// `vo-filter` Gaussian-window sigma separating the low-/high-pass
+    /// components.
+    pub vo_filter_sigma: f32,
+    /// `vo-filter` inner-sort median window size (`0` = tomopy auto, as
+    /// `vo_sort_size`).
+    pub vo_filter_size: usize,
+    /// `vo-filter` median-window dimensionality (as `vo_sort_dim`).
+    pub vo_filter_dim: u8,
+    /// `vo-large` signal-to-noise ratio for stripe detection.
+    pub vo_large_snr: f32,
+    /// `vo-large` median window size.
+    pub vo_large_size: usize,
+    /// `vo-large` fraction of extreme pixels dropped before estimating the
+    /// per-column intensity factor.
+    pub vo_large_drop_ratio: f32,
+    /// `vo-large` normalize each column by its intensity factor.
+    pub vo_large_norm: bool,
+    /// `vo-dead` signal-to-noise ratio for stripe detection.
+    pub vo_dead_snr: f32,
+    /// `vo-dead` median window size.
+    pub vo_dead_size: usize,
+    /// `vo-dead` run the residual large-stripe pass after filling.
+    pub vo_dead_norm: bool,
+    /// `vo-fit` Savitzky–Golay polynomial fit order.
+    pub vo_fit_order: usize,
+    /// `vo-fit` Gaussian smoothing sigma along the detector columns.
+    pub vo_fit_sigma_x: f32,
+    /// `vo-fit` Gaussian smoothing sigma along the projections.
+    pub vo_fit_sigma_y: f32,
 
     // --- Phase-retrieval physics (used when a phase method is selected) ---
     // Stored as f64 so decimal quantities like `1e-4` serialize cleanly in the
@@ -123,6 +159,22 @@ impl Default for Config {
             vo_snr: 3.0,
             vo_la_size: 61,
             vo_sm_size: 21,
+            // tomopy defaults for the Vo 2018 single-method variants.
+            vo_sort_size: 0,
+            vo_sort_dim: 1,
+            vo_filter_sigma: 3.0,
+            vo_filter_size: 0,
+            vo_filter_dim: 1,
+            vo_large_snr: 3.0,
+            vo_large_size: 51,
+            vo_large_drop_ratio: 0.1,
+            vo_large_norm: true,
+            vo_dead_snr: 3.0,
+            vo_dead_size: 51,
+            vo_dead_norm: true,
+            vo_fit_order: 3,
+            vo_fit_sigma_x: 5.0,
+            vo_fit_sigma_y: 20.0,
 
             pixel_size: 1e-4,
             propagation_distance: 50.0,

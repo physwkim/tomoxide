@@ -149,8 +149,9 @@ struct CommonRecon {
     /// Apodization filter (none|ramp|shepp|cosine|cosine2|hamming|hann|parzen).
     #[arg(long)]
     filter: Option<String>,
-    /// Stripe-removal method (none|fw|ti|sf|vo-all), applied before recon with
-    /// tomopy/tomocupy default parameters.
+    /// Stripe-removal method (none|fw|ti|sf|vo-all|vo-sort|vo-filter|vo-large|
+    /// vo-dead|vo-fit), applied before recon with tomopy/tomocupy default
+    /// parameters.
     #[arg(long)]
     remove_stripe: Option<String>,
     /// Phase-retrieval method (none|paganin|Gpaganin|farago), applied before
@@ -197,6 +198,51 @@ struct CommonRecon {
     /// Stripe removal (`vo-all`): small-stripe window size [default: 21].
     #[arg(long)]
     vo_sm_size: Option<usize>,
+    /// Stripe removal (`vo-sort`): median window size (`0` = tomopy auto) [default: 0].
+    #[arg(long)]
+    vo_sort_size: Option<usize>,
+    /// Stripe removal (`vo-sort`): median-window dimensionality (1 or 2) [default: 1].
+    #[arg(long)]
+    vo_sort_dim: Option<u8>,
+    /// Stripe removal (`vo-filter`): low-/high-pass Gaussian sigma [default: 3.0].
+    #[arg(long)]
+    vo_filter_sigma: Option<f32>,
+    /// Stripe removal (`vo-filter`): inner-sort median window size (`0` = tomopy auto) [default: 0].
+    #[arg(long)]
+    vo_filter_size: Option<usize>,
+    /// Stripe removal (`vo-filter`): median-window dimensionality (1 or 2) [default: 1].
+    #[arg(long)]
+    vo_filter_dim: Option<u8>,
+    /// Stripe removal (`vo-large`): detection signal-to-noise ratio [default: 3.0].
+    #[arg(long)]
+    vo_large_snr: Option<f32>,
+    /// Stripe removal (`vo-large`): median window size [default: 51].
+    #[arg(long)]
+    vo_large_size: Option<usize>,
+    /// Stripe removal (`vo-large`): dropped extreme-pixel fraction [default: 0.1].
+    #[arg(long)]
+    vo_large_drop_ratio: Option<f32>,
+    /// Stripe removal (`vo-large`): normalize columns by the intensity factor [default: true].
+    #[arg(long)]
+    vo_large_norm: Option<bool>,
+    /// Stripe removal (`vo-dead`): detection signal-to-noise ratio [default: 3.0].
+    #[arg(long)]
+    vo_dead_snr: Option<f32>,
+    /// Stripe removal (`vo-dead`): median window size [default: 51].
+    #[arg(long)]
+    vo_dead_size: Option<usize>,
+    /// Stripe removal (`vo-dead`): run the residual large-stripe pass [default: true].
+    #[arg(long)]
+    vo_dead_norm: Option<bool>,
+    /// Stripe removal (`vo-fit`): Savitzky–Golay fit order [default: 3].
+    #[arg(long)]
+    vo_fit_order: Option<usize>,
+    /// Stripe removal (`vo-fit`): Gaussian sigma along detector columns [default: 5].
+    #[arg(long)]
+    vo_fit_sigma_x: Option<f32>,
+    /// Stripe removal (`vo-fit`): Gaussian sigma along projections [default: 20].
+    #[arg(long)]
+    vo_fit_sigma_y: Option<f32>,
     /// Phase retrieval: detector pixel size (cm) [default: 1e-4].
     #[arg(long)]
     pixel_size: Option<f32>,
@@ -274,6 +320,20 @@ struct StripeParams {
     vo_snr: f32,
     vo_la_size: usize,
     vo_sm_size: usize,
+    vo_sort_size: Option<usize>,
+    vo_sort_dim: u8,
+    vo_filter_sigma: f32,
+    vo_filter_size: Option<usize>,
+    vo_filter_dim: u8,
+    vo_large_snr: f32,
+    vo_large_size: usize,
+    vo_large_drop_ratio: f32,
+    vo_large_norm: bool,
+    vo_dead_snr: f32,
+    vo_dead_size: usize,
+    vo_dead_norm: bool,
+    vo_fit_order: usize,
+    vo_fit_sigma: (f32, f32),
 }
 
 /// Resolved phase-retrieval physics for the selected method (config merged with
@@ -308,9 +368,34 @@ fn build_stripe(name: &str, p: &StripeParams) -> anyhow::Result<StripeMethod> {
             la_size: p.vo_la_size,
             sm_size: p.vo_sm_size,
         },
+        "vo-sort" | "vo_sort" => StripeMethod::VoSort {
+            size: p.vo_sort_size,
+            dim: p.vo_sort_dim,
+        },
+        "vo-filter" | "vo_filter" => StripeMethod::VoFilter {
+            sigma: p.vo_filter_sigma,
+            size: p.vo_filter_size,
+            dim: p.vo_filter_dim,
+        },
+        "vo-large" | "vo_large" => StripeMethod::VoLarge {
+            snr: p.vo_large_snr,
+            size: p.vo_large_size,
+            drop_ratio: p.vo_large_drop_ratio,
+            norm: p.vo_large_norm,
+        },
+        "vo-dead" | "vo_dead" => StripeMethod::VoDead {
+            snr: p.vo_dead_snr,
+            size: p.vo_dead_size,
+            norm: p.vo_dead_norm,
+        },
+        "vo-fit" | "vo_fit" => StripeMethod::VoFit {
+            order: p.vo_fit_order,
+            sigma: p.vo_fit_sigma,
+        },
         other => {
             return Err(anyhow!(
-                "unknown stripe method '{other}' (none|fw|ti|sf|vo-all)"
+                "unknown stripe method '{other}' \
+                 (none|fw|ti|sf|vo-all|vo-sort|vo-filter|vo-large|vo-dead|vo-fit)"
             ))
         }
     })
@@ -468,6 +553,30 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         vo_snr: c.vo_snr.unwrap_or(cfg.vo_snr),
         vo_la_size: c.vo_la_size.unwrap_or(cfg.vo_la_size),
         vo_sm_size: c.vo_sm_size.unwrap_or(cfg.vo_sm_size),
+        // Median sizes follow the `fw_level` convention: `0` ⇒ auto (None).
+        vo_sort_size: {
+            let s = c.vo_sort_size.unwrap_or(cfg.vo_sort_size);
+            (s != 0).then_some(s)
+        },
+        vo_sort_dim: c.vo_sort_dim.unwrap_or(cfg.vo_sort_dim),
+        vo_filter_sigma: c.vo_filter_sigma.unwrap_or(cfg.vo_filter_sigma),
+        vo_filter_size: {
+            let s = c.vo_filter_size.unwrap_or(cfg.vo_filter_size);
+            (s != 0).then_some(s)
+        },
+        vo_filter_dim: c.vo_filter_dim.unwrap_or(cfg.vo_filter_dim),
+        vo_large_snr: c.vo_large_snr.unwrap_or(cfg.vo_large_snr),
+        vo_large_size: c.vo_large_size.unwrap_or(cfg.vo_large_size),
+        vo_large_drop_ratio: c.vo_large_drop_ratio.unwrap_or(cfg.vo_large_drop_ratio),
+        vo_large_norm: c.vo_large_norm.unwrap_or(cfg.vo_large_norm),
+        vo_dead_snr: c.vo_dead_snr.unwrap_or(cfg.vo_dead_snr),
+        vo_dead_size: c.vo_dead_size.unwrap_or(cfg.vo_dead_size),
+        vo_dead_norm: c.vo_dead_norm.unwrap_or(cfg.vo_dead_norm),
+        vo_fit_order: c.vo_fit_order.unwrap_or(cfg.vo_fit_order),
+        vo_fit_sigma: (
+            c.vo_fit_sigma_x.unwrap_or(cfg.vo_fit_sigma_x),
+            c.vo_fit_sigma_y.unwrap_or(cfg.vo_fit_sigma_y),
+        ),
     };
     // Config physics are f64 (clean TOML); cast to the f32 the phase methods use.
     let phase_params = PhaseParams {
@@ -1104,6 +1213,47 @@ fn run_sharded_subprocesses(
                     .arg("--vo_sm_size")
                     .arg(sp.vo_sm_size.to_string());
             }
+            "vo-sort" | "vo_sort" => {
+                // `0` round-trips as auto (`None`), the `fw_level` convention.
+                cmd.arg("--vo_sort_size")
+                    .arg(sp.vo_sort_size.unwrap_or(0).to_string())
+                    .arg("--vo_sort_dim")
+                    .arg(sp.vo_sort_dim.to_string());
+            }
+            "vo-filter" | "vo_filter" => {
+                cmd.arg("--vo_filter_sigma")
+                    .arg(sp.vo_filter_sigma.to_string())
+                    .arg("--vo_filter_size")
+                    .arg(sp.vo_filter_size.unwrap_or(0).to_string())
+                    .arg("--vo_filter_dim")
+                    .arg(sp.vo_filter_dim.to_string());
+            }
+            "vo-large" | "vo_large" => {
+                cmd.arg("--vo_large_snr")
+                    .arg(sp.vo_large_snr.to_string())
+                    .arg("--vo_large_size")
+                    .arg(sp.vo_large_size.to_string())
+                    .arg("--vo_large_drop_ratio")
+                    .arg(sp.vo_large_drop_ratio.to_string())
+                    .arg("--vo_large_norm")
+                    .arg(sp.vo_large_norm.to_string());
+            }
+            "vo-dead" | "vo_dead" => {
+                cmd.arg("--vo_dead_snr")
+                    .arg(sp.vo_dead_snr.to_string())
+                    .arg("--vo_dead_size")
+                    .arg(sp.vo_dead_size.to_string())
+                    .arg("--vo_dead_norm")
+                    .arg(sp.vo_dead_norm.to_string());
+            }
+            "vo-fit" | "vo_fit" => {
+                cmd.arg("--vo_fit_order")
+                    .arg(sp.vo_fit_order.to_string())
+                    .arg("--vo_fit_sigma_x")
+                    .arg(sp.vo_fit_sigma.0.to_string())
+                    .arg("--vo_fit_sigma_y")
+                    .arg(sp.vo_fit_sigma.1.to_string());
+            }
             _ => {}
         }
         // Phase-retrieval physics only matters when a phase method is selected;
@@ -1578,6 +1728,75 @@ mod tests {
     #[test]
     fn unknown_algorithm_rejected() {
         assert!(parse_chain_stage("nope", 25).is_err());
+    }
+
+    /// Every `remove_stripe_method` spelling maps to its `StripeMethod`
+    /// variant with the resolved parameters (the Vo 2018 single-method
+    /// variants included), and unknown names list the full set.
+    #[test]
+    fn vo_variant_stripe_methods_parse() {
+        let p = StripeParams {
+            fw_sigma: 2.0,
+            fw_level: None,
+            ti_nblock: 0,
+            ti_beta: 1.5,
+            sf_size: 5,
+            vo_snr: 3.0,
+            vo_la_size: 61,
+            vo_sm_size: 21,
+            vo_sort_size: None,
+            vo_sort_dim: 1,
+            vo_filter_sigma: 3.0,
+            vo_filter_size: Some(7),
+            vo_filter_dim: 2,
+            vo_large_snr: 3.0,
+            vo_large_size: 51,
+            vo_large_drop_ratio: 0.1,
+            vo_large_norm: true,
+            vo_dead_snr: 4.0,
+            vo_dead_size: 41,
+            vo_dead_norm: false,
+            vo_fit_order: 3,
+            vo_fit_sigma: (5.0, 20.0),
+        };
+        assert_eq!(
+            build_stripe("vo-sort", &p).unwrap(),
+            StripeMethod::VoSort { size: None, dim: 1 }
+        );
+        assert_eq!(
+            build_stripe("vo_filter", &p).unwrap(),
+            StripeMethod::VoFilter {
+                sigma: 3.0,
+                size: Some(7),
+                dim: 2
+            }
+        );
+        assert_eq!(
+            build_stripe("vo-large", &p).unwrap(),
+            StripeMethod::VoLarge {
+                snr: 3.0,
+                size: 51,
+                drop_ratio: 0.1,
+                norm: true
+            }
+        );
+        assert_eq!(
+            build_stripe("vo-dead", &p).unwrap(),
+            StripeMethod::VoDead {
+                snr: 4.0,
+                size: 41,
+                norm: false
+            }
+        );
+        assert_eq!(
+            build_stripe("vo-fit", &p).unwrap(),
+            StripeMethod::VoFit {
+                order: 3,
+                sigma: (5.0, 20.0)
+            }
+        );
+        let err = build_stripe("nope", &p).unwrap_err().to_string();
+        assert!(err.contains("vo-fit"), "{err}");
     }
 
     #[test]
