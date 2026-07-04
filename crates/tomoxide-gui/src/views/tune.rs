@@ -36,6 +36,7 @@ const FILTERS: &[&str] = &[
     "none", "ramp", "shepp", "cosine", "cosine2", "hamming", "hann", "parzen",
 ];
 const STRIPES: &[&str] = &["none", "fw", "ti", "sf", "vo-all"];
+const PHASES: &[&str] = &["none", "paganin", "Gpaganin", "farago"];
 
 /// One finished preview kept for display / pinning.
 struct PreviewImage {
@@ -69,6 +70,15 @@ pub struct TuneView {
     pub vo_snr: f32,
     pub vo_la_size: usize,
     pub vo_sm_size: usize,
+    /// Phase-retrieval method (Config spelling: `none`/`paganin`/`Gpaganin`/
+    /// `farago`). Previews read a row band sized by the kernel support.
+    pub phase: String,
+    pub pixel_size: f32,
+    pub propagation_distance: f32,
+    pub energy: f32,
+    pub alpha: f32,
+    pub db: f32,
+    pub w: f32,
 
     pub slice: usize,
     auto_recon: bool,
@@ -111,6 +121,14 @@ impl TuneView {
             vo_snr: 3.0,
             vo_la_size: 61,
             vo_sm_size: 21,
+            // Physics defaults = Config::default() (the CLI template).
+            phase: "none".into(),
+            pixel_size: 1e-4,
+            propagation_distance: 50.0,
+            energy: 30.0,
+            alpha: 1e-3,
+            db: 1000.0,
+            w: 2e-4,
             slice: 0,
             auto_recon: false,
             dirty: false,
@@ -208,10 +226,41 @@ impl TuneView {
         if self.stripe != "none" {
             s.push_str(&format!(" stripe={}", self.stripe));
         }
+        if self.phase != "none" {
+            s.push_str(&format!(" phase={}", self.phase));
+        }
         if !self.center_auto {
             s.push_str(&format!(" c={:.2}", self.center));
         }
         s
+    }
+
+    /// The panel's phase fields as a typed [`tomoxide::PhaseMethod`].
+    fn build_phase(&self) -> Result<tomoxide::PhaseMethod, String> {
+        use tomoxide::PhaseMethod;
+        Ok(match self.phase.as_str() {
+            "none" => PhaseMethod::None,
+            "paganin" => PhaseMethod::Paganin {
+                pixel_size: self.pixel_size,
+                dist: self.propagation_distance,
+                energy: self.energy,
+                alpha: self.alpha,
+            },
+            "Gpaganin" => PhaseMethod::GPaganin {
+                pixel_size: self.pixel_size,
+                dist: self.propagation_distance,
+                energy: self.energy,
+                db: self.db,
+                w: self.w,
+            },
+            "farago" => PhaseMethod::Farago {
+                pixel_size: self.pixel_size,
+                dist: self.propagation_distance,
+                energy: self.energy,
+                db: self.db,
+            },
+            other => return Err(format!("unknown phase method '{other}'")),
+        })
     }
 
     fn is_iterative(&self) -> bool {
@@ -238,6 +287,13 @@ impl TuneView {
         cfg.vo_snr = self.vo_snr;
         cfg.vo_la_size = self.vo_la_size;
         cfg.vo_sm_size = self.vo_sm_size;
+        cfg.retrieve_phase_method = self.phase.clone();
+        cfg.pixel_size = self.pixel_size as f64;
+        cfg.propagation_distance = self.propagation_distance as f64;
+        cfg.energy = self.energy as f64;
+        cfg.alpha = self.alpha as f64;
+        cfg.db = self.db as f64;
+        cfg.w = self.w as f64;
         Ok(())
     }
 
@@ -267,6 +323,13 @@ impl TuneView {
         self.vo_snr = cfg.vo_snr;
         self.vo_la_size = cfg.vo_la_size;
         self.vo_sm_size = cfg.vo_sm_size;
+        self.phase = cfg.retrieve_phase_method.clone();
+        self.pixel_size = cfg.pixel_size as f32;
+        self.propagation_distance = cfg.propagation_distance as f32;
+        self.energy = cfg.energy as f32;
+        self.alpha = cfg.alpha as f32;
+        self.db = cfg.db as f32;
+        self.w = cfg.w as f32;
         self.dirty = true;
     }
 
@@ -302,6 +365,7 @@ impl TuneView {
             reg_par,
             ext_pad: self.ext_pad,
             stripe,
+            phase: self.build_phase()?,
         })
     }
 
@@ -434,13 +498,44 @@ impl TuneView {
                 }
                 self.dirty |= changed;
             });
-        ui.label(
-            egui::RichText::new(
-                "phase retrieval: full runs only (Run mode; preview needs a row-band reader — M2)",
-            )
-            .small()
-            .weak(),
-        );
+        egui::CollapsingHeader::new("Phase retrieval")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut changed = combo(ui, "phase method", &mut self.phase, PHASES);
+                if self.phase != "none" {
+                    changed |= drag(ui, "pixel_size (cm)", &mut self.pixel_size, 1e-5);
+                    changed |= drag(
+                        ui,
+                        "propagation_distance (cm)",
+                        &mut self.propagation_distance,
+                        1.0,
+                    );
+                    changed |= drag(ui, "energy (keV)", &mut self.energy, 1.0);
+                    match self.phase.as_str() {
+                        "paganin" => changed |= drag(ui, "alpha", &mut self.alpha, 1e-4),
+                        "Gpaganin" => {
+                            changed |= drag(ui, "delta/beta", &mut self.db, 10.0);
+                            changed |= drag(ui, "W (cm)", &mut self.w, 1e-5);
+                        }
+                        "farago" => changed |= drag(ui, "delta/beta", &mut self.db, 10.0),
+                        _ => {}
+                    }
+                    // Preview cost hint: the retrieval couples rows, so the
+                    // preview reads a band this many rows each side.
+                    if let Ok(method) = self.build_phase() {
+                        let m = tomoxide::prep::phase::margin_rows(&method);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "preview reads a ±{m}-row band around the slice \
+                                 (Fresnel kernel support)"
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
+                self.dirty |= changed;
+            });
     }
 
     pub fn ui(

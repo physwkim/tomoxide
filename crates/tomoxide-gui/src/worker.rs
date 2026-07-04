@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use siplot::egui;
-use tomoxide::io::{InMemoryWriter, VolumeWriter};
+use tomoxide::io::{DatasetReader, RowBandReader};
 use tomoxide::{
-    Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PrepOptions, ReconParams,
-    ReconSteps, StripeMethod, Volume,
+    Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PhaseMethod, ReconParams,
+    StripeMethod,
 };
 
 /// Metadata of the opened DXchange dataset (read once per open).
@@ -49,6 +49,10 @@ pub struct PreviewSpec {
     /// `ReconParams::ext_pad`).
     pub ext_pad: bool,
     pub stripe: StripeMethod,
+    /// Phase retrieval. A non-`None` method makes the preview read a
+    /// [`RowBandReader`] band around the slice (the retrieval couples
+    /// detector rows) — see [`run_preview`].
+    pub phase: PhaseMethod,
 }
 
 /// Rotation-axis auto-detection method (docs/GUI.md §2 Center).
@@ -255,42 +259,47 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     }
 }
 
-/// Adapts a z-shard to [`InMemoryWriter`]: the pipelined range driver still
-/// calls `reserve` with the *full* dataset slice count and writes chunks at
-/// global offsets, which for a one-slice preview would allocate the whole
-/// volume — so reserve only the window and shift chunks back by its start.
-struct WindowWriter {
-    inner: InMemoryWriter,
-    z0: usize,
-    rows: usize,
-}
-
-impl VolumeWriter for WindowWriter {
-    fn reserve(&mut self, _total_nz: usize) -> tomoxide::Result<()> {
-        self.inner.reserve(self.rows)
-    }
-
-    fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> tomoxide::Result<()> {
-        self.inner.write_chunk(vol, start - self.z0, end - self.z0)
-    }
-
-    fn finalize(&mut self) -> tomoxide::Result<()> {
-        self.inner.finalize()
-    }
-}
-
-/// One-slice reconstruction through the streaming pipeline into memory.
+/// Single-slice preview: banded read → the same prep order as
+/// `tomoxide::reconstruct` (normalize+minus-log → phase → sinogram layout →
+/// stripe) → reconstruction of the requested row only.
+///
+/// Phase retrieval couples detector rows, so the read is a [`RowBandReader`]
+/// band `[z − m, z + m]` with `m` = the Fresnel kernel's pixel support
+/// (`prep::phase::margin_rows`; 0 without phase, i.e. exactly one row read).
+/// Prep runs on the whole band; the sinogram is then cropped to the center
+/// row *before* stripe removal and reconstruction (every stripe method is
+/// per-sinogram independent, so crop-then-stripe equals stripe-then-crop) —
+/// the preview stays one-slice cheap however wide the phase kernel is.
 fn run_preview(
     engine: &Engine,
     path: &std::path::Path,
     spec: &PreviewSpec,
 ) -> tomoxide::Result<(usize, usize, Vec<f32>)> {
+    let backend = engine.backend();
     let mut probe = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
     let (_nproj, nz, nx, _nflat, _ndark) = probe.read_sizes()?;
-    let theta = probe.read_theta()?;
     drop(probe);
 
-    let mut geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
+    let slice = spec.slice.min(nz.saturating_sub(1));
+    let m = tomoxide::prep::phase::margin_rows(&spec.phase);
+    let z0 = slice.saturating_sub(m);
+    let z1 = (slice + m + 1).min(nz);
+
+    let inner = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
+    let mut ds = RowBandReader::new(inner, z0, z1)?.read_all()?;
+    tomoxide::prep::normalize_dataset(&mut ds, backend)?;
+    tomoxide::prep::retrieve_phase(&mut ds.data, spec.phase, backend)?;
+    let sino = ds.data.to_layout(tomoxide::Layout::Sinogram);
+    let row = slice - z0;
+    let mut one = tomoxide::Tomo::new(
+        sino.array
+            .slice(ndarray::s![row..row + 1, .., ..])
+            .to_owned(),
+        tomoxide::Layout::Sinogram,
+    );
+    tomoxide::prep::remove_stripe(&mut one, spec.stripe)?;
+
+    let mut geom = Geometry::parallel(Angles(ds.theta), nx, 1, 1.0);
     if let Some(c) = spec.center {
         geom.center = Center::Scalar(c);
     }
@@ -302,37 +311,9 @@ fn run_preview(
         ext_pad: spec.ext_pad,
         ..Default::default()
     };
-    let prep = PrepOptions {
-        stripe: spec.stripe,
-        ..Default::default()
-    };
-
-    let slice = spec.slice.min(nz.saturating_sub(1));
-    let mem = InMemoryWriter::new();
-    let buf = mem.buffer();
-    let mut writer = Some(WindowWriter {
-        inner: mem,
-        z0: slice,
-        rows: 1,
-    });
-    let p = path.to_path_buf();
-    ReconSteps::new(1).run_streaming_pipelined_range(
-        slice,
-        slice + 1,
-        move || tomoxide::io::open_dxchange(&p.to_string_lossy()),
-        move || Ok(Box::new(writer.take().expect("writer built once")) as Box<dyn VolumeWriter>),
-        &geom,
-        spec.algorithm,
-        &params,
-        &prep,
-        engine,
-    )?;
-
-    let guard = buf.lock().expect("preview buffer lock");
-    let (_nz1, ny, nxo) = guard
-        .dims()
-        .ok_or_else(|| tomoxide::Error::Backend("preview produced no chunk".into()))?;
-    Ok((ny, nxo, guard.data().to_vec()))
+    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
+    let (_nz1, ny, nxo) = vol.dims();
+    Ok((ny, nxo, vol.array.iter().copied().collect()))
 }
 
 /// Auto-detect the rotation axis with the chosen method.
@@ -465,9 +446,39 @@ mod tests {
             reg_par: Vec::new(),
             ext_pad: false,
             stripe: StripeMethod::None,
+            phase: PhaseMethod::None,
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
+        assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
+    }
+
+    /// Phase retrieval previews through a row band (`RowBandReader`; the
+    /// margin at these physics is 65 rows, far wider than the 6-row fixture,
+    /// so the band clamps to the whole file) and still returns one finite,
+    /// non-zero slice.
+    #[test]
+    fn preview_phase_banded_runs() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let spec = PreviewSpec {
+            slice: 3,
+            algorithm: Algorithm::Fbp,
+            center: None,
+            filter: FilterName::Parzen,
+            num_iter: 1,
+            reg_par: Vec::new(),
+            ext_pad: false,
+            stripe: StripeMethod::None,
+            phase: PhaseMethod::Paganin {
+                pixel_size: 1e-4,
+                dist: 50.0,
+                energy: 30.0,
+                alpha: 1e-3,
+            },
+        };
+        let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
+        assert_eq!(data.len(), ny * nx);
+        assert!(data.iter().all(|v| v.is_finite()), "non-finite preview");
         assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
     }
 
@@ -497,6 +508,7 @@ mod tests {
             // The Tune panel default: iterative previews run support-extended.
             ext_pad: true,
             stripe: StripeMethod::None,
+            phase: PhaseMethod::None,
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -520,6 +532,7 @@ mod tests {
             reg_par: Vec::new(),
             ext_pad: false,
             stripe: StripeMethod::Sf { size: 3 },
+            phase: PhaseMethod::None,
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
