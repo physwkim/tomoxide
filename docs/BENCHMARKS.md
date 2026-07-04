@@ -37,7 +37,10 @@ iteration behaviour of the analytic and iterative methods on real data.
 - **Reference (quality proxy).** Real data has no ground truth, so the yardstick
   is the **dense 450-view SIRT@200** reconstruction of the same rows — the best
   available estimate of the true object. Sparse/noisy reconstructions are scored
-  against it.
+  against it. **This proxy is method-dependent** — a dense FBP and a dense
+  iterative recon of the *same* data disagree at Pearson r ≈ 0.73–0.81, so the
+  reference silently favours recons that share its operator/prior. [§10](#10-fbp-vs-iterative-accuracy-against-a-known-truth-phantom)
+  removes that bias with a synthetic known-truth phantom.
 - **Metric.** **Pearson correlation** (scale- and offset-invariant, so it is not
   fooled by the amplitude-convention differences between methods) is the primary
   discriminator; relative L2 is reported where informative.
@@ -393,7 +396,120 @@ RTX 5000 Ada via Vulkan, best-of-3:
 
 ---
 
+## 10. FBP vs iterative: accuracy against a known-truth phantom
+
+FBP often *looks* sharper and more detailed than an early-stopped iterative
+recon, yet on real data (§4–5) the two score "similar". This section settles two
+questions the real-data yardstick cannot: is FBP's apparent extra detail
+**accuracy or just contrast**, and is a well-run iterative method genuinely
+**closer to the true object**? It is the only section here scored against a
+*known* ground truth.
+
+> **Scope of the claims.** One Shepp–Logan-based phantom family (a
+> piecewise-constant variant and a smooth *textured* variant), 2D central slice,
+> parallel-beam, `parzen` FBP. The phantom is synthetic — real specimens differ
+> in structure and noise. The real-data disagreement figures (§10.1) are from a
+> single NCA XANES scan. Treat the *directions* as robust and the exact numbers
+> as one-sample.
+
+### 10.1 Why real data cannot answer this
+
+The §1 quality proxy is a dense iterative recon — but "dense truth" is itself
+method-dependent. On a real 1800-view NCA scan, dense reconstructions by
+different methods disagree (mutual Pearson r of the same rows):
+
+| dense ref (1800-view) | FBP | CGLS-20 | SIRT-150 | TV λ.02 |
+|-----------------------|:---:|:-------:|:--------:|:-------:|
+| **FBP**    | 1.000 | 0.727 | 0.804 | 0.808 |
+| **CGLS-20**  | 0.727 | 1.000 | 0.951 | 0.919 |
+| **SIRT-150** | 0.804 | 0.951 | 1.000 | 0.993 |
+| **TV λ.02**  | 0.808 | 0.919 | 0.993 | 1.000 |
+
+FBP sits ~0.8 from every iterative recon; the iterative methods agree with each
+other at 0.92–0.99. There is **no method-neutral truth** in real data: whichever
+dense method you crown as reference biases the score toward recons that share its
+operator/prior. A synthetic phantom is the only way out.
+
+### 10.2 Phantom protocol (inverse-crime-mitigated)
+
+- **Truth built at 2× (1600²):** Shepp–Logan + resolution-bar groups. A second
+  *textured* variant multiplies in a smooth sinusoid + radial-gradient
+  modulation so the object is **not** piecewise-constant — this denies TV its
+  home-field advantage.
+- **Generation grid ≠ recon grid:** forward-project the truth, bin the detector
+  2× → 800, reconstruct at 800; score against the phantom binned to 800. The grid
+  mismatch avoids the inverse crime (recon operator ≠ inverse of the exact
+  generator).
+- **Noise:** transmission-domain Poisson, `counts ~ Poisson(I₀·e^−sino)`. The
+  sinogram is first normalised to **peak attenuation ≈ 2.5** — without this the
+  raw path integral (~500) makes `e^−sino` underflow and the noise becomes
+  `I₀`-independent (a real bug we hit; watch for saturated sinograms).
+- **Metrics vs known truth:** affine-fit **NRMSE** (scale/offset-invariant, ↓)
+  and mid-band structural correlation **r_mid** (band-limited complex
+  correlation, ↑) — the accuracy analogue of FRC, but measured against truth
+  rather than a second half.
+
+> **Reproducibility ≠ accuracy.** FRC / half-split correlation measures whether
+> two halves *agree*, not whether they are *right*; a strong prior inflates FRC
+> by biasing both halves the same way. Only a known truth separates the two —
+> which is exactly why this section exists and §1–§9 (real data) cannot replace
+> it.
+
+### 10.3 Results — textured phantom, TV λ retuned per scale
+
+NRMSE ↓ / r_mid ↑; best NRMSE per row in **bold**. TV's λ is the sweep winner at
+this sinogram scale (see finding 4).
+
+**450 views (well-sampled):**
+
+| noise | FBP | CGLS-30 | SIRT-150 | TV (best λ) |
+|-------|:---:|:-------:|:--------:|:-----------:|
+| noiseless | 0.275 / 0.828 | 0.148 / 0.945 | 0.258 / 0.880 | **0.127 / 0.955** (λ 3e-4) |
+| I₀=8000   | 0.278 / 0.808 | 0.284 / 0.867 | 0.263 / 0.853 | **0.154 / 0.918** (λ 1e-3) |
+| I₀=3000   | 0.284 / 0.777 | 0.423 / 0.760 | 0.272 / 0.814 | **0.185 / 0.881** (λ 1e-3) |
+
+**120 views (sparse):**
+
+| noise | FBP | CGLS-30 | SIRT-150 | TV (best λ) |
+|-------|:---:|:-------:|:--------:|:-----------:|
+| noiseless | 0.291 / 0.766 | 0.273 / 0.782 | 0.288 / 0.799 | **0.203 / 0.800** (λ 1e-3) |
+| I₀=8000   | 0.302 / 0.711 | 0.315 / 0.714 | 0.300 / 0.739 | **0.220 / 0.764** (λ 1e-3) |
+| I₀=3000   | 0.320 / 0.640 | 0.370 / 0.630 | 0.318 / 0.663 | **0.232 / 0.707** (λ 3e-3) |
+
+FBP, CGLS and SIRT are linear, so scaling the sinogram leaves their scores
+unchanged; TV is nonlinear and its λ must be retuned for the scale (finding 4).
+
+### 10.4 Findings
+
+1. **A properly-regularised iterative method (TV, λ tuned to the noise) is
+   closest to the truth in every regime** — sparse or dense, clean or noisy —
+   *including on the textured phantom built to deny TV its piecewise-constant
+   advantage*. At 450 views it roughly halves FBP's NRMSE (0.13–0.19 vs ~0.28).
+2. **"Iterative" is not one thing — configuration decides.** Unregularised,
+   fixed-iteration CGLS is the *best* method at high SNR (450 noiseless: 0.148)
+   but the *worst* under noise (450 I₀=3000: 0.423 > FBP 0.284) — it fits noise
+   almost immediately (matches §4.5). SIRT-150 tracks FBP: robust, never
+   disastrous, never best.
+3. **FBP is the noise-robust floor.** Its NRMSE barely moves across the whole
+   noise range (450: 0.275 → 0.284) because the ramp + `parzen` apodisation caps
+   what it passes — but it is never the most accurate. Its extra *apparent*
+   detail is high-frequency contrast (real edges + streaks + noise), which reads
+   as "sharper" while *lowering* fidelity. Sharpness ≠ accuracy.
+4. **TV's λ is data-scale-dependent.** It must be retuned when the sinogram
+   amplitude changes, and increased as noise rises (here 3e-4 → 1e-3 → 3e-3). A
+   λ fitted at one amplitude over-regularises by orders of magnitude at another —
+   the same trap as scoring a scaled recon without re-fitting λ.
+
+This corroborates §7's selection guide from the truth side: `tv` with a fitted λ
+for noisy/sparse data; `cgls` only for well-posed/dense data at a small iteration
+count; `sirt` as the robust default; `fbp` for a fast, safe look — accepting it
+will not be the most accurate, and its sharper appearance is contrast, not
+recovered structure.
+
+---
+
 > Sections 2–7 were reproduced with the `cuda` feature build on real data;
+> §10 on real data (§10.1) plus synthetic known-truth phantoms, same build;
 > sections 8–9 with the `cuda` and `gpu-wgpu` builds on the controlled/synthetic
 > volumes stated inline. Scripts and intermediate reconstructions are not
 > committed. Re-run on your own sample and GPU before committing to a method or an

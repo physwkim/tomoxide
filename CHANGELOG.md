@@ -224,6 +224,20 @@ All notable changes to this project are documented here. The format is based on
   (matching the streaming/shard semantics); an explicit row range under
   laminography is rejected (the tilt couples all rows) instead of dropped.
 
+### Documentation
+
+- **`docs/BENCHMARKS.md` §10 — FBP vs iterative accuracy against a known-truth
+  phantom.** Settles whether FBP's sharper *look* is accuracy or contrast using a
+  synthetic Shepp–Logan phantom (piecewise-const + a TV-adversarial textured
+  variant), inverse-crime-mitigated (generate at 2×, bin detector, recon at 1×),
+  with a transmission-Poisson noise sweep. Finding: a properly-regularised
+  iterative recon (TV, λ tuned to the noise) is closest to truth in every regime
+  (≈ halves FBP NRMSE at 450 views), FBP is the noise-robust floor whose extra
+  detail is contrast not accuracy, and unregularised fixed-iter CGLS is best at
+  high SNR but worse than FBP under noise. Also documents that real-data dense
+  references are method-dependent (FBP vs iterative disagree at r ≈ 0.73–0.81),
+  qualifying the §1 quality-proxy caveat.
+
 ## [0.5.1] - 2026-07-02
 
 ### Changed
