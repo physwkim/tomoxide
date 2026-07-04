@@ -388,6 +388,25 @@ pub fn read_h5_frame(
     Ok((ny, nx, data))
 }
 
+/// Shape `(n, ny, nx)` of a 3-D HDF5 dataset — the metadata probe paired with
+/// [`read_h5_frame`], so a volume browser can size itself without reading any
+/// frame. Errors on a non-3-D dataset. `data_path` may be absolute or relative.
+pub fn read_h5_sizes(path: &str, data_path: &str) -> Result<(usize, usize, usize)> {
+    let file = H5File::open(path).map_err(|e| Error::Io(format!("open {path}: {e}")))?;
+    let key = data_path.strip_prefix('/').unwrap_or(data_path);
+    let ds = file
+        .dataset(key)
+        .map_err(|e| Error::Io(format!("dataset {data_path}: {e}")))?;
+    let shape = ds.shape();
+    let [n, ny, nx] = shape[..] else {
+        return Err(Error::ShapeMismatch {
+            expected: "[n, ny, nx] (3-D stack)".into(),
+            found: format!("{shape:?}"),
+        });
+    };
+    Ok((n, ny, nx))
+}
+
 /// DXchange HDF5 reader over a pure-Rust [`H5File`].
 struct H5DxchangeReader {
     file: H5File,
@@ -1431,6 +1450,14 @@ mod tests {
         assert!(matches!(
             read_h5_frame(p, "/exchange/data", 2),
             Err(Error::InvalidParam(_))
+        ));
+
+        // The shape probe agrees, on both path spellings.
+        assert_eq!(read_h5_sizes(p, "/exchange/data").unwrap(), (2, 2, 3));
+        assert_eq!(read_h5_sizes(p, "exchange/data").unwrap(), (2, 2, 3));
+        assert!(matches!(
+            read_h5_sizes(p, "/exchange/missing"),
+            Err(Error::Io(_))
         ));
         let _ = std::fs::remove_file(&path);
     }
