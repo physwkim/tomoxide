@@ -83,6 +83,7 @@ pub struct App {
     tune: crate::views::tune::TuneView,
     center: crate::views::center::CenterView,
     run: crate::views::run::RunView,
+    output: crate::views::output::OutputView,
 }
 
 impl App {
@@ -115,6 +116,7 @@ impl App {
             tune: crate::views::tune::TuneView::new(render_state),
             center: crate::views::center::CenterView::new(render_state),
             run: crate::views::run::RunView::new(render_state),
+            output: crate::views::output::OutputView::new(render_state),
         }
     }
 
@@ -353,8 +355,11 @@ impl App {
                 }
             }
             Mode::Output => {
-                ui.heading("Output");
-                ui.label("Planned for M2 (docs/GUI.md §7): results browse via StackView.");
+                let mut msgs = Vec::new();
+                self.output.ui(ui, self.run.completed_output(), &mut msgs);
+                for m in msgs {
+                    self.log.push(m);
+                }
             }
             Mode::Live => {
                 ui.heading("Live");

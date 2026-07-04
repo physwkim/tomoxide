@@ -3,12 +3,26 @@
 //! routed by the app shell.
 //!
 //! `PlotId` allocation convention (siplot ids must not collide; some widgets
-//! reserve a small range): Data 0–29, Tune 30–49, Center 50–69, Run 70–89.
+//! reserve a small range): Data 0–29, Tune 30–49, Center 50–69, Run 70–89,
+//! Output 90–109.
 
 pub mod center;
 pub mod data;
+pub mod output;
 pub mod run;
 pub mod tune;
+
+/// Decode a single-image f32 tiff (the CLI's slice output format). Shared by
+/// the Run live view and the Output browser.
+pub(crate) fn load_tiff_f32(path: &std::path::Path) -> anyhow::Result<(u32, u32, Vec<f32>)> {
+    let file = std::fs::File::open(path)?;
+    let mut dec = tiff::decoder::Decoder::new(std::io::BufReader::new(file))?;
+    let (w, h) = dec.dimensions()?;
+    match dec.read_image()? {
+        tiff::decoder::DecodingResult::F32(v) => Ok((w, h, v)),
+        _ => anyhow::bail!("not an f32 tiff"),
+    }
+}
 
 /// Viridis scaled to the robust 0.5–99.5 percentile range of `data`
 /// (fallback 0..1). Absolute min/max let a handful of extreme pixels own the

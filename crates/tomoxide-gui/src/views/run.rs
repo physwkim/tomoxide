@@ -13,6 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use siplot::egui_wgpu::RenderState;
 use siplot::{Plot2D, egui};
 
+use crate::views::load_tiff_f32;
 use crate::views::tune::TuneView;
 use crate::worker::DatasetMeta;
 
@@ -71,6 +72,9 @@ pub struct RunView {
     active: Option<ActiveRun>,
     /// Outcome line of the last finished run, shown until the next start.
     last_outcome: Option<String>,
+    /// `(output base, save_format)` of the last *successful* run — the Output
+    /// screen offers it as a one-click source.
+    completed: Option<(String, String)>,
 
     plot: Plot2D,
     image: Option<siplot::ItemHandle>,
@@ -95,6 +99,7 @@ impl RunView {
                 .collect(),
             active: None,
             last_outcome: None,
+            completed: None,
             plot,
             image: None,
             shown_end: None,
@@ -104,6 +109,11 @@ impl RunView {
 
     pub fn on_dataset(&mut self, meta: &DatasetMeta) {
         self.output = format!("{}_rec", meta.path.with_extension("").display());
+    }
+
+    /// `(output base, save_format)` of the last successful run, if any.
+    pub fn completed_output(&self) -> Option<&(String, String)> {
+        self.completed.as_ref()
     }
 
     /// Build the recipe (shared CLI config) for this run from the Tune panel
@@ -246,6 +256,7 @@ impl RunView {
                     )
                 } else if status.success() {
                     let _ = std::fs::remove_file(&run.recipe);
+                    self.completed = Some((run.output.clone(), self.save_format.clone()));
                     format!(
                         "run finished in {secs:.1}s → {} ({} rows)",
                         run.output, run.rows_done
@@ -567,17 +578,6 @@ fn spawn_line_reader<R: std::io::Read + Send + 'static>(
             }
         }
     });
-}
-
-/// Decode a single-image f32 tiff (the CLI's slice output format).
-fn load_tiff_f32(path: &Path) -> anyhow::Result<(u32, u32, Vec<f32>)> {
-    let file = std::fs::File::open(path)?;
-    let mut dec = tiff::decoder::Decoder::new(std::io::BufReader::new(file))?;
-    let (w, h) = dec.dimensions()?;
-    match dec.read_image()? {
-        tiff::decoder::DecodingResult::F32(v) => Ok((w, h, v)),
-        _ => anyhow::bail!("not an f32 tiff"),
-    }
 }
 
 /// Free space on the filesystem holding `output` (walking up to the nearest
