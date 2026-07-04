@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **CLI `--progress_json`** (`recon`, `recon_steps`) — one flushed JSON line
+  per completed output chunk on stdout
+  (`{"start":s,"end":e,"total":nz,"secs":t}`; global slice range, full output
+  slice count, wall-clock seconds since run start), implemented as a thin
+  `VolumeWriter` tee. The multi-GPU shard orchestrator forwards the flag and
+  lets children inherit stdout, so shard lines stream through with global
+  ranges against one total. Machine progress for wrappers — the GUI Run
+  screen tails these from its subprocess runs. Runtime-only (not a config
+  key); progress lines are exactly the stdout lines starting with `{`.
 - **Cooperative cancellation for the chunked drivers** — new
   `pipeline::CancelToken` (`Clone`-able atomic flag) attachable via
   `ReconSteps::with_cancel`; all three drivers (`run`, `run_streaming`,

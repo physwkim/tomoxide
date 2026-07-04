@@ -215,6 +215,14 @@ struct CommonRecon {
     /// Phase retrieval (Gpaganin): characteristic transverse length `W` (cm) [default: 2e-4].
     #[arg(long)]
     w: Option<f32>,
+    /// Emit one flushed JSON line per completed output chunk on stdout:
+    /// `{"start":s,"end":e,"total":nz,"secs":t}` — global slice range, total
+    /// output slices, and wall-clock seconds since the run started. Machine
+    /// progress for wrappers (the GUI tails these from its subprocess runs);
+    /// progress lines are exactly the stdout lines starting with `{`, other
+    /// human-readable output still appears. Runtime-only: not a config key.
+    #[arg(long)]
+    progress_json: bool,
 }
 
 /// One stage of a warm-start chain: an algorithm plus its resolved iteration
@@ -662,7 +670,10 @@ fn main() -> anyhow::Result<()> {
                     reader.read_all()?
                 };
                 let vol = reconstruct_chain(ds, &geom, &plan, lamino_rh, &engine)?;
-                let mut writer = tomoxide::io::create_writer(&out, save_format)?;
+                let mut writer = maybe_progress(
+                    tomoxide::io::create_writer(&out, save_format)?,
+                    common.progress_json,
+                );
                 let nz = vol.dims().0;
                 if banded {
                     writer.reserve(nz_total)?;
@@ -708,7 +719,15 @@ fn main() -> anyhow::Result<()> {
                     && nz > devices.len()
                     && nx >= MULTI_GPU_MIN_NX;
                 if shardable {
-                    run_sharded_subprocesses(&file, &out, &plan, chunk, nz, &devices)?;
+                    run_sharded_subprocesses(
+                        &file,
+                        &out,
+                        &plan,
+                        chunk,
+                        nz,
+                        &devices,
+                        common.progress_json,
+                    )?;
                 } else {
                     // Overlapped streaming path: same output as the whole-volume
                     // path (cuFFT-floor identical, Pearson 1.0), lower peak memory,
@@ -728,6 +747,7 @@ fn main() -> anyhow::Result<()> {
                         plan.reg_par.clone(),
                         plan.ext_pad,
                         plan.prep,
+                        common.progress_json,
                         &engine,
                     )?;
                 }
@@ -763,7 +783,10 @@ fn main() -> anyhow::Result<()> {
                 };
                 let vol =
                     tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
-                let mut writer = tomoxide::io::create_writer(&out, save_format)?;
+                let mut writer = maybe_progress(
+                    tomoxide::io::create_writer(&out, save_format)?,
+                    common.progress_json,
+                );
                 let nz = vol.dims().0;
                 if banded {
                     writer.reserve(nz_total)?;
@@ -829,6 +852,7 @@ fn main() -> anyhow::Result<()> {
                 plan.reg_par,
                 plan.ext_pad,
                 plan.prep,
+                common.progress_json,
                 &engine,
             )?;
             println!("wrote streamed reconstruction to {out}");
@@ -857,6 +881,67 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One `--progress_json` stdout line. Hand-formatted (no serde dependency for
+/// four fixed fields); `start`/`end` are the chunk's global slice range,
+/// `total` the full output slice count, `secs` wall-clock since run start.
+fn progress_line(start: usize, end: usize, total: usize, secs: f64) -> String {
+    format!("{{\"start\":{start},\"end\":{end},\"total\":{total},\"secs\":{secs:.3}}}\n")
+}
+
+/// `--progress_json` tee: forwards every call to the wrapped writer, then
+/// prints one [`progress_line`] per completed chunk (docs/GUI.md §6 #4 — the
+/// GUI's progress channel for subprocess runs). The line is emitted as a
+/// single locked write + flush so lines from concurrent shard processes never
+/// interleave mid-line. `total` comes from `reserve`, which every driver calls
+/// with the *full* output slice count even for `--start_row/--end_row` shard
+/// runs, so wrappers can aggregate shards against one denominator.
+struct ProgressJsonWriter {
+    inner: Box<dyn tomoxide::io::VolumeWriter>,
+    total: usize,
+    t0: std::time::Instant,
+}
+
+impl tomoxide::io::VolumeWriter for ProgressJsonWriter {
+    fn reserve(&mut self, total_nz: usize) -> tomoxide::Result<()> {
+        self.total = total_nz;
+        self.inner.reserve(total_nz)
+    }
+    fn write_chunk(
+        &mut self,
+        vol: &tomoxide::Volume<f32>,
+        start: usize,
+        end: usize,
+    ) -> tomoxide::Result<()> {
+        self.inner.write_chunk(vol, start, end)?;
+        use std::io::Write as _;
+        let line = progress_line(start, end, self.total, self.t0.elapsed().as_secs_f64());
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.flush();
+        Ok(())
+    }
+    fn finalize(&mut self) -> tomoxide::Result<()> {
+        self.inner.finalize()
+    }
+}
+
+/// Wrap `writer` in the [`ProgressJsonWriter`] tee when `--progress_json` is
+/// set; pass it through untouched otherwise.
+fn maybe_progress(
+    writer: Box<dyn tomoxide::io::VolumeWriter>,
+    enabled: bool,
+) -> Box<dyn tomoxide::io::VolumeWriter> {
+    if enabled {
+        Box::new(ProgressJsonWriter {
+            inner: writer,
+            total: 0,
+            t0: std::time::Instant::now(),
+        })
+    } else {
+        writer
+    }
+}
+
 /// Run the overlapped read‖compute‖write streaming pipeline for one file.
 ///
 /// Probes geometry (metadata only) on the calling thread, then hands
@@ -879,6 +964,7 @@ fn run_pipelined(
     reg_par: Vec<f32>,
     ext_pad: bool,
     prep: PrepOptions,
+    progress_json: bool,
     engine: &Engine,
 ) -> anyhow::Result<()> {
     let path = file.to_string_lossy().into_owned();
@@ -898,7 +984,10 @@ fn run_pipelined(
         z_start,
         z_end,
         move || tomoxide::io::open_dxchange(&read_path),
-        move || tomoxide::io::create_writer(&write_path, save_format),
+        move || {
+            tomoxide::io::create_writer(&write_path, save_format)
+                .map(|w| maybe_progress(w, progress_json))
+        },
         &geom,
         algo,
         &params,
@@ -922,6 +1011,11 @@ fn run_pipelined(
 /// full resolved [`ReconPlan`] as explicit flags (so children need no `--config`
 /// and reproduce the parent's filter/stripe/phase/iteration settings exactly).
 /// The call fails if any child fails.
+///
+/// With `--progress_json` the flag is forwarded and the children inherit the
+/// parent's stdout, so their per-chunk JSON lines (global slice ranges against
+/// the full-volume total) stream through to whoever tails the parent.
+#[allow(clippy::too_many_arguments)]
 fn run_sharded_subprocesses(
     file: &Path,
     out: &str,
@@ -929,6 +1023,7 @@ fn run_sharded_subprocesses(
     chunk: usize,
     nz: usize,
     devices: &[i32],
+    progress_json: bool,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let n = devices.len();
@@ -1031,11 +1126,20 @@ fn run_sharded_subprocesses(
         if let Some(c) = plan.center {
             cmd.arg("--center").arg(c.to_string());
         }
+        if progress_json {
+            cmd.arg("--progress_json");
+        }
         // Pin the child to one physical GPU; clear any inherited multi-device
         // selection so the child's `selected_devices()` is exactly `[0]`.
+        // With `--progress_json` the child inherits stdout so its JSON lines
+        // reach the parent's consumer; otherwise child stdout is discarded.
         cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string())
             .env("TOMOXIDE_CUDA_DEVICES", "0")
-            .stdout(std::process::Stdio::null())
+            .stdout(if progress_json {
+                std::process::Stdio::inherit()
+            } else {
+                std::process::Stdio::null()
+            })
             .stderr(std::process::Stdio::piped());
         let child = cmd
             .spawn()
@@ -1474,5 +1578,89 @@ mod tests {
     #[test]
     fn unknown_algorithm_rejected() {
         assert!(parse_chain_stage("nope", 25).is_err());
+    }
+
+    #[test]
+    fn progress_line_format() {
+        // The GUI parses these lines; pin the exact shape (keys, order, no
+        // spaces, trailing newline, 3-decimal secs).
+        assert_eq!(
+            progress_line(8, 16, 128, 1.23456),
+            "{\"start\":8,\"end\":16,\"total\":128,\"secs\":1.235}\n"
+        );
+    }
+
+    /// The tee must forward `reserve`/`write_chunk`/`finalize` to the wrapped
+    /// writer unchanged (the JSON side effect goes to stdout, which is not
+    /// captured here — the format itself is pinned above).
+    #[test]
+    fn progress_tee_forwards_all_calls() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Log {
+            reserved: Option<usize>,
+            chunks: Vec<(usize, usize, usize)>, // (start, end, n_slices)
+            finalized: bool,
+        }
+        struct MockWriter(Arc<Mutex<Log>>);
+        impl tomoxide::io::VolumeWriter for MockWriter {
+            fn reserve(&mut self, total_nz: usize) -> tomoxide::Result<()> {
+                self.0.lock().unwrap().reserved = Some(total_nz);
+                Ok(())
+            }
+            fn write_chunk(
+                &mut self,
+                vol: &tomoxide::Volume<f32>,
+                start: usize,
+                end: usize,
+            ) -> tomoxide::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .chunks
+                    .push((start, end, vol.dims().0));
+                Ok(())
+            }
+            fn finalize(&mut self) -> tomoxide::Result<()> {
+                self.0.lock().unwrap().finalized = true;
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut w = maybe_progress(Box::new(MockWriter(log.clone())), true);
+        w.reserve(64).unwrap();
+        let vol = tomoxide::Volume::new(ndarray::Array3::<f32>::zeros((4, 2, 2)));
+        w.write_chunk(&vol, 8, 12).unwrap();
+        w.finalize().unwrap();
+
+        let l = log.lock().unwrap();
+        assert_eq!(l.reserved, Some(64));
+        assert_eq!(l.chunks, vec![(8, 12, 4)]);
+        assert!(l.finalized);
+    }
+
+    /// `maybe_progress(_, false)` must be a pass-through (no tee layer).
+    #[test]
+    fn maybe_progress_disabled_is_passthrough() {
+        struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+        use std::sync::Arc;
+        impl tomoxide::io::VolumeWriter for Counting {
+            fn write_chunk(
+                &mut self,
+                _vol: &tomoxide::Volume<f32>,
+                _start: usize,
+                _end: usize,
+            ) -> tomoxide::Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut w = maybe_progress(Box::new(Counting(n.clone())), false);
+        let vol = tomoxide::Volume::new(ndarray::Array3::<f32>::zeros((1, 2, 2)));
+        w.write_chunk(&vol, 0, 1).unwrap();
+        assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }
