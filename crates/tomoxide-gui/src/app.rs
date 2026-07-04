@@ -113,7 +113,7 @@ impl App {
             meta: None,
             data: crate::views::data::DataView::new(render_state),
             tune: crate::views::tune::TuneView::new(render_state),
-            center: crate::views::center::CenterView::default(),
+            center: crate::views::center::CenterView::new(render_state),
             run: crate::views::run::RunView::new(render_state),
         }
     }
@@ -171,6 +171,19 @@ impl App {
                         method.label()
                     ));
                     self.center.on_center(method, center, millis);
+                }
+                Event::CenterSweep {
+                    centers,
+                    ny,
+                    nx,
+                    frames,
+                    millis,
+                } => {
+                    self.log.push(format!(
+                        "center sweep: {} candidates — {millis} ms",
+                        centers.len()
+                    ));
+                    self.center.on_sweep(centers, ny, nx, &frames);
                 }
                 Event::JobFailed { what, error } => {
                     self.log.push(format!("FAILED {what}: {error}"));

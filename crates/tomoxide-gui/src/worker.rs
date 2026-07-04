@@ -95,6 +95,10 @@ pub enum Job {
         row: usize,
         init: Option<f32>,
     },
+    /// Reconstruct the sinogram at `row` once per trial center in
+    /// `(start, stop, step)` (`recon::center::write_center`) →
+    /// [`Event::CenterSweep`]. The montage input for the Center screen.
+    CenterSweep { row: usize, range: (f32, f32, f32) },
     /// Exit the worker loop.
     Shutdown,
 }
@@ -116,6 +120,15 @@ pub enum Event {
     CenterFound {
         method: CenterMethod,
         center: f32,
+        millis: u128,
+    },
+    /// A finished center sweep: one `[ny, nx]` trial reconstruction per
+    /// candidate center, concatenated row-major in `frames`.
+    CenterSweep {
+        centers: Vec<f32>,
+        ny: usize,
+        nx: usize,
+        frames: Vec<f32>,
         millis: u128,
     },
     /// A finished single-slice preview: `[ny, nx]` row-major reconstruction.
@@ -235,6 +248,25 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                     }),
                 }
             }
+            Job::CenterSweep { row, range } => {
+                let Some(path) = &current else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match run_center_sweep(&engine, path, row, range) {
+                    Ok((centers, ny, nx, frames)) => send(Event::CenterSweep {
+                        centers,
+                        ny,
+                        nx,
+                        frames,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    Err(e) => send(Event::JobFailed {
+                        what: "center sweep".into(),
+                        error: e.to_string(),
+                    }),
+                }
+            }
             Job::Preview { generation, spec } => {
                 let Some(path) = &current else {
                     continue;
@@ -314,6 +346,36 @@ fn run_preview(
     let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
     let (_nz1, ny, nxo) = vol.dims();
     Ok((ny, nxo, vol.array.iter().copied().collect()))
+}
+
+/// Trial reconstructions of one sinogram row over a range of candidate
+/// centers (`recon::center::write_center`), for the sweep montage. The FOV
+/// disk mask is on (`ratio` 1.0): the corner backprojection smear it removes
+/// varies with the trial center and would otherwise dominate the per-frame
+/// sharpness metric.
+fn run_center_sweep(
+    engine: &Engine,
+    path: &std::path::Path,
+    row: usize,
+    range: (f32, f32, f32),
+) -> tomoxide::Result<(Vec<f32>, usize, usize, Vec<f32>)> {
+    let backend = engine.backend();
+    let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
+    let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+    let row = row.min(nz.saturating_sub(1));
+    let mut ds = reader.read_chunk(row, row + 1)?;
+    tomoxide::prep::normalize_dataset(&mut ds, backend)?;
+    let (centers, vols) = tomoxide::recon::center::write_center(
+        &ds.data,
+        &ds.theta,
+        backend,
+        Some(range),
+        None,
+        true,
+        1.0,
+    )?;
+    let (_n, ny, nx) = vols.dim();
+    Ok((centers, ny, nx, vols.iter().copied().collect()))
 }
 
 /// Auto-detect the rotation axis with the chosen method.
@@ -569,6 +631,24 @@ mod tests {
                 method.label()
             );
         }
+    }
+
+    /// The sweep reconstructs one frame per `arange` candidate; the frame
+    /// stack is candidate-major with square `ncol × ncol` frames.
+    #[test]
+    fn center_sweep_shapes_match_candidates() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let meta = probe(&fixture()).unwrap();
+        let mid = meta.nx as f32 / 2.0;
+        // ± 1 px in 0.5 steps, stop nudged like the view: 5 candidates.
+        let range = (mid - 1.0, mid + 1.25, 0.5);
+        let (centers, ny, nx, frames) =
+            run_center_sweep(&engine, &fixture(), meta.nz / 2, range).unwrap();
+        assert_eq!(centers.len(), 5);
+        assert_eq!((ny, nx), (meta.nx, meta.nx));
+        assert_eq!(frames.len(), centers.len() * ny * nx);
+        assert!(centers.windows(2).all(|w| w[1] > w[0]));
+        assert!(frames.iter().all(|v| v.is_finite()));
     }
 
     /// Phase correlation runs on the fixture's 0°/180° projection pair.
