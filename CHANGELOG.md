@@ -38,6 +38,16 @@ All notable changes to this project are documented here. The format is based on
   `f32` through the reader's full dtype dispatch (u8/i8/u16/i16/u32/i32/f32/
   f64). Real beamline stacks are usually `uint16`; the GUI projection browser
   reads through this (siplot's own HDF5 loader handles 4/8-byte floats only).
+- **`io::read_h5_sizes`** — the `(n, ny, nx)` shape probe paired with
+  `read_h5_frame`, so a volume browser can size its frame list without
+  reading any data.
+- **Vo 2018 single-method stripe variants through config/CLI** — the
+  long-implemented `StripeMethod::VoSort`/`VoFilter`/`VoLarge`/`VoDead`/
+  `VoFit` are now selectable as `--remove_stripe vo-sort | vo-filter |
+  vo-large | vo-dead | vo-fit`, with per-method config fields/flags
+  (`vo_sort_*`, `vo_filter_*`, `vo_large_*`, `vo_dead_*`, `vo_fit_*`;
+  median sizes use the `fw_level` convention `0` = tomopy auto) and
+  multi-GPU shard forwarding.
 - **`tomoxide-gui` M1 (offline preview loop)** — new repo-internal but
   workspace-`exclude`d crate (siplot is edition-2024/rust-1.92; workspace
   membership would raise the repo's effective MSRV above 1.82) implementing
