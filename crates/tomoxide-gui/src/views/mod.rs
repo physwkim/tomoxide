@@ -1,8 +1,8 @@
-//! Per-mode screens. Each view owns its siplot widgets (constructed once with
+//! Per-mode screens. Each view owns its rsplot widgets (constructed once with
 //! the wgpu `RenderState`) and receives worker [`Event`](crate::worker::Event)s
 //! routed by the app shell.
 //!
-//! `PlotId` allocation convention (siplot ids must not collide; some widgets
+//! `PlotId` allocation convention (rsplot ids must not collide; some widgets
 //! reserve a small range): Data 0–29, Tune 30–49, Center 50–69, Run 70–89,
 //! Output 90–109.
 
@@ -11,6 +11,19 @@ pub mod data;
 pub mod output;
 pub mod run;
 pub mod tune;
+
+/// Render the "value under the cursor" readout for an [`rsplot::ImageView`],
+/// mirroring the silx `PositionInfo` "Data" column. `ImageView`'s own readout
+/// shows the cursor's x, y only; the pixel value under the cursor is a separate
+/// query ([`rsplot::ImageView::value_changed`]), so it is drawn here. A fixed
+/// placeholder keeps the row height stable when the cursor is off the image.
+pub(crate) fn value_readout(ui: &mut rsplot::egui::Ui, value: Option<(f64, f64, f64)>) {
+    let text = match value {
+        Some((col, row, v)) => format!("value @ ({col:.0}, {row:.0}) = {v:.6}"),
+        None => "value @ —".to_owned(),
+    };
+    ui.label(text);
+}
 
 /// Decode a single-image f32 tiff (the CLI's slice output format). Shared by
 /// the Run live view and the Output browser.
@@ -30,9 +43,9 @@ pub(crate) fn load_tiff_f32(path: &std::path::Path) -> anyhow::Result<(u32, u32,
 /// huge edge ring / out-of-disk values in the frame, and with min/max scaling
 /// the intact interior structure was left ~1 % of the gray range ("smeared").
 /// Percentile clipping is the silx/ImageJ-style autoscale.
-pub(crate) fn autoscale_viridis(data: &[f32]) -> siplot::Colormap {
+pub(crate) fn autoscale_viridis(data: &[f32]) -> rsplot::Colormap {
     let (lo, hi) = robust_range(data);
-    siplot::Colormap::viridis(lo, hi)
+    rsplot::Colormap::viridis(lo, hi)
 }
 
 /// Finite 0.5th and 99.5th percentiles of `data`; falls back to (0, 1) when

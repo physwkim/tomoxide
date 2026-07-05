@@ -1,4 +1,4 @@
-//! tomoxide-gui — desktop front-end for tomoxide, built on siplot (egui+wgpu).
+//! tomoxide-gui — desktop front-end for tomoxide, built on rsplot (egui+wgpu).
 //!
 //! Design: docs/GUI.md. Six modes (Data / Tune / Center / Run / Output / Live)
 //! behind a left mode rail, with a session log pane and a status bar. M1
@@ -28,9 +28,9 @@ fn main() -> eframe::Result {
         }
     }
     let options = eframe::NativeOptions {
-        // siplot widgets require the wgpu renderer (cc.wgpu_render_state).
+        // rsplot widgets require the wgpu renderer (cc.wgpu_render_state).
         renderer: eframe::Renderer::Wgpu,
-        viewport: siplot::egui::ViewportBuilder::default()
+        viewport: rsplot::egui::ViewportBuilder::default()
             .with_title("tomoxide")
             .with_inner_size([1440.0, 900.0]),
         ..Default::default()

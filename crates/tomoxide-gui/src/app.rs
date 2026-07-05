@@ -1,7 +1,7 @@
 //! Application shell: left mode rail, per-mode central panel, session log
 //! pane, status bar (docs/GUI.md §2).
 
-use siplot::egui;
+use rsplot::egui;
 
 /// The six workflow modes on the rail. Order = top-to-bottom rail order =
 /// the operator's usual left-to-right workflow.
@@ -92,7 +92,7 @@ impl App {
         open: Option<std::path::PathBuf>,
         start_mode: Option<Mode>,
     ) -> Self {
-        // Every siplot widget constructor needs this; fail loudly at startup
+        // Every rsplot widget constructor needs this; fail loudly at startup
         // rather than per-view if the renderer is misconfigured.
         let render_state = cc
             .wgpu_render_state
@@ -187,10 +187,27 @@ impl App {
                     ));
                     self.center.on_sweep(centers, ny, nx, &frames);
                 }
+                Event::LambdaSweep {
+                    lambdas,
+                    ny,
+                    nx,
+                    frames,
+                    residual,
+                    roughness,
+                    millis,
+                } => {
+                    self.log
+                        .push(format!("λ sweep: {} values — {millis} ms", lambdas.len()));
+                    self.tune
+                        .on_lambda_sweep(lambdas, ny, nx, &frames, residual, roughness);
+                }
                 Event::JobFailed { what, error } => {
                     self.log.push(format!("FAILED {what}: {error}"));
                     if what.starts_with("preview") {
                         self.tune.on_preview_failed();
+                    }
+                    if what.starts_with("lambda") {
+                        self.tune.on_lambda_failed();
                     }
                     if what.starts_with("center") {
                         self.center.on_failed();

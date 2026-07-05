@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use siplot::egui_wgpu::RenderState;
-use siplot::{Plot2D, egui};
+use rsplot::egui_wgpu::RenderState;
+use rsplot::{Plot2D, egui};
 
 use crate::views::load_tiff_f32;
 use crate::views::tune::TuneView;
@@ -112,7 +112,7 @@ pub struct RunView {
     queue_running: bool,
 
     plot: Plot2D,
-    image: Option<siplot::ItemHandle>,
+    image: Option<rsplot::ItemHandle>,
     /// `latest_end` already loaded into the plot (skip redundant decodes).
     shown_end: Option<usize>,
     /// Throttle tiff decodes to ~2/s even when chunks complete faster.

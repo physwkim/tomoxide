@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use siplot::egui_wgpu::RenderState;
-use siplot::{ColormapDialog, CompareImages, Plot2D, egui};
+use rsplot::egui_wgpu::RenderState;
+use rsplot::{CompareImages, CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
 use tomoxide::{Algorithm, StripeMethod};
 
 use crate::worker::{DatasetMeta, Job, PreviewSpec};
@@ -56,6 +56,16 @@ struct PreviewImage {
     data: Vec<f32>,
     /// Short parameter summary shown in the compare legend.
     summary: String,
+}
+
+/// A finished regularization-strength (λ) sweep: the λ grid and its L-curve
+/// coordinates (the trial reconstructions themselves live in the montage
+/// [`ImageStack`]). `residual[i]` = `‖A x_i − b‖₂`, `roughness[i]` = the
+/// isotropic TV seminorm of `x_i`.
+struct LambdaSweep {
+    lambdas: Vec<f32>,
+    residual: Vec<f64>,
+    roughness: Vec<f64>,
 }
 
 pub struct TuneView {
@@ -119,18 +129,37 @@ pub struct TuneView {
     current: Option<PreviewImage>,
     pinned: Option<PreviewImage>,
 
-    preview_plot: Plot2D,
+    preview_plot: ImageView,
     compare: CompareImages,
-    cmap_dialog: ColormapDialog,
-    preview_image: Option<siplot::ItemHandle>,
+
+    // --- λ sweep (L-curve regularization tuner) ---
+    /// Log-spaced sweep endpoints and count (λ = reg_par[0]).
+    lam_min: f32,
+    lam_max: f32,
+    lam_count: usize,
+    lam_pending: bool,
+    lam_window_open: bool,
+    lam_sweep: Option<LambdaSweep>,
+    lam_stack: ImageStack,
+    lam_plot: Plot1D,
+    lam_curve: Option<ItemHandle>,
 }
 
 impl TuneView {
     pub fn new(render_state: &RenderState) -> Self {
-        let mut preview_plot = Plot2D::new(render_state, 30);
-        preview_plot.set_graph_title("preview");
-        preview_plot.set_graph_cursor(true);
+        // An ImageView (not a bare Plot2D) so the preview crosshair can read out
+        // the pixel value under the cursor (value_changed → silx PositionInfo
+        // "Data"). Its interactive colorbar (value histogram + draggable
+        // vmin/vmax) replaces the former ColormapDialog; side histograms off.
+        let mut preview_plot = ImageView::new(render_state, 30);
+        preview_plot.set_side_histogram_displayed(false);
+        preview_plot.set_interactive_colorbar(true);
+        preview_plot.image_plot_mut().set_graph_title("preview");
         let compare = CompareImages::new(render_state, 40);
+        let mut lam_stack = ImageStack::new(render_state, 42);
+        lam_stack.set_table_visible(false);
+        let mut lam_plot = Plot1D::new(render_state, 44);
+        lam_plot.set_graph_title("L-curve: log₁₀‖Ax−b‖ vs log₁₀ roughness — click to pick");
         TuneView {
             algorithm: "fbp".into(),
             filter: "parzen".into(),
@@ -182,8 +211,18 @@ impl TuneView {
             pinned: None,
             preview_plot,
             compare,
-            cmap_dialog: ColormapDialog::new(),
-            preview_image: None,
+            // A 4-decade default span: λ scale is data-dependent (a good value
+            // at one sinogram amplitude over-smooths at another — see
+            // docs/BENCHMARKS.md §10), so start wide and let the L-curve narrow.
+            lam_min: 1e-4,
+            lam_max: 1.0,
+            lam_count: 7,
+            lam_pending: false,
+            lam_window_open: false,
+            lam_sweep: None,
+            lam_stack,
+            lam_plot,
+            lam_curve: None,
         }
     }
 
@@ -193,6 +232,10 @@ impl TuneView {
         self.current = None;
         self.pinned = None;
         self.pending = false;
+        self.lam_pending = false;
+        self.lam_window_open = false;
+        self.lam_sweep = None;
+        self.lam_stack.set_frames(Vec::new());
         // A fresh dataset makes any shown preview stale; with no preview at
         // all this also fires the initial one (see ui()).
         self.dirty = true;
@@ -218,28 +261,11 @@ impl TuneView {
             summary: self.summary(),
         };
         let cmap = super::autoscale_viridis(&image.data);
-        match self.preview_image {
-            Some(h) => {
-                let _ = self.preview_plot.try_update_image(
-                    h,
-                    image.nx as u32,
-                    image.ny as u32,
-                    &image.data,
-                    cmap,
-                );
-            }
-            None => {
-                if let Ok(h) = self.preview_plot.try_add_image(
-                    image.nx as u32,
-                    image.ny as u32,
-                    &image.data,
-                    cmap,
-                ) {
-                    self.preview_image = Some(h);
-                }
-            }
-        }
+        let _ = self
+            .preview_plot
+            .set_image(image.nx as u32, image.ny as u32, &image.data, cmap);
         self.preview_plot
+            .image_plot_mut()
             .set_graph_title(format!("slice {} — {}", self.slice, image.summary));
         self.current = Some(image);
         self.update_compare();
@@ -311,6 +337,184 @@ impl TuneView {
             self.algorithm.as_str(),
             "fbp" | "gridrec" | "fourierrec" | "lprec" | "linerec"
         )
+    }
+
+    /// Algorithms whose `reg_par[0]` is a regularization strength λ worth
+    /// sweeping on the L-curve (the TV / penalized / smoothed least-squares
+    /// set). `sirt`/`cgls`/`mlem`/`osem` take no `reg_par`, so the sweep is
+    /// hidden for them.
+    fn uses_reg_par(&self) -> bool {
+        matches!(
+            self.algorithm.as_str(),
+            "tv" | "grad" | "tikh" | "pml_hybrid" | "pml_quad" | "ospml_hybrid" | "ospml_quad"
+        )
+    }
+
+    /// Issue a λ sweep: reconstruct the current slice across a log-spaced λ
+    /// grid, all other parameters fixed. One in flight at a time.
+    fn request_lambda_sweep(&mut self, jobs: &Sender<Job>, log: &mut Vec<String>) {
+        if self.lam_pending {
+            return;
+        }
+        let spec = match self.build_spec() {
+            Ok(s) => s,
+            Err(e) => {
+                log.push(format!("λ sweep parameters: {e}"));
+                return;
+            }
+        };
+        let lambdas = log_space(self.lam_min, self.lam_max, self.lam_count);
+        if lambdas.is_empty() {
+            log.push("λ sweep needs 0 < min < max and n ≥ 2".into());
+            return;
+        }
+        if jobs.send(Job::LambdaSweep { spec, lambdas }).is_ok() {
+            self.lam_pending = true;
+            self.lam_window_open = true;
+        }
+    }
+
+    /// Route a finished λ sweep here: build the montage frames and the L-curve
+    /// (log residual vs log roughness), and jump the stack to the corner (the
+    /// suggested λ — picking it is still the user's call).
+    pub fn on_lambda_sweep(
+        &mut self,
+        lambdas: Vec<f32>,
+        ny: usize,
+        nx: usize,
+        frames: &[f32],
+        residual: Vec<f64>,
+        roughness: Vec<f64>,
+    ) {
+        self.lam_pending = false;
+        if lambdas.is_empty() || ny * nx == 0 {
+            return;
+        }
+        let size = ny * nx;
+        let cmap = super::autoscale_viridis(frames);
+        let stack_frames: Vec<Option<Frame>> = lambdas
+            .iter()
+            .enumerate()
+            .map(|(i, &lam)| {
+                let data = &frames[i * size..(i + 1) * size];
+                Some(Frame::new(
+                    nx as u32,
+                    ny as u32,
+                    data.to_vec(),
+                    Some(format!("λ={lam:.2e}")),
+                ))
+            })
+            .collect();
+        self.lam_stack.set_frames(stack_frames);
+        self.lam_stack.set_colormap(cmap);
+
+        let (lx, ly) = log_lcurve(&residual, &roughness);
+        let curve = CurveData::new(lx.clone(), ly.clone(), egui::Color32::LIGHT_GREEN);
+        match self.lam_curve {
+            Some(h) => {
+                self.lam_plot.update_curve_data(h, &curve);
+            }
+            None => {
+                self.lam_curve = Some(
+                    self.lam_plot
+                        .add_curve_data_with_legend(&curve, "L-curve (λ low→high)"),
+                );
+            }
+        }
+        self.lam_stack.set_current(corner_index(&lx, &ly));
+        self.lam_sweep = Some(LambdaSweep {
+            lambdas,
+            residual,
+            roughness,
+        });
+    }
+
+    /// A worker λ sweep failed: clear the in-flight flag.
+    pub fn on_lambda_failed(&mut self) {
+        self.lam_pending = false;
+    }
+
+    /// λ of the montage frame the stack currently shows.
+    fn selected_lambda(&self) -> Option<f32> {
+        let sweep = self.lam_sweep.as_ref()?;
+        sweep.lambdas.get(self.lam_stack.current()).copied()
+    }
+
+    /// Adopt the selected λ as `reg_par[0]` (keeping any further entries) and
+    /// mark the panel dirty so an enabled auto-recon refreshes the preview.
+    fn apply_selected_lambda(&mut self) {
+        if let Some(lam) = self.selected_lambda() {
+            let mut rp = parse_reg_par(&self.reg_par).unwrap_or_default();
+            match rp.first_mut() {
+                Some(first) => *first = lam,
+                None => rp.push(lam),
+            }
+            self.reg_par = rp
+                .iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.dirty = true;
+        }
+    }
+
+    /// The floating λ-sweep window: montage on top, L-curve below. A click on
+    /// the curve snaps the montage to the nearest λ.
+    fn lambda_window(&mut self, ctx: &egui::Context) {
+        if !self.lam_window_open {
+            return;
+        }
+        let mut open = self.lam_window_open;
+        egui::Window::new("λ sweep — L-curve")
+            .open(&mut open)
+            .default_size([540.0, 600.0])
+            .show(ctx, |ui| {
+                if self.lam_sweep.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        let msg = if self.lam_pending {
+                            "reconstructing the λ grid…"
+                        } else {
+                            "Run a λ sweep to browse trial reconstructions per λ."
+                        };
+                        ui.label(msg);
+                    });
+                    return;
+                }
+                egui::Panel::bottom("lam_curve")
+                    .resizable(true)
+                    .default_size(230.0)
+                    .show_inside(ui, |ui| self.lambda_curve_panel(ui));
+                self.lam_stack.ui(ui);
+            });
+        self.lam_window_open = open;
+    }
+
+    /// The L-curve under the montage; a click snaps to the nearest λ, and the
+    /// title reads out the shown frame's λ / residual / roughness.
+    fn lambda_curve_panel(&mut self, ui: &mut egui::Ui) {
+        let resp = self.lam_plot.show(ui);
+        let Some(sweep) = &self.lam_sweep else {
+            return;
+        };
+        let (lx, ly) = log_lcurve(&sweep.residual, &sweep.roughness);
+        if resp.response.clicked()
+            && let Some(pos) = resp.response.interact_pointer_pos()
+        {
+            let (x, y) = resp.transform.pixel_to_data(pos);
+            if let Some(i) = nearest_point(&lx, &ly, x, y) {
+                self.lam_stack.set_current(i);
+            }
+        }
+        let i = self.lam_stack.current();
+        if let (Some(&lam), Some(&res), Some(&rough)) = (
+            sweep.lambdas.get(i),
+            sweep.residual.get(i),
+            sweep.roughness.get(i),
+        ) {
+            self.lam_plot.set_graph_title(format!(
+                "L-curve — click to pick — λ={lam:.2e}: residual {res:.3e}, roughness {rough:.3e}"
+            ));
+        }
     }
 
     /// Fill the shared CLI config with this panel's parameters (recipe save).
@@ -732,6 +936,64 @@ impl TuneView {
                     if let Some(c) = &self.current {
                         ui.label(egui::RichText::new(format!("B: {}", c.summary)).small());
                     }
+
+                    if self.uses_reg_par() {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("λ sweep (L-curve)");
+                            ui.label(egui::RichText::new("reg_par[0]").small().weak());
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("min");
+                            ui.add(
+                                egui::DragValue::new(&mut self.lam_min)
+                                    .speed(0.0002)
+                                    .range(1e-8..=1e3),
+                            );
+                            ui.label("max");
+                            ui.add(
+                                egui::DragValue::new(&mut self.lam_max)
+                                    .speed(0.02)
+                                    .range(1e-8..=1e3),
+                            );
+                            ui.label("n");
+                            ui.add(egui::DragValue::new(&mut self.lam_count).range(2..=16));
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.lam_pending, egui::Button::new("Sweep λ"))
+                                .on_hover_text(
+                                    "reconstruct this slice across a log-spaced λ grid; \
+                                     the L-curve corner is the principled λ (sharper = \
+                                     smaller λ is not automatically more accurate)",
+                                )
+                                .clicked()
+                            {
+                                self.request_lambda_sweep(jobs, log);
+                            }
+                            if self.lam_sweep.is_some()
+                                && ui
+                                    .button("Use selected λ")
+                                    .on_hover_text("adopt the highlighted λ as reg_par[0]")
+                                    .clicked()
+                            {
+                                self.apply_selected_lambda();
+                            }
+                            if self.lam_sweep.is_some() && ui.button("Show montage").clicked() {
+                                self.lam_window_open = true;
+                            }
+                            if self.lam_pending {
+                                ui.spinner();
+                            }
+                        });
+                        if let Some(lam) = self.selected_lambda() {
+                            ui.label(
+                                egui::RichText::new(format!("selected λ = {lam:.3e}"))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    }
                 });
             });
 
@@ -741,19 +1003,18 @@ impl TuneView {
             self.compare.show(ui);
             self.compare.show_status_bar(ui);
         } else {
-            self.preview_plot.show_toolbar_with(ui, |ui, _plot| {
-                ui.separator();
-                self.cmap_dialog.toggle_button(ui);
-            });
+            self.preview_plot.show_toolbar(ui);
             if self.current.is_some() {
-                self.preview_plot.show(ui);
-                self.cmap_dialog.show(ui.ctx(), &mut self.preview_plot);
+                self.preview_plot.show(ui, None, None);
+                super::value_readout(ui, self.preview_plot.value_changed());
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Press Reconstruct to preview the selected slice.");
                 });
             }
         }
+
+        self.lambda_window(ui.ctx());
     }
 }
 
@@ -764,6 +1025,68 @@ fn parse_reg_par(s: &str) -> Result<Vec<f32>, String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.parse::<f32>().map_err(|e| format!("reg_par: {e}")))
         .collect()
+}
+
+/// `n` log-spaced values in `[min, max]` inclusive. Empty on an invalid range
+/// (needs `0 < min < max` and `n ≥ 2`).
+fn log_space(min: f32, max: f32, n: usize) -> Vec<f32> {
+    if !(min > 0.0 && max > min) || n < 2 {
+        return Vec::new();
+    }
+    let (a, b) = (min.ln(), max.ln());
+    (0..n)
+        .map(|i| (a + (b - a) * i as f32 / (n - 1) as f32).exp())
+        .collect()
+}
+
+/// L-curve coordinates: base-10 logs of the residual (x) and roughness (y),
+/// each floored to avoid `log10(0) = −∞`.
+fn log_lcurve(residual: &[f64], roughness: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let lg = |v: &f64| v.max(1e-30).log10();
+    (
+        residual.iter().map(lg).collect(),
+        roughness.iter().map(lg).collect(),
+    )
+}
+
+/// Index of the L-curve corner: the point of maximum perpendicular distance to
+/// the chord joining the first and last points (a robust, parameter-free corner
+/// estimate). Falls back to the first index for degenerate curves.
+fn corner_index(xs: &[f64], ys: &[f64]) -> usize {
+    let n = xs.len();
+    if n < 3 {
+        return 0;
+    }
+    let (x0, y0) = (xs[0], ys[0]);
+    let (dx, dy) = (xs[n - 1] - x0, ys[n - 1] - y0);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len == 0.0 {
+        return 0;
+    }
+    let mut best = 0;
+    let mut best_d = -1.0;
+    for i in 0..n {
+        let d = ((xs[i] - x0) * dy - (ys[i] - y0) * dx).abs() / len;
+        if d > best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Index of the L-curve point nearest the click position (Euclidean in the
+/// shown log–log coordinates).
+fn nearest_point(xs: &[f64], ys: &[f64], x: f64, y: f64) -> Option<usize> {
+    xs.iter()
+        .zip(ys.iter())
+        .enumerate()
+        .min_by(|(_, (ax, ay)), (_, (bx, by))| {
+            let da = (*ax - x).powi(2) + (*ay - y).powi(2);
+            let db = (*bx - x).powi(2) + (*by - y).powi(2);
+            da.total_cmp(&db)
+        })
+        .map(|(i, _)| i)
 }
 
 fn combo(ui: &mut egui::Ui, label: &str, value: &mut String, options: &[&str]) -> bool {
@@ -810,4 +1133,56 @@ fn drag_dim(ui: &mut egui::Ui, value: &mut u8) -> bool {
         changed = ui.add(egui::DragValue::new(value).range(1..=2)).changed();
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_space_is_geometric_and_inclusive() {
+        let v = log_space(1e-4, 1.0, 5);
+        assert_eq!(v.len(), 5);
+        assert!((v[0] - 1e-4).abs() < 1e-9);
+        assert!((v[4] - 1.0).abs() < 1e-5);
+        // Constant ratio between consecutive entries (geometric spacing).
+        let r = v[1] / v[0];
+        for w in v.windows(2) {
+            assert!((w[1] / w[0] - r).abs() < 1e-3, "ratios differ: {v:?}");
+        }
+    }
+
+    #[test]
+    fn log_space_rejects_bad_ranges() {
+        assert!(log_space(0.0, 1.0, 5).is_empty());
+        assert!(log_space(1.0, 1.0, 5).is_empty());
+        assert!(log_space(1.0, 0.5, 5).is_empty());
+        assert!(log_space(1e-4, 1.0, 1).is_empty());
+    }
+
+    #[test]
+    fn corner_index_finds_the_knee() {
+        // An L-shaped curve: the bend at index 1 is the corner.
+        let xs = [0.0, 0.0, 1.0, 2.0];
+        let ys = [2.0, 0.0, 0.0, 0.0];
+        assert_eq!(corner_index(&xs, &ys), 1);
+        // Degenerate (collinear / too short) → first index.
+        assert_eq!(corner_index(&[0.0, 1.0], &[0.0, 1.0]), 0);
+    }
+
+    #[test]
+    fn nearest_point_picks_closest() {
+        let xs = [0.0, 1.0, 2.0];
+        let ys = [0.0, 1.0, 2.0];
+        assert_eq!(nearest_point(&xs, &ys, 0.9, 1.1), Some(1));
+        assert_eq!(nearest_point(&xs, &ys, -5.0, -5.0), Some(0));
+        assert_eq!(nearest_point(&[], &[], 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn log_lcurve_floors_zero() {
+        let (lx, ly) = log_lcurve(&[0.0, 100.0], &[10.0, 0.0]);
+        assert!(lx[0] < -20.0 && lx[1] > 1.9 && lx[1] < 2.1);
+        assert!(ly[0] > 0.9 && ly[0] < 1.1 && ly[1] < -20.0);
+    }
 }

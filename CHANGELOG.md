@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **`tomoxide-gui` now depends on `rsplot` 0.5.0 from crates.io** (was the
+  `siplot` git dependency pinned to a rev). The plotting crate and its GitHub
+  repo were renamed `siplot` → `rsplot` (and the sibling EPICS engine
+  `sidm` → `rsdm`) and published to crates.io; the GUI switches to
+  `rsplot = "=0.5.0"` with a commented-out `[patch.crates-io]` for local dev.
+  Mostly a `use siplot` → `use rsplot` identifier rename. The one behavioural
+  gap: the local `siplot` carried an unpushed commit making a `Plot2D`
+  crosshair read out the pixel value under the cursor ("x, y, value"); `rsplot`
+  0.5.0 instead exposes the value via the higher-level `ImageView`
+  (`value_changed`, silx `PositionInfo` "Data"). The Data sinogram inspector and
+  the Tune single-slice preview were migrated `Plot2D` → `ImageView` to keep the
+  value readout (the preview's `ColormapDialog` is replaced by `ImageView`'s
+  interactive colorbar). GUI build/clippy/35 tests green on CPU and CUDA;
+  interactive rendering of the new readout is unverified (headless).
+
 ### Added
 
 - **CLI `--progress_json`** (`recon`, `recon_steps`) — one flushed JSON line
@@ -37,7 +54,7 @@ All notable changes to this project are documented here. The format is based on
 - **`io::read_h5_frame`** — read one `[ny, nx]` frame of a 3-D HDF5 stack as
   `f32` through the reader's full dtype dispatch (u8/i8/u16/i16/u32/i32/f32/
   f64). Real beamline stacks are usually `uint16`; the GUI projection browser
-  reads through this (siplot's own HDF5 loader handles 4/8-byte floats only).
+  reads through this (rsplot's own HDF5 loader handles 4/8-byte floats only).
 - **`io::read_h5_sizes`** — the `(n, ny, nx)` shape probe paired with
   `read_h5_frame`, so a volume browser can size its frame list without
   reading any data.
@@ -49,7 +66,7 @@ All notable changes to this project are documented here. The format is based on
   median sizes use the `fw_level` convention `0` = tomopy auto) and
   multi-GPU shard forwarding.
 - **`tomoxide-gui` M1 (offline preview loop)** — new repo-internal but
-  workspace-`exclude`d crate (siplot is edition-2024/rust-1.92; workspace
+  workspace-`exclude`d crate (rsplot is edition-2024/rust-1.92; workspace
   membership would raise the repo's effective MSRV above 1.82) implementing
   docs/GUI.md M1: a single worker thread owns the `Engine` and all HDF5
   handles (`!Send`); **Data** (DXchange open + metadata, projection browser —
@@ -64,8 +81,20 @@ All notable changes to this project are documented here. The format is based on
   dataset and/or picks the starting mode from the command line, and Tune
   fires the first preview of a fresh dataset by itself (the auto toggle
   still gates re-runs on parameter changes).
+- **GUI Tune — λ sweep (L-curve regularization tuner).** For algorithms whose
+  `reg_par[0]` is a regularization strength λ (`tv`, `grad`, `tikh`,
+  `pml_*`, `ospml_*`), a new worker `Job::LambdaSweep` reconstructs the preview
+  slice once per λ across a log-spaced grid and scores each on the L-curve —
+  data residual `‖A x − b‖₂` (the fidelity term, via `sim::project`) vs the
+  reconstruction's isotropic TV seminorm (roughness). A floating window shows
+  the per-λ montage over the L-curve; the max-distance-to-chord corner is the
+  suggested λ, a click picks any point, and "Use selected λ" writes it to
+  `reg_par[0]`. The guide is the L-curve corner, not a sharpness auto-pick:
+  sharpness falls monotonically with λ and real data has no ground truth
+  (`docs/BENCHMARKS.md` §10), so the choice stays the user's. Verified finite
+  and λ-varying on both CPU and the CUDA device-resident 1-slice path.
 - **GUI design document** (`docs/GUI.md`) — design for a `tomoxide-gui`
-  desktop application built on siplot (egui + wgpu) and sidm (EPICS PVA):
+  desktop application built on rsplot (egui + wgpu) and rsdm (EPICS PVA):
   offline workflow (dataset browsing, single-slice tune loop with A/B
   compare, center finding with a `write_center` sweep montage, subprocess
   full-volume runs, output browsing) plus a tomostream-style live streaming

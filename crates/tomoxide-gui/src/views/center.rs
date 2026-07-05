@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use siplot::egui_wgpu::RenderState;
-use siplot::{CurveData, Frame, ImageStack, ItemHandle, Plot1D, egui};
+use rsplot::egui_wgpu::RenderState;
+use rsplot::{CurveData, Frame, ImageStack, ItemHandle, Plot1D, egui};
 
 use crate::worker::{CenterMethod, DatasetMeta, Job};
 

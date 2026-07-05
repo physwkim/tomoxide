@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use siplot::egui;
+use rsplot::egui;
 use tomoxide::io::{DatasetReader, RowBandReader};
 use tomoxide::{
     Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PhaseMethod, ReconParams,
@@ -99,6 +99,14 @@ pub enum Job {
     /// `(start, stop, step)` (`recon::center::write_center`) →
     /// [`Event::CenterSweep`]. The montage input for the Center screen.
     CenterSweep { row: usize, range: (f32, f32, f32) },
+    /// Reconstruct the preview slice once per λ in `lambdas` (all other
+    /// parameters fixed by `spec`), replacing `reg_par[0]` each time →
+    /// [`Event::LambdaSweep`]. The montage + L-curve input for the Tune
+    /// screen's regularization-strength tuner.
+    LambdaSweep {
+        spec: PreviewSpec,
+        lambdas: Vec<f32>,
+    },
     /// Exit the worker loop.
     Shutdown,
 }
@@ -129,6 +137,18 @@ pub enum Event {
         ny: usize,
         nx: usize,
         frames: Vec<f32>,
+        millis: u128,
+    },
+    /// A finished λ sweep: one `[ny, nx]` reconstruction per λ (row-major in
+    /// `frames`), plus the L-curve coordinates — data residual `‖Ax − b‖₂`
+    /// and roughness (isotropic TV seminorm) of each reconstruction.
+    LambdaSweep {
+        lambdas: Vec<f32>,
+        ny: usize,
+        nx: usize,
+        frames: Vec<f32>,
+        residual: Vec<f64>,
+        roughness: Vec<f64>,
         millis: u128,
     },
     /// A finished single-slice preview: `[ny, nx]` row-major reconstruction.
@@ -267,6 +287,27 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                     }),
                 }
             }
+            Job::LambdaSweep { spec, lambdas } => {
+                let Some(path) = &current else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match run_lambda_sweep(&engine, path, &spec, &lambdas) {
+                    Ok((ny, nx, frames, residual, roughness)) => send(Event::LambdaSweep {
+                        lambdas,
+                        ny,
+                        nx,
+                        frames,
+                        residual,
+                        roughness,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    Err(e) => send(Event::JobFailed {
+                        what: "lambda sweep".into(),
+                        error: e.to_string(),
+                    }),
+                }
+            }
             Job::Preview { generation, spec } => {
                 let Some(path) = &current else {
                     continue;
@@ -308,6 +349,23 @@ fn run_preview(
     spec: &PreviewSpec,
 ) -> tomoxide::Result<(usize, usize, Vec<f32>)> {
     let backend = engine.backend();
+    let (one, geom) = prep_slice(engine, path, spec)?;
+    let params = recon_params(spec, one.array.dim().2, spec.reg_par.clone());
+    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
+    let (_nz1, ny, nxo) = vol.dims();
+    Ok((ny, nxo, vol.array.iter().copied().collect()))
+}
+
+/// Prep the requested slice down to the one-row sinogram and its geometry —
+/// the shared front half of [`run_preview`] and [`run_lambda_sweep`]. Banded
+/// read → normalize+minus-log → phase → sinogram layout → crop to the slice
+/// row → stripe (see the module comment on crop-then-stripe).
+fn prep_slice(
+    engine: &Engine,
+    path: &std::path::Path,
+    spec: &PreviewSpec,
+) -> tomoxide::Result<(tomoxide::Tomo, Geometry)> {
+    let backend = engine.backend();
     let mut probe = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
     let (_nproj, nz, nx, _nflat, _ndark) = probe.read_sizes()?;
     drop(probe);
@@ -335,17 +393,100 @@ fn run_preview(
     if let Some(c) = spec.center {
         geom.center = Center::Scalar(c);
     }
-    let params = ReconParams {
+    Ok((one, geom))
+}
+
+/// Reconstruction parameters for a preview, with `reg_par` supplied by the
+/// caller (the λ sweep overrides `reg_par[0]` per frame).
+fn recon_params(spec: &PreviewSpec, nx: usize, reg_par: Vec<f32>) -> ReconParams {
+    ReconParams {
         num_gridx: Some(nx),
         filter_name: spec.filter,
         num_iter: spec.num_iter,
-        reg_par: spec.reg_par.clone(),
+        reg_par,
         ext_pad: spec.ext_pad,
         ..Default::default()
-    };
-    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
-    let (_nz1, ny, nxo) = vol.dims();
-    Ok((ny, nxo, vol.array.iter().copied().collect()))
+    }
+}
+
+/// Reconstruct the preview slice once per λ (overriding `reg_par[0]`, keeping
+/// any further entries), and score each result on the L-curve: data residual
+/// `‖A x − b‖₂` (the exact fidelity term the regularized solver minimizes —
+/// `A` is the same forward projector) and the isotropic TV seminorm (roughness).
+/// The corner of `log residual` vs `log roughness` is the principled λ — sharper
+/// = smaller λ is *not* automatically better on real data (docs/BENCHMARKS.md
+/// §10), so the pick stays the user's.
+/// `(ny, nx, frames, residual, roughness)` — the λ montage and its L-curve
+/// coordinates (see [`Event::LambdaSweep`]).
+type LambdaSweepOut = (usize, usize, Vec<f32>, Vec<f64>, Vec<f64>);
+
+fn run_lambda_sweep(
+    engine: &Engine,
+    path: &std::path::Path,
+    spec: &PreviewSpec,
+    lambdas: &[f32],
+) -> tomoxide::Result<LambdaSweepOut> {
+    let backend = engine.backend();
+    let (one, geom) = prep_slice(engine, path, spec)?;
+    let nx = one.array.dim().2;
+
+    let mut frames = Vec::new();
+    let mut residual = Vec::with_capacity(lambdas.len());
+    let mut roughness = Vec::with_capacity(lambdas.len());
+    let (mut ny, mut nxo) = (0usize, 0usize);
+    for &lam in lambdas {
+        let mut reg_par = spec.reg_par.clone();
+        match reg_par.first_mut() {
+            Some(first) => *first = lam,
+            None => reg_par.push(lam),
+        }
+        let params = recon_params(spec, nx, reg_par);
+        let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
+        let (_nz1, y, x) = vol.dims();
+        (ny, nxo) = (y, x);
+        let sino = tomoxide::sim::project(&vol, &geom, backend)?;
+        residual.push(l2_diff(&sino.array, &one.array));
+        roughness.push(tv_seminorm(&vol.array));
+        frames.extend(vol.array.iter().copied());
+    }
+    Ok((ny, nxo, frames, residual, roughness))
+}
+
+/// Euclidean norm of the elementwise difference of two equally-shaped arrays.
+fn l2_diff(a: &ndarray::Array3<f32>, b: &ndarray::Array3<f32>) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x as f64 - y as f64;
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Isotropic total-variation seminorm `Σ √(∂ₓ² + ∂ᵧ²)` of a one-slice volume
+/// `[1, ny, nx]` — the L-curve roughness axis (forward differences, zero at the
+/// far edges).
+fn tv_seminorm(vol: &ndarray::Array3<f32>) -> f64 {
+    let (_nz, ny, nx) = vol.dim();
+    let mut sum = 0.0f64;
+    for y in 0..ny {
+        for x in 0..nx {
+            let v = vol[[0, y, x]] as f64;
+            let dx = if x + 1 < nx {
+                vol[[0, y, x + 1]] as f64 - v
+            } else {
+                0.0
+            };
+            let dy = if y + 1 < ny {
+                vol[[0, y + 1, x]] as f64 - v
+            } else {
+                0.0
+            };
+            sum += (dx * dx + dy * dy).sqrt();
+        }
+    }
+    sum
 }
 
 /// Trial reconstructions of one sinogram row over a range of candidate
@@ -649,6 +790,90 @@ mod tests {
         assert_eq!(frames.len(), centers.len() * ny * nx);
         assert!(centers.windows(2).all(|w| w[1] > w[0]));
         assert!(frames.iter().all(|v| v.is_finite()));
+    }
+
+    /// A TV λ sweep reconstructs one frame per λ and scores each on the
+    /// L-curve. Frames are λ-major square images; residual/roughness are finite
+    /// and per-λ, and stronger regularization is not less rough than weaker
+    /// (roughness is monotone non-increasing in λ) — the property the L-curve
+    /// display relies on.
+    #[test]
+    fn lambda_sweep_scores_lcurve() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let meta = probe(&fixture()).unwrap();
+        let spec = PreviewSpec {
+            slice: meta.nz / 2,
+            algorithm: Algorithm::Tv,
+            center: None,
+            filter: FilterName::Parzen,
+            num_iter: 20,
+            reg_par: vec![0.001],
+            ext_pad: false,
+            stripe: StripeMethod::None,
+            phase: PhaseMethod::None,
+        };
+        let lambdas = [0.001_f32, 0.01, 0.1];
+        let (ny, nx, frames, residual, roughness) =
+            run_lambda_sweep(&engine, &fixture(), &spec, &lambdas).unwrap();
+        assert_eq!((ny, nx), (meta.nx, meta.nx));
+        assert_eq!(frames.len(), lambdas.len() * ny * nx);
+        assert_eq!(residual.len(), lambdas.len());
+        assert_eq!(roughness.len(), lambdas.len());
+        assert!(residual.iter().all(|v| v.is_finite() && *v >= 0.0));
+        assert!(roughness.iter().all(|v| v.is_finite() && *v >= 0.0));
+        // More regularization → smoother (never rougher) reconstruction.
+        assert!(
+            roughness.windows(2).all(|w| w[1] <= w[0] * 1.001),
+            "roughness not monotone in λ: {roughness:?}"
+        );
+        // The λ frames are not all identical (the sweep actually varied output).
+        let size = ny * nx;
+        assert!(
+            frames[..size] != frames[size..2 * size],
+            "λ sweep produced identical frames"
+        );
+    }
+
+    /// The λ sweep runs end-to-end on CUDA (device-resident 1-slice recon +
+    /// forward projection for the residual) and yields finite, varying scores.
+    /// Skips itself when no CUDA device answers.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn lambda_sweep_cuda_is_finite_and_varies() {
+        if tomoxide::CudaBackend::new().is_err() {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        let engine = Engine::new(BackendKind::Cuda).unwrap();
+        if engine.name() != "cuda" {
+            eprintln!("skipping: engine resolved to {}", engine.name());
+            return;
+        }
+        let meta = probe(&fixture()).unwrap();
+        let spec = PreviewSpec {
+            slice: meta.nz / 2,
+            algorithm: Algorithm::Tv,
+            center: None,
+            filter: FilterName::Parzen,
+            num_iter: 20,
+            reg_par: vec![0.001],
+            ext_pad: true,
+            stripe: StripeMethod::None,
+            phase: PhaseMethod::None,
+        };
+        let lambdas = [0.001_f32, 0.01, 0.1];
+        let (_ny, _nx, _frames, residual, roughness) =
+            run_lambda_sweep(&engine, &fixture(), &spec, &lambdas).unwrap();
+        assert!(residual.iter().all(|v| v.is_finite() && *v > 0.0));
+        assert!(roughness.iter().all(|v| v.is_finite()));
+        // The residual axis must actually move with λ — a flat axis would mean
+        // the 1-slice forward projection collapsed (the batch-domain bug).
+        let (rmin, rmax) = residual
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        assert!(rmax > rmin, "residual L-curve axis is flat: {residual:?}");
     }
 
     /// Phase correlation runs on the fixture's 0°/180° projection pair.

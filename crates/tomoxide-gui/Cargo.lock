@@ -2621,6 +2621,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsplot"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22339460bbc7cda1f8f46b7773a1f62a5f9eabb7963895c7eb69ffb7d632230d"
+dependencies = [
+ "arboard",
+ "bytemuck",
+ "colorous",
+ "egui",
+ "egui-wgpu",
+ "lowe-sift",
+ "medians",
+ "png",
+ "printers",
+ "rfd",
+ "rust-hdf5 0.2.28",
+ "tiff",
+ "tz-rs",
+ "tzdb",
+]
+
+[[package]]
 name = "rust-hdf5"
 version = "0.2.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2829,27 +2851,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "siplot"
-version = "0.4.2"
-source = "git+https://github.com/physwkim/siplot.git?rev=45c14a6e12612045190be7af136dc75141ec0503#45c14a6e12612045190be7af136dc75141ec0503"
-dependencies = [
- "arboard",
- "bytemuck",
- "colorous",
- "egui",
- "egui-wgpu",
- "lowe-sift",
- "medians",
- "png",
- "printers",
- "rfd",
- "rust-hdf5 0.2.28",
- "tiff",
- "tz-rs",
- "tzdb",
-]
 
 [[package]]
 name = "skrifa"
@@ -3179,9 +3180,9 @@ dependencies = [
  "log",
  "ndarray",
  "rfd",
+ "rsplot",
  "serde",
  "serde_json",
- "siplot",
  "tiff",
  "toml",
  "tomoxide",

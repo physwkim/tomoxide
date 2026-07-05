@@ -1,6 +1,6 @@
-# tomoxide-gui — desktop GUI for tomoxide, built on siplot (egui + wgpu).
+# tomoxide-gui — desktop GUI for tomoxide, built on rsplot (egui + wgpu).
 #
-# NOT a member of the repo workspace (root Cargo.toml `exclude`): siplot is
+# NOT a member of the repo workspace (root Cargo.toml `exclude`): rsplot is
 # edition-2024 / rust 1.92 while the library workspace holds MSRV 1.82, and a
 # workspace member's manifest is parsed by every cargo invocation. Own
 # [workspace] + own Cargo.lock; build from this directory. See docs/GUI.md §3.1.
@@ -11,7 +11,7 @@ edition = "2024"
 rust-version = "1.92"
 license = "BSD-3-Clause"
 repository = "https://github.com/physwkim/tomoxide"
-description = "tomoxide desktop GUI (siplot/egui)"
+description = "tomoxide desktop GUI (rsplot/egui)"
 
 [workspace]
 
@@ -22,7 +22,7 @@ description = "tomoxide desktop GUI (siplot/egui)"
 # default stays featureless (the feature needs rustc ≥ 1.92, above the
 # library workspace's 1.82 MSRV; this crate already pins 1.92).
 # gpu-wgpu stays off — tomoxide's wgpu backend duplicates a second wgpu stack
-# next to siplot's egui-wgpu and buys the GUI nothing (docs/GUI.md §3.2).
+# next to rsplot's egui-wgpu and buys the GUI nothing (docs/GUI.md §3.2).
 default = ["cuda", "sift-center"]
 cuda = ["tomoxide/cuda"]
 sift-center = ["tomoxide/sift-center"]
@@ -32,17 +32,19 @@ tomoxide = { path = "../tomoxide", features = ["config"] }
 # Same major as tomoxide's workspace pin — its public API leaks ndarray types
 # (Tomo.array, find_center_pc's Array2), so both must resolve to one ndarray.
 ndarray = "0.16"
-# siplot re-exports its egui/egui-wgpu, so widget code never version-skews;
-# pinned to a rev because the GUI tracks siplot's API, not its main branch.
-siplot = { git = "https://github.com/physwkim/siplot.git", rev = "45c14a6e12612045190be7af136dc75141ec0503" }
-# eframe must run the wgpu renderer (siplot widgets need cc.wgpu_render_state).
+# rsplot re-exports its egui/egui-wgpu, so widget code never version-skews.
+# From crates.io (the crate and its GitHub repo were renamed siplot → rsplot,
+# and adl2sidm's engine crate sidm → rsdm); a `=` pin keeps the GUI tracking one
+# rsplot API rather than picking up 0.5.x additions silently.
+rsplot = "=0.5.0"
+# eframe must run the wgpu renderer (rsplot widgets need cc.wgpu_render_state).
 eframe = { version = "0.34", default-features = false, features = [
     "wgpu",
     "default_fonts",
     "wayland",
     "x11",
 ] }
-# native file-open dialog; same version siplot uses so it builds once
+# native file-open dialog; same version rsplot uses so it builds once
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 # Run screen: parse the CLI's `--progress_json` chunk lines.
@@ -57,6 +59,6 @@ tiff = "0.11"
 # Run screen pre-flight: free-space check for the disk estimate.
 fs4 = "0.13"
 
-# Local development against the sibling checkout (uncomment; do not commit):
-# [patch."https://github.com/physwkim/siplot.git"]
-# siplot = { path = "../../../siplot" }
+# Local development against a sibling checkout (uncomment; do not commit):
+# [patch.crates-io]
+# rsplot = { path = "../../../rsplot" }

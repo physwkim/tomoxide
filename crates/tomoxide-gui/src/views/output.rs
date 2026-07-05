@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-use siplot::egui_wgpu::RenderState;
-use siplot::{
+use rsplot::egui_wgpu::RenderState;
+use rsplot::{
     CurveData, Frame, FrameLoader, ImageStack, ItemHandle, Plot1D, ScalarFieldView, egui,
 };
 
@@ -371,7 +371,7 @@ impl OutputView {
         let mut field = ScalarFieldView::new(render_state, 0);
         field.add_auto_isosurface(
             render_state,
-            siplot::mean_plus_std,
+            rsplot::mean_plus_std,
             egui::Color32::from_rgb(255, 70, 90),
         );
         OutputView {
@@ -493,7 +493,7 @@ impl OutputView {
     fn apply_scan(&mut self, scan: Scan) {
         (self.lo, self.hi) = scan.window;
         self.stack
-            .set_colormap(siplot::Colormap::viridis(self.lo as f64, self.hi as f64));
+            .set_colormap(rsplot::Colormap::viridis(self.lo as f64, self.hi as f64));
         let (dz, dy, dx) = scan.dims;
         self.field_ready = self
             .field

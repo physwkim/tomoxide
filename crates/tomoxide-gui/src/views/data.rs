@@ -4,14 +4,14 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use siplot::egui_wgpu::RenderState;
-use siplot::{CurveData, Frame, FrameLoader, ImageStack, ItemHandle, Plot1D, Plot2D, egui};
+use rsplot::egui_wgpu::RenderState;
+use rsplot::{CurveData, Frame, FrameLoader, ImageStack, ImageView, ItemHandle, Plot1D, egui};
 
 use crate::worker::{DatasetMeta, Job};
 
 /// Projection-browser loader: same `"file::dataset::index"` source format as
-/// siplot's `Hdf5FrameLoader`, but reading through tomoxide's dtype-dispatching
-/// HDF5 frame read — real beamline stacks are usually `uint16`, which siplot's
+/// rsplot's `Hdf5FrameLoader`, but reading through tomoxide's dtype-dispatching
+/// HDF5 frame read — real beamline stacks are usually `uint16`, which rsplot's
 /// own loader rejects (it reads only 4/8-byte float datasets).
 struct DxFrameLoader;
 
@@ -39,8 +39,7 @@ pub struct DataView {
     stack: ImageStack,
     theta_plot: Plot1D,
     theta_curve: Option<ItemHandle>,
-    sino_plot: Plot2D,
-    sino_image: Option<ItemHandle>,
+    sino_plot: ImageView,
     /// Detector row selected by the slider.
     sino_row: usize,
     /// Row of an in-flight ReadSinogram job (one outstanding request at a
@@ -58,9 +57,16 @@ impl DataView {
         stack.set_table_visible(false);
         let mut theta_plot = Plot1D::new(render_state, 10);
         theta_plot.set_graph_title("theta");
-        let mut sino_plot = Plot2D::new(render_state, 20);
-        sino_plot.set_graph_title("sinogram");
-        sino_plot.set_graph_cursor(true);
+        // An ImageView (not a bare Plot2D) so the crosshair readout can show the
+        // pixel value under the cursor via value_changed() — the silx
+        // PositionInfo "Data" column. Side histograms and the dedicated colorbar
+        // are off so the inspector stays a plain image + readout (the aspect
+        // ratio is freed too: sinograms are [nproj × nx], shown stretched).
+        let mut sino_plot = ImageView::new(render_state, 20);
+        sino_plot.set_side_histogram_displayed(false);
+        sino_plot.set_show_colorbar(false);
+        sino_plot.image_plot_mut().set_keep_data_aspect_ratio(false);
+        sino_plot.image_plot_mut().set_graph_title("sinogram");
         DataView {
             path_input: String::new(),
             meta: None,
@@ -68,7 +74,6 @@ impl DataView {
             theta_plot,
             theta_curve: None,
             sino_plot,
-            sino_image: None,
             sino_row: 0,
             sino_pending: None,
             sino_shown: None,
@@ -90,7 +95,7 @@ impl DataView {
             .collect();
         self.stack.set_sources(sources);
         // Raw-count display range from frame 0 (the stack has no autoscale).
-        self.stack.set_colormap(siplot::Colormap::viridis(
+        self.stack.set_colormap(rsplot::Colormap::viridis(
             meta.data_range.0 as f64,
             meta.data_range.1 as f64,
         ));
@@ -127,23 +132,11 @@ impl DataView {
         self.sino_pending = None;
         self.sino_shown = Some(row);
         let cmap = super::autoscale_viridis(data);
-        match self.sino_image {
-            Some(h) => {
-                let _ = self
-                    .sino_plot
-                    .try_update_image(h, nx as u32, nproj as u32, data, cmap);
-            }
-            None => {
-                if let Ok(h) = self
-                    .sino_plot
-                    .try_add_image(nx as u32, nproj as u32, data, cmap)
-                {
-                    self.sino_plot.set_item_legend(h, "raw counts");
-                    self.sino_image = Some(h);
-                }
-            }
-        }
+        let _ = self
+            .sino_plot
+            .set_image(nx as u32, nproj as u32, data, cmap);
         self.sino_plot
+            .image_plot_mut()
             .set_graph_title(format!("sinogram — row {row}"));
     }
 
@@ -238,7 +231,8 @@ impl DataView {
                         ui.spinner();
                     }
                 });
-                self.sino_plot.show(ui);
+                self.sino_plot.show(ui, None, None);
+                super::value_readout(ui, self.sino_plot.value_changed());
             });
 
         // Remaining central space: the projection browser.
