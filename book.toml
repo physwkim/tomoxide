@@ -1,0 +1,21 @@
+[book]
+title = "tomoxide"
+description = "A Rust tomographic reconstruction toolkit — CPU · CUDA · wgpu (Metal)"
+authors = ["Sang Woo Kim"]
+language = "en"
+# The narrative docs live in docs/; SUMMARY.md there selects which are published
+# (NEXT_STEPS.md is intentionally left out — it is the internal roadmap).
+src = "docs"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/physwkim/tomoxide"
+git-repository-icon = "fa-github"
+
+[output.html.search]
+enable = true
+
+[output.html.fold]
+enable = true
+level = 1
