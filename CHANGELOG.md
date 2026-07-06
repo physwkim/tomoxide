@@ -28,6 +28,14 @@ All notable changes to this project are documented here. The format is based on
   readout is pinned to the bottom so the image fills exactly the available
   height, keeping the sinogram's resizable bottom panel stable (an earlier
   version let it grow into / collapse away from the projection browser).
+- **`tomoxide-gui` is now published to crates.io** at `0.6.0` (its first
+  release, aligned with the library and CLI). To make it installable
+  everywhere, its default features are CPU-only (`["sift-center"]`, was
+  `["cuda", "sift-center"]`) so `cargo install tomoxide-gui` and the docs.rs
+  build succeed without an NVIDIA toolkit — enable the CUDA backend explicitly
+  with `--features cuda`. Its `tomoxide` path dependency gained a matching
+  `version` (`0.6.0`), which crates.io requires to publish. The crate still
+  lives outside the Cargo workspace (edition 2024 / rust 1.92, own lockfile).
 
 ### Added
 
