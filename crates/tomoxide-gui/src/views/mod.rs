@@ -12,6 +12,33 @@ pub mod output;
 pub mod run;
 pub mod tune;
 
+/// Draw an [`rsplot::ImageView`] with its pixel-value readout pinned to the
+/// bottom of the current region and the image filling the space above.
+///
+/// Layout stability rule: the image must consume *exactly* the available height
+/// so that `content == available`. `ImageView::show` fills `available` on its
+/// own, but it also appends its x, y position-info bar below the image — so the
+/// caller must empty that bar (`*view.position_info_mut() = PositionInfo::new(
+/// vec![])`) at construction, otherwise content is `available + bar` and, in a
+/// content-sized `egui` panel (which stores its content rect as next frame's
+/// size), that surplus makes the panel grow or collapse frame over frame.
+///
+/// The value readout is reserved at the bottom (bottom-up layout) rather than
+/// appended after the image, so it does not add to the image's height either —
+/// the image fills `available - readout`, and total content is exactly
+/// `available`. `value_readout` reports col, row, value, covering what the
+/// emptied x, y bar used to show.
+pub(crate) fn show_image_view_with_value(ui: &mut rsplot::egui::Ui, view: &mut rsplot::ImageView) {
+    use rsplot::egui;
+    let value = view.value_changed();
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+        value_readout(ui, value);
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            view.show(ui, None, None);
+        });
+    });
+}
+
 /// Render the "value under the cursor" readout for an [`rsplot::ImageView`],
 /// mirroring the silx `PositionInfo` "Data" column. `ImageView`'s own readout
 /// shows the cursor's x, y only; the pixel value under the cursor is a separate

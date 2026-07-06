@@ -155,6 +155,10 @@ impl TuneView {
         preview_plot.set_side_histogram_displayed(false);
         preview_plot.set_interactive_colorbar(true);
         preview_plot.image_plot_mut().set_graph_title("preview");
+        // Empty the x,y position-info bar so the image fills exactly the
+        // available height (value_readout reports col, row, value); see
+        // views::show_image_view_with_value.
+        *preview_plot.position_info_mut() = rsplot::PositionInfo::new(Vec::new());
         let compare = CompareImages::new(render_state, 40);
         let mut lam_stack = ImageStack::new(render_state, 42);
         lam_stack.set_table_visible(false);
@@ -1005,8 +1009,7 @@ impl TuneView {
         } else {
             self.preview_plot.show_toolbar(ui);
             if self.current.is_some() {
-                self.preview_plot.show(ui, None, None);
-                super::value_readout(ui, self.preview_plot.value_changed());
+                super::show_image_view_with_value(ui, &mut self.preview_plot);
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Press Reconstruct to preview the selected slice.");

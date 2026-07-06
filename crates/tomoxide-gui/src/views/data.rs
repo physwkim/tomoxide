@@ -67,6 +67,14 @@ impl DataView {
         sino_plot.set_show_colorbar(false);
         sino_plot.image_plot_mut().set_keep_data_aspect_ratio(false);
         sino_plot.image_plot_mut().set_graph_title("sinogram");
+        // Empty the x,y position-info bar: ImageView appends it *after* the
+        // image, so with it the widget's content is taller than the height it
+        // was given. The sinogram lives in a resizable Panel::bottom, and an
+        // egui panel stores its content rect as next frame's size — so that
+        // mismatch forms a size<->content feedback loop that collapses (or
+        // grows) the panel. Emptied, the image fills exactly the available
+        // height; value_readout below already reports col, row, value.
+        *sino_plot.position_info_mut() = rsplot::PositionInfo::new(Vec::new());
         DataView {
             path_input: String::new(),
             meta: None,
@@ -217,6 +225,11 @@ impl DataView {
                 self.theta_plot.show(ui);
             });
 
+        // Resizable: the sinogram content is built to consume exactly the
+        // available height (empty position-info bar in `new`; readout pinned to
+        // the bottom in show_image_view_with_value), so content == available and
+        // the panel's content-driven size is a stable fixed point at whatever
+        // height the user drags to — no collapse, no push.
         egui::Panel::bottom("data_sino")
             .resizable(true)
             .default_size(320.0)
@@ -231,8 +244,7 @@ impl DataView {
                         ui.spinner();
                     }
                 });
-                self.sino_plot.show(ui, None, None);
-                super::value_readout(ui, self.sino_plot.value_changed());
+                super::show_image_view_with_value(ui, &mut self.sino_plot);
             });
 
         // Remaining central space: the projection browser.
