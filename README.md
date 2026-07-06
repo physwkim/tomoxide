@@ -1,19 +1,23 @@
 # tomoxide
 
+[![crates.io](https://img.shields.io/crates/v/tomoxide.svg)](https://crates.io/crates/tomoxide)
+[![docs.rs](https://img.shields.io/docsrs/tomoxide)](https://docs.rs/tomoxide)
+[![docs site](https://img.shields.io/badge/docs-mdBook-blue)](https://physwkim.github.io/tomoxide/)
+
 > A Rust tomographic reconstruction toolkit — the algorithmic breadth of
 > [tomopy](https://github.com/tomopy/tomopy) fused with the GPU-accelerated
 > streaming reconstruction of [tomocupy](https://github.com/tomography/tomocupy),
 > behind a single **tri-backend** abstraction: **CPU · CUDA · wgpu (Metal)**.
 
-> **Status: working — v0.3.0.** All three backends reconstruct real datasets.
+> **Status: working — v0.6.0.** All three backends reconstruct real datasets.
 > The **CPU** backend ports tomopy's analytic (`fbp`, `gridrec`, `fourierrec`,
 > `lprec`, `linerec`) and iterative (`sirt`, `mlem`, `osem`, `ospml`, `pml`,
 > `tv`, `grad`, `tikh`, `art`, `bart`) families; the **CUDA** backend ports
 > tomocupy's device-resident streaming kernels (multi-GPU, fp16, laminography,
 > and the full iterative suite on-device); the **wgpu** backend runs a portable
-> subset (Metal / Vulkan / DX12) with no NVIDIA toolkit. See
-> [CHANGELOG.md](CHANGELOG.md) and the
-> [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md).
+> subset (Metal / Vulkan / DX12) with no NVIDIA toolkit. See the
+> [documentation site](https://physwkim.github.io/tomoxide/) and
+> [CHANGELOG.md](CHANGELOG.md).
 
 ## Why
 
@@ -28,8 +32,10 @@
 
 ## Workspace layout
 
-Two crates: the `tomoxide` library (everything — all three backends live in it as
-modules behind `cuda` / `gpu-wgpu` features) and the `tomoxide-cli` binary.
+Two published crates — the `tomoxide` library (everything — all three backends
+live in it as modules behind `cuda` / `gpu-wgpu` features) and the `tomoxide-cli`
+binary — plus a desktop GUI (`tomoxide-gui`) that lives in the repo but outside
+the Cargo workspace (it targets a newer toolchain, so it is not on crates.io).
 
 ```
 crates/
@@ -37,6 +43,7 @@ crates/
                  backends, reconstruction, preprocessing, I/O, simulation, and
                  the high-level pipelines
   tomoxide-cli   `tomoxide` command-line front-end (init/status/recon/recon_steps/tune_chunk)
+  tomoxide-gui   desktop app (rsplot / egui + wgpu); workspace-excluded, not published
 ```
 
 Inside the library:
@@ -56,6 +63,18 @@ crates/tomoxide/src/
 crates/tomoxide/cuda/   vendored tomocupy .cu/.cuh kernels + shim.cpp
                         (compiled by build.rs via nvcc when `cuda` is enabled)
 ```
+
+## Install
+
+Both crates are published on crates.io:
+
+```sh
+cargo add tomoxide          # library — add to a Rust project
+cargo install tomoxide-cli  # the `tomoxide` command-line tool
+```
+
+Opt into a GPU backend with a feature (`--features cuda` needs the CUDA toolkit;
+`--features gpu-wgpu` is portable Metal / Vulkan / DX12 with no NVIDIA toolkit).
 
 ## Build
 
@@ -462,13 +481,16 @@ tomocupy's pipeline dominates. Reproduce by generating a DXchange file with the
 `make_synthetic_dxchange` example and timing `tomoxide recon` against
 `tomocupy recon` on it.
 
-## Documentation
+The narrative docs are also published as a browsable site:
+**<https://physwkim.github.io/tomoxide/>**. The API reference is on
+[docs.rs/tomoxide](https://docs.rs/tomoxide).
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, backend abstraction, streaming pipeline, cross-backend conventions.
 - [docs/ALGORITHMS.md](docs/ALGORITHMS.md) — the analytic and iterative methods and their parameters.
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — measured reconstruction quality, speed, and iteration behaviour of the methods on real data (which method/filter to pick).
+- [docs/GUI.md](docs/GUI.md) — the `tomoxide-gui` desktop app design (Data / Tune / Center / Run / Output / Live modes, offline + live streaming).
 - [docs/PORTING.md](docs/PORTING.md) — upstream tomopy/tomocupy → tomoxide module map with provenance.
-- [CHANGELOG.md](CHANGELOG.md) — release-by-release changes; [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md).
+- [CHANGELOG.md](CHANGELOG.md) — release-by-release changes.
 
 ## License
 
