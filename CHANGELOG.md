@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-06
+
 ### Changed
 
 - **`tomoxide-gui` now depends on `rsplot` 0.5.0 from crates.io** (was the
@@ -20,8 +22,12 @@ All notable changes to this project are documented here. The format is based on
   (`value_changed`, silx `PositionInfo` "Data"). The Data sinogram inspector and
   the Tune single-slice preview were migrated `Plot2D` → `ImageView` to keep the
   value readout (the preview's `ColormapDialog` is replaced by `ImageView`'s
-  interactive colorbar). GUI build/clippy/35 tests green on CPU and CUDA;
-  interactive rendering of the new readout is unverified (headless).
+  interactive colorbar). GUI build/clippy/35 tests green on CPU and CUDA. The
+  Data sinogram inspector and Tune preview `ImageView` layout was fixed and
+  verified on-screen: the `ImageView` position-info bar is emptied and the value
+  readout is pinned to the bottom so the image fills exactly the available
+  height, keeping the sinogram's resizable bottom panel stable (an earlier
+  version let it grow into / collapse away from the projection browser).
 
 ### Added
 
@@ -581,7 +587,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/physwkim/tomoxide/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/physwkim/tomoxide/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/physwkim/tomoxide/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/physwkim/tomoxide/compare/v0.3.0...v0.4.0
