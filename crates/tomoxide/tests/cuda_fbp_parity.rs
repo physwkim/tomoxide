@@ -3,10 +3,12 @@
 //! Reconstructs a forward-projected Shepp-Logan phantom with `recon(Fbp)` on the
 //! CUDA backend (FBP filter on the CPU via the shared definition, back-projection
 //! on the GPU via tomocupy's `cfunc_linerec`) and checks it against both the
-//! phantom (round-trip) and the pure-CPU reconstruction. The GPU kernel uses
-//! tomocupy's convention — a y-flip and a `4/nproj` scale vs the CPU
-//! back-projector's `π/nproj` — so the comparison is scale-invariant Pearson
-//! correlation, with the y-flip applied to line the two grids up.
+//! phantom (round-trip) and the pure-CPU reconstruction. Since the convention
+//! unification both backends share orientation and the analytic `π/nproj` dθ
+//! weight; this suite predates that, so it compares flip-tolerantly
+//! (best-of-both-flips) with scale-invariant Pearson — absolute scale and
+//! orientation are pinned elsewhere (tests/cuda_cpu_convention_parity.rs,
+//! tests/iterative_amplitude.rs).
 //!
 //! Runs only with the `cuda` feature (needs an NVIDIA device + nvcc at build).
 #![cfg(feature = "cuda")]
@@ -286,6 +288,11 @@ fn cuda_fused_equals_per_stage() {
         .unwrap()
         .backproject(&filtered, &geom, &mut vol)
         .unwrap();
+    // `FilteredBackproject` is the pure adjoint Wᵀ; the FBP π/nang angular-
+    // quadrature dθ weight is applied by the analytic dispatcher, so this
+    // hand-rolled per-stage composition applies it itself.
+    vol.array
+        .mapv_inplace(|v| v * std::f32::consts::PI / nang as f32);
 
     let maxabs = vol.array.iter().fold(0.0f32, |m, &b| m.max(b.abs()));
     let max_d = fused

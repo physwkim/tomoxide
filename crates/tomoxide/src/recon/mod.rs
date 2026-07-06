@@ -160,6 +160,13 @@ fn analytic(
     };
     let mut vol = Volume::new(Array3::zeros((nz, n, n)));
     bp.backproject(&filtered, &centered, &mut vol)?;
+    // FBP angular quadrature: the back-projection integral ∫₀^π … dθ discretizes
+    // to a sum weighted by dθ = π/nang. `FilteredBackproject` is the *pure*
+    // adjoint Wᵀ (the iterative solvers need it unweighted), so the analytic
+    // path owns this weight — matching the fused CUDA/wgpu analytic paths, which
+    // pass the same π/nproj gain to their kernels.
+    let dtheta = std::f32::consts::PI / sino.n_angles() as f32;
+    vol.array.mapv_inplace(|v| v * dtheta);
     Ok(vol)
 }
 
@@ -177,6 +184,14 @@ fn iterative(
         return Err(Error::InvalidParam(
             "warm-start `init` is not supported for row-action ART/BART".into(),
         ));
+    }
+
+    // Truncated-projection support extension: solve on an edge-replicate
+    // extended lane + wider grid, return the central crop. Sits above the
+    // backend dispatch so CPU, CUDA, and wgpu all see the identical extended
+    // problem (see `ReconParams::ext_pad`).
+    if params.ext_pad {
+        return ext_pad_solve(sino, geom, algorithm, params, backend);
     }
 
     // ART/BART are row-action (Kaczmarz) — they consume the single-ray rows, not
@@ -252,6 +267,99 @@ fn iterative(
         // Art/Bart by the ray-projector path above, so they never reach here.
         _ => unreachable!("non-iterative algorithm reached iterative dispatch"),
     }
+}
+
+/// Truncated-projection support extension (`ReconParams::ext_pad`).
+///
+/// Edge-replicate extends every projection by `pad = ncols/4` columns per
+/// side, shifts the rotation center by `pad`, solves the same algorithm on
+/// the `n + 2·pad` grid, and returns the central `n × n` crop. The extension
+/// gives out-of-view mass a support region to land in, so the least-squares
+/// fit stops dumping the truncation inconsistency into a FOV-edge ring — the
+/// iterative analog of the edge-replicate padding the analytic filter step
+/// (`FbpFilter::apply`) and gridrec already apply. A warm-start `init` and a
+/// Tikhonov `reg_data` prior are embedded centered (zero ring); the pad-ring
+/// state is not part of the caller-visible volume, so a split warm-started
+/// run is *approximately* — not bit — equal to a continuous one under
+/// `ext_pad`.
+fn ext_pad_solve(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    backend: &dyn Backend,
+) -> Result<Volume<f32>> {
+    let b = sino.as_layout(Layout::Sinogram);
+    let (nz, nang, ncols) = (b.n_rows(), b.n_angles(), b.n_cols());
+    let n = grid_size(sino, params);
+    let pad = (ncols / 4).max(1);
+    let ncols_ext = ncols + 2 * pad;
+    let n_ext = n + 2 * pad;
+
+    // Edge-replicate extended sinogram, [nz, nang, ncols_ext].
+    let mut ext = Array3::<f32>::zeros((nz, nang, ncols_ext));
+    for iz in 0..nz {
+        for ia in 0..nang {
+            let src = b.array.index_axis(Axis(0), iz);
+            let row = src.index_axis(Axis(0), ia);
+            let mut dst = ext.index_axis_mut(Axis(0), iz);
+            let mut dst = dst.index_axis_mut(Axis(0), ia);
+            let (first, last) = (row[0], row[ncols - 1]);
+            for j in 0..pad {
+                dst[j] = first;
+                dst[pad + ncols + j] = last;
+            }
+            for j in 0..ncols {
+                dst[pad + j] = row[j];
+            }
+        }
+    }
+    let sino_ext = Tomo::new(ext, Layout::Sinogram);
+
+    // Same geometry on the wider lane: rotation center shifts with the pad.
+    let mut geom_ext = geom.clone();
+    geom_ext.detector.width = ncols_ext;
+    geom_ext.center = match &geom.center {
+        Center::Scalar(c) => Center::Scalar(c + pad as f32),
+        Center::PerRow(v) => Center::PerRow(v.iter().map(|c| c + pad as f32).collect()),
+    };
+
+    // Embed an `[nz, n, n]` volume centered in the `[nz, n_ext, n_ext]` grid.
+    // (`slice_axis`, not the `s![]` macro — the macro expands with an
+    // `allow(unsafe_code)` that this module's `forbid` rejects.)
+    let core = ndarray::Slice::from(pad..pad + n);
+    let embed = |src: &Array3<f32>| -> Array3<f32> {
+        let mut out = Array3::<f32>::zeros((nz, n_ext, n_ext));
+        let mut view = out.slice_axis_mut(Axis(1), core);
+        view.slice_axis_mut(Axis(2), core).assign(src);
+        out
+    };
+    let mut params_ext = params.clone();
+    params_ext.ext_pad = false; // solve the extended problem plainly
+    params_ext.num_gridx = Some(n_ext);
+    params_ext.num_gridy = params.num_gridy.map(|_| n_ext);
+    if let Some(v) = &params.init {
+        if v.dims() != (nz, n, n) {
+            return Err(Error::ShapeMismatch {
+                expected: format!("init volume [{nz}, {n}, {n}]"),
+                found: format!("{:?}", v.dims()),
+            });
+        }
+        params_ext.init = Some(Volume::new(embed(&v.array)));
+    }
+    if params.reg_data.len() == nz * n * n {
+        let prior =
+            Array3::from_shape_vec((nz, n, n), params.reg_data.clone()).expect("len checked above");
+        params_ext.reg_data = embed(&prior).into_raw_vec_and_offset().0;
+    }
+
+    let vol = iterative(&sino_ext, &geom_ext, algorithm, &params_ext, backend)?;
+    Ok(Volume::new(
+        vol.array
+            .slice_axis(Axis(1), core)
+            .slice_axis(Axis(2), core)
+            .to_owned(),
+    ))
 }
 
 /// Simultaneous Iterative Reconstruction Technique.
@@ -626,10 +734,9 @@ fn ospml(
 /// is either fixed (`reg_par[0] ≥ 0`) or Barzilai–Borwein adaptive
 /// (`reg_par[0] < 0`, `λ = ⟨Δx, Δg⟩ / ⟨Δg, Δg⟩`, first step `1e-3`). `x` iterates
 /// in the r-scaled domain (tomopy scales the initial guess by `1/r`; from a zero
-/// start that is a no-op) and is multiplied by `r` on return. `R` = forward
-/// projector, `Rᵀ` = its *raw* adjoint — the back-projector bakes in a `π/nang`
-/// factor (for FBP), which is divided back out here so the `r` normalization
-/// holds. Unlike the EM methods this imposes no positivity.
+/// start that is a no-op) and is multiplied by `r` on return. `R` = the plain
+/// line-integral forward projector, `Rᵀ` = the back-projector, its exact
+/// unweighted adjoint. Unlike the EM methods this imposes no positivity.
 ///
 /// `tikhonov = Some((reg1, prior))` adds the Tikhonov gradient
 /// `2·reg1·(x − prior)` (penalizing ‖x − prior‖², a ridge term pulling the
@@ -659,12 +766,6 @@ fn gradient_descent(
     let ncols = b.n_cols();
 
     let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
-    let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
-                                                        // The forward projector now carries the adjoint gain π/nang (see `CpuBackend::
-                                                        // project`); divide it back out of the data residual so the fixed-step/BB
-                                                        // conditioning is invariant to that gain (identical to the pre-adjoint-unification
-                                                        // behaviour, and matched by the CUDA device-resident solver).
-    let fwd_gain_inv = nang as f32 / std::f32::consts::PI;
     let fixed_step = params.reg_par.first().copied().unwrap_or(1.0);
 
     // r-scaled domain (physical = r · iterate); a warm-start seed enters as init / r.
@@ -681,9 +782,9 @@ fn gradient_descent(
         let mut prox1 = ax.array.clone();
         ndarray::Zip::from(&mut prox1)
             .and(&b.array)
-            .for_each(|p, &d| *p = (*p * r - d) * fwd_gain_inv); // (r·R x − b)/gain
+            .for_each(|p, &d| *p = *p * r - d); // r·R x − b
         bp.backproject(&Tomo::new(prox1, Layout::Sinogram), geom, &mut bpv)?;
-        let mut grad = bpv.array.mapv(|v| 2.0 * r * adj_scale * v); // 2r·Rᵀ(…)
+        let mut grad = bpv.array.mapv(|v| 2.0 * r * v); // 2r·Rᵀ(…)
 
         // Tikhonov gradient 2·reg1·(x − prior), added in the scaled domain.
         if let Some((reg1, ref prior)) = tikhonov {
@@ -888,11 +989,11 @@ fn cgls(
 /// `pᵈ ← (pᵈ + c(r·R x̄ − b))/(1+c)` — then a primal step
 /// `xₙ ← x_old − c·r·Rᵀ(pᵈ) + c·div(pᵀᵛ)` and the θ=1 over-relaxation
 /// `x̄ ← 2xₙ − x_old`. `λ = reg_par[0]` is the TV strength; `c = 0.35` is tomopy's
-/// fixed primal–dual step. As in `grad`, `x` lives in the r-scaled domain
-/// (`r = 1/√(ncols·nang/2)`) and is rescaled by `r` on return, the back-projector's
-/// `π/nang` factor is divided back out for the raw adjoint, and the result is the
-/// final extrapolated point `x̄` (matching tomopy, which returns `recon`). No
-/// positivity constraint.
+/// fixed primal–dual step. As in `grad`, `R`/`Rᵀ` are the unweighted
+/// line-integral pair, `x` lives in the r-scaled domain
+/// (`r = 1/√(ncols·nang/2)`) and is rescaled by `r` on return, and the result is
+/// the final extrapolated point `x̄` (matching tomopy, which returns `recon`).
+/// No positivity constraint.
 ///
 /// The projector-model caveat from `grad` applies: tomopy's `r` and the hardcoded
 /// `c = 0.35` (the Chambolle–Pock step, where convergence wants `c²·‖K‖² ≤ 1` for
@@ -914,12 +1015,6 @@ fn tv(
     let ncols = b.n_cols();
 
     let r = 1.0 / ((ncols * nang) as f32 / 2.0).sqrt();
-    let adj_scale = nang as f32 / std::f32::consts::PI; // undo the back-projector's π/nang
-                                                        // Divide the forward projector's adjoint gain π/nang back out of the data term
-                                                        // (see `gradient_descent`) so the fixed Chambolle–Pock step stays well-
-                                                        // conditioned regardless of that gain; keeps the CP data operator norm — and
-                                                        // thus the convergence rate and the TV/data balance — invariant to it.
-    let fwd_gain_inv = nang as f32 / std::f32::consts::PI;
     let lambda = params.reg_par.first().copied().unwrap_or(1.0); // TV strength
     const C: f32 = 0.35; // tomopy's fixed primal–dual step
 
@@ -941,8 +1036,8 @@ fn tv(
         ndarray::Zip::from(&mut pd.array)
             .and(&ax.array)
             .and(&b.array)
-            .for_each(|q, &a, &d| *q = (*q + fwd_gain_inv * (C * r * a - C * d)) / (1.0 + C));
-        bp.backproject(&pd, geom, &mut bpv)?; // (π/nang)·Rᵀ(pᵈ)
+            .for_each(|q, &a, &d| *q = (*q + C * r * a - C * d) / (1.0 + C));
+        bp.backproject(&pd, geom, &mut bpv)?; // Rᵀ(pᵈ)
 
         for z in 0..nz {
             // TV dual ascent on x̄, then project onto the λ-ball (interior stencil;
@@ -961,7 +1056,7 @@ fn tv(
             for iy in 0..n {
                 for ix in 0..n {
                     let x_old = x[[z, iy, ix]];
-                    let mut u = x_old - C * r * adj_scale * bpv.array[[z, iy, ix]];
+                    let mut u = x_old - C * r * bpv.array[[z, iy, ix]];
                     u += if ix == 0 {
                         C * p0x[[z, iy, 0]]
                     } else {

@@ -1,0 +1,1191 @@
+//! Tune mode (docs/GUI.md §2 Tune): the single-slice parameter tuning loop.
+//! Pick a slice, adjust parameters, reconstruct that one slice in memory, and
+//! A/B-compare against a pinned earlier result.
+
+use std::sync::Arc;
+use std::sync::mpsc::Sender;
+
+use rsplot::egui_wgpu::RenderState;
+use rsplot::{CompareImages, CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
+use tomoxide::{Algorithm, StripeMethod};
+
+use crate::worker::{DatasetMeta, Job, PreviewSpec};
+
+/// Algorithms offered in the combo, in FromStr spelling.
+const ALGORITHMS: &[&str] = &[
+    "fbp",
+    "gridrec",
+    "fourierrec",
+    "lprec",
+    "linerec",
+    "art",
+    "bart",
+    "sirt",
+    "mlem",
+    "osem",
+    "ospml_hybrid",
+    "ospml_quad",
+    "pml_hybrid",
+    "pml_quad",
+    "tv",
+    "grad",
+    "tikh",
+    "cgls",
+];
+const FILTERS: &[&str] = &[
+    "none", "ramp", "shepp", "cosine", "cosine2", "hamming", "hann", "parzen",
+];
+const STRIPES: &[&str] = &[
+    "none",
+    "fw",
+    "ti",
+    "sf",
+    "vo-all",
+    "vo-sort",
+    "vo-filter",
+    "vo-large",
+    "vo-dead",
+    "vo-fit",
+];
+const PHASES: &[&str] = &["none", "paganin", "Gpaganin", "farago"];
+
+/// One finished preview kept for display / pinning.
+struct PreviewImage {
+    ny: usize,
+    nx: usize,
+    data: Vec<f32>,
+    /// Short parameter summary shown in the compare legend.
+    summary: String,
+}
+
+/// A finished regularization-strength (λ) sweep: the λ grid and its L-curve
+/// coordinates (the trial reconstructions themselves live in the montage
+/// [`ImageStack`]). `residual[i]` = `‖A x_i − b‖₂`, `roughness[i]` = the
+/// isotropic TV seminorm of `x_i`.
+struct LambdaSweep {
+    lambdas: Vec<f32>,
+    residual: Vec<f64>,
+    roughness: Vec<f64>,
+}
+
+pub struct TuneView {
+    // --- parameters (Config-field spellings; recipe mapping is task #8) ---
+    pub algorithm: String,
+    pub filter: String,
+    pub center_auto: bool,
+    pub center: f32,
+    pub num_iter: usize,
+    /// Comma-separated reg_par list, parsed on request.
+    pub reg_par: String,
+    /// Truncated-projection support extension for iterative methods
+    /// (`ReconParams::ext_pad`). On by default: real beamline samples routinely
+    /// overhang the FOV, and without it the iterative preview is swamped by
+    /// the truncation edge ring.
+    pub ext_pad: bool,
+    pub stripe: String,
+    pub fw_sigma: f32,
+    pub fw_level: usize,
+    pub ti_nblock: usize,
+    pub ti_beta: f32,
+    pub sf_size: usize,
+    pub vo_snr: f32,
+    pub vo_la_size: usize,
+    pub vo_sm_size: usize,
+    /// `vo-sort`/`vo-filter` median size: 0 = tomopy auto (fw_level convention).
+    pub vo_sort_size: usize,
+    pub vo_sort_dim: u8,
+    pub vo_filter_sigma: f32,
+    pub vo_filter_size: usize,
+    pub vo_filter_dim: u8,
+    pub vo_large_snr: f32,
+    pub vo_large_size: usize,
+    pub vo_large_drop_ratio: f32,
+    pub vo_large_norm: bool,
+    pub vo_dead_snr: f32,
+    pub vo_dead_size: usize,
+    pub vo_dead_norm: bool,
+    pub vo_fit_order: usize,
+    pub vo_fit_sigma_x: f32,
+    pub vo_fit_sigma_y: f32,
+    /// Phase-retrieval method (Config spelling: `none`/`paganin`/`Gpaganin`/
+    /// `farago`). Previews read a row band sized by the kernel support.
+    pub phase: String,
+    pub pixel_size: f32,
+    pub propagation_distance: f32,
+    pub energy: f32,
+    pub alpha: f32,
+    pub db: f32,
+    pub w: f32,
+
+    pub slice: usize,
+    auto_recon: bool,
+    /// Parameters changed since the last issued preview.
+    dirty: bool,
+    /// Monotone id per issued preview; one in flight at a time.
+    generation: u64,
+    pending: bool,
+    last_millis: Option<u128>,
+
+    current: Option<PreviewImage>,
+    pinned: Option<PreviewImage>,
+
+    preview_plot: ImageView,
+    compare: CompareImages,
+
+    // --- λ sweep (L-curve regularization tuner) ---
+    /// Log-spaced sweep endpoints and count (λ = reg_par[0]).
+    lam_min: f32,
+    lam_max: f32,
+    lam_count: usize,
+    lam_pending: bool,
+    lam_window_open: bool,
+    lam_sweep: Option<LambdaSweep>,
+    lam_stack: ImageStack,
+    lam_plot: Plot1D,
+    lam_curve: Option<ItemHandle>,
+}
+
+impl TuneView {
+    pub fn new(render_state: &RenderState) -> Self {
+        // An ImageView (not a bare Plot2D) so the preview crosshair can read out
+        // the pixel value under the cursor (value_changed → silx PositionInfo
+        // "Data"). Its interactive colorbar (value histogram + draggable
+        // vmin/vmax) replaces the former ColormapDialog; side histograms off.
+        let mut preview_plot = ImageView::new(render_state, 30);
+        preview_plot.set_side_histogram_displayed(false);
+        preview_plot.set_interactive_colorbar(true);
+        preview_plot.image_plot_mut().set_graph_title("preview");
+        // Empty the x,y position-info bar so the image fills exactly the
+        // available height (value_readout reports col, row, value); see
+        // views::show_image_view_with_value.
+        *preview_plot.position_info_mut() = rsplot::PositionInfo::new(Vec::new());
+        let compare = CompareImages::new(render_state, 40);
+        let mut lam_stack = ImageStack::new(render_state, 42);
+        lam_stack.set_table_visible(false);
+        let mut lam_plot = Plot1D::new(render_state, 44);
+        lam_plot.set_graph_title("L-curve: log₁₀‖Ax−b‖ vs log₁₀ roughness — click to pick");
+        TuneView {
+            algorithm: "fbp".into(),
+            filter: "parzen".into(),
+            center_auto: true,
+            center: 0.0,
+            num_iter: 10,
+            reg_par: String::new(),
+            ext_pad: true,
+            stripe: "none".into(),
+            fw_sigma: 2.0,
+            fw_level: 0,
+            ti_nblock: 0,
+            ti_beta: 1.5,
+            sf_size: 5,
+            vo_snr: 3.0,
+            vo_la_size: 61,
+            vo_sm_size: 21,
+            // tomopy defaults = Config::default() for the Vo 2018 variants.
+            vo_sort_size: 0,
+            vo_sort_dim: 1,
+            vo_filter_sigma: 3.0,
+            vo_filter_size: 0,
+            vo_filter_dim: 1,
+            vo_large_snr: 3.0,
+            vo_large_size: 51,
+            vo_large_drop_ratio: 0.1,
+            vo_large_norm: true,
+            vo_dead_snr: 3.0,
+            vo_dead_size: 51,
+            vo_dead_norm: true,
+            vo_fit_order: 3,
+            vo_fit_sigma_x: 5.0,
+            vo_fit_sigma_y: 20.0,
+            // Physics defaults = Config::default() (the CLI template).
+            phase: "none".into(),
+            pixel_size: 1e-4,
+            propagation_distance: 50.0,
+            energy: 30.0,
+            alpha: 1e-3,
+            db: 1000.0,
+            w: 2e-4,
+            slice: 0,
+            auto_recon: false,
+            dirty: false,
+            generation: 0,
+            pending: false,
+            last_millis: None,
+            current: None,
+            pinned: None,
+            preview_plot,
+            compare,
+            // A 4-decade default span: λ scale is data-dependent (a good value
+            // at one sinogram amplitude over-smooths at another — see
+            // docs/BENCHMARKS.md §10), so start wide and let the L-curve narrow.
+            lam_min: 1e-4,
+            lam_max: 1.0,
+            lam_count: 7,
+            lam_pending: false,
+            lam_window_open: false,
+            lam_sweep: None,
+            lam_stack,
+            lam_plot,
+            lam_curve: None,
+        }
+    }
+
+    pub fn on_dataset(&mut self, meta: &DatasetMeta) {
+        self.slice = meta.nz / 2;
+        self.center = (meta.nx as f32) / 2.0;
+        self.current = None;
+        self.pinned = None;
+        self.pending = false;
+        self.lam_pending = false;
+        self.lam_window_open = false;
+        self.lam_sweep = None;
+        self.lam_stack.set_frames(Vec::new());
+        // A fresh dataset makes any shown preview stale; with no preview at
+        // all this also fires the initial one (see ui()).
+        self.dirty = true;
+    }
+
+    pub fn on_preview(
+        &mut self,
+        generation: u64,
+        ny: usize,
+        nx: usize,
+        data: Vec<f32>,
+        millis: u128,
+    ) {
+        if generation != self.generation {
+            return; // superseded while in flight
+        }
+        self.pending = false;
+        self.last_millis = Some(millis);
+        let image = PreviewImage {
+            ny,
+            nx,
+            data,
+            summary: self.summary(),
+        };
+        let cmap = super::autoscale_viridis(&image.data);
+        let _ = self
+            .preview_plot
+            .set_image(image.nx as u32, image.ny as u32, &image.data, cmap);
+        self.preview_plot
+            .image_plot_mut()
+            .set_graph_title(format!("slice {} — {}", self.slice, image.summary));
+        self.current = Some(image);
+        self.update_compare();
+    }
+
+    /// A worker preview failed: clear the in-flight flag so the loop resumes.
+    pub fn on_preview_failed(&mut self) {
+        self.pending = false;
+    }
+
+    /// Wall time of the last finished preview — the Run screen's pre-flight
+    /// panel extrapolates its full-volume time estimate from it.
+    pub fn last_preview_millis(&self) -> Option<u128> {
+        self.last_millis
+    }
+
+    fn summary(&self) -> String {
+        let mut s = self.algorithm.clone();
+        if self.is_iterative() {
+            s.push_str(&format!(":{}", self.num_iter));
+            if self.ext_pad {
+                s.push_str("+pad");
+            }
+        } else {
+            s.push_str(&format!("/{}", self.filter));
+        }
+        if self.stripe != "none" {
+            s.push_str(&format!(" stripe={}", self.stripe));
+        }
+        if self.phase != "none" {
+            s.push_str(&format!(" phase={}", self.phase));
+        }
+        if !self.center_auto {
+            s.push_str(&format!(" c={:.2}", self.center));
+        }
+        s
+    }
+
+    /// The panel's phase fields as a typed [`tomoxide::PhaseMethod`].
+    fn build_phase(&self) -> Result<tomoxide::PhaseMethod, String> {
+        use tomoxide::PhaseMethod;
+        Ok(match self.phase.as_str() {
+            "none" => PhaseMethod::None,
+            "paganin" => PhaseMethod::Paganin {
+                pixel_size: self.pixel_size,
+                dist: self.propagation_distance,
+                energy: self.energy,
+                alpha: self.alpha,
+            },
+            "Gpaganin" => PhaseMethod::GPaganin {
+                pixel_size: self.pixel_size,
+                dist: self.propagation_distance,
+                energy: self.energy,
+                db: self.db,
+                w: self.w,
+            },
+            "farago" => PhaseMethod::Farago {
+                pixel_size: self.pixel_size,
+                dist: self.propagation_distance,
+                energy: self.energy,
+                db: self.db,
+            },
+            other => return Err(format!("unknown phase method '{other}'")),
+        })
+    }
+
+    fn is_iterative(&self) -> bool {
+        !matches!(
+            self.algorithm.as_str(),
+            "fbp" | "gridrec" | "fourierrec" | "lprec" | "linerec"
+        )
+    }
+
+    /// Algorithms whose `reg_par[0]` is a regularization strength λ worth
+    /// sweeping on the L-curve (the TV / penalized / smoothed least-squares
+    /// set). `sirt`/`cgls`/`mlem`/`osem` take no `reg_par`, so the sweep is
+    /// hidden for them.
+    fn uses_reg_par(&self) -> bool {
+        matches!(
+            self.algorithm.as_str(),
+            "tv" | "grad" | "tikh" | "pml_hybrid" | "pml_quad" | "ospml_hybrid" | "ospml_quad"
+        )
+    }
+
+    /// Issue a λ sweep: reconstruct the current slice across a log-spaced λ
+    /// grid, all other parameters fixed. One in flight at a time.
+    fn request_lambda_sweep(&mut self, jobs: &Sender<Job>, log: &mut Vec<String>) {
+        if self.lam_pending {
+            return;
+        }
+        let spec = match self.build_spec() {
+            Ok(s) => s,
+            Err(e) => {
+                log.push(format!("λ sweep parameters: {e}"));
+                return;
+            }
+        };
+        let lambdas = log_space(self.lam_min, self.lam_max, self.lam_count);
+        if lambdas.is_empty() {
+            log.push("λ sweep needs 0 < min < max and n ≥ 2".into());
+            return;
+        }
+        if jobs.send(Job::LambdaSweep { spec, lambdas }).is_ok() {
+            self.lam_pending = true;
+            self.lam_window_open = true;
+        }
+    }
+
+    /// Route a finished λ sweep here: build the montage frames and the L-curve
+    /// (log residual vs log roughness), and jump the stack to the corner (the
+    /// suggested λ — picking it is still the user's call).
+    pub fn on_lambda_sweep(
+        &mut self,
+        lambdas: Vec<f32>,
+        ny: usize,
+        nx: usize,
+        frames: &[f32],
+        residual: Vec<f64>,
+        roughness: Vec<f64>,
+    ) {
+        self.lam_pending = false;
+        if lambdas.is_empty() || ny * nx == 0 {
+            return;
+        }
+        let size = ny * nx;
+        let cmap = super::autoscale_viridis(frames);
+        let stack_frames: Vec<Option<Frame>> = lambdas
+            .iter()
+            .enumerate()
+            .map(|(i, &lam)| {
+                let data = &frames[i * size..(i + 1) * size];
+                Some(Frame::new(
+                    nx as u32,
+                    ny as u32,
+                    data.to_vec(),
+                    Some(format!("λ={lam:.2e}")),
+                ))
+            })
+            .collect();
+        self.lam_stack.set_frames(stack_frames);
+        self.lam_stack.set_colormap(cmap);
+
+        let (lx, ly) = log_lcurve(&residual, &roughness);
+        let curve = CurveData::new(lx.clone(), ly.clone(), egui::Color32::LIGHT_GREEN);
+        match self.lam_curve {
+            Some(h) => {
+                self.lam_plot.update_curve_data(h, &curve);
+            }
+            None => {
+                self.lam_curve = Some(
+                    self.lam_plot
+                        .add_curve_data_with_legend(&curve, "L-curve (λ low→high)"),
+                );
+            }
+        }
+        self.lam_stack.set_current(corner_index(&lx, &ly));
+        self.lam_sweep = Some(LambdaSweep {
+            lambdas,
+            residual,
+            roughness,
+        });
+    }
+
+    /// A worker λ sweep failed: clear the in-flight flag.
+    pub fn on_lambda_failed(&mut self) {
+        self.lam_pending = false;
+    }
+
+    /// λ of the montage frame the stack currently shows.
+    fn selected_lambda(&self) -> Option<f32> {
+        let sweep = self.lam_sweep.as_ref()?;
+        sweep.lambdas.get(self.lam_stack.current()).copied()
+    }
+
+    /// Adopt the selected λ as `reg_par[0]` (keeping any further entries) and
+    /// mark the panel dirty so an enabled auto-recon refreshes the preview.
+    fn apply_selected_lambda(&mut self) {
+        if let Some(lam) = self.selected_lambda() {
+            let mut rp = parse_reg_par(&self.reg_par).unwrap_or_default();
+            match rp.first_mut() {
+                Some(first) => *first = lam,
+                None => rp.push(lam),
+            }
+            self.reg_par = rp
+                .iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.dirty = true;
+        }
+    }
+
+    /// The floating λ-sweep window: montage on top, L-curve below. A click on
+    /// the curve snaps the montage to the nearest λ.
+    fn lambda_window(&mut self, ctx: &egui::Context) {
+        if !self.lam_window_open {
+            return;
+        }
+        let mut open = self.lam_window_open;
+        egui::Window::new("λ sweep — L-curve")
+            .open(&mut open)
+            .default_size([540.0, 600.0])
+            .show(ctx, |ui| {
+                if self.lam_sweep.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        let msg = if self.lam_pending {
+                            "reconstructing the λ grid…"
+                        } else {
+                            "Run a λ sweep to browse trial reconstructions per λ."
+                        };
+                        ui.label(msg);
+                    });
+                    return;
+                }
+                egui::Panel::bottom("lam_curve")
+                    .resizable(true)
+                    .default_size(230.0)
+                    .show_inside(ui, |ui| self.lambda_curve_panel(ui));
+                self.lam_stack.ui(ui);
+            });
+        self.lam_window_open = open;
+    }
+
+    /// The L-curve under the montage; a click snaps to the nearest λ, and the
+    /// title reads out the shown frame's λ / residual / roughness.
+    fn lambda_curve_panel(&mut self, ui: &mut egui::Ui) {
+        let resp = self.lam_plot.show(ui);
+        let Some(sweep) = &self.lam_sweep else {
+            return;
+        };
+        let (lx, ly) = log_lcurve(&sweep.residual, &sweep.roughness);
+        if resp.response.clicked()
+            && let Some(pos) = resp.response.interact_pointer_pos()
+        {
+            let (x, y) = resp.transform.pixel_to_data(pos);
+            if let Some(i) = nearest_point(&lx, &ly, x, y) {
+                self.lam_stack.set_current(i);
+            }
+        }
+        let i = self.lam_stack.current();
+        if let (Some(&lam), Some(&res), Some(&rough)) = (
+            sweep.lambdas.get(i),
+            sweep.residual.get(i),
+            sweep.roughness.get(i),
+        ) {
+            self.lam_plot.set_graph_title(format!(
+                "L-curve — click to pick — λ={lam:.2e}: residual {res:.3e}, roughness {rough:.3e}"
+            ));
+        }
+    }
+
+    /// Fill the shared CLI config with this panel's parameters (recipe save).
+    pub fn write_config(&self, cfg: &mut tomoxide::config::Config) -> Result<(), String> {
+        cfg.algorithm = self.algorithm.clone();
+        cfg.filter_name = self.filter.clone();
+        cfg.rotation_axis = (!self.center_auto).then_some(self.center);
+        cfg.num_iter = self.num_iter;
+        cfg.ext_pad = self.ext_pad;
+        cfg.reg_par = parse_reg_par(&self.reg_par)?;
+        cfg.remove_stripe_method = self.stripe.clone();
+        cfg.fw_sigma = self.fw_sigma;
+        cfg.fw_level = self.fw_level;
+        cfg.ti_nblock = self.ti_nblock;
+        cfg.ti_beta = self.ti_beta;
+        cfg.sf_size = self.sf_size;
+        cfg.vo_snr = self.vo_snr;
+        cfg.vo_la_size = self.vo_la_size;
+        cfg.vo_sm_size = self.vo_sm_size;
+        cfg.vo_sort_size = self.vo_sort_size;
+        cfg.vo_sort_dim = self.vo_sort_dim;
+        cfg.vo_filter_sigma = self.vo_filter_sigma;
+        cfg.vo_filter_size = self.vo_filter_size;
+        cfg.vo_filter_dim = self.vo_filter_dim;
+        cfg.vo_large_snr = self.vo_large_snr;
+        cfg.vo_large_size = self.vo_large_size;
+        cfg.vo_large_drop_ratio = self.vo_large_drop_ratio;
+        cfg.vo_large_norm = self.vo_large_norm;
+        cfg.vo_dead_snr = self.vo_dead_snr;
+        cfg.vo_dead_size = self.vo_dead_size;
+        cfg.vo_dead_norm = self.vo_dead_norm;
+        cfg.vo_fit_order = self.vo_fit_order;
+        cfg.vo_fit_sigma_x = self.vo_fit_sigma_x;
+        cfg.vo_fit_sigma_y = self.vo_fit_sigma_y;
+        cfg.retrieve_phase_method = self.phase.clone();
+        cfg.pixel_size = self.pixel_size as f64;
+        cfg.propagation_distance = self.propagation_distance as f64;
+        cfg.energy = self.energy as f64;
+        cfg.alpha = self.alpha as f64;
+        cfg.db = self.db as f64;
+        cfg.w = self.w as f64;
+        Ok(())
+    }
+
+    /// Adopt a loaded recipe's parameters (recipe load). Marks the panel
+    /// dirty so an enabled auto-recon refreshes the preview.
+    pub fn apply_config(&mut self, cfg: &tomoxide::config::Config) {
+        self.algorithm = cfg.algorithm.clone();
+        self.filter = cfg.filter_name.clone();
+        self.center_auto = cfg.rotation_axis.is_none();
+        if let Some(c) = cfg.rotation_axis {
+            self.center = c;
+        }
+        self.num_iter = cfg.num_iter.max(1);
+        self.ext_pad = cfg.ext_pad;
+        self.reg_par = cfg
+            .reg_par
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.stripe = cfg.remove_stripe_method.clone();
+        self.fw_sigma = cfg.fw_sigma;
+        self.fw_level = cfg.fw_level;
+        self.ti_nblock = cfg.ti_nblock;
+        self.ti_beta = cfg.ti_beta;
+        self.sf_size = cfg.sf_size;
+        self.vo_snr = cfg.vo_snr;
+        self.vo_la_size = cfg.vo_la_size;
+        self.vo_sm_size = cfg.vo_sm_size;
+        self.vo_sort_size = cfg.vo_sort_size;
+        self.vo_sort_dim = cfg.vo_sort_dim;
+        self.vo_filter_sigma = cfg.vo_filter_sigma;
+        self.vo_filter_size = cfg.vo_filter_size;
+        self.vo_filter_dim = cfg.vo_filter_dim;
+        self.vo_large_snr = cfg.vo_large_snr;
+        self.vo_large_size = cfg.vo_large_size;
+        self.vo_large_drop_ratio = cfg.vo_large_drop_ratio;
+        self.vo_large_norm = cfg.vo_large_norm;
+        self.vo_dead_snr = cfg.vo_dead_snr;
+        self.vo_dead_size = cfg.vo_dead_size;
+        self.vo_dead_norm = cfg.vo_dead_norm;
+        self.vo_fit_order = cfg.vo_fit_order;
+        self.vo_fit_sigma_x = cfg.vo_fit_sigma_x;
+        self.vo_fit_sigma_y = cfg.vo_fit_sigma_y;
+        self.phase = cfg.retrieve_phase_method.clone();
+        self.pixel_size = cfg.pixel_size as f32;
+        self.propagation_distance = cfg.propagation_distance as f32;
+        self.energy = cfg.energy as f32;
+        self.alpha = cfg.alpha as f32;
+        self.db = cfg.db as f32;
+        self.w = cfg.w as f32;
+        self.dirty = true;
+    }
+
+    /// Resolve the panel state into a fully-typed spec (errors → session log).
+    fn build_spec(&self) -> Result<PreviewSpec, String> {
+        let algorithm: Algorithm = self.algorithm.parse().map_err(|e| format!("{e}"))?;
+        let filter = self.filter.parse().map_err(|e| format!("{e}"))?;
+        let reg_par = parse_reg_par(&self.reg_par)?;
+        let stripe = match self.stripe.as_str() {
+            "none" => StripeMethod::None,
+            "fw" => StripeMethod::Fw {
+                sigma: self.fw_sigma,
+                level: (self.fw_level != 0).then_some(self.fw_level),
+            },
+            "ti" => StripeMethod::Ti {
+                nblock: self.ti_nblock,
+                beta: self.ti_beta,
+            },
+            "sf" => StripeMethod::Sf { size: self.sf_size },
+            "vo-all" => StripeMethod::VoAll {
+                snr: self.vo_snr,
+                la_size: self.vo_la_size,
+                sm_size: self.vo_sm_size,
+            },
+            "vo-sort" => StripeMethod::VoSort {
+                size: (self.vo_sort_size != 0).then_some(self.vo_sort_size),
+                dim: self.vo_sort_dim,
+            },
+            "vo-filter" => StripeMethod::VoFilter {
+                sigma: self.vo_filter_sigma,
+                size: (self.vo_filter_size != 0).then_some(self.vo_filter_size),
+                dim: self.vo_filter_dim,
+            },
+            "vo-large" => StripeMethod::VoLarge {
+                snr: self.vo_large_snr,
+                size: self.vo_large_size,
+                drop_ratio: self.vo_large_drop_ratio,
+                norm: self.vo_large_norm,
+            },
+            "vo-dead" => StripeMethod::VoDead {
+                snr: self.vo_dead_snr,
+                size: self.vo_dead_size,
+                norm: self.vo_dead_norm,
+            },
+            "vo-fit" => StripeMethod::VoFit {
+                order: self.vo_fit_order,
+                sigma: (self.vo_fit_sigma_x, self.vo_fit_sigma_y),
+            },
+            other => return Err(format!("unknown stripe method '{other}'")),
+        };
+        Ok(PreviewSpec {
+            slice: self.slice,
+            algorithm,
+            center: (!self.center_auto).then_some(self.center),
+            filter,
+            num_iter: self.num_iter,
+            reg_par,
+            ext_pad: self.ext_pad,
+            stripe,
+            phase: self.build_phase()?,
+        })
+    }
+
+    fn request(&mut self, jobs: &Sender<Job>, log: &mut Vec<String>) {
+        match self.build_spec() {
+            Ok(spec) => {
+                self.generation += 1;
+                if jobs
+                    .send(Job::Preview {
+                        generation: self.generation,
+                        spec,
+                    })
+                    .is_ok()
+                {
+                    self.pending = true;
+                    self.dirty = false;
+                }
+            }
+            Err(e) => {
+                log.push(format!("preview parameters: {e}"));
+                self.dirty = false;
+            }
+        }
+    }
+
+    fn update_compare(&mut self) {
+        let (Some(a), Some(b)) = (&self.pinned, &self.current) else {
+            return;
+        };
+        let mut all = a.data.clone();
+        all.extend_from_slice(&b.data);
+        let cmap = super::autoscale_viridis(&all);
+        let _ = self.compare.set_images(
+            (a.nx as u32, a.ny as u32),
+            &a.data,
+            (b.nx as u32, b.ny as u32),
+            &b.data,
+            cmap,
+        );
+    }
+
+    fn params_panel(&mut self, ui: &mut egui::Ui, meta: &DatasetMeta) {
+        let iterative = self.is_iterative();
+        ui.heading("Parameters");
+        egui::CollapsingHeader::new("Algorithm")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut changed = false;
+                changed |= combo(ui, "algorithm", &mut self.algorithm, ALGORITHMS);
+                ui.add_enabled_ui(!iterative, |ui| {
+                    changed |= combo(ui, "filter", &mut self.filter, FILTERS);
+                });
+                ui.add_enabled_ui(iterative, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("iterations");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut self.num_iter).range(1..=500))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("reg_par");
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.reg_par)
+                                    .hint_text("0.5,0.01")
+                                    .desired_width(90.0),
+                            )
+                            .changed();
+                    });
+                    changed |= ui
+                        .checkbox(&mut self.ext_pad, "extend FOV")
+                        .on_hover_text(
+                            "solve on an edge-extended lane and crop back, so samples \
+                             overhanging the field of view don't produce an edge ring \
+                             (truncated projections); ~2.25\u{d7} slower per iteration",
+                        )
+                        .changed();
+                });
+                self.dirty |= changed;
+            });
+        egui::CollapsingHeader::new("Geometry")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("slice");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.slice,
+                            0..=meta.nz.saturating_sub(1),
+                        ))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut self.center_auto, "auto center").changed();
+                    ui.add_enabled_ui(!self.center_auto, |ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.center)
+                                    .speed(0.25)
+                                    .range(0.0..=meta.nx as f32),
+                            )
+                            .changed();
+                    });
+                });
+                self.dirty |= changed;
+            });
+        egui::CollapsingHeader::new("Stripe removal")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut changed = combo(ui, "method", &mut self.stripe, STRIPES);
+                match self.stripe.as_str() {
+                    "fw" => {
+                        changed |= drag(ui, "sigma", &mut self.fw_sigma, 0.1);
+                        changed |= drag_usize(ui, "level (0=auto)", &mut self.fw_level);
+                    }
+                    "ti" => {
+                        changed |= drag_usize(ui, "nblock", &mut self.ti_nblock);
+                        changed |= drag(ui, "beta", &mut self.ti_beta, 0.1);
+                    }
+                    "sf" => {
+                        changed |= drag_usize(ui, "size", &mut self.sf_size);
+                    }
+                    "vo-all" => {
+                        changed |= drag(ui, "snr", &mut self.vo_snr, 0.1);
+                        changed |= drag_usize(ui, "la_size", &mut self.vo_la_size);
+                        changed |= drag_usize(ui, "sm_size", &mut self.vo_sm_size);
+                    }
+                    "vo-sort" => {
+                        changed |= drag_usize(ui, "size (0=auto)", &mut self.vo_sort_size);
+                        changed |= drag_dim(ui, &mut self.vo_sort_dim);
+                    }
+                    "vo-filter" => {
+                        changed |= drag(ui, "sigma", &mut self.vo_filter_sigma, 0.1);
+                        changed |= drag_usize(ui, "size (0=auto)", &mut self.vo_filter_size);
+                        changed |= drag_dim(ui, &mut self.vo_filter_dim);
+                    }
+                    "vo-large" => {
+                        changed |= drag(ui, "snr", &mut self.vo_large_snr, 0.1);
+                        changed |= drag_usize(ui, "size", &mut self.vo_large_size);
+                        changed |= drag(ui, "drop_ratio", &mut self.vo_large_drop_ratio, 0.01);
+                        changed |= ui.checkbox(&mut self.vo_large_norm, "normalize").changed();
+                    }
+                    "vo-dead" => {
+                        changed |= drag(ui, "snr", &mut self.vo_dead_snr, 0.1);
+                        changed |= drag_usize(ui, "size", &mut self.vo_dead_size);
+                        changed |= ui
+                            .checkbox(&mut self.vo_dead_norm, "residual large-stripe pass")
+                            .changed();
+                    }
+                    "vo-fit" => {
+                        changed |= drag_usize(ui, "order", &mut self.vo_fit_order);
+                        changed |= drag(ui, "sigma_x", &mut self.vo_fit_sigma_x, 0.5);
+                        changed |= drag(ui, "sigma_y", &mut self.vo_fit_sigma_y, 0.5);
+                    }
+                    _ => {}
+                }
+                self.dirty |= changed;
+            });
+        egui::CollapsingHeader::new("Phase retrieval")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut changed = combo(ui, "phase method", &mut self.phase, PHASES);
+                if self.phase != "none" {
+                    changed |= drag(ui, "pixel_size (cm)", &mut self.pixel_size, 1e-5);
+                    changed |= drag(
+                        ui,
+                        "propagation_distance (cm)",
+                        &mut self.propagation_distance,
+                        1.0,
+                    );
+                    changed |= drag(ui, "energy (keV)", &mut self.energy, 1.0);
+                    match self.phase.as_str() {
+                        "paganin" => changed |= drag(ui, "alpha", &mut self.alpha, 1e-4),
+                        "Gpaganin" => {
+                            changed |= drag(ui, "delta/beta", &mut self.db, 10.0);
+                            changed |= drag(ui, "W (cm)", &mut self.w, 1e-5);
+                        }
+                        "farago" => changed |= drag(ui, "delta/beta", &mut self.db, 10.0),
+                        _ => {}
+                    }
+                    // Preview cost hint: the retrieval couples rows, so the
+                    // preview reads a band this many rows each side.
+                    if let Ok(method) = self.build_phase() {
+                        let m = tomoxide::prep::phase::margin_rows(&method);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "preview reads a ±{m}-row band around the slice \
+                                 (Fresnel kernel support)"
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
+                self.dirty |= changed;
+            });
+    }
+
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        jobs: &Sender<Job>,
+        meta: Option<&Arc<DatasetMeta>>,
+        log: &mut Vec<String>,
+    ) {
+        let Some(meta) = meta.cloned() else {
+            ui.label("Open a dataset in Data mode first.");
+            return;
+        };
+
+        // Auto-recon loop: one preview in flight; re-issue when params moved.
+        // The very first preview of a dataset fires without the auto toggle,
+        // so entering Tune shows a slice instead of an empty panel.
+        if (self.auto_recon || self.current.is_none()) && self.dirty && !self.pending {
+            self.request(jobs, log);
+        }
+
+        egui::Panel::left("tune_params")
+            .resizable(true)
+            .default_size(320.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.params_panel(ui, &meta);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.pending, egui::Button::new("Reconstruct"))
+                            .clicked()
+                        {
+                            self.request(jobs, log);
+                        }
+                        ui.checkbox(&mut self.auto_recon, "auto");
+                        if self.pending {
+                            ui.spinner();
+                        }
+                    });
+                    if let Some(ms) = self.last_millis {
+                        ui.label(egui::RichText::new(format!("last: {ms} ms")).small().weak());
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let can_pin = self.current.is_some();
+                        if ui
+                            .add_enabled(can_pin, egui::Button::new("Pin A"))
+                            .clicked()
+                        {
+                            self.pinned = self.current.take();
+                            // keep showing the pinned data as current too
+                            if let Some(p) = &self.pinned {
+                                self.current = Some(PreviewImage {
+                                    ny: p.ny,
+                                    nx: p.nx,
+                                    data: p.data.clone(),
+                                    summary: p.summary.clone(),
+                                });
+                            }
+                            self.update_compare();
+                        }
+                        if self.pinned.is_some() && ui.button("Unpin").clicked() {
+                            self.pinned = None;
+                        }
+                    });
+                    if let Some(p) = &self.pinned {
+                        ui.label(egui::RichText::new(format!("A: {}", p.summary)).small());
+                    }
+                    if let Some(c) = &self.current {
+                        ui.label(egui::RichText::new(format!("B: {}", c.summary)).small());
+                    }
+
+                    if self.uses_reg_par() {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("λ sweep (L-curve)");
+                            ui.label(egui::RichText::new("reg_par[0]").small().weak());
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("min");
+                            ui.add(
+                                egui::DragValue::new(&mut self.lam_min)
+                                    .speed(0.0002)
+                                    .range(1e-8..=1e3),
+                            );
+                            ui.label("max");
+                            ui.add(
+                                egui::DragValue::new(&mut self.lam_max)
+                                    .speed(0.02)
+                                    .range(1e-8..=1e3),
+                            );
+                            ui.label("n");
+                            ui.add(egui::DragValue::new(&mut self.lam_count).range(2..=16));
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.lam_pending, egui::Button::new("Sweep λ"))
+                                .on_hover_text(
+                                    "reconstruct this slice across a log-spaced λ grid; \
+                                     the L-curve corner is the principled λ (sharper = \
+                                     smaller λ is not automatically more accurate)",
+                                )
+                                .clicked()
+                            {
+                                self.request_lambda_sweep(jobs, log);
+                            }
+                            if self.lam_sweep.is_some()
+                                && ui
+                                    .button("Use selected λ")
+                                    .on_hover_text("adopt the highlighted λ as reg_par[0]")
+                                    .clicked()
+                            {
+                                self.apply_selected_lambda();
+                            }
+                            if self.lam_sweep.is_some() && ui.button("Show montage").clicked() {
+                                self.lam_window_open = true;
+                            }
+                            if self.lam_pending {
+                                ui.spinner();
+                            }
+                        });
+                        if let Some(lam) = self.selected_lambda() {
+                            ui.label(
+                                egui::RichText::new(format!("selected λ = {lam:.3e}"))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    }
+                });
+            });
+
+        if self.pinned.is_some() {
+            // A/B comparison of the pinned and the latest preview.
+            self.compare.show_toolbar(ui);
+            self.compare.show(ui);
+            self.compare.show_status_bar(ui);
+        } else {
+            self.preview_plot.show_toolbar(ui);
+            if self.current.is_some() {
+                super::show_image_view_with_value(ui, &mut self.preview_plot);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Press Reconstruct to preview the selected slice.");
+                });
+            }
+        }
+
+        self.lambda_window(ui.ctx());
+    }
+}
+
+/// Parse a comma-separated `reg_par` list (empty entries skipped).
+fn parse_reg_par(s: &str) -> Result<Vec<f32>, String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<f32>().map_err(|e| format!("reg_par: {e}")))
+        .collect()
+}
+
+/// `n` log-spaced values in `[min, max]` inclusive. Empty on an invalid range
+/// (needs `0 < min < max` and `n ≥ 2`).
+fn log_space(min: f32, max: f32, n: usize) -> Vec<f32> {
+    if !(min > 0.0 && max > min) || n < 2 {
+        return Vec::new();
+    }
+    let (a, b) = (min.ln(), max.ln());
+    (0..n)
+        .map(|i| (a + (b - a) * i as f32 / (n - 1) as f32).exp())
+        .collect()
+}
+
+/// L-curve coordinates: base-10 logs of the residual (x) and roughness (y),
+/// each floored to avoid `log10(0) = −∞`.
+fn log_lcurve(residual: &[f64], roughness: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let lg = |v: &f64| v.max(1e-30).log10();
+    (
+        residual.iter().map(lg).collect(),
+        roughness.iter().map(lg).collect(),
+    )
+}
+
+/// Index of the L-curve corner: the point of maximum perpendicular distance to
+/// the chord joining the first and last points (a robust, parameter-free corner
+/// estimate). Falls back to the first index for degenerate curves.
+fn corner_index(xs: &[f64], ys: &[f64]) -> usize {
+    let n = xs.len();
+    if n < 3 {
+        return 0;
+    }
+    let (x0, y0) = (xs[0], ys[0]);
+    let (dx, dy) = (xs[n - 1] - x0, ys[n - 1] - y0);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len == 0.0 {
+        return 0;
+    }
+    let mut best = 0;
+    let mut best_d = -1.0;
+    for i in 0..n {
+        let d = ((xs[i] - x0) * dy - (ys[i] - y0) * dx).abs() / len;
+        if d > best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Index of the L-curve point nearest the click position (Euclidean in the
+/// shown log–log coordinates).
+fn nearest_point(xs: &[f64], ys: &[f64], x: f64, y: f64) -> Option<usize> {
+    xs.iter()
+        .zip(ys.iter())
+        .enumerate()
+        .min_by(|(_, (ax, ay)), (_, (bx, by))| {
+            let da = (*ax - x).powi(2) + (*ay - y).powi(2);
+            let db = (*bx - x).powi(2) + (*by - y).powi(2);
+            da.total_cmp(&db)
+        })
+        .map(|(i, _)| i)
+}
+
+fn combo(ui: &mut egui::Ui, label: &str, value: &mut String, options: &[&str]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(value.clone())
+            .show_ui(ui, |ui| {
+                for opt in options {
+                    changed |= ui
+                        .selectable_value(value, (*opt).to_string(), *opt)
+                        .changed();
+                }
+            });
+    });
+    changed
+}
+
+fn drag(ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f32) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed = ui.add(egui::DragValue::new(value).speed(speed)).changed();
+    });
+    changed
+}
+
+fn drag_usize(ui: &mut egui::Ui, label: &str, value: &mut usize) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed = ui.add(egui::DragValue::new(value)).changed();
+    });
+    changed
+}
+
+/// Median-window dimensionality selector for the Vo sort/filter methods:
+/// `1` → `(size, 1)` footprint, `2` → `(size, size)`.
+fn drag_dim(ui: &mut egui::Ui, value: &mut u8) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("dim");
+        changed = ui.add(egui::DragValue::new(value).range(1..=2)).changed();
+    });
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_space_is_geometric_and_inclusive() {
+        let v = log_space(1e-4, 1.0, 5);
+        assert_eq!(v.len(), 5);
+        assert!((v[0] - 1e-4).abs() < 1e-9);
+        assert!((v[4] - 1.0).abs() < 1e-5);
+        // Constant ratio between consecutive entries (geometric spacing).
+        let r = v[1] / v[0];
+        for w in v.windows(2) {
+            assert!((w[1] / w[0] - r).abs() < 1e-3, "ratios differ: {v:?}");
+        }
+    }
+
+    #[test]
+    fn log_space_rejects_bad_ranges() {
+        assert!(log_space(0.0, 1.0, 5).is_empty());
+        assert!(log_space(1.0, 1.0, 5).is_empty());
+        assert!(log_space(1.0, 0.5, 5).is_empty());
+        assert!(log_space(1e-4, 1.0, 1).is_empty());
+    }
+
+    #[test]
+    fn corner_index_finds_the_knee() {
+        // An L-shaped curve: the bend at index 1 is the corner.
+        let xs = [0.0, 0.0, 1.0, 2.0];
+        let ys = [2.0, 0.0, 0.0, 0.0];
+        assert_eq!(corner_index(&xs, &ys), 1);
+        // Degenerate (collinear / too short) → first index.
+        assert_eq!(corner_index(&[0.0, 1.0], &[0.0, 1.0]), 0);
+    }
+
+    #[test]
+    fn nearest_point_picks_closest() {
+        let xs = [0.0, 1.0, 2.0];
+        let ys = [0.0, 1.0, 2.0];
+        assert_eq!(nearest_point(&xs, &ys, 0.9, 1.1), Some(1));
+        assert_eq!(nearest_point(&xs, &ys, -5.0, -5.0), Some(0));
+        assert_eq!(nearest_point(&[], &[], 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn log_lcurve_floors_zero() {
+        let (lx, ly) = log_lcurve(&[0.0, 100.0], &[10.0, 0.0]);
+        assert!(lx[0] < -20.0 && lx[1] > 1.9 && lx[1] < 2.1);
+        assert!(ly[0] > 0.9 && ly[0] < 1.1 && ly[1] < -20.0);
+    }
+}

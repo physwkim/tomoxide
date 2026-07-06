@@ -3,17 +3,20 @@
 //
 // One thread per output voxel (flat index over [nz, ny, nx]) accumulates the
 // already-filtered sinogram along all angles by linear interpolation, then
-// scales by π / nproj. `cossin` carries the per-angle (cosθ, sinθ) interleaved
-// and `center` the per-row rotation-axis position — both computed host-side so
-// the trig matches the CPU reference exactly; the GPU/CPU drift is only in the
-// multiply-accumulate rounding, hence callers compare with a tolerance.
+// scales by the caller's `scale` gain: π/nproj for the analytic FBP paths (the
+// angular-quadrature dθ weight) and 1.0 for the iterative solvers (the pure
+// adjoint of project.wgsl's unweighted scatter). `cossin` carries the per-angle
+// (cosθ, sinθ) interleaved and `center` the per-row rotation-axis position —
+// both computed host-side so the trig matches the CPU reference exactly; the
+// GPU/CPU drift is only in the multiply-accumulate rounding, hence callers
+// compare with a tolerance.
 
 struct Params {
     nproj : u32,
     ncols : u32,
     ny    : u32,
     nx    : u32,
-    scale : f32, // π / nproj
+    scale : f32, // caller gain: π/nproj (analytic FBP) or 1.0 (iterative adjoint)
     _pad0 : u32,
     _pad1 : u32,
     _pad2 : u32,

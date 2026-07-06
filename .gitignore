@@ -1,4 +1,6 @@
 /target
+# the GUI is workspace-excluded (own lock), so it builds into its own target
+/crates/tomoxide-gui/target
 **/*.rs.bk
 Cargo.lock.bak
 

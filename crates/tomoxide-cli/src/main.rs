@@ -2,7 +2,6 @@
 //! `init` / `recon` / `recon_steps` / `status`).
 
 mod chunk_cache;
-mod config;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -17,7 +16,7 @@ use tomoxide::{
     ReconParams, StripeMethod,
 };
 
-use crate::config::Config;
+use tomoxide::config::Config;
 
 /// GPU/CPU tomographic reconstruction (tomopy + tomocupy, in Rust).
 #[derive(Parser, Debug)]
@@ -118,8 +117,9 @@ struct CommonRecon {
     /// Input DXchange HDF5 file.
     file: PathBuf,
     /// Optional TOML config (from `tomoxide init`). Supplies defaults for
-    /// algorithm/center/filter/stripe/phase/num_iter/save_format/chunk; any flag
-    /// below overrides its config value.
+    /// algorithm/center/dtype/filter/stripe/phase/num_iter/save_format/output/
+    /// chunk (and, for `recon`, lamino_angle); any flag below overrides its
+    /// config value.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Algorithm (fbp, gridrec, fourierrec, lprec, linerec, sirt, …). A
@@ -134,17 +134,24 @@ struct CommonRecon {
     /// Rotation-axis column (omit to auto-find / use the detector midline).
     #[arg(long)]
     center: Option<f32>,
-    /// Reconstruction precision: float32 | float16 (CUDA analytic paths only).
-    #[arg(long, default_value = "float32")]
-    dtype: String,
+    /// Reconstruction precision: float32 | float16 (CUDA analytic paths only)
+    /// [default: float32].
+    #[arg(long)]
+    dtype: Option<String>,
     /// Output format: tiff | h5 | zarr (tomocupy `--save-format`).
     #[arg(long)]
     save_format: Option<String>,
+    /// Output base path — each writer adds its own suffix (tiff:
+    /// `<base>_NNNNN.tiff` per slice; h5: `<base>.h5`; zarr: `<base>.zarr`)
+    /// [default: <input-without-extension>_rec].
+    #[arg(long)]
+    output: Option<PathBuf>,
     /// Apodization filter (none|ramp|shepp|cosine|cosine2|hamming|hann|parzen).
     #[arg(long)]
     filter: Option<String>,
-    /// Stripe-removal method (none|fw|ti|sf|vo-all), applied before recon with
-    /// tomopy/tomocupy default parameters.
+    /// Stripe-removal method (none|fw|ti|sf|vo-all|vo-sort|vo-filter|vo-large|
+    /// vo-dead|vo-fit), applied before recon with tomopy/tomocupy default
+    /// parameters.
     #[arg(long)]
     remove_stripe: Option<String>,
     /// Phase-retrieval method (none|paganin|Gpaganin|farago), applied before
@@ -160,6 +167,13 @@ struct CommonRecon {
     /// comma-separated f32 list (e.g. `--reg_par 0.5,0.01`).
     #[arg(long)]
     reg_par: Option<String>,
+    /// Truncated-projection support extension for iterative methods: solve on
+    /// an edge-replicate widened lane (+`ncols/4` per side) and return the
+    /// central crop, so samples overhanging the field of view stop producing a
+    /// FOV-edge ring. `--ext_pad` alone enables it; `--ext_pad false` disables
+    /// a config-file setting. Ignored by analytic methods. ~2.25x cost/iter.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    ext_pad: Option<bool>,
     /// Stripe removal (`fw`): damping factor `sigma` [default: 2.0].
     #[arg(long)]
     fw_sigma: Option<f32>,
@@ -184,6 +198,51 @@ struct CommonRecon {
     /// Stripe removal (`vo-all`): small-stripe window size [default: 21].
     #[arg(long)]
     vo_sm_size: Option<usize>,
+    /// Stripe removal (`vo-sort`): median window size (`0` = tomopy auto) [default: 0].
+    #[arg(long)]
+    vo_sort_size: Option<usize>,
+    /// Stripe removal (`vo-sort`): median-window dimensionality (1 or 2) [default: 1].
+    #[arg(long)]
+    vo_sort_dim: Option<u8>,
+    /// Stripe removal (`vo-filter`): low-/high-pass Gaussian sigma [default: 3.0].
+    #[arg(long)]
+    vo_filter_sigma: Option<f32>,
+    /// Stripe removal (`vo-filter`): inner-sort median window size (`0` = tomopy auto) [default: 0].
+    #[arg(long)]
+    vo_filter_size: Option<usize>,
+    /// Stripe removal (`vo-filter`): median-window dimensionality (1 or 2) [default: 1].
+    #[arg(long)]
+    vo_filter_dim: Option<u8>,
+    /// Stripe removal (`vo-large`): detection signal-to-noise ratio [default: 3.0].
+    #[arg(long)]
+    vo_large_snr: Option<f32>,
+    /// Stripe removal (`vo-large`): median window size [default: 51].
+    #[arg(long)]
+    vo_large_size: Option<usize>,
+    /// Stripe removal (`vo-large`): dropped extreme-pixel fraction [default: 0.1].
+    #[arg(long)]
+    vo_large_drop_ratio: Option<f32>,
+    /// Stripe removal (`vo-large`): normalize columns by the intensity factor [default: true].
+    #[arg(long)]
+    vo_large_norm: Option<bool>,
+    /// Stripe removal (`vo-dead`): detection signal-to-noise ratio [default: 3.0].
+    #[arg(long)]
+    vo_dead_snr: Option<f32>,
+    /// Stripe removal (`vo-dead`): median window size [default: 51].
+    #[arg(long)]
+    vo_dead_size: Option<usize>,
+    /// Stripe removal (`vo-dead`): run the residual large-stripe pass [default: true].
+    #[arg(long)]
+    vo_dead_norm: Option<bool>,
+    /// Stripe removal (`vo-fit`): Savitzky–Golay fit order [default: 3].
+    #[arg(long)]
+    vo_fit_order: Option<usize>,
+    /// Stripe removal (`vo-fit`): Gaussian sigma along detector columns [default: 5].
+    #[arg(long)]
+    vo_fit_sigma_x: Option<f32>,
+    /// Stripe removal (`vo-fit`): Gaussian sigma along projections [default: 20].
+    #[arg(long)]
+    vo_fit_sigma_y: Option<f32>,
     /// Phase retrieval: detector pixel size (cm) [default: 1e-4].
     #[arg(long)]
     pixel_size: Option<f32>,
@@ -202,6 +261,14 @@ struct CommonRecon {
     /// Phase retrieval (Gpaganin): characteristic transverse length `W` (cm) [default: 2e-4].
     #[arg(long)]
     w: Option<f32>,
+    /// Emit one flushed JSON line per completed output chunk on stdout:
+    /// `{"start":s,"end":e,"total":nz,"secs":t}` — global slice range, total
+    /// output slices, and wall-clock seconds since the run started. Machine
+    /// progress for wrappers (the GUI tails these from its subprocess runs);
+    /// progress lines are exactly the stdout lines starting with `{`, other
+    /// human-readable output still appears. Runtime-only: not a config key.
+    #[arg(long)]
+    progress_json: bool,
 }
 
 /// One stage of a warm-start chain: an algorithm plus its resolved iteration
@@ -224,12 +291,16 @@ struct ReconPlan {
     algo: Algorithm,
     center: Option<f32>,
     dtype: Dtype,
+    /// Output base path override (`--output`/config); `None` ⇒ derive
+    /// `<input-without-extension>_rec` from the input file.
+    out: Option<String>,
     save_format: tomoxide::io::SaveFormat,
     save_format_str: String,
     filter: FilterName,
     filter_str: String,
     num_iter: usize,
     reg_par: Vec<f32>,
+    ext_pad: bool,
     prep: PrepOptions,
     stripe_str: String,
     phase_str: String,
@@ -249,6 +320,20 @@ struct StripeParams {
     vo_snr: f32,
     vo_la_size: usize,
     vo_sm_size: usize,
+    vo_sort_size: Option<usize>,
+    vo_sort_dim: u8,
+    vo_filter_sigma: f32,
+    vo_filter_size: Option<usize>,
+    vo_filter_dim: u8,
+    vo_large_snr: f32,
+    vo_large_size: usize,
+    vo_large_drop_ratio: f32,
+    vo_large_norm: bool,
+    vo_dead_snr: f32,
+    vo_dead_size: usize,
+    vo_dead_norm: bool,
+    vo_fit_order: usize,
+    vo_fit_sigma: (f32, f32),
 }
 
 /// Resolved phase-retrieval physics for the selected method (config merged with
@@ -283,9 +368,34 @@ fn build_stripe(name: &str, p: &StripeParams) -> anyhow::Result<StripeMethod> {
             la_size: p.vo_la_size,
             sm_size: p.vo_sm_size,
         },
+        "vo-sort" | "vo_sort" => StripeMethod::VoSort {
+            size: p.vo_sort_size,
+            dim: p.vo_sort_dim,
+        },
+        "vo-filter" | "vo_filter" => StripeMethod::VoFilter {
+            sigma: p.vo_filter_sigma,
+            size: p.vo_filter_size,
+            dim: p.vo_filter_dim,
+        },
+        "vo-large" | "vo_large" => StripeMethod::VoLarge {
+            snr: p.vo_large_snr,
+            size: p.vo_large_size,
+            drop_ratio: p.vo_large_drop_ratio,
+            norm: p.vo_large_norm,
+        },
+        "vo-dead" | "vo_dead" => StripeMethod::VoDead {
+            snr: p.vo_dead_snr,
+            size: p.vo_dead_size,
+            norm: p.vo_dead_norm,
+        },
+        "vo-fit" | "vo_fit" => StripeMethod::VoFit {
+            order: p.vo_fit_order,
+            sigma: p.vo_fit_sigma,
+        },
         other => {
             return Err(anyhow!(
-                "unknown stripe method '{other}' (none|fw|ti|sf|vo-all)"
+                "unknown stripe method '{other}' \
+                 (none|fw|ti|sf|vo-all|vo-sort|vo-filter|vo-large|vo-dead|vo-fit)"
             ))
         }
     })
@@ -394,7 +504,17 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         .ok_or_else(|| anyhow!("no algorithm given (empty --algorithm)"))?
         .algo;
     let center = c.center.or(cfg.rotation_axis);
-    let dtype: Dtype = c.dtype.parse().map_err(|e| anyhow!("{e}"))?;
+    let dtype: Dtype = c
+        .dtype
+        .clone()
+        .unwrap_or_else(|| cfg.dtype.clone())
+        .parse()
+        .map_err(|e| anyhow!("{e}"))?;
+    let out = c
+        .output
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| cfg.output.clone().filter(|s| !s.is_empty()));
     let save_format_str = c
         .save_format
         .clone()
@@ -410,6 +530,7 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         Some(s) => parse_f32_list(s)?,
         None => cfg.reg_par.clone(),
     };
+    let ext_pad = c.ext_pad.unwrap_or(cfg.ext_pad);
     let stripe_str = c
         .remove_stripe
         .clone()
@@ -432,6 +553,30 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         vo_snr: c.vo_snr.unwrap_or(cfg.vo_snr),
         vo_la_size: c.vo_la_size.unwrap_or(cfg.vo_la_size),
         vo_sm_size: c.vo_sm_size.unwrap_or(cfg.vo_sm_size),
+        // Median sizes follow the `fw_level` convention: `0` ⇒ auto (None).
+        vo_sort_size: {
+            let s = c.vo_sort_size.unwrap_or(cfg.vo_sort_size);
+            (s != 0).then_some(s)
+        },
+        vo_sort_dim: c.vo_sort_dim.unwrap_or(cfg.vo_sort_dim),
+        vo_filter_sigma: c.vo_filter_sigma.unwrap_or(cfg.vo_filter_sigma),
+        vo_filter_size: {
+            let s = c.vo_filter_size.unwrap_or(cfg.vo_filter_size);
+            (s != 0).then_some(s)
+        },
+        vo_filter_dim: c.vo_filter_dim.unwrap_or(cfg.vo_filter_dim),
+        vo_large_snr: c.vo_large_snr.unwrap_or(cfg.vo_large_snr),
+        vo_large_size: c.vo_large_size.unwrap_or(cfg.vo_large_size),
+        vo_large_drop_ratio: c.vo_large_drop_ratio.unwrap_or(cfg.vo_large_drop_ratio),
+        vo_large_norm: c.vo_large_norm.unwrap_or(cfg.vo_large_norm),
+        vo_dead_snr: c.vo_dead_snr.unwrap_or(cfg.vo_dead_snr),
+        vo_dead_size: c.vo_dead_size.unwrap_or(cfg.vo_dead_size),
+        vo_dead_norm: c.vo_dead_norm.unwrap_or(cfg.vo_dead_norm),
+        vo_fit_order: c.vo_fit_order.unwrap_or(cfg.vo_fit_order),
+        vo_fit_sigma: (
+            c.vo_fit_sigma_x.unwrap_or(cfg.vo_fit_sigma_x),
+            c.vo_fit_sigma_y.unwrap_or(cfg.vo_fit_sigma_y),
+        ),
     };
     // Config physics are f64 (clean TOML); cast to the f32 the phase methods use.
     let phase_params = PhaseParams {
@@ -455,12 +600,14 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
             algo,
             center,
             dtype,
+            out,
             save_format,
             save_format_str,
             filter,
             filter_str,
             num_iter,
             reg_par,
+            ext_pad,
             prep,
             stripe_str,
             phase_str,
@@ -586,6 +733,7 @@ fn main() -> anyhow::Result<()> {
             let (plan, cfg) = resolve(&common)?;
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
             let file = common.file.clone();
+            let lamino_angle = lamino_angle.or(cfg.lamino_angle);
             let dtype = plan.dtype;
             let save_format = plan.save_format;
             println!(
@@ -605,7 +753,7 @@ fn main() -> anyhow::Result<()> {
                 plan.num_iter,
                 plan.reg_par
             );
-            let out = recon_out_path(&file);
+            let out = plan.out.clone().unwrap_or_else(|| recon_out_path(&file));
             // Algorithm chaining (`--algorithm a,b`) warm-starts each stage from the
             // previous stage's volume, which needs the whole prior volume — so it
             // takes the whole-volume path and never the per-slice pipeline/shard.
@@ -614,6 +762,8 @@ fn main() -> anyhow::Result<()> {
             if plan.chain.len() > 1 {
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
+                let (z0, z1, banded) =
+                    row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
                 if let Some(deg) = lamino_angle {
                     use std::f32::consts::PI;
                     geom.beam = tomoxide::Beam::Laminography {
@@ -621,12 +771,27 @@ fn main() -> anyhow::Result<()> {
                     };
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
-                let ds = reader.read_all()?;
+                let nz_total = geom.detector.height;
+                let ds = if banded {
+                    geom.detector.height = z1 - z0;
+                    reader.read_chunk(z0, z1)?
+                } else {
+                    reader.read_all()?
+                };
                 let vol = reconstruct_chain(ds, &geom, &plan, lamino_rh, &engine)?;
-                let mut writer = tomoxide::io::create_writer(&out, save_format)?;
+                let mut writer = maybe_progress(
+                    tomoxide::io::create_writer(&out, save_format)?,
+                    common.progress_json,
+                );
                 let nz = vol.dims().0;
-                writer.reserve(nz)?;
-                writer.write_chunk(&vol, 0, nz)?;
+                if banded {
+                    writer.reserve(nz_total)?;
+                    writer.write_chunk(&vol, z0, z0 + nz)?;
+                } else {
+                    writer.reserve(nz)?;
+                    writer.write_chunk(&vol, 0, nz)?;
+                }
+                writer.finalize()?;
             } else if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
@@ -663,7 +828,15 @@ fn main() -> anyhow::Result<()> {
                     && nz > devices.len()
                     && nx >= MULTI_GPU_MIN_NX;
                 if shardable {
-                    run_sharded_subprocesses(&file, &plan, chunk, nz, &devices)?;
+                    run_sharded_subprocesses(
+                        &file,
+                        &out,
+                        &plan,
+                        chunk,
+                        nz,
+                        &devices,
+                        common.progress_json,
+                    )?;
                 } else {
                     // Overlapped streaming path: same output as the whole-volume
                     // path (cuFFT-floor identical, Pearson 1.0), lower peak memory,
@@ -681,7 +854,9 @@ fn main() -> anyhow::Result<()> {
                         plan.filter,
                         plan.num_iter,
                         plan.reg_par.clone(),
+                        plan.ext_pad,
                         plan.prep,
+                        common.progress_json,
                         &engine,
                     )?;
                 }
@@ -690,12 +865,15 @@ fn main() -> anyhow::Result<()> {
                 // laminography).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
+                let (z0, z1, banded) =
+                    row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
                 let mut params = recon_params(
                     &geom,
                     dtype,
                     plan.filter,
                     plan.num_iter,
                     plan.reg_par.clone(),
+                    plan.ext_pad,
                 );
                 if let Some(deg) = lamino_angle {
                     use std::f32::consts::PI;
@@ -705,13 +883,28 @@ fn main() -> anyhow::Result<()> {
                     params.lamino_rh = lamino_rh;
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
-                let ds = reader.read_all()?;
+                let nz_total = geom.detector.height;
+                let ds = if banded {
+                    geom.detector.height = z1 - z0;
+                    reader.read_chunk(z0, z1)?
+                } else {
+                    reader.read_all()?
+                };
                 let vol =
                     tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
-                let mut writer = tomoxide::io::create_writer(&out, save_format)?;
+                let mut writer = maybe_progress(
+                    tomoxide::io::create_writer(&out, save_format)?,
+                    common.progress_json,
+                );
                 let nz = vol.dims().0;
-                writer.reserve(nz)?;
-                writer.write_chunk(&vol, 0, nz)?;
+                if banded {
+                    writer.reserve(nz_total)?;
+                    writer.write_chunk(&vol, z0, z0 + nz)?;
+                } else {
+                    writer.reserve(nz)?;
+                    writer.write_chunk(&vol, 0, nz)?;
+                }
+                writer.finalize()?;
             }
             println!("wrote reconstruction to {out}");
         }
@@ -723,6 +916,12 @@ fn main() -> anyhow::Result<()> {
                      warm-start; it is supported only by `recon` (whole-volume), \
                      not the streaming `recon_steps`",
                     plan.algorithm
+                ));
+            }
+            if cfg.lamino_angle.is_some() {
+                return Err(anyhow!(
+                    "lamino_angle (from config) needs the whole-volume path; it is \
+                     supported only by `recon`, not the streaming `recon_steps`"
                 ));
             }
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
@@ -746,7 +945,7 @@ fn main() -> anyhow::Result<()> {
                 plan.num_iter,
                 plan.reg_par
             );
-            let out = recon_out_path(&file);
+            let out = plan.out.clone().unwrap_or_else(|| recon_out_path(&file));
             run_pipelined(
                 &file,
                 &out,
@@ -760,7 +959,9 @@ fn main() -> anyhow::Result<()> {
                 plan.filter,
                 plan.num_iter,
                 plan.reg_par,
+                plan.ext_pad,
                 plan.prep,
+                common.progress_json,
                 &engine,
             )?;
             println!("wrote streamed reconstruction to {out}");
@@ -789,6 +990,67 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One `--progress_json` stdout line. Hand-formatted (no serde dependency for
+/// four fixed fields); `start`/`end` are the chunk's global slice range,
+/// `total` the full output slice count, `secs` wall-clock since run start.
+fn progress_line(start: usize, end: usize, total: usize, secs: f64) -> String {
+    format!("{{\"start\":{start},\"end\":{end},\"total\":{total},\"secs\":{secs:.3}}}\n")
+}
+
+/// `--progress_json` tee: forwards every call to the wrapped writer, then
+/// prints one [`progress_line`] per completed chunk (docs/GUI.md §6 #4 — the
+/// GUI's progress channel for subprocess runs). The line is emitted as a
+/// single locked write + flush so lines from concurrent shard processes never
+/// interleave mid-line. `total` comes from `reserve`, which every driver calls
+/// with the *full* output slice count even for `--start_row/--end_row` shard
+/// runs, so wrappers can aggregate shards against one denominator.
+struct ProgressJsonWriter {
+    inner: Box<dyn tomoxide::io::VolumeWriter>,
+    total: usize,
+    t0: std::time::Instant,
+}
+
+impl tomoxide::io::VolumeWriter for ProgressJsonWriter {
+    fn reserve(&mut self, total_nz: usize) -> tomoxide::Result<()> {
+        self.total = total_nz;
+        self.inner.reserve(total_nz)
+    }
+    fn write_chunk(
+        &mut self,
+        vol: &tomoxide::Volume<f32>,
+        start: usize,
+        end: usize,
+    ) -> tomoxide::Result<()> {
+        self.inner.write_chunk(vol, start, end)?;
+        use std::io::Write as _;
+        let line = progress_line(start, end, self.total, self.t0.elapsed().as_secs_f64());
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.flush();
+        Ok(())
+    }
+    fn finalize(&mut self) -> tomoxide::Result<()> {
+        self.inner.finalize()
+    }
+}
+
+/// Wrap `writer` in the [`ProgressJsonWriter`] tee when `--progress_json` is
+/// set; pass it through untouched otherwise.
+fn maybe_progress(
+    writer: Box<dyn tomoxide::io::VolumeWriter>,
+    enabled: bool,
+) -> Box<dyn tomoxide::io::VolumeWriter> {
+    if enabled {
+        Box::new(ProgressJsonWriter {
+            inner: writer,
+            total: 0,
+            t0: std::time::Instant::now(),
+        })
+    } else {
+        writer
+    }
+}
+
 /// Run the overlapped read‖compute‖write streaming pipeline for one file.
 ///
 /// Probes geometry (metadata only) on the calling thread, then hands
@@ -809,7 +1071,9 @@ fn run_pipelined(
     filter: FilterName,
     num_iter: usize,
     reg_par: Vec<f32>,
+    ext_pad: bool,
     prep: PrepOptions,
+    progress_json: bool,
     engine: &Engine,
 ) -> anyhow::Result<()> {
     let path = file.to_string_lossy().into_owned();
@@ -818,7 +1082,7 @@ fn run_pipelined(
     let mut probe = tomoxide::io::open_dxchange(&path)?;
     let geom = geometry_from_reader(probe.as_mut(), center)?;
     drop(probe);
-    let params = recon_params(&geom, dtype, filter, num_iter, reg_par);
+    let params = recon_params(&geom, dtype, filter, num_iter, reg_par, ext_pad);
     let read_path = path;
     let write_path = out.to_string();
     // Reconstruct only `[start_row, end_row)` (a z-shard); both omitted ⇒ the
@@ -829,7 +1093,10 @@ fn run_pipelined(
         z_start,
         z_end,
         move || tomoxide::io::open_dxchange(&read_path),
-        move || tomoxide::io::create_writer(&write_path, save_format),
+        move || {
+            tomoxide::io::create_writer(&write_path, save_format)
+                .map(|w| maybe_progress(w, progress_json))
+        },
         &geom,
         algo,
         &params,
@@ -853,12 +1120,19 @@ fn run_pipelined(
 /// full resolved [`ReconPlan`] as explicit flags (so children need no `--config`
 /// and reproduce the parent's filter/stripe/phase/iteration settings exactly).
 /// The call fails if any child fails.
+///
+/// With `--progress_json` the flag is forwarded and the children inherit the
+/// parent's stdout, so their per-chunk JSON lines (global slice ranges against
+/// the full-volume total) stream through to whoever tails the parent.
+#[allow(clippy::too_many_arguments)]
 fn run_sharded_subprocesses(
     file: &Path,
+    out: &str,
     plan: &ReconPlan,
     chunk: usize,
     nz: usize,
     devices: &[i32],
+    progress_json: bool,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let n = devices.len();
@@ -895,7 +1169,14 @@ fn run_sharded_subprocesses(
             .arg("--start_row")
             .arg(z0.to_string())
             .arg("--end_row")
-            .arg(z1.to_string());
+            .arg(z1.to_string())
+            // The parent's resolved output path, so a `--output`/config override
+            // reaches every shard (children never see the parent's `--config`).
+            .arg("--output")
+            .arg(out);
+        if plan.ext_pad {
+            cmd.arg("--ext_pad").arg("true");
+        }
         if !plan.reg_par.is_empty() {
             let csv = plan
                 .reg_par
@@ -932,6 +1213,47 @@ fn run_sharded_subprocesses(
                     .arg("--vo_sm_size")
                     .arg(sp.vo_sm_size.to_string());
             }
+            "vo-sort" | "vo_sort" => {
+                // `0` round-trips as auto (`None`), the `fw_level` convention.
+                cmd.arg("--vo_sort_size")
+                    .arg(sp.vo_sort_size.unwrap_or(0).to_string())
+                    .arg("--vo_sort_dim")
+                    .arg(sp.vo_sort_dim.to_string());
+            }
+            "vo-filter" | "vo_filter" => {
+                cmd.arg("--vo_filter_sigma")
+                    .arg(sp.vo_filter_sigma.to_string())
+                    .arg("--vo_filter_size")
+                    .arg(sp.vo_filter_size.unwrap_or(0).to_string())
+                    .arg("--vo_filter_dim")
+                    .arg(sp.vo_filter_dim.to_string());
+            }
+            "vo-large" | "vo_large" => {
+                cmd.arg("--vo_large_snr")
+                    .arg(sp.vo_large_snr.to_string())
+                    .arg("--vo_large_size")
+                    .arg(sp.vo_large_size.to_string())
+                    .arg("--vo_large_drop_ratio")
+                    .arg(sp.vo_large_drop_ratio.to_string())
+                    .arg("--vo_large_norm")
+                    .arg(sp.vo_large_norm.to_string());
+            }
+            "vo-dead" | "vo_dead" => {
+                cmd.arg("--vo_dead_snr")
+                    .arg(sp.vo_dead_snr.to_string())
+                    .arg("--vo_dead_size")
+                    .arg(sp.vo_dead_size.to_string())
+                    .arg("--vo_dead_norm")
+                    .arg(sp.vo_dead_norm.to_string());
+            }
+            "vo-fit" | "vo_fit" => {
+                cmd.arg("--vo_fit_order")
+                    .arg(sp.vo_fit_order.to_string())
+                    .arg("--vo_fit_sigma_x")
+                    .arg(sp.vo_fit_sigma.0.to_string())
+                    .arg("--vo_fit_sigma_y")
+                    .arg(sp.vo_fit_sigma.1.to_string());
+            }
             _ => {}
         }
         // Phase-retrieval physics only matters when a phase method is selected;
@@ -954,11 +1276,20 @@ fn run_sharded_subprocesses(
         if let Some(c) = plan.center {
             cmd.arg("--center").arg(c.to_string());
         }
+        if progress_json {
+            cmd.arg("--progress_json");
+        }
         // Pin the child to one physical GPU; clear any inherited multi-device
         // selection so the child's `selected_devices()` is exactly `[0]`.
+        // With `--progress_json` the child inherits stdout so its JSON lines
+        // reach the parent's consumer; otherwise child stdout is discarded.
         cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string())
             .env("TOMOXIDE_CUDA_DEVICES", "0")
-            .stdout(std::process::Stdio::null())
+            .stdout(if progress_json {
+                std::process::Stdio::inherit()
+            } else {
+                std::process::Stdio::null()
+            })
             .stderr(std::process::Stdio::piped());
         let child = cmd
             .spawn()
@@ -1223,6 +1554,33 @@ fn tune_chunk(
 
 /// Build a parallel-beam geometry from the reader's sizes/angles, optionally
 /// overriding the rotation center (else the detector midline).
+/// Resolve an explicit `--start_row/--end_row` against the dataset's row count
+/// for the whole-volume paths: clamp the end, reject an empty band, and reject
+/// banding under laminography (the tilt couples every detector row into every
+/// output voxel, so a row band is not a unit of work there). Returns
+/// `(z0, z1, banded)`; both flags omitted ⇒ the full `[0, nz)` un-banded.
+fn row_band(
+    start: Option<usize>,
+    end: Option<usize>,
+    nz: usize,
+    lamino_angle: Option<f32>,
+) -> anyhow::Result<(usize, usize, bool)> {
+    let banded = start.is_some() || end.is_some();
+    if banded && lamino_angle.is_some() {
+        return Err(anyhow!(
+            "laminography reconstructs the whole stack; --start_row/--end_row are unsupported"
+        ));
+    }
+    let z0 = start.unwrap_or(0);
+    let z1 = end.unwrap_or(nz).min(nz);
+    if z0 >= z1 {
+        return Err(anyhow!(
+            "row range [{z0}, {z1}) is empty (dataset has {nz} rows)"
+        ));
+    }
+    Ok((z0, z1, banded))
+}
+
 fn geometry_from_reader(
     reader: &mut dyn DatasetReader,
     center: Option<f32>,
@@ -1245,6 +1603,7 @@ fn recon_params(
     filter_name: FilterName,
     num_iter: usize,
     reg_par: Vec<f32>,
+    ext_pad: bool,
 ) -> ReconParams {
     ReconParams {
         num_gridx: Some(geom.detector.width),
@@ -1252,6 +1611,7 @@ fn recon_params(
         filter_name,
         num_iter,
         reg_par,
+        ext_pad,
         ..Default::default()
     }
 }
@@ -1290,6 +1650,7 @@ fn reconstruct_chain(
             plan.filter,
             stage.num_iter,
             plan.reg_par.clone(),
+            plan.ext_pad,
         );
         params.lamino_rh = lamino_rh;
         params.init = init.take();
@@ -1367,5 +1728,158 @@ mod tests {
     #[test]
     fn unknown_algorithm_rejected() {
         assert!(parse_chain_stage("nope", 25).is_err());
+    }
+
+    /// Every `remove_stripe_method` spelling maps to its `StripeMethod`
+    /// variant with the resolved parameters (the Vo 2018 single-method
+    /// variants included), and unknown names list the full set.
+    #[test]
+    fn vo_variant_stripe_methods_parse() {
+        let p = StripeParams {
+            fw_sigma: 2.0,
+            fw_level: None,
+            ti_nblock: 0,
+            ti_beta: 1.5,
+            sf_size: 5,
+            vo_snr: 3.0,
+            vo_la_size: 61,
+            vo_sm_size: 21,
+            vo_sort_size: None,
+            vo_sort_dim: 1,
+            vo_filter_sigma: 3.0,
+            vo_filter_size: Some(7),
+            vo_filter_dim: 2,
+            vo_large_snr: 3.0,
+            vo_large_size: 51,
+            vo_large_drop_ratio: 0.1,
+            vo_large_norm: true,
+            vo_dead_snr: 4.0,
+            vo_dead_size: 41,
+            vo_dead_norm: false,
+            vo_fit_order: 3,
+            vo_fit_sigma: (5.0, 20.0),
+        };
+        assert_eq!(
+            build_stripe("vo-sort", &p).unwrap(),
+            StripeMethod::VoSort { size: None, dim: 1 }
+        );
+        assert_eq!(
+            build_stripe("vo_filter", &p).unwrap(),
+            StripeMethod::VoFilter {
+                sigma: 3.0,
+                size: Some(7),
+                dim: 2
+            }
+        );
+        assert_eq!(
+            build_stripe("vo-large", &p).unwrap(),
+            StripeMethod::VoLarge {
+                snr: 3.0,
+                size: 51,
+                drop_ratio: 0.1,
+                norm: true
+            }
+        );
+        assert_eq!(
+            build_stripe("vo-dead", &p).unwrap(),
+            StripeMethod::VoDead {
+                snr: 4.0,
+                size: 41,
+                norm: false
+            }
+        );
+        assert_eq!(
+            build_stripe("vo-fit", &p).unwrap(),
+            StripeMethod::VoFit {
+                order: 3,
+                sigma: (5.0, 20.0)
+            }
+        );
+        let err = build_stripe("nope", &p).unwrap_err().to_string();
+        assert!(err.contains("vo-fit"), "{err}");
+    }
+
+    #[test]
+    fn progress_line_format() {
+        // The GUI parses these lines; pin the exact shape (keys, order, no
+        // spaces, trailing newline, 3-decimal secs).
+        assert_eq!(
+            progress_line(8, 16, 128, 1.23456),
+            "{\"start\":8,\"end\":16,\"total\":128,\"secs\":1.235}\n"
+        );
+    }
+
+    /// The tee must forward `reserve`/`write_chunk`/`finalize` to the wrapped
+    /// writer unchanged (the JSON side effect goes to stdout, which is not
+    /// captured here — the format itself is pinned above).
+    #[test]
+    fn progress_tee_forwards_all_calls() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Log {
+            reserved: Option<usize>,
+            chunks: Vec<(usize, usize, usize)>, // (start, end, n_slices)
+            finalized: bool,
+        }
+        struct MockWriter(Arc<Mutex<Log>>);
+        impl tomoxide::io::VolumeWriter for MockWriter {
+            fn reserve(&mut self, total_nz: usize) -> tomoxide::Result<()> {
+                self.0.lock().unwrap().reserved = Some(total_nz);
+                Ok(())
+            }
+            fn write_chunk(
+                &mut self,
+                vol: &tomoxide::Volume<f32>,
+                start: usize,
+                end: usize,
+            ) -> tomoxide::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .chunks
+                    .push((start, end, vol.dims().0));
+                Ok(())
+            }
+            fn finalize(&mut self) -> tomoxide::Result<()> {
+                self.0.lock().unwrap().finalized = true;
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut w = maybe_progress(Box::new(MockWriter(log.clone())), true);
+        w.reserve(64).unwrap();
+        let vol = tomoxide::Volume::new(ndarray::Array3::<f32>::zeros((4, 2, 2)));
+        w.write_chunk(&vol, 8, 12).unwrap();
+        w.finalize().unwrap();
+
+        let l = log.lock().unwrap();
+        assert_eq!(l.reserved, Some(64));
+        assert_eq!(l.chunks, vec![(8, 12, 4)]);
+        assert!(l.finalized);
+    }
+
+    /// `maybe_progress(_, false)` must be a pass-through (no tee layer).
+    #[test]
+    fn maybe_progress_disabled_is_passthrough() {
+        struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+        use std::sync::Arc;
+        impl tomoxide::io::VolumeWriter for Counting {
+            fn write_chunk(
+                &mut self,
+                _vol: &tomoxide::Volume<f32>,
+                _start: usize,
+                _end: usize,
+            ) -> tomoxide::Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut w = maybe_progress(Box::new(Counting(n.clone())), false);
+        let vol = tomoxide::Volume::new(ndarray::Array3::<f32>::zeros((1, 2, 2)));
+        w.write_chunk(&vol, 0, 1).unwrap();
+        assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

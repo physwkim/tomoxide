@@ -534,14 +534,17 @@ mod cuda_impl {
 
     impl FilteredBackproject for CudaBackend {
         /// Parallel-beam voxel-driven back-projection via the vendored
-        /// `cfunc_linerec` kernel (phi = π/2). The sinogram must already be filtered
-        /// and centred on the detector midpoint (`recon` does this through the
-        /// shared FBP filter), so the kernel assumes centre `n/2`. Output is
+        /// `cfunc_linerec` kernel (phi = π/2, gain 1). The sinogram must already be
+        /// filtered and centred on the detector midpoint (`recon` does this through
+        /// the shared FBP filter), so the kernel assumes centre `n/2`. Output is
         /// `[nz, n, n]` in the **CPU/tomopy convention**: the kernel's tomocupy
-        /// y-flip and `4/nproj` gain have been unified to the CPU handedness and
-        /// `π/nproj` scale (Phase 1/2 cross-backend unification), so CUDA back-
-        /// projection matches the CPU back-projector directly (see
-        /// `tests/cuda_cpu_convention_parity.rs` and `docs/ARCHITECTURE.md §4.1`).
+        /// y-flip has been unified to the CPU handedness (Phase 1/2 cross-backend
+        /// unification), so CUDA back-projection matches the CPU back-projector
+        /// directly (see `tests/cuda_cpu_convention_parity.rs` and
+        /// `docs/ARCHITECTURE.md §4.1`). Like every `FilteredBackproject`, this is
+        /// the *pure* adjoint `Wᵀ` (no angular-quadrature gain): the analytic
+        /// dispatcher applies the FBP `π/nproj` dθ weight itself, and the iterative
+        /// solvers consume `Wᵀ` directly.
         fn backproject(
             &self,
             sino: &Tomo<f32>,
@@ -584,14 +587,27 @@ mod cuda_impl {
             let sino_slice = sino_std
                 .as_slice()
                 .expect("as_standard_layout is C-contiguous");
+            // Batch-domain minimum (same family as `IterativeReconstruct::
+            // solve`): the kernel's z-bilinear sampling needs ≥2 slices — a
+            // 1-slice batch back-projects to zero. Duplicate the row (the
+            // interpolation weights sum to 1 on identical rows, so the result
+            // is exact) and drop the duplicate after download.
+            let nz_run = nz.max(2);
+            let dup;
+            let sino_slice = if nz_run != nz {
+                dup = [sino_slice, sino_slice].concat();
+                &dup[..]
+            } else {
+                sino_slice
+            };
 
             // Device buffers: filtered sinogram, theta, output volume.
             let g = DevBuf::from_host_f32(sino_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
-            let f = DevBuf::zeroed(nz * ncols * ncols * std::mem::size_of::<f32>())?;
+            let f = DevBuf::zeroed(nz_run * ncols * ncols * std::mem::size_of::<f32>())?;
 
             // cfunc_linerec(nproj, nz, n, ncproj=nproj, ncz=nz): whole stack at once.
-            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
+            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz_run, ncols, nproj, nz_run) };
             if handle.is_null() {
                 return Err(Error::Backend("cfunc_linerec allocation failed".into()));
             }
@@ -603,6 +619,7 @@ mod cuda_impl {
                     g.ptr,
                     theta_d.ptr as *const f32,
                     phi,
+                    1.0, // pure adjoint Wᵀ — no angular-quadrature gain
                     0,
                     std::ptr::null_mut(),
                 );
@@ -613,8 +630,9 @@ mod cuda_impl {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
 
-            let mut host = vec![0.0f32; nz * ncols * ncols];
+            let mut host = vec![0.0f32; nz_run * ncols * ncols];
             f.to_host_f32(&mut host)?;
+            host.truncate(nz * ncols * ncols);
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
             Ok(())
@@ -624,14 +642,15 @@ mod cuda_impl {
     impl ForwardProject for CudaBackend {
         /// Parallel-beam forward projection (`forwardprojection_ker`), the exact
         /// discrete transpose of [`FilteredBackproject::backproject`]
-        /// (`cfunc_linerec`, phi = π/2): same handedness, centre `n/2`, and matching
-        /// `π/nproj` scale (both unified off tomocupy's y-flip/`4/nproj` to the
-        /// CPU/tomopy convention). The two therefore form a symmetric `{A, Aᵀ}` pair
-        /// at the SAME scale — matching the now-adjoint CPU projector pair — which is
-        /// what the generic iterative solvers (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV)
-        /// require. Like the back-projector, the kernel hard-wires
-        /// centre `n/2` (it ignores `geom.center`) and assumes the detector width
-        /// equals the grid `n`. Output is `[nz, nproj, n]` in `Sinogram` layout.
+        /// (`cfunc_linerec`, phi = π/2, gain 1): same handedness, centre `n/2`, and
+        /// both unweighted, so the two form a true `{A, Aᵀ}` pair — matching the
+        /// CPU projector pair — which is what the generic iterative solvers
+        /// (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV) require. `A` is the plain
+        /// line-integral Radon transform (unit pixel spacing), so a converged
+        /// solve of `A x = p` yields the physical μ. Like the back-projector, the
+        /// kernel hard-wires centre `n/2` (it ignores `geom.center`) and assumes
+        /// the detector width equals the grid `n`. Output is `[nz, nproj, n]` in
+        /// `Sinogram` layout.
         fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
             if geom.beam != Beam::Parallel {
                 return Err(Error::InvalidParam(
@@ -667,12 +686,25 @@ mod cuda_impl {
             let vol_slice = vol_std
                 .as_slice()
                 .expect("as_standard_layout is C-contiguous");
+            // Batch-domain minimum (same family as `IterativeReconstruct::
+            // solve`): the kernel's z-bilinear scatter needs ≥2 slices — a
+            // 1-slice volume forward-projects to zero. Duplicate the slice
+            // (exact: the interpolation weights sum to 1 on identical rows)
+            // and drop the duplicate after download.
+            let nz_run = nz.max(2);
+            let dup;
+            let vol_slice = if nz_run != nz {
+                dup = [vol_slice, vol_slice].concat();
+                &dup[..]
+            } else {
+                vol_slice
+            };
 
             // Device buffers: input volume, theta, zeroed output sinogram (the
             // kernel only atomic-adds into it).
             let f = DevBuf::from_host_f32(vol_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
-            let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
+            let g = DevBuf::zeroed(nz_run * nproj * n * std::mem::size_of::<f32>())?;
 
             let phi = std::f32::consts::FRAC_PI_2; // parallel beam
             unsafe {
@@ -681,7 +713,7 @@ mod cuda_impl {
                     f.ptr,
                     theta_d.ptr as *const f32,
                     phi,
-                    nz as i32,
+                    nz_run as i32,
                     n as i32,
                     nproj as i32,
                     std::ptr::null_mut(),
@@ -692,8 +724,9 @@ mod cuda_impl {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
 
-            let mut host = vec![0.0f32; nz * nproj * n];
+            let mut host = vec![0.0f32; nz_run * nproj * n];
             g.to_host_f32(&mut host)?;
+            host.truncate(nz * nproj * n);
             let array = Array3::from_shape_vec((nz, nproj, n), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda sinogram shape: {e}")))?;
             *out = Tomo::new(array, Layout::Sinogram);
@@ -743,7 +776,9 @@ mod cuda_impl {
 
     /// On-device back projection `f = Aᵀ g` (parallel beam) via a reused
     /// `cfunc_linerec` handle: zero `f` (the kernel accumulates) then launch.
-    /// `vbytes` = byte size of `f`.
+    /// Gain 1 — the pure adjoint of [`dev_forward`], no angular-quadrature
+    /// weight (that π/nproj belongs to the analytic FBP paths only). `vbytes` =
+    /// byte size of `f`.
     ///
     /// # Safety
     /// `handle` from [`ffi::tomoxide_linerec_new`]; `f`/`g`/`theta` valid device
@@ -764,6 +799,7 @@ mod cuda_impl {
             g,
             theta,
             std::f32::consts::FRAC_PI_2,
+            1.0,
             0,
             null,
         );
@@ -1056,7 +1092,7 @@ mod cuda_impl {
 
     /// Device-resident least-squares gradient descent (`grad`) and its Tikhonov
     /// variant (`tikh`). The iterate lives on the GPU in the r-scaled domain
-    /// (init 0); each iteration computes `grad = 2r·adj·Rᵀ(r·R x − b)` (+ the
+    /// (init 0); each iteration computes `grad = 2r·Rᵀ(r·R x − b)` (+ the
     /// Tikhonov term `2·reg1·(x − prior)` when `tikh` is `Some`), a per-slice step
     /// `λ` (fixed if `reg_par[0] ≥ 0`, else Barzilai–Borwein via on-device
     /// reductions), and `x ← x − λ g`, then unscales by `r`. `recon0`/`grad0`
@@ -1090,12 +1126,7 @@ mod cuda_impl {
         let null = std::ptr::null_mut::<c_void>();
 
         let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
-        let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
-                                                             // Divide the forward projector's adjoint gain π/nproj back out of the data
-                                                             // gradient (folded into `coef`, since grad = coef·Rᵀ(r·R x − b)) so the
-                                                             // conditioning is invariant to that gain — matching the host `gradient_descent`.
-        let fwd_gain_inv = nproj as f32 / std::f32::consts::PI;
-        let coef = 2.0 * r * adj_scale * fwd_gain_inv;
+        let coef = 2.0 * r; // grad = 2r·Rᵀ(r·R x − b), {R, Rᵀ} the unweighted pair
         let fixed_step = reg_par.first().copied().unwrap_or(1.0);
         let two_reg1 = tikh.as_ref().map(|(r1, _)| 2.0 * r1).unwrap_or(0.0);
 
@@ -1126,7 +1157,7 @@ mod cuda_impl {
                 dev_forward(ax_d.ptr, vol_d.ptr, tp, nz, n, nproj, sbytes); // ax = R x
                 ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null); // r·R x − b
                 dev_backproject(handle, bpv_d.ptr, ax_d.ptr, tp, vbytes); // Rᵀ(…)
-                ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·adj·Rᵀ
+                ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·Rᵀ
                 if let Some(pd) = &prior_d {
                     ffi::tomoxide_iter_grad_tikh(
                         grad_d.ptr, vol_d.ptr, pd.ptr, two_reg1, nvol, null,
@@ -1323,11 +1354,6 @@ mod cuda_impl {
         );
         let null = std::ptr::null_mut::<c_void>();
         let r = 1.0 / ((ncols * nproj) as f32 / 2.0).sqrt();
-        let adj_scale = nproj as f32 / std::f32::consts::PI; // undo back-projector's π/nproj
-                                                             // Divide the forward projector's adjoint gain π/nproj back out of the data
-                                                             // residual so the fixed Chambolle–Pock step stays well-conditioned regardless
-                                                             // of that gain (matches the host `tv`).
-        let fwd_gain_inv = nproj as f32 / std::f32::consts::PI;
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
@@ -1350,23 +1376,13 @@ mod cuda_impl {
         unsafe {
             for _ in 0..num_iter.max(1) {
                 dev_forward(ax_d.ptr, xbar_d.ptr, tp, nz, n, nproj, sbytes); // R x̄
-                ffi::tomoxide_iter_tv_datadual(
-                    pd_d.ptr,
-                    ax_d.ptr,
-                    b_d.ptr,
-                    C,
-                    r,
-                    fwd_gain_inv,
-                    nsino,
-                    null,
-                );
-                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, vbytes); // (π/nproj)·Rᵀ(pd)
+                ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null);
+                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, vbytes); // Rᵀ(pd)
                 ffi::tomoxide_iter_tv_dual(
                     p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
                 );
                 ffi::tomoxide_iter_tv_primal(
-                    x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, adj_scale, n, nz,
-                    null,
+                    x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, n, nz, null,
                 );
             }
             ffi::tomoxide_iter_scale_inplace(xbar_d.ptr, r, nvol, null); // back to physical domain
@@ -1395,7 +1411,8 @@ mod cuda_impl {
         /// assume detector width = grid `n`). Reuses the same `A`/`Aᵀ` kernels as
         /// the generic solvers, so results match the host to the atomic-add floor
         /// (since the orientation/scale unification the CUDA projectors share the
-        /// CPU handedness and `π/nproj` scale — no volume-space y-flip).
+        /// CPU handedness — no volume-space y-flip; the projector pair is the
+        /// unweighted `{Wᵀ, W}`, so every solver converges to the physical μ).
         fn solve(
             &self,
             sino: &Tomo<f32>,
@@ -1433,8 +1450,34 @@ mod cuda_impl {
                 }
                 None => None,
             };
+            // Batch-domain minimum, same family as the analytic paths: the
+            // z-bilinear forward/back-projection kernel pair samples slice
+            // pairs (vr, vr+1), so a 1-slice problem forward-projects to zero
+            // and never converges. Duplicate the slice into a 2-slice problem
+            // — identical neighbouring rows make the z-interpolation exact
+            // (the weights sum to 1) and the duplicated blocks are independent
+            // copies of the same problem, so every solver's iterates (incl.
+            // the global dot products of GRAD/TIKH/CGLS: numerator and
+            // denominator both double) match the single-slice solve — and
+            // drop the duplicate row from the output.
+            let padded = nz == 1;
+            let sino2: Tomo<f32>;
+            let sino: &Tomo<f32> = if padded {
+                let a = ndarray::concatenate(ndarray::Axis(0), &[s.array.view(), s.array.view()])
+                    .map_err(|e| Error::InvalidParam(format!("pad 1-slice sinogram: {e}")))?;
+                sino2 = Tomo::new(a, Layout::Sinogram);
+                &sino2
+            } else {
+                sino
+            };
+            let init_host = init_host.map(|mut v| {
+                if padded {
+                    v.extend_from_within(..);
+                }
+                v
+            });
             let init = init_host.as_deref();
-            match algorithm {
+            let solved = match algorithm {
                 Algorithm::Sirt => sirt_device(sino, geom, n, it, init).map(Some),
                 Algorithm::Mlem => {
                     em_device(sino, geom, n, it, vec![(0..nproj).collect()], init).map(Some)
@@ -1472,13 +1515,16 @@ mod cuda_impl {
                     // Tikhonov prior: reg_data ([nz,n,n] flat) or zeros. Wrong-sized
                     // reg_data ⇒ fall back so the host raises the shape error.
                     let reg1 = params.reg_par.get(1).copied().unwrap_or(0.0);
-                    let prior = if params.reg_data.is_empty() {
+                    let mut prior = if params.reg_data.is_empty() {
                         vec![0.0f32; nz * n * n]
                     } else if params.reg_data.len() == nz * n * n {
                         params.reg_data.clone()
                     } else {
                         return Ok(None);
                     };
+                    if padded {
+                        prior.extend_from_within(..);
+                    }
                     grad_device(
                         sino,
                         geom,
@@ -1496,6 +1542,14 @@ mod cuda_impl {
                 }
                 Algorithm::Cgls => cgls_device(sino, geom, n, it, init).map(Some),
                 _ => Ok(None),
+            };
+            match solved {
+                Ok(Some(v)) if padded => Ok(Some(Volume::new(v.array.slice_move(ndarray::s![
+                    0..1,
+                    ..,
+                    ..
+                ])))),
+                other => other,
             }
         }
     }
@@ -1512,8 +1566,9 @@ mod cuda_impl {
     /// (Phase 2) targets CPU/tomopy — whose filter carries no such ½ — so it was
     /// dropped. The gain lives only here, so this single site sets the filter scale
     /// for every CUDA analytic method (fbp/linerec/fourierrec f32 + f16, one-shot +
-    /// streaming). fbp/linerec additionally need the back-projector `c` change
-    /// (`4/nproj → π/nproj`, `cfunc_linerec.cu`) to reach CPU scale; fourierrec
+    /// streaming). fbp/linerec additionally need the `π/nproj` dθ weight the
+    /// analytic call sites pass to `cfunc_linerec` (was tomocupy's baked-in
+    /// `4/nproj`) to reach CPU scale; fourierrec
     /// additionally normalizes its unnormalized cuFFT inverse by `(2n)²`. The
     /// laminography path also reads this filter but is a *different algorithm* from
     /// CPU USFFT lamino and is excluded from the unification (its cuda/cpu scale +
@@ -1533,7 +1588,8 @@ mod cuda_impl {
         // CUDA analytic amplitude to match tomocupy; the cross-backend convention
         // unification (Phase 2) targets CPU/tomopy instead, whose filter carries no
         // such ½ — so drop it. This alone brings lprec to cpu scale (k ½→1); fbp/
-        // linerec additionally need the back-projector `c` change (4/nproj→π/nproj).
+        // linerec additionally need the π/nproj dθ weight passed at the analytic
+        // back-projection call sites (was tomocupy's baked-in 4/nproj).
         let inv_pad = 1.0f32 / pad as f32;
         let mut w = vec![0.0f32; nz * nfreq * 2];
         for z in 0..nz {
@@ -1616,6 +1672,7 @@ mod cuda_impl {
                 gf.ptr,
                 theta_dev.ptr as *const f32,
                 std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                 0,
                 null,
             );
@@ -1705,6 +1762,7 @@ mod cuda_impl {
                 gf.ptr,
                 theta_dev.ptr as *const f32,
                 phi,
+                std::f32::consts::PI / nproj as f32, // analytic angular quadrature dθ
                 sz,
                 null,
             );
@@ -1794,6 +1852,7 @@ mod cuda_impl {
                 gf.ptr,
                 theta_dev.ptr as *const f32,
                 std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                 0,
                 null,
             );
@@ -3125,6 +3184,7 @@ mod cuda_impl {
                             self.gf.ptr,
                             self.theta.ptr as *const f32,
                             std::f32::consts::FRAC_PI_2,
+                            std::f32::consts::PI / nproj as f32, // FBP dθ weight
                             0,
                             null,
                         );
@@ -3278,6 +3338,7 @@ mod cuda_impl {
                         self.gf.ptr,
                         self.theta.ptr as *const f32,
                         std::f32::consts::FRAC_PI_2,
+                        std::f32::consts::PI / nproj as f32, // FBP dθ weight
                         0,
                         null,
                     );
@@ -3455,6 +3516,7 @@ mod cuda_impl {
                     slots[s].gf.ptr,
                     theta_dev.ptr as *const f32,
                     std::f32::consts::FRAC_PI_2,
+                    std::f32::consts::PI / nproj as f32, // FBP dθ weight
                     0,
                     st,
                 );
@@ -3712,6 +3774,7 @@ mod cuda_impl {
                     slots[s].gf.ptr,
                     theta_dev.ptr as *const f32,
                     std::f32::consts::FRAC_PI_2,
+                    std::f32::consts::PI / nproj as f32, // FBP dθ weight
                     0,
                     st,
                 );
@@ -4087,6 +4150,31 @@ mod cuda_impl {
                 ));
             }
 
+            // Kernel batch-domain minimums, same rule as `streaming()`: the
+            // z-bilinear back-projection samples slice pairs (vr, vr+1), so a
+            // 1-slice stack back-projects to zero (kernels_linerec.cuh
+            // `vr < nz-1`), and Fourierrec packs slice pairs (s, s+nz/2) for
+            // the real-FFT path, so it needs an even count. Pad the sinogram
+            // (and its per-row filter weights) with zero rows and drop the pad
+            // rows from the output volume.
+            let nz_out = nz;
+            let mut nz = nz.max(2);
+            if matches!(algorithm, Algorithm::Fourierrec) && nz % 2 != 0 {
+                nz += 1;
+            }
+            let padded: Vec<f32>;
+            let raw = if nz != nz_out {
+                let mut v = Vec::with_capacity(nz * nproj * ncols);
+                v.extend_from_slice(raw);
+                v.resize(nz * nproj * ncols, 0.0);
+                padded = v;
+                &padded[..]
+            } else {
+                raw
+            };
+            let mut w = w;
+            w.resize(nz * nfreq2, 0.0);
+
             // Half-precision path (tomocupy `--dtype float16`): single GPU, whole
             // stack in one chunk. The half cuFFT filter needs a power-of-two
             // transform width, so `pad` must be a power of two. f16 tiling, the
@@ -4107,11 +4195,7 @@ mod cuda_impl {
                         analytic_fbp_stream_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     Algorithm::Fourierrec => {
-                        if nz % 2 != 0 {
-                            return Err(Error::InvalidParam(format!(
-                                "cuda fourierrec needs an even slice count; got nz={nz}"
-                            )));
-                        }
+                        // nz is even here by the batch-domain pad above.
                         analytic_fourierrec_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     other => {
@@ -4120,8 +4204,10 @@ mod cuda_impl {
                         )))
                     }
                 };
+                let mut vol = vol;
+                vol.truncate(nz_out * n * n);
                 return Ok(Volume::new(
-                    Array3::from_shape_vec((nz, n, n), vol)
+                    Array3::from_shape_vec((nz_out, n, n), vol)
                         .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
                 ));
             }
@@ -4192,11 +4278,7 @@ mod cuda_impl {
                     }
                 }
                 Algorithm::Fourierrec => {
-                    if nz % 2 != 0 {
-                        return Err(Error::InvalidParam(format!(
-                            "cuda fourierrec needs an even slice count; got nz={nz}"
-                        )));
-                    }
+                    // nz is even here by the batch-domain pad above.
                     let devices = selected_devices();
                     unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
                     analytic_fourierrec_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
@@ -4208,8 +4290,10 @@ mod cuda_impl {
                 }
             };
 
+            let mut vol = vol;
+            vol.truncate(nz_out * n * n);
             Ok(Volume::new(
-                Array3::from_shape_vec((nz, n, n), vol)
+                Array3::from_shape_vec((nz_out, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
             ))
         }
@@ -4245,11 +4329,18 @@ mod cuda_impl {
             let f16 = params.dtype == crate::dtype::Dtype::F16;
             let fourier = matches!(algorithm, Algorithm::Fourierrec);
             let is_lprec = matches!(algorithm, Algorithm::Lprec);
-            // Fourierrec packs slice pairs (s, s+max_nz/2) for the real-FFT path, so
-            // it needs an even chunk (f32 and f16 both have a device-resident tail;
-            // see `finish_recon`'s fourier branch). An odd chunk → per-chunk fallback.
+            // The device kernels have batch-domain minimums the stream capacity
+            // must respect: the z-bilinear back-projection samples slice pairs
+            // (vr, vr+1), so a 1-slice batch back-projects to zero
+            // (kernels_linerec.cuh `vr < nz-1`), and Fourierrec packs slice
+            // pairs (s, s+max_nz/2) for the real-FFT path, so it needs an even
+            // count. Allocate the stream at the padded capacity; chunks smaller
+            // than capacity go through the existing partial-chunk path (zeroed
+            // sino tail in `reconstruct_chunk*`, tail rows dropped in
+            // `finish_recon`), which never reads the pad rows as data.
+            let mut max_nz = max_nz.max(2);
             if fourier && max_nz % 2 != 0 {
-                return Ok(None);
+                max_nz += 1;
             }
             // lprec's gather/scatter + spline runtime is f32-only (no f16 port);
             // f16 lprec falls back to the per-chunk host-interp path.
@@ -4499,8 +4590,9 @@ mod cuda_impl {
     /// or the memory/index tile count for single-GPU streaming), returns a count
     /// that keeps an even split at ≥2 slices per chunk — capped at `nz/2`, floored
     /// at 1. `nz < 4` collapses to a single whole-stack chunk (two ≥2 chunks don't
-    /// fit); `nz < 2` is the kernel's own single-slice degenerate case, which no
-    /// chunking can rescue.
+    /// fit); `nz < 2` is the kernel's own single-slice degenerate case, closed by
+    /// the batch-domain zero-pad in `reconstruct`/`streaming` (both hand the
+    /// kernels ≥2 slices).
     fn linerec_chunk_count(nz: usize, want: usize) -> usize {
         want.min(nz / 2).max(1)
     }
@@ -4932,14 +5024,13 @@ mod cuda_impl {
             n: usize,
         ) -> Result<Volume<f32>> {
             let s = filtered.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
-            let nz = s.n_rows();
+            let nz_out = s.n_rows();
             let nproj = s.n_angles();
             let ncols = s.n_cols();
-            if nz % 2 != 0 {
-                return Err(Error::InvalidParam(format!(
-                    "cuda fourierrec needs an even slice count (complex pairing); got nz={nz}"
-                )));
-            }
+            // The complex pairing needs an even slice count; pad an odd stack
+            // with one zero slice (same batch-domain rule as the analytic
+            // paths) and drop the pad row from the output.
+            let nz = nz_out + nz_out % 2;
             if n != ncols {
                 return Err(Error::InvalidParam(format!(
                     "cuda fourierrec needs a square grid = detector width {ncols}; got {n}"
@@ -4960,13 +5051,21 @@ mod cuda_impl {
             // Pack slice pairs (s, s+nz/2) into interleaved complex: for each
             // complex element [s, p, x], re = filtered[s], im = filtered[s+nz/2].
             let half = nz / 2;
+            // Rows at or past `nz_out` are the zero pad of an odd stack.
+            let at = |row: usize, p: usize, x: usize| {
+                if row < nz_out {
+                    src[row * nproj * ncols + p * ncols + x]
+                } else {
+                    0.0
+                }
+            };
             let mut g = vec![0.0f32; nz * nproj * ncols];
             for sp in 0..half {
                 for p in 0..nproj {
                     for x in 0..ncols {
                         let idx = sp * nproj * ncols + p * ncols + x;
-                        g[2 * idx] = src[sp * nproj * ncols + p * ncols + x];
-                        g[2 * idx + 1] = src[(sp + half) * nproj * ncols + p * ncols + x];
+                        g[2 * idx] = at(sp, p, x);
+                        g[2 * idx + 1] = at(sp + half, p, x);
                     }
                 }
             }
@@ -5011,8 +5110,9 @@ mod cuda_impl {
                     }
                 }
             }
+            vol.truncate(nz_out * n * n);
             Ok(Volume::new(
-                Array3::from_shape_vec((nz, n, n), vol)
+                Array3::from_shape_vec((nz_out, n, n), vol)
                     .map_err(|e| Error::InvalidParam(format!("cuda fourierrec shape: {e}")))?,
             ))
         }

@@ -52,6 +52,34 @@ pub fn reconstruct(
     crate::recon::recon(&sino, geom, algorithm, params, backend)
 }
 
+/// Cooperative cancellation flag for the chunked drivers.
+///
+/// Clone the token, hand one clone to [`ReconSteps::with_cancel`], and call
+/// [`cancel`](CancelToken::cancel) from any thread; the driver checks the flag
+/// **between chunks** (never mid-kernel) and returns
+/// [`Error::Cancelled`](crate::error::Error::Cancelled). Chunks already handed
+/// to the writer stay written — cancellation truncates the run, it does not
+/// roll it back. A default token never cancels.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    /// A fresh, not-cancelled token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation; every clone observes it at its next check.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Chunked/streaming reconstruction driver (port of tomocupy
 /// `rec_steps.py::GPURecSteps::recon_steps_all`).
 ///
@@ -70,6 +98,8 @@ pub fn reconstruct(
 pub struct ReconSteps {
     /// Detector rows (slices) reconstructed and written per chunk.
     pub chunk_rows: usize,
+    /// Cooperative cancellation, checked between chunks (default: never fires).
+    cancel: CancelToken,
 }
 
 impl ReconSteps {
@@ -77,6 +107,25 @@ impl ReconSteps {
     pub fn new(chunk_rows: usize) -> Self {
         ReconSteps {
             chunk_rows: chunk_rows.max(1),
+            cancel: CancelToken::new(),
+        }
+    }
+
+    /// Attach a cancellation token; [`CancelToken::cancel`] on any clone makes
+    /// the driver return [`Error::Cancelled`](crate::error::Error::Cancelled)
+    /// at the next chunk boundary.
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// `Err(Cancelled)` once the token has fired — the drivers call this at
+    /// every chunk boundary.
+    fn check_cancel(&self) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            Err(crate::error::Error::Cancelled)
+        } else {
+            Ok(())
         }
     }
 
@@ -97,6 +146,7 @@ impl ReconSteps {
 
         // Read-all + row-coupling stages once (tomocupy recon_steps_all reads
         // the whole dataset to memory before processing by steps).
+        self.check_cancel()?;
         let mut ds = reader.read_all()?;
         crate::prep::normalize_dataset(&mut ds, backend)?;
         crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
@@ -110,6 +160,7 @@ impl ReconSteps {
         let mut r0 = 0;
         let mut recon = None; // handle-reusing reconstructor, built on chunk 0
         while r0 < nz {
+            self.check_cancel()?;
             let r1 = (r0 + chunk).min(nz);
             // Per-slice-independent stages on this z-chunk.
             let sub = sino
@@ -131,6 +182,7 @@ impl ReconSteps {
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
+        writer.finalize()?;
         Ok(())
     }
 }
@@ -175,6 +227,7 @@ impl ReconSteps {
         let mut r0 = 0;
         let mut recon = None; // handle-reusing reconstructor, built on chunk 0
         while r0 < nz {
+            self.check_cancel()?;
             let r1 = (r0 + chunk).min(nz);
             let ds = reader.read_chunk(r0, r1)?;
             let chunk_geom = chunk_geometry(geom, r0, r1);
@@ -191,6 +244,7 @@ impl ReconSteps {
             writer.write_chunk(&vol, r0, r1)?;
             r0 = r1;
         }
+        writer.finalize()?;
         Ok(())
     }
 }
@@ -292,8 +346,12 @@ impl ReconSteps {
                     .into(),
             ));
         }
+        self.check_cancel()?;
         let backend = engine.backend();
         let chunk = self.chunk_rows.max(1);
+        // The reader thread polls its own clone (to stop issuing reads early);
+        // the compute loop's check is the one that surfaces `Cancelled`.
+        let cancel_reader = self.cancel.clone();
 
         // read thread → compute (this thread) → write thread, each bounded.
         let (read_tx, read_rx) =
@@ -356,6 +414,9 @@ impl ReconSteps {
                     }
                     let mut r0 = z0;
                     while r0 < z1 {
+                        if cancel_reader.is_cancelled() {
+                            break; // compute's check owns the Cancelled error
+                        }
                         let r1 = (r0 + chunk).min(z1);
                         let rows = r1 - r0;
                         let need = nproj * rows * nx;
@@ -381,6 +442,9 @@ impl ReconSteps {
                 } else {
                     let mut r0 = z0;
                     while r0 < z1 {
+                        if cancel_reader.is_cancelled() {
+                            break; // compute's check owns the Cancelled error
+                        }
                         let r1 = (r0 + chunk).min(z1);
                         let ds = reader.read_chunk(r0, r1)?;
                         // A send error means compute hung up (errored/aborted); stop
@@ -412,6 +476,7 @@ impl ReconSteps {
                     // is a move, not a copy — the volume is standard C-layout here.
                     let _ = out_free_tx.send(vol.array.into_raw_vec_and_offset().0);
                 }
+                writer.finalize()?;
                 Ok(())
             });
 
@@ -423,6 +488,7 @@ impl ReconSteps {
                 write_tx,
                 free_tx,
                 out_free_rx,
+                &self.cancel,
                 backend,
                 geom,
                 algorithm,
@@ -469,6 +535,7 @@ fn compute_chunks(
     write_tx: std::sync::mpsc::SyncSender<(usize, usize, Volume<f32>)>,
     free_tx: std::sync::mpsc::SyncSender<Box<dyn crate::backend::HostBuffer>>,
     out_free: std::sync::mpsc::Receiver<Vec<f32>>,
+    cancel: &CancelToken,
     backend: &dyn crate::backend::Backend,
     geom: &Geometry,
     algorithm: Algorithm,
@@ -480,6 +547,11 @@ fn compute_chunks(
     // setup once, not per chunk.
     let mut recon: Option<Option<Box<dyn crate::backend::StreamingAnalytic>>> = None;
     while let Ok((r0, r1, msg)) = read_rx.recv() {
+        if cancel.is_cancelled() {
+            // Dropping read_rx/write_tx unwinds the reader (send fails, breaks)
+            // and lets the writer finalize what was already written.
+            return Err(crate::error::Error::Cancelled);
+        }
         // Feed any volume buffers the writer has returned back to the
         // reconstructor so this chunk's device→host download reuses a warm
         // allocation (no-op for backends that build the volume on the host).

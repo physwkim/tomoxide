@@ -83,6 +83,82 @@ pub struct ChunkAux {
     pub theta: Vec<f32>,
 }
 
+/// Restrict any [`DatasetReader`] to the detector-row band `[r0, r1)`.
+///
+/// Wrapped, the dataset appears to be `r1 − r0` rows tall: `read_sizes`
+/// reports the band height, and `read_all` / `read_chunk` / `read_chunk_into`
+/// address rows relative to `r0` (a chunk `[a, b)` reads the underlying rows
+/// `[r0+a, r0+b)`). `theta` passes through; flat/dark frames are sliced to the
+/// same rows by the inner reader's own chunk reads.
+///
+/// This is the banded-preview adapter (docs/GUI.md §6 #5): row-coupled prep
+/// (phase retrieval) needs detector rows around the slice of interest, so a
+/// preview reconstructs the band `[z − m, z + m]` through this wrapper and
+/// displays the center row — without reading the whole file. `m` comes from
+/// [`crate::prep::phase::margin_rows`].
+pub struct RowBandReader {
+    inner: Box<dyn DatasetReader>,
+    r0: usize,
+    r1: usize,
+}
+
+impl RowBandReader {
+    /// Wrap `inner`, restricting it to rows `[r0, r1)` (`r1` clamped to the
+    /// dataset height). Errors when the clamped band is empty.
+    pub fn new(mut inner: Box<dyn DatasetReader>, r0: usize, r1: usize) -> Result<Self> {
+        let (_nproj, nz, _nx, _nflat, _ndark) = inner.read_sizes()?;
+        let r1 = r1.min(nz);
+        if r0 >= r1 {
+            return Err(Error::InvalidParam(format!(
+                "RowBandReader: empty row band [{r0}, {r1}) in a {nz}-row dataset"
+            )));
+        }
+        Ok(RowBandReader { inner, r0, r1 })
+    }
+
+    /// Map band-relative rows `[row0, row1)` to underlying dataset rows,
+    /// rejecting ranges that leave the band.
+    fn to_inner(&self, row0: usize, row1: usize) -> Result<(usize, usize)> {
+        let nz = self.r1 - self.r0;
+        if row0 > row1 || row1 > nz {
+            return Err(Error::InvalidParam(format!(
+                "RowBandReader: chunk [{row0}, {row1}) outside the band height {nz}"
+            )));
+        }
+        Ok((self.r0 + row0, self.r0 + row1))
+    }
+}
+
+impl DatasetReader for RowBandReader {
+    fn read_sizes(&mut self) -> Result<(usize, usize, usize, usize, usize)> {
+        let (nproj, _nz, nx, nflat, ndark) = self.inner.read_sizes()?;
+        Ok((nproj, self.r1 - self.r0, nx, nflat, ndark))
+    }
+
+    fn read_theta(&mut self) -> Result<Vec<f32>> {
+        self.inner.read_theta()
+    }
+
+    fn read_all(&mut self) -> Result<Dataset<f32>> {
+        self.inner.read_chunk(self.r0, self.r1)
+    }
+
+    fn read_chunk(&mut self, row0: usize, row1: usize) -> Result<Dataset<f32>> {
+        let (row0, row1) = self.to_inner(row0, row1)?;
+        self.inner.read_chunk(row0, row1)
+    }
+
+    fn read_chunk_into(
+        &mut self,
+        row0: usize,
+        row1: usize,
+        data_out: &mut [f32],
+    ) -> Result<ChunkAux> {
+        let (row0, row1) = self.to_inner(row0, row1)?;
+        self.inner.read_chunk_into(row0, row1, data_out)
+    }
+}
+
 /// A reconstruction writer (port of tomocupy `dataio/writer.py:73`).
 pub trait VolumeWriter {
     /// Declare the full output slice count `total_nz` before the first chunk.
@@ -105,6 +181,23 @@ pub trait VolumeWriter {
     /// not the whole reconstruction. `start <= end` and the volume's slice count
     /// must equal `end - start`, mirroring the streaming driver's per-chunk call.
     fn write_chunk(&mut self, vol: &Volume<f32>, start: usize, end: usize) -> Result<()>;
+
+    /// Finish the output after the last [`write_chunk`](Self::write_chunk).
+    ///
+    /// Every streaming/whole-volume driver calls this exactly once on the
+    /// success path, before the writer is dropped. Single-container writers
+    /// (H5) finalize the container here with a **non-durable** close
+    /// (`close_no_sync`: writes all headers + the superblock, so the file is a
+    /// complete, valid HDF5 on return, but skips the `fsync` that otherwise
+    /// dominates close latency — bytes are handed to the OS, durability is left
+    /// to page-cache writeback, matching the TIFF/Zarr writers, which never
+    /// `fsync`). If a driver drops the writer *without* calling `finalize`
+    /// (an error/panic path), the container is still finalized **durably** on
+    /// drop — so `finalize` only trades that durability for speed on the
+    /// success path. Per-file writers (TIFF) keep the default no-op.
+    fn finalize(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Output container format (tomocupy `--save-format`).
@@ -135,6 +228,123 @@ impl std::str::FromStr for SaveFormat {
     }
 }
 
+/// The volume assembled in memory by [`InMemoryWriter`].
+///
+/// Sized by [`VolumeWriter::reserve`] (slice count) plus the first chunk's
+/// cross-section; zero-filled until the corresponding chunk lands, so a
+/// cancelled run leaves the unwritten tail at `0.0`.
+#[derive(Debug, Default)]
+pub struct InMemoryVolume {
+    total_nz: usize,
+    dims: Option<(usize, usize)>,
+    data: Vec<f32>,
+}
+
+impl InMemoryVolume {
+    /// Full output shape `(nz, ny, nx)`, known once the first chunk arrived.
+    pub fn dims(&self) -> Option<(usize, usize, usize)> {
+        self.dims.map(|(ny, nx)| (self.total_nz, ny, nx))
+    }
+
+    /// The flat row-major `[nz, ny, nx]` buffer (empty before the first chunk).
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Clone the buffer into a [`Volume`] (`None` before the first chunk).
+    pub fn to_volume(&self) -> Option<Volume<f32>> {
+        let (nz, ny, nx) = self.dims()?;
+        let array = Array3::from_shape_vec((nz, ny, nx), self.data.clone())
+            .expect("data length is kept at nz*ny*nx by write_chunk");
+        Some(Volume::new(array))
+    }
+}
+
+/// A [`VolumeWriter`] that assembles the reconstruction in memory instead of
+/// on disk — the GUI/preview counterpart of the TIFF/H5/Zarr writers.
+///
+/// The buffer lives behind a shared handle ([`buffer`](Self::buffer)) so the
+/// caller keeps access after the writer is consumed — the pipelined driver
+/// constructs and drops its writer on the writer thread. An optional
+/// [`on_chunk`](Self::with_on_chunk) callback fires after each chunk lands and
+/// doubles as a progress signal.
+#[derive(Default)]
+pub struct InMemoryWriter {
+    vol: std::sync::Arc<std::sync::Mutex<InMemoryVolume>>,
+    on_chunk: Option<Box<dyn FnMut(usize, usize) + Send>>,
+}
+
+impl InMemoryWriter {
+    /// An empty writer; shape is fixed by `reserve` + the first chunk.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Shared handle to the assembled volume; stays valid after the writer is
+    /// dropped (e.g. by the pipelined driver's writer thread).
+    pub fn buffer(&self) -> std::sync::Arc<std::sync::Mutex<InMemoryVolume>> {
+        std::sync::Arc::clone(&self.vol)
+    }
+
+    /// Invoke `on_chunk(start, end)` after each chunk is copied in — a
+    /// progress signal for the global slice range that just completed.
+    pub fn with_on_chunk(mut self, on_chunk: impl FnMut(usize, usize) + Send + 'static) -> Self {
+        self.on_chunk = Some(Box::new(on_chunk));
+        self
+    }
+}
+
+impl VolumeWriter for InMemoryWriter {
+    fn reserve(&mut self, total_nz: usize) -> Result<()> {
+        let mut vol = self.vol.lock().expect("InMemoryVolume lock poisoned");
+        vol.total_nz = total_nz;
+        Ok(())
+    }
+
+    fn write_chunk(&mut self, chunk: &Volume<f32>, start: usize, end: usize) -> Result<()> {
+        let (cz, ny, nx) = chunk.array.dim();
+        {
+            let mut vol = self.vol.lock().expect("InMemoryVolume lock poisoned");
+            if cz != end - start || end > vol.total_nz {
+                return Err(Error::ShapeMismatch {
+                    expected: format!(
+                        "chunk of {} slices within [0, {})",
+                        end.saturating_sub(start),
+                        vol.total_nz
+                    ),
+                    found: format!("{cz} slices at [{start}, {end})"),
+                });
+            }
+            match vol.dims {
+                None => {
+                    vol.dims = Some((ny, nx));
+                    let total = vol.total_nz;
+                    vol.data = vec![0.0; total * ny * nx];
+                }
+                Some(d) if d != (ny, nx) => {
+                    return Err(Error::ShapeMismatch {
+                        expected: format!("cross-section {:?} (from first chunk)", d),
+                        found: format!("({ny}, {nx})"),
+                    });
+                }
+                Some(_) => {}
+            }
+            let dst = &mut vol.data[start * ny * nx..end * ny * nx];
+            if let Some(src) = chunk.array.as_slice() {
+                dst.copy_from_slice(src);
+            } else {
+                for (d, s) in dst.iter_mut().zip(chunk.array.iter()) {
+                    *d = *s;
+                }
+            }
+        }
+        if let Some(cb) = &mut self.on_chunk {
+            cb(start, end);
+        }
+        Ok(())
+    }
+}
+
 /// Open a DXchange HDF5 file for reading.
 ///
 /// Backed by the pure-Rust `rust-hdf5` crate (no libhdf5). Reads the standard
@@ -143,6 +353,58 @@ impl std::str::FromStr for SaveFormat {
 /// `dataio/reader.py:59` `Reader`.
 pub fn open_dxchange(path: &str) -> Result<Box<dyn DatasetReader>> {
     Ok(Box::new(H5DxchangeReader::open(path)?))
+}
+
+/// Read frame `index` of a 3-D `[n, ny, nx]` HDF5 dataset as
+/// `(ny, nx, row-major f32)`, converting from any numeric on-disk dtype (the
+/// same dispatch the DXchange readers use — real beamline stacks are usually
+/// `uint16`). One hyperslab read per call: the lazy entry point for
+/// projection/volume frame browsers. `data_path` may be absolute
+/// (`/exchange/data`) or relative.
+pub fn read_h5_frame(
+    path: &str,
+    data_path: &str,
+    index: usize,
+) -> Result<(usize, usize, Vec<f32>)> {
+    let file = H5File::open(path).map_err(|e| Error::Io(format!("open {path}: {e}")))?;
+    // rust-hdf5 keys nested datasets without a leading slash.
+    let key = data_path.strip_prefix('/').unwrap_or(data_path);
+    let ds = file
+        .dataset(key)
+        .map_err(|e| Error::Io(format!("dataset {data_path}: {e}")))?;
+    let shape = ds.shape();
+    let [n, ny, nx] = shape[..] else {
+        return Err(Error::ShapeMismatch {
+            expected: "[n, ny, nx] (3-D stack)".into(),
+            found: format!("{shape:?}"),
+        });
+    };
+    if index >= n {
+        return Err(Error::InvalidParam(format!(
+            "frame {index} out of range (stack has {n})"
+        )));
+    }
+    let data = read_f32_slice(&ds, &[index, 0, 0], &[1, ny, nx])?;
+    Ok((ny, nx, data))
+}
+
+/// Shape `(n, ny, nx)` of a 3-D HDF5 dataset — the metadata probe paired with
+/// [`read_h5_frame`], so a volume browser can size itself without reading any
+/// frame. Errors on a non-3-D dataset. `data_path` may be absolute or relative.
+pub fn read_h5_sizes(path: &str, data_path: &str) -> Result<(usize, usize, usize)> {
+    let file = H5File::open(path).map_err(|e| Error::Io(format!("open {path}: {e}")))?;
+    let key = data_path.strip_prefix('/').unwrap_or(data_path);
+    let ds = file
+        .dataset(key)
+        .map_err(|e| Error::Io(format!("dataset {data_path}: {e}")))?;
+    let shape = ds.shape();
+    let [n, ny, nx] = shape[..] else {
+        return Err(Error::ShapeMismatch {
+            expected: "[n, ny, nx] (3-D stack)".into(),
+            found: format!("{shape:?}"),
+        });
+    };
+    Ok((n, ny, nx))
 }
 
 /// DXchange HDF5 reader over a pure-Rust [`H5File`].
@@ -737,9 +999,19 @@ impl VolumeWriter for TiffWriter {
         }
         for local in 0..cz {
             // Slice is [y, x], contiguous row-major (x fastest) in z-major
-            // Volume storage — exactly TIFF's width=nx, height=ny order.
+            // Volume storage — exactly TIFF's width=nx, height=ny order. A
+            // z-slice of a standard C-layout volume is itself contiguous, so
+            // hand its backing slice to the encoder zero-copy; gather into a
+            // temporary only for a non-contiguous caller.
             let slice = vol.array.index_axis(Axis(0), local);
-            let buf: Vec<f32> = slice.iter().copied().collect();
+            let gathered;
+            let buf: &[f32] = match slice.as_slice() {
+                Some(s) => s,
+                None => {
+                    gathered = slice.iter().copied().collect::<Vec<f32>>();
+                    &gathered
+                }
+            };
 
             let global = start + local;
             let fname = format!("{}_{global:05}.tiff", self.prefix);
@@ -747,7 +1019,7 @@ impl VolumeWriter for TiffWriter {
                 File::create(&fname).map_err(|e| Error::Io(format!("create {fname}: {e}")))?;
             let mut enc = TiffEncoder::new(BufWriter::new(file))
                 .map_err(|e| Error::Io(format!("tiff encoder {fname}: {e}")))?;
-            enc.write_image::<Gray32Float>(nx as u32, ny as u32, &buf)
+            enc.write_image::<Gray32Float>(nx as u32, ny as u32, buf)
                 .map_err(|e| Error::Io(format!("tiff write {fname}: {e}")))?;
         }
         Ok(())
@@ -762,9 +1034,12 @@ impl VolumeWriter for TiffWriter {
 /// `axes`/`description`/`units` attributes. The dataset is sized to the
 /// `reserve(total_nz)` slice count (the cross-section `(ny, nx)` comes from the
 /// first per-chunk volume); each `write_chunk` lands its chunk's slices in the
-/// global `[start, end)` rows via an HDF5 hyperslab, and the file is flushed so
-/// a streaming caller's partial output is durable. `path` is the output base —
-/// `.h5` is appended if absent (mirroring tomocupy `fnameout += '.h5'`).
+/// global `[start, end)` rows via an HDF5 hyperslab — `rust-hdf5` `pwrite`s the
+/// bytes immediately, but the container (headers + superblock) is only written
+/// when the writer is finalized. [`finalize`](VolumeWriter::finalize) closes it
+/// non-durably (`close_no_sync`); dropping without finalize closes it durably.
+/// `path` is the output base — `.h5` is appended if absent (mirroring tomocupy
+/// `fnameout += '.h5'`).
 ///
 /// Contiguous (not chunked) layout is required: `write_slice` hyperslabs are
 /// only valid on contiguous datasets, and `h5nolinks` output is uncompressed.
@@ -811,6 +1086,25 @@ impl H5Writer {
 
     /// Create `{path}.h5` with an `exchange/data` dataset of shape `(nz, ny, nx)`.
     fn create_dataset(&self, nz: usize, ny: usize, nx: usize) -> Result<H5WriteState> {
+        // Unlink a stale output first so the create always lands on a fresh
+        // inode. Creating over an existing output would otherwise truncate
+        // real content, which arms ext4 `auto_da_alloc`
+        // (replace-via-truncate protection) and turns the final `close(2)`
+        // into an implicit ~325 ms writeback — re-paying exactly the sync the
+        // non-durable `finalize` (`close_no_sync`) skips. The unlink trades
+        // away rust-hdf5's lock-before-truncate protection for this one file;
+        // that is acceptable here because the reconstruction output is
+        // regenerable and a concurrent reader of the old file keeps its inode.
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Io(format!(
+                    "remove stale {}: {e}",
+                    self.path.display()
+                )))
+            }
+        }
         let file = H5File::create(&self.path)
             .map_err(|e| Error::Io(format!("create {}: {e}", self.path.display())))?;
         let group = file
@@ -893,15 +1187,49 @@ impl VolumeWriter for H5Writer {
         }
         // The whole chunk (local rows `0..cz`, C-order `[cz, ny, nx]`) is written
         // into global rows `[start, end)` (tomocupy `dset[st:end] = rec`).
-        let slab: Vec<f32> = vol.array.iter().copied().collect();
-        state
-            .dataset
-            .write_slice(&[start, 0, 0], &[cz, ny, nx], &slab)
-            .map_err(|e| Error::Io(format!("write /exchange/data[{start}..{end}]: {e}")))?;
-        state
-            .file
-            .flush()
-            .map_err(|e| Error::Io(format!("flush {}: {e}", self.path.display())))?;
+        // `write_slice` `pwrite`s the chunk to the OS immediately; there is no
+        // per-chunk flush (`H5File::flush` is a documented no-op). The container
+        // is finalized once, in `finalize`.
+        //
+        // Every in-tree driver hands a standard C-layout chunk volume, whose
+        // backing slice is already the C-order `[cz, ny, nx]` slab `write_slice`
+        // expects — pass it zero-copy. The elementwise gather this replaces was
+        // the H5 writer's dominant cost (~2× the raw file write for a 512³
+        // volume); it remains only as the fallback for a non-contiguous caller.
+        let write = |slab: &[f32]| {
+            state
+                .dataset
+                .write_slice(&[start, 0, 0], &[cz, ny, nx], slab)
+                .map_err(|e| Error::Io(format!("write /exchange/data[{start}..{end}]: {e}")))
+        };
+        match vol.array.as_slice() {
+            Some(slab) => write(slab)?,
+            None => {
+                let slab: Vec<f32> = vol.array.iter().copied().collect();
+                write(&slab)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        // Close non-durably: writes all object headers + the superblock (so the
+        // file is a complete, valid HDF5 on return) but skips the finalize-path
+        // `fsync`, which otherwise dominates close latency. Durability is left to
+        // OS page-cache writeback, matching the TIFF/Zarr writers. Taking `state`
+        // leaves the writer spent; a later `write_chunk` would recreate the file,
+        // but the driver contract calls `finalize` exactly once, last.
+        //
+        // If this is never reached (an error/panic path drops the writer with
+        // `state` still `Some`), the inner `H5File`'s own `Drop` finalizes the
+        // file *durably* — a safe, slower fallback, never a corrupt file.
+        if let Some(state) = self.state.take() {
+            let H5WriteState { file, dataset, .. } = state;
+            // Release the dataset handle before closing the file it belongs to.
+            drop(dataset);
+            file.close_no_sync()
+                .map_err(|e| Error::Io(format!("close {}: {e}", self.path.display())))?;
+        }
         Ok(())
     }
 }
@@ -1048,13 +1376,24 @@ impl VolumeWriter for ZarrWriter {
         for local in 0..cz {
             let slice = vol.array.index_axis(Axis(0), local);
             // C-order (y-major, x fastest) little-endian f32 — exactly `<f4`.
-            let mut bytes = Vec::with_capacity(ny * nx * 4);
-            for &v in slice.iter() {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
+            // On a little-endian target the bytes of a contiguous slice already
+            // are `<f4`, so reinterpret them in place (bytemuck's safe Pod
+            // cast); gather elementwise only on a big-endian target or for a
+            // non-contiguous caller.
+            let gathered;
+            let bytes: &[u8] = match slice.as_slice() {
+                Some(s) if cfg!(target_endian = "little") => bytemuck::cast_slice(s),
+                _ => {
+                    gathered = slice
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>();
+                    &gathered
+                }
+            };
             let global = start + local;
             let chunk = data_dir.join(format!("{global}.0.0"));
-            std::fs::write(&chunk, &bytes)
+            std::fs::write(&chunk, bytes)
                 .map_err(|e| Error::Io(format!("write {}: {e}", chunk.display())))?;
         }
         Ok(())
@@ -1079,6 +1418,48 @@ mod tests {
             open_dxchange("definitely-not-a-real-file.h5"),
             Err(Error::Io(_))
         ));
+    }
+
+    #[test]
+    fn read_h5_frame_reads_one_u16_frame() {
+        // Beamline stacks are typically uint16; the frame read must convert
+        // via the dtype dispatch, not byte-copy. 2 frames × 2 rows × 3 cols.
+        let path = std::env::temp_dir().join("tomoxide_read_h5_frame_test.h5");
+        let _ = std::fs::remove_file(&path);
+        {
+            let file = H5File::create(&path).unwrap();
+            let group = file.create_group("exchange").unwrap();
+            let ds = group
+                .new_dataset::<u16>()
+                .shape([2, 2, 3])
+                .create("data")
+                .unwrap();
+            let vals: Vec<u16> = (0..12).collect();
+            ds.write_raw(&vals).unwrap();
+        }
+        let p = path.to_str().unwrap();
+
+        // Absolute and relative dataset paths both resolve.
+        let (ny, nx, f1) = read_h5_frame(p, "/exchange/data", 1).unwrap();
+        assert_eq!((ny, nx), (2, 3));
+        assert_eq!(f1, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+        let (_, _, f0) = read_h5_frame(p, "exchange/data", 0).unwrap();
+        assert_eq!(f0, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        // Out-of-range frame and non-3-D dataset are rejected.
+        assert!(matches!(
+            read_h5_frame(p, "/exchange/data", 2),
+            Err(Error::InvalidParam(_))
+        ));
+
+        // The shape probe agrees, on both path spellings.
+        assert_eq!(read_h5_sizes(p, "/exchange/data").unwrap(), (2, 2, 3));
+        assert_eq!(read_h5_sizes(p, "exchange/data").unwrap(), (2, 2, 3));
+        assert!(matches!(
+            read_h5_sizes(p, "/exchange/missing"),
+            Err(Error::Io(_))
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

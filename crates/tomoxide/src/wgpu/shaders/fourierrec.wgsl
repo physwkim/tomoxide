@@ -33,7 +33,7 @@ struct FrParams {
     coeff1   : f32, // Gaussian exponent  = -PI^2 / mu
     gscale   : f32, // gather input scale = 4 / nd
     phi_sign : f32, // divphi global sign = 1 - nd%4
-    inv_nf2  : f32, // inverse-2D-FFT normalisation = 1 / nf^2
+    norm     : f32, // pi/4 = (1/nf^2 inverse-FFT normalisation) x (pi*nd^2 unified amplitude)
     _p1      : f32,
     _p2      : f32,
 };
@@ -220,7 +220,7 @@ fn deapodize(@builtin(global_invocation_id) gid : vec3<u32>,
     let inner_row = ty + nd / 2u;
     let inner_col = tx + nd / 2u;
     let icell = z * nf * nf + inner_row * nf + inner_col;
-    let v = de_inner[icell].x * phi * de_p.inv_nf2;
+    let v = de_inner[icell].x * phi * de_p.norm;
     let my = (f32(ty) - ndf * 0.5) / ndf;
     let mx = (f32(tx) - ndf * 0.5) / ndf;
     let masked = select(0.0, v, (4.0 * mx * mx + 4.0 * my * my) < 1.0);

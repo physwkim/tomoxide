@@ -21,6 +21,8 @@
 
 // Foundational layer (was tomoxide-core).
 pub mod backend;
+#[cfg(feature = "config")]
+pub mod config;
 pub mod data;
 pub mod dtype;
 pub mod error;
@@ -43,7 +45,7 @@ pub mod engine;
 pub mod pipeline;
 
 pub use engine::Engine;
-pub use pipeline::{reconstruct, PrepOptions, ReconSteps};
+pub use pipeline::{reconstruct, CancelToken, PrepOptions, ReconSteps};
 
 // Flat re-exports of the common building blocks (was tomoxide-core's root).
 pub use backend::{

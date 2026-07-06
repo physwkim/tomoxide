@@ -3,10 +3,12 @@
 // linear-interp adjoint of backproject.wgsl.
 //
 // Forward projection is a SCATTER: each object voxel splats its value across the
-// two nearest detector columns of every angle. This kernel is the exact
-// TRANSPOSE of the voxel-driven back-projector — one thread per object voxel
-// (flat index over [nz, ny, nx]), the same trig/interp, read↔write swapped — so
-// {A, Aᵀ} is a matched pair by construction (the iterative solvers rely on this).
+// two nearest detector columns of every angle — unweighted, so this is the plain
+// line-integral Radon transform (unit pixel spacing). This kernel is the exact
+// TRANSPOSE of the voxel-driven back-projector at gain 1 — one thread per object
+// voxel (flat index over [nz, ny, nx]), the same trig/interp, read↔write swapped
+// — so {A, Aᵀ} is a matched pair by construction (the iterative solvers rely on
+// this) and a converged solve of `A x = p` yields the physical μ.
 // Voxels of different (iy, ix) splat onto the same detector column, so the
 // accumulation goes through the injected `atom_add_sino` helper
 // (WgpuBackend::atomic_f32_decl): native f32 atomicAdd on devices with
@@ -26,7 +28,7 @@ struct Params {
     ncols : u32,
     ny    : u32,
     nx    : u32,
-    scale : f32, // π/nproj — the adjoint gain matching the back-projector
+    _pad0 : u32,
     _pad1 : u32,
     _pad2 : u32,
     _pad3 : u32,
@@ -50,7 +52,7 @@ fn project(@builtin(global_invocation_id) gid : vec3<u32>,
     // atomics (a large fraction of a reconstruction's grid is background).
     let f = vol[flat];
     if (f == 0.0) { return; }
-    let fs = f * params.scale;
+    let fs = f;
 
     let iz = flat / plane;
     let rem = flat % plane;

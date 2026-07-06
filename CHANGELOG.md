@@ -6,6 +6,273 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-06
+
+### Changed
+
+- **`tomoxide-gui` now depends on `rsplot` 0.5.0 from crates.io** (was the
+  `siplot` git dependency pinned to a rev). The plotting crate and its GitHub
+  repo were renamed `siplot` → `rsplot` (and the sibling EPICS engine
+  `sidm` → `rsdm`) and published to crates.io; the GUI switches to
+  `rsplot = "=0.5.0"` with a commented-out `[patch.crates-io]` for local dev.
+  Mostly a `use siplot` → `use rsplot` identifier rename. The one behavioural
+  gap: the local `siplot` carried an unpushed commit making a `Plot2D`
+  crosshair read out the pixel value under the cursor ("x, y, value"); `rsplot`
+  0.5.0 instead exposes the value via the higher-level `ImageView`
+  (`value_changed`, silx `PositionInfo` "Data"). The Data sinogram inspector and
+  the Tune single-slice preview were migrated `Plot2D` → `ImageView` to keep the
+  value readout (the preview's `ColormapDialog` is replaced by `ImageView`'s
+  interactive colorbar). GUI build/clippy/35 tests green on CPU and CUDA. The
+  Data sinogram inspector and Tune preview `ImageView` layout was fixed and
+  verified on-screen: the `ImageView` position-info bar is emptied and the value
+  readout is pinned to the bottom so the image fills exactly the available
+  height, keeping the sinogram's resizable bottom panel stable (an earlier
+  version let it grow into / collapse away from the projection browser).
+
+### Added
+
+- **CLI `--progress_json`** (`recon`, `recon_steps`) — one flushed JSON line
+  per completed output chunk on stdout
+  (`{"start":s,"end":e,"total":nz,"secs":t}`; global slice range, full output
+  slice count, wall-clock seconds since run start), implemented as a thin
+  `VolumeWriter` tee. The multi-GPU shard orchestrator forwards the flag and
+  lets children inherit stdout, so shard lines stream through with global
+  ranges against one total. Machine progress for wrappers — the GUI Run
+  screen tails these from its subprocess runs. Runtime-only (not a config
+  key); progress lines are exactly the stdout lines starting with `{`.
+- **Cooperative cancellation for the chunked drivers** — new
+  `pipeline::CancelToken` (`Clone`-able atomic flag) attachable via
+  `ReconSteps::with_cancel`; all three drivers (`run`, `run_streaming`,
+  `run_streaming_pipelined_range`) check it at chunk boundaries and stop with
+  the new `Error::Cancelled`. Cancellation truncates: chunks already written
+  stay on disk and the writer finalizes the partial output.
+- **`io::InMemoryWriter`** — a `VolumeWriter` that collects the reconstruction
+  into a shared in-memory `InMemoryVolume` (the `Arc<Mutex<…>>` handle
+  survives the pipelined driver consuming the writer) with an optional
+  `on_chunk` progress callback. Backing store for GUI previews.
+- **`tomoxide::config` (feature `config`)** — the CLI's TOML `Config` moved
+  into the library behind a default-off feature (optional `serde`/`toml`
+  deps) so GUI recipes and CLI configs are one format. Gains three fields:
+  `lamino_angle`, `dtype`, and `output` (base path; each writer adds its own
+  suffix). The CLI gained the matching `--output` flag, `--config` now feeds
+  all three, and the multi-GPU z-shard fan-out forwards the resolved output
+  path to its children.
+- **`io::read_h5_frame`** — read one `[ny, nx]` frame of a 3-D HDF5 stack as
+  `f32` through the reader's full dtype dispatch (u8/i8/u16/i16/u32/i32/f32/
+  f64). Real beamline stacks are usually `uint16`; the GUI projection browser
+  reads through this (rsplot's own HDF5 loader handles 4/8-byte floats only).
+- **`io::read_h5_sizes`** — the `(n, ny, nx)` shape probe paired with
+  `read_h5_frame`, so a volume browser can size its frame list without
+  reading any data.
+- **Vo 2018 single-method stripe variants through config/CLI** — the
+  long-implemented `StripeMethod::VoSort`/`VoFilter`/`VoLarge`/`VoDead`/
+  `VoFit` are now selectable as `--remove_stripe vo-sort | vo-filter |
+  vo-large | vo-dead | vo-fit`, with per-method config fields/flags
+  (`vo_sort_*`, `vo_filter_*`, `vo_large_*`, `vo_dead_*`, `vo_fit_*`;
+  median sizes use the `fw_level` convention `0` = tomopy auto) and
+  multi-GPU shard forwarding.
+- **`tomoxide-gui` M1 (offline preview loop)** — new repo-internal but
+  workspace-`exclude`d crate (rsplot is edition-2024/rust-1.92; workspace
+  membership would raise the repo's effective MSRV above 1.82) implementing
+  docs/GUI.md M1: a single worker thread owns the `Engine` and all HDF5
+  handles (`!Send`); **Data** (DXchange open + metadata, projection browser —
+  frames load through `io::read_h5_frame` so `uint16` beamline stacks render,
+  with the colormap scaled to the stack's raw-count range — theta plot, raw
+  sinogram inspector), **Tune** (single-slice preview through
+  `run_streaming_pipelined_range` into `io::InMemoryWriter`, parameter panel
+  with auto-recon, A/B pin compare), **Center** (Vo / entropy /
+  phase-correlation / SIFT auto methods, ±0.5/±0.25 px tweak, hand-off to
+  Tune), and recipe save/load (recipe file = CLI config TOML plus a `[gui]`
+  table the CLI ignores). `tomoxide-gui [FILE] [--mode <mode>]` opens a
+  dataset and/or picks the starting mode from the command line, and Tune
+  fires the first preview of a fresh dataset by itself (the auto toggle
+  still gates re-runs on parameter changes).
+- **GUI Tune — λ sweep (L-curve regularization tuner).** For algorithms whose
+  `reg_par[0]` is a regularization strength λ (`tv`, `grad`, `tikh`,
+  `pml_*`, `ospml_*`), a new worker `Job::LambdaSweep` reconstructs the preview
+  slice once per λ across a log-spaced grid and scores each on the L-curve —
+  data residual `‖A x − b‖₂` (the fidelity term, via `sim::project`) vs the
+  reconstruction's isotropic TV seminorm (roughness). A floating window shows
+  the per-λ montage over the L-curve; the max-distance-to-chord corner is the
+  suggested λ, a click picks any point, and "Use selected λ" writes it to
+  `reg_par[0]`. The guide is the L-curve corner, not a sharpness auto-pick:
+  sharpness falls monotonically with λ and real data has no ground truth
+  (`docs/BENCHMARKS.md` §10), so the choice stays the user's. Verified finite
+  and λ-varying on both CPU and the CUDA device-resident 1-slice path.
+- **GUI design document** (`docs/GUI.md`) — design for a `tomoxide-gui`
+  desktop application built on rsplot (egui + wgpu) and rsdm (EPICS PVA):
+  offline workflow (dataset browsing, single-slice tune loop with A/B
+  compare, center finding with a `write_center` sweep montage, subprocess
+  full-volume runs, output browsing) plus a tomostream-style live streaming
+  mode, with the prioritized list of library additions it requires.
+
+### Added
+
+- **`ext_pad` — truncated-projection support extension for iterative
+  methods.** Real samples routinely overhang the field of view, so the
+  projections don't end at zero; an iterative forward model whose support is
+  the detector-width grid then dumps that inconsistency into a huge FOV-edge
+  ring and background offset that swamp the (intact) interior — on real
+  800-wide data a 10-iteration CGLS correlated only 0.56 with fbp full-frame
+  while agreeing 0.99 in the interior. With `ReconParams::ext_pad` (CLI
+  `--ext_pad`, config `ext_pad`, GUI Tune "extend FOV" — on by default in the
+  GUI) the sinogram is edge-replicate extended by `ncols/4` per side, the
+  solve runs on the wider grid, and the central crop is returned; the wrapper
+  sits above the backend dispatch so CPU/CUDA/wgpu see the identical extended
+  problem. Real-data result: CGLS-10 full-frame correlation with fbp 0.56 →
+  0.996, interior display contrast restored to fbp's level. Off by default in
+  the library (tomopy-parity semantics unchanged; ~2.25× cost per iteration).
+
+### Changed
+
+- **Analytic reconstructions now emit the physical μ** — the shared
+  `make_fbp_filter` base ramp is the physical `|ω|` inversion filter (peak
+  `0.5` at Nyquist) instead of tomopy/tomocupy's doubled ramp (peak `1`), and
+  `recon::gridrec`'s `ramp_scale` drops its matching empirical `×2`. Every
+  analytic method (FBP, linerec, fourierrec, lprec, gridrec, on all backends)
+  therefore reconstructs the attenuation μ per pixel-unit rather than `2×μ` —
+  the same scale the iterative solvers converge to, so fbp→iterative
+  warm-starts are now scale-consistent. **All analytic output amplitudes are
+  halved**; downstream code that hard-coded the old scale (rescale windows,
+  8/16-bit export ranges) must adjust. Cross-method and cross-backend ratios
+  are unchanged (both sides halve). Pinned by `tests/analytic_amplitude.rs` (a
+  unit disk reconstructs to core mean ≈ 1.0). This is a deliberate departure
+  from both upstreams, whose absolute analytic amplitude is itself
+  convention-dependent (tomopy gridrec ≈ 1.16×μ, tomocupy ≈ 4/π×μ).
+- **Iterative reconstructions now converge to the physical μ** — the
+  forward/back-projector pair used by the iterative solvers is the plain
+  line-integral Radon transform `W` and its pure adjoint `Wᵀ` on every
+  backend (CPU, CUDA, wgpu); the `π/nproj` FBP angular-quadrature weight
+  previously baked into both operators is now passed by the *analytic* FBP
+  call sites only, where it belongs. A converged SIRT/CGLS/MLEM/… solve of
+  `W x = p` therefore lands on the attenuation per pixel-unit (pinned by the
+  new `tests/iterative_amplitude.rs` against an analytic disk sinogram)
+  instead of `(nproj/π)·μ` — e.g. ≈ 143× smaller at 450 projections —
+  matching ART/BART, which always solved the ungained ray equations. Iterate
+  trajectories are unchanged up to that overall scale for the self-scaling
+  methods (SIRT/CGLS/MLEM/OSEM/PML/OSPML); for `grad`/`tikh`/`tv` the fixed
+  step and regularization now act on the physical scale, so hand-tuned
+  `reg_par` values from before may need retuning. The grad/tv host and CUDA
+  gain-compensation machinery (`adj_scale`/`fwd_gain_inv`) is deleted.
+  Analytic (FBP/gridrec/…) outputs are unchanged.
+- **GUI preview autoscale is percentile-robust** — image colormaps scale to
+  the 0.5–99.5 % range instead of the absolute min/max, so a handful of
+  extreme pixels (e.g. the FOV-edge ring iterative methods produce on
+  truncated-FOV data) no longer own the whole gray range and flatten the
+  interior structure.
+- **`sift-center` is pure Rust** — `find_center_sift` now runs on the
+  `lowe-sift` crate instead of the `opencv` binding, dropping the system
+  OpenCV + clang build requirement entirely. The uint8 normalization stays
+  bit-exact vs numpy; the SIFT stage is an independent implementation of
+  Lowe's paper, so recovered shifts land within ~0.034 px and the center
+  within 0.008 px of the cv2 golden (tolerances in `sift_center_parity`
+  updated from float-noise to algorithmic bounds). The feature now needs
+  rustc ≥ 1.92 (above the 1.82 MSRV, which is unchanged for default builds).
+- **`tomoxide-gui` builds with `sift-center` on by default** (alongside
+  `cuda`), so the Center screen's SIFT method is always available with no
+  extra system packages. A feature-gated smoke test pins the SIFT center
+  call chain end-to-end.
+- **HDF5/TIFF writers are zero-copy** — `H5Writer`/`TiffWriter` handed each
+  chunk through an elementwise gather copy before writing; a standard C-layout
+  chunk (what every driver produces) is now passed straight to the write call
+  (`as_slice`), with the gather kept only as a non-contiguous fallback. The
+  gather was the H5 writer's dominant cost (~2× the raw file write at 512³).
+- **The HDF5 reconstruction output is finalized without `fsync`** — new
+  `VolumeWriter::finalize` hook (called once by every driver on the success
+  path); `H5Writer` implements it with rust-hdf5 0.3.1's `close_no_sync`
+  (complete, valid HDF5; durability left to OS page-cache writeback, matching
+  the TIFF/Zarr writers). Dropping the writer without `finalize` (error paths)
+  still closes durably. Also removes the H5 writer's per-chunk `flush()`
+  (a documented no-op in rust-hdf5) and its stale "durable partial output"
+  doc claim. Combined effect on a 512³ fbp streaming recon (1 GPU): h5 output
+  1.61 s → 0.84 s, on par with tiff (0.83 s), bit-identical output.
+  rust-hdf5 0.3.2 supplies the second half of that win: its `create` no longer
+  `ftruncate`s a brand-new empty file — that truncate armed ext4
+  `auto_da_alloc`, whose implicit writeback inside the final `close(2)`
+  (~325 ms at 512³) silently defeated `close_no_sync`.
+- **The HDF5 writer unlinks a stale output before creating** — re-running a
+  reconstruction over an existing `.h5` output now lands on a fresh inode
+  instead of truncating the old file, so the overwrite rerun no longer pays
+  the `auto_da_alloc` writeback either (was +0.44 s end-to-end at 512³). The
+  unlink trades away rust-hdf5's lock-before-truncate protection for this one
+  regenerable output file.
+- **The Zarr writer emits `<f4` chunk bytes zero-copy** on little-endian
+  targets (bytemuck safe Pod cast — bytemuck core is now an unconditional
+  dependency, its `derive` feature still gated behind `gpu-wgpu`); the
+  per-element `to_le_bytes` gather remains only for big-endian targets and
+  non-contiguous callers.
+
+### Fixed
+
+- **CUDA analytic reconstruction of a single slice was silently all-zero**
+  (and an odd Fourierrec slice count a hard error). The z-bilinear
+  back-projection kernel samples slice pairs, so it needs a ≥2-slice batch,
+  and `cfunc_fourierrec` packs slice pairs, so it needs an even one — but a
+  1-slice job (GUI preview, `recon --start_row R --end_row R+1`) built the
+  streaming handle at capacity 1 and the one-shot path handed the kernels the
+  raw count. Both now pad the batch with zero rows up to the kernel domain
+  (≥2, even for Fourierrec) and drop the pad rows from the output, reusing
+  the existing partial-chunk machinery; `FourierReconstruct::reconstruct`
+  likewise zero-pads an odd stack instead of erroring. Multi-slice outputs
+  are unchanged (single-row CLI recon is bit-identical to the same row of a
+  multi-row run).
+- **CUDA iterative reconstruction of a single slice was garbage** (the same
+  batch-domain family as the analytic fix above, via the other kernel pair):
+  the device-resident solvers and the `FilteredBackproject`/`ForwardProject`
+  wrappers share the z-bilinear projection kernels, so a 1-slice problem
+  forward-projected to zero and the solve iterated on nothing — a GUI Tune
+  preview of sirt/tv showed garbage. `IterativeReconstruct::solve` and both
+  wrappers now duplicate the slice into a 2-slice problem (exact: the z-interp
+  weights sum to 1 on identical rows, and EM ratios stay finite where zero-pad
+  rows would 0/0) and drop the duplicate; the 1-slice solve equals the same
+  slice of a multi-slice solve.
+- **fourierrec output was uniformly π·nd² smaller than every other method**
+  (read as "all zeros" on real data — ~10⁻⁸ at nd = 800) on all three
+  backends: the deapodization missed the Δθ = π/nang angular quadrature
+  weight and compensated the inverse-FFT normalization against the wrong
+  reference amplitude. Invisible to every parity test because they compare
+  Pearson-style (scale-invariant) or fourierrec-to-fourierrec; the best-fit
+  fbp/fourierrec amplitude is now pinned ≈1 by a regression test. Host
+  (`phi_amp = π·nd²/nang`), CUDA (`divphi` ×π/4 over the unnormalized cuFFT
+  inverse), and wgpu (deapodize `norm = π/4`) all land on the unified
+  fbp/tomopy scale; cross-backend ratios are unchanged.
+- **gridrec disagreed with fbp/fourierrec on real data and sat on an
+  arbitrary amplitude.** Three defects in one method: (1) its output was
+  never masked to the detector-width disk, so gridding leakage outside the
+  field of view dominated the frame (corr vs fbp 0.36 on real 800-wide data
+  while agreeing 0.97 inside a 0.9-radius disk); (2) its radial FFT was
+  zero-padded, so the nonzero borders of real (truncated-FOV/absorbance)
+  projections became a hard step that rang across the FOV-edge annulus — it
+  now edge-replicates the padding exactly like `FbpFilter::apply`; (3) its
+  ramp weight and deapodization were unnormalized (the Kaiser–Bessel pair's
+  W/I₀(β) constant was dropped and no polar density compensation applied),
+  leaving a size-dependent scale (~2600× below fbp at n=128) — samples now
+  carry `2π·|ρ|/nang` and the true KB constant, landing on the unified
+  fbp/tomopy amplitude. Pinned by amplitude and truncated-projection
+  regression tests; real 800-wide data now: gridrec↔fourierrec corr 0.992,
+  gridrec↔ramp-fbp corr 0.963, scales within 3 %.
+- **`recon --start_row/--end_row` was silently ignored by the whole-volume
+  paths** (algorithms without a streaming handle — gridrec and the iterative
+  set, everything on CPU/wgpu — plus `--algorithm` chains): a 1-row request
+  read and wrote all rows. Both whole-volume branches now read only the
+  requested detector-row band and write it at its global slice offset
+  (matching the streaming/shard semantics); an explicit row range under
+  laminography is rejected (the tilt couples all rows) instead of dropped.
+
+### Documentation
+
+- **`docs/BENCHMARKS.md` §10 — FBP vs iterative accuracy against a known-truth
+  phantom.** Settles whether FBP's sharper *look* is accuracy or contrast using a
+  synthetic Shepp–Logan phantom (piecewise-const + a TV-adversarial textured
+  variant), inverse-crime-mitigated (generate at 2×, bin detector, recon at 1×),
+  with a transmission-Poisson noise sweep. Finding: a properly-regularised
+  iterative recon (TV, λ tuned to the noise) is closest to truth in every regime
+  (≈ halves FBP NRMSE at 450 views), FBP is the noise-robust floor whose extra
+  detail is contrast not accuracy, and unregularised fixed-iter CGLS is best at
+  high SNR but worse than FBP under noise. Also documents that real-data dense
+  references are method-dependent (FBP vs iterative disagree at r ≈ 0.73–0.81),
+  qualifying the §1 quality-proxy caveat.
+
 ## [0.5.1] - 2026-07-02
 
 ### Changed
@@ -320,7 +587,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/physwkim/tomoxide/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/physwkim/tomoxide/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/physwkim/tomoxide/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/physwkim/tomoxide/compare/v0.3.0...v0.4.0

@@ -50,7 +50,7 @@ void cfunc_linerec::ensure_texture() {
 }
 #endif
 
-void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, int sz, size_t stream_) {
+void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float gain, int sz, size_t stream_) {
     real* g = (real *)g_;
     real* f = (real *)f_;
     float* theta = (float *)theta_;
@@ -66,13 +66,14 @@ void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float ph
     dim3 fillBlock(32, 8, 1);
     dim3 fillGrid(ceil(n / 32.0), ceil(ncz / 8.0), ncproj);
     fill_tex_ker<<<fillGrid, fillBlock, 0, stream>>>(surf_obj, g, ncz, n, ncproj);
-    // Back-projector gain π/nproj (was tomocupy's 4/nproj). Matches the CPU/tomopy
-    // back-projector (cpu/mod.rs `PI/nang`) so fbp/linerec are scale-unified, and —
-    // paired with the identical change in forwardproj.cu — keeps {forward, back} a
-    // true adjoint pair for the iterative suite (convention unification Phase 2b).
-    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, 3.14159265358979f/nproj, sz, ncz, n, nz, ncproj);
+    // Back-projector gain is the CALLER's angular quadrature weight: the analytic
+    // FBP paths pass π/nproj (the dθ weight, was tomocupy's 4/nproj — unified to
+    // the CPU/tomopy scale), the iterative solvers pass 1 so this kernel is the
+    // pure adjoint of forwardproj.cu's unweighted scatter and the pair {A, Aᵀ}
+    // converges to the physical μ.
+    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, gain, sz, ncz, n, nz, ncproj);
 #else
-    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, ncz, n, nz, ncproj);
+    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, gain, sz, ncz, n, nz, ncproj);
 #endif
 }
 

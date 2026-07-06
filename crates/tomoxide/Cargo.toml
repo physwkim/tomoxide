@@ -17,12 +17,17 @@ exclude = ["tests/fixtures"]
 default = []
 # CUDA backend (nvcc-compiled vendored kernels; build.rs gates on this feature).
 cuda = []
-# Portable GPU backend (wgpu / Metal).
-gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Portable GPU backend (wgpu / Metal). Adds bytemuck's derive (proc-macro) for
+# the `#[derive(Pod, Zeroable)]` uniform structs; bytemuck core is always on.
+gpu-wgpu = ["dep:wgpu", "dep:pollster", "bytemuck/derive"]
 # Beam-hardening correction (pulls xraylib; its build runs bindgen → needs libclang).
 beam-hardening = ["dep:xraylib"]
-# SIFT center finding (pulls the opencv crate; links OpenCV, bindgen at build).
-sift-center = ["dep:opencv"]
+# SIFT center finding (pure-Rust lowe-sift; needs rustc ≥ 1.92 — see the
+# workspace manifest note).
+sift-center = ["dep:lowe-sift"]
+# Reconstruction Config (TOML): shared by the CLI (`--config`/`tomoxide init`)
+# and GUI recipes. Off by default so the core library stays serde-free.
+config = ["dep:serde", "dep:toml"]
 
 [dependencies]
 # numerics
@@ -47,15 +52,29 @@ log.workspace = true
 # end-to-end win — measured on a 1200x512x512 fbp streaming recon (1 GPU):
 # gzip-chunked 73.5s -> 4.3s (17x), uncompressed-chunked 9.5s -> 3.1s (3.1x);
 # output is byte-for-byte identical (deterministic decode).
-rust-hdf5 = { version = "0.3.0", features = ["parallel"] }
+# >=0.3.1: `H5File::close_no_sync` — finalize the reconstruction output (valid,
+# complete HDF5) without the finalize-path `fsync`; the recon output is
+# regenerable, and the TIFF/Zarr writers never fsync either (see the H5
+# writer's `finalize`). >=0.3.2: `create` no longer `ftruncate`s a brand-new
+# empty file — that truncate armed ext4 `auto_da_alloc`, whose implicit
+# writeback-on-close (~325 ms per 512^3 volume) silently defeated
+# `close_no_sync`. With both, h5 streaming output costs the same as tiff
+# (0.84 vs 0.83 s end-to-end at 512^3, 1 GPU).
+rust-hdf5 = { version = "0.3.2", features = ["parallel"] }
 tiff = "0.11"
 # optional GPU (wgpu / Metal) — only with `gpu-wgpu`
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
-bytemuck = { workspace = true, optional = true }
+# unconditional (not gpu-gated): the Zarr writer emits `<f4` chunk bytes via
+# bytemuck's safe Pod cast — io/mod.rs forbids `unsafe`, so the zero-copy
+# reinterpret needs it. Core only; `gpu-wgpu` adds the derive feature.
+bytemuck.workspace = true
 # optional x-ray physics (beam hardening) / computer vision (SIFT center)
 xraylib = { workspace = true, optional = true }
-opencv = { workspace = true, optional = true }
+lowe-sift = { workspace = true, optional = true }
+# optional config-file support — only with `config`
+serde = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndarray.workspace = true

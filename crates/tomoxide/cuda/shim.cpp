@@ -121,9 +121,9 @@ void* tomoxide_linerec_new(size_t nproj, size_t nz, size_t n, size_t ncproj, siz
   return new cfunc_linerec(nproj, nz, n, ncproj, ncz);
 }
 void tomoxide_linerec_backproject(void* h, void* f, const void* g, const float* theta, float phi,
-                                  int sz, void* stream) {
-  static_cast<cfunc_linerec*>(h)->backprojection(as_size(f), as_size(g), as_size(theta), phi, sz,
-                                                 as_size(stream));
+                                  float gain, int sz, void* stream) {
+  static_cast<cfunc_linerec*>(h)->backprojection(as_size(f), as_size(g), as_size(theta), phi, gain,
+                                                 sz, as_size(stream));
 }
 void tomoxide_linerec_free(void* h) { delete static_cast<cfunc_linerec*>(h); }
 

@@ -82,6 +82,14 @@ pub fn fourierrec(
                                   // tomocupy `divphi` global sign `1 − n%4` (== +1 for n divisible by 4, the
                                   // supported case; replicated verbatim so the overall sign matches).
     let phi_sign = 1.0 - (nd % 4) as f32;
+    // Unified amplitude (Phase 2 scale convention — every method emits the
+    // tomopy/fbp amplitude): the angular sum carries the Δθ = π/nang quadrature
+    // weight (as linerec's backprojection does), and `fft_2d` normalizes the
+    // (2nd)² inverse by 1/(2nd)² where the tomocupy reference leaves it
+    // unnormalized — together that leaves ×π·nd²/nang. Without it fourierrec
+    // lands π·nd² below fbp/gridrec (measured to 0.06 % at nd = 800), which
+    // Pearson-only tests cannot see; pinned by `fourierrec_matches_fbp_amplitude`.
+    let phi_amp = std::f32::consts::PI * (nd as f32) * (nd as f32) / nang as f32;
 
     // (cos θ, sin θ) per angle.
     let trig: Vec<(f32, f32)> = geom
@@ -222,7 +230,7 @@ pub fn fourierrec(
                 let tx = ox + crop;
                 let dx = tx as f32 / nd as f32 - 0.5;
                 let phi = (mu * (nd as f32) * (nd as f32) * (dx * dx + dy * dy)).exp()
-                    / nang as f32
+                    * phi_amp
                     * phi_sign;
                 let inner_col = tx + nd / 2;
                 let v = inner[inner_row * nf + inner_col].re * phi;

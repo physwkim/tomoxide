@@ -1,11 +1,14 @@
 //! SIFT center-finding parity against tomocupy's cv2 implementation.
 //!
 //! Golden from `tools/gen_sift_center_golden.py` (cv2 4.13 SIFT + BFMatcher).
-//! The Rust port links the SAME OpenCV (conda libopencv 4.13), so the uint8
-//! normalization, keypoints, matches, and recovered center match it closely
-//! (the small residual is f32 keypoint coords / match ordering).
+//! The uint8 normalization is a bit-exact numpy port (Δ = 0). The SIFT stage
+//! is the pure-Rust `lowe-sift` crate — an independent implementation of
+//! Lowe's paper, not a cv2 binding — so keypoints are not bit-identical to
+//! cv2's: measured on this fixture, per-pair mean shifts land within
+//! ~0.034 px of the cv2 golden and the recovered center within 0.008 px.
+//! The tolerances below bound that algorithmic residual, not float noise.
 //!
-//! Runs only with the `sift-center` feature (needs OpenCV at build + run time).
+//! Runs only with the `sift-center` feature.
 #![cfg(feature = "sift-center")]
 
 use ndarray::{Array1, Array2, Array3};
@@ -59,15 +62,15 @@ fn shifts_and_center_match_cv2() {
             max_d = max_d.max((shifts[[i, j]] - g_shifts[[i, j]]).abs());
         }
     }
-    // Same OpenCV library both sides → measured ≈ 5e-7 (f32 floor).
-    assert!(max_d < 1e-4, "SIFT shift max abs diff {max_d}");
+    // Independent SIFT implementation vs the cv2 golden → measured ≈ 0.034 px.
+    assert!(max_d < 0.2, "SIFT shift max abs diff {max_d}");
 
     // center = ncol/2 - mean(shift_x)/2 (mean over pairs), matching the golden.
     let ncol = datap1.dim().2 as f32;
     let mean_dx = (0..shifts.dim().0).map(|i| shifts[[i, 1]]).sum::<f32>() / shifts.dim().0 as f32;
     let center = ncol / 2.0 - mean_dx / 2.0;
     assert!(
-        (center - g_center[0]).abs() < 1e-4,
+        (center - g_center[0]).abs() < 0.1,
         "center {center} vs {}",
         g_center[0]
     );
@@ -78,8 +81,5 @@ fn shifts_and_center_match_cv2() {
     let proj180 = fliplr(&d2[0]);
     let c0 = find_center_sift(&proj0, &proj180, 0.5).unwrap();
     let want0 = ncol / 2.0 - g_shifts[[0, 1]] / 2.0;
-    assert!(
-        (c0 - want0).abs() < 1e-4,
-        "find_center_sift {c0} vs {want0}"
-    );
+    assert!((c0 - want0).abs() < 0.1, "find_center_sift {c0} vs {want0}");
 }

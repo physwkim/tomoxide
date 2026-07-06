@@ -3,18 +3,22 @@
 //
 // The voxel-driven back-projector gathers, for output voxel
 //   j = tx + ty*n + tz*n*n,
-//   f[j] += c * Σ_t  bilinear(g; u(j,t), v(j,t))   with c = π/nproj,
-// i.e. as a matrix `f = (c·W)·g` where `W` is the bilinear gather operator.
-// Its adjoint (the forward projector the iterative solvers need as `A`, with the
-// back-projector serving as `Aᵀ`) is `g = (c·Wᵀ)·f`: each voxel scatters its
-// value into the *same* (u,v) taps with the *same* bilinear weights and the same
-// `c`. Keeping the geometry byte-identical to `backprojection_ker` — the
-// (un-flipped) row `ty`, the `n/2` centre, the rotation matrix `R`, the
-// `(int)(·-1e-5)` tap,
-// and the in-bounds guard — makes {project, backproject} a true {A, Aᵀ} pair, so
-// SIRT/MLEM/OSEM/… converge. The shared guard `vr < nz-1` drops slice 0 for the
-// parallel beam (`v = tz` ⇒ `vr = tz-1`), the documented ≥2-slice rule, exactly
-// as the back-projector does.
+//   f[j] += c * Σ_t  bilinear(g; u(j,t), v(j,t)),
+// i.e. as a matrix `f = (c·W)·g` where `W` is the bilinear gather operator and
+// `c` the caller's gain (π/nproj for FBP's angular quadrature, 1 for the
+// iterative adjoint — see cfunc_linerec.cu). This forward projector is the
+// iterative solvers' `A = Wᵀ`, the *unweighted* scatter transpose: each voxel
+// scatters its value into the *same* (u,v) taps with the *same* bilinear
+// weights and no gain, so with the iterative back-projection (gain 1) the pair
+// {A, Aᵀ} = {Wᵀ, W} is a true adjoint pair AND `A` is the plain line-integral
+// Radon transform (unit pixel spacing) — a converged solve of `A x = p` yields
+// the physical μ, matching ART/BART and tomopy `project.c`. Keeping the
+// geometry byte-identical to `backprojection_ker` — the (un-flipped) row `ty`,
+// the `n/2` centre, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
+// in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge.
+// The shared guard `vr < nz-1` drops slice 0 for the parallel beam (`v = tz` ⇒
+// `vr = tz-1`), the documented ≥2-slice rule, exactly as the back-projector
+// does.
 //
 // f32 only (the iterative suite is f32); built into libtomoxide_cuda_kernels.a
 // by build.rs's `.cu` glob.
@@ -26,7 +30,7 @@
 // sinogram [nz][nproj][n] (must be pre-zeroed; the kernel only atomic-adds),
 // `f` the input volume [nz][n][n].
 static __global__ void forwardprojection_ker(float *g, const float *f, const float *theta,
-                                             float phi, float c, int n, int nz, int nproj)
+                                             float phi, int n, int nz, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -49,7 +53,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
         return;
 
     // Same (un-flipped) row and centre as the back-projector's accumulation index.
-    float val = c * f[tx + ty * n + tz * n * n];
+    float val = f[tx + ty * n + tz * n * n];
     if (val == 0.0f)
         return; // a zero voxel scatters nothing
 
@@ -84,18 +88,18 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 }
 
 // C-ABI host wrapper. `g` (output sinogram [nz][nproj][n]) must be pre-zeroed.
-// `c = π/nproj` matches backprojection_ker exactly so {forward, back} are a true
-// adjoint pair. The launch geometry mirrors cfunc_linerec::backprojection.
+// Unweighted (gain 1): the geometry matches backprojection_ker with gain 1 (the
+// iterative back-projection call), so {forward, back} are a true adjoint pair
+// and the forward is the plain line-integral Radon transform — matching the CPU
+// and wgpu forward projectors, so the iterative suite is scale-unified across
+// backends at the physical μ. The launch geometry mirrors
+// cfunc_linerec::backprojection.
 extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
                                         int nz, int n, int nproj, void *stream)
 {
     dim3 dimBlock(32, 32, 1);
     dim3 grid((unsigned)ceil(n / 32.0), (unsigned)ceil(n / 32.0), (unsigned)nz);
     size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
-    // π/nproj matches backprojection_ker's gain (see cfunc_linerec.cu) so
-    // {forward, back} stay a true adjoint pair, and matches the CPU forward/back
-    // (both PI/nang) so the iterative suite is scale-unified across backends.
-    float c = 3.14159265358979f / (float)nproj;
     forwardprojection_ker<<<grid, dimBlock, shmem, (cudaStream_t)stream>>>(
-        (float *)g, (const float *)f, theta, phi, c, n, nz, nproj);
+        (float *)g, (const float *)f, theta, phi, n, nz, nproj);
 }

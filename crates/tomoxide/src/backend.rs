@@ -418,11 +418,17 @@ pub enum RampShape {
 /// float16 pow2-rounding for the rest, keeping the wgpu radix-2 FFT usable at
 /// any width).
 ///
-/// The base ramp magnitude runs `0` at DC to `1` at Nyquist and `name`
-/// apodizes it. [`RampShape::Linear`] is the plain `2·k/pad` line (tomopy);
-/// [`RampShape::Wint`] is `2·pad·wint(t)` ([`wint_ramp`], tomocupy's degree-12
-/// quadrature ramp). Either way tomocupy's post-processing is mirrored: the
-/// windowed ramp is clamped to `≥0` and the DC bin is doubled. A grid too short
+/// The base ramp is the physical inversion filter `|ω|` in cycles/pixel, so it
+/// runs `0` at DC to `0.5` at Nyquist and `name` apodizes it.
+/// [`RampShape::Linear`] is the plain `k/pad` line (tomopy's ramp shape);
+/// [`RampShape::Wint`] is `pad·wint(t)` ([`wint_ramp`], tomocupy's degree-12
+/// quadrature ramp). Both tomopy and tomocupy carry an extra factor `2` here
+/// (their ramp peaks at `1` at Nyquist), which puts every analytic
+/// reconstruction at `2×` the physical attenuation μ; tomoxide drops it so the
+/// analytic output is μ per pixel-unit — the same scale the iterative solvers
+/// and `recon::lamino`'s own `|f|/ne` ramp converge to. Either way tomocupy's
+/// post-processing is mirrored: the windowed ramp is clamped to `≥0` and the DC
+/// bin is doubled (a no-op here since the ramp is `0` at DC). A grid too short
 /// for the order-12 rule falls back to the linear ramp even when `Wint` is
 /// requested (tomocupy's `_wint` is itself undefined there). The window set
 /// matches tomopy/tomocupy.
@@ -443,19 +449,23 @@ pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<V
     // below it). Real recons (`nhalf ≫ 23`) always take this path; only tiny
     // test/edge grids fall back to the plain linear ramp.
     const WINT_MIN: usize = 2 * ORDER - 1;
-    // Half-spectrum base ramp: tomocupy's `2·pad·wint(t)` quadrature ramp (≈
-    // `2·t`) for `Wint`, else the plain linear ramp — also the fallback when the
-    // grid is too short for the order-12 rule. `None` carries no ramp, so skip.
+    // Half-spectrum base ramp: the physical `|ω|` inversion filter in
+    // cycles/pixel (0 at DC, 0.5 at Nyquist). tomocupy's degree-12 `_wint`
+    // quadrature ramp (`pad·wint(t) ≈ t`) for `Wint`, else the plain linear ramp
+    // `k/pad` — also the fallback when the grid is too short for the order-12
+    // rule. Both upstreams double this (peak 1 at Nyquist), putting analytic
+    // output at 2×μ; we drop the factor 2 to land on the physical μ. `None`
+    // carries no ramp, so skip.
     let ramp_half: Vec<f32> = if name == FilterName::None {
         Vec::new()
     } else if shape == RampShape::Wint && nhalf >= WINT_MIN {
         let t: Vec<f64> = (0..nhalf).map(|k| k as f64 / pad as f64).collect();
         wint_ramp(ORDER, &t)
             .iter()
-            .map(|&wk| (2.0 * pad as f64 * wk) as f32)
+            .map(|&wk| (pad as f64 * wk) as f32)
             .collect()
     } else {
-        (0..nhalf).map(|k| 2.0 * k as f32 / pad as f32).collect()
+        (0..nhalf).map(|k| k as f32 / pad as f32).collect()
     };
     let mut f = vec![0.0f32; pad];
     for (k, slot) in f.iter_mut().enumerate() {

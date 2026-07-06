@@ -115,6 +115,38 @@ fn wavelength(energy: f64) -> f64 {
     2.0 * PHASE_PI * PLANCK_CONSTANT * SPEED_OF_LIGHT / energy
 }
 
+/// Detector rows of context a row-restricted (banded) run needs around the
+/// rows it will keep, so their retrieval matches a full-frame run: the Fresnel
+/// kernel's pixel support `⌈π·λ·dist / pixel_size²⌉` — the same `pad_pix` that
+/// sizes [`calc_pad_width`]'s padding (tomopy `_calc_pad_width`). `0` for
+/// [`PhaseMethod::None`]. Sizes the [`crate::io::RowBandReader`] band of a
+/// single-slice preview (docs/GUI.md §2.2).
+pub fn margin_rows(method: &PhaseMethod) -> usize {
+    let (pixel_size, dist, energy) = match *method {
+        PhaseMethod::None => return 0,
+        PhaseMethod::Paganin {
+            pixel_size,
+            dist,
+            energy,
+            ..
+        }
+        | PhaseMethod::GPaganin {
+            pixel_size,
+            dist,
+            energy,
+            ..
+        }
+        | PhaseMethod::Farago {
+            pixel_size,
+            dist,
+            energy,
+            ..
+        } => (pixel_size, dist, energy),
+    };
+    let (ps, dist) = (pixel_size as f64, dist as f64);
+    (PHASE_PI * wavelength(energy as f64) * dist / (ps * ps)).ceil() as usize
+}
+
 /// Pad each axis up to a power of two large enough to host the Fresnel kernel
 /// (tomopy `_calc_pad_width`): `(2^⌈log2(dim+pad_pix)⌉ − dim)/2`.
 fn calc_pad_width(dim: usize, pixel_size: f64, wl: f64, dist: f64) -> usize {

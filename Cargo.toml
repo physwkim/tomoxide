@@ -13,9 +13,16 @@ members = [
     "crates/tomoxide",
     "crates/tomoxide-cli",
 ]
+# The GUI lives in the repo but OUTSIDE this workspace (own [workspace], own
+# lock): it depends on rsplot (edition 2024, rust 1.92), and cargo parses every
+# member manifest on every command — as a member it would silently raise the
+# whole repo's effective MSRV from 1.82 to 1.92 (`default-members` does not
+# avoid the parse). Fold it in when the workspace MSRV reaches 1.92+.
+# See docs/GUI.md §3.1.
+exclude = ["crates/tomoxide-gui"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.82"
 license = "BSD-3-Clause"
@@ -25,7 +32,7 @@ description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in
 
 [workspace.dependencies]
 # --- the single library crate (used by the CLI binary) ---
-tomoxide = { path = "crates/tomoxide", version = "0.5.1" }
+tomoxide = { path = "crates/tomoxide", version = "0.6.0" }
 
 # --- x-ray physics (beam hardening; optional, pulled only by the
 # `beam-hardening` feature). From crates.io so the workspace is self-contained
@@ -37,8 +44,12 @@ tomoxide = { path = "crates/tomoxide", version = "0.5.1" }
 xraylib = "0.1"
 
 # --- computer vision (SIFT center finding; optional, `sift-center` feature).
-# Links a system/conda OpenCV (≥4.x); its build runs bindgen → needs clang. ---
-opencv = { version = "0.98", default-features = false, features = ["features2d", "imgproc"] }
+# Pure-Rust Lowe SIFT — no system OpenCV or clang. Its rust-version is 1.92,
+# above the workspace MSRV 1.82: the dep is optional and resolver = "2" does
+# not enforce rust-version, so only builds that ENABLE `sift-center` need the
+# newer toolchain. `default-features = false` drops its `image`-crate
+# conversion helpers (tomoxide builds `GrayImage` buffers directly). ---
+lowe-sift = { version = "0.2.1", default-features = false }
 
 # --- numerics ---
 ndarray = "0.16"
@@ -68,7 +79,10 @@ toml = "0.8"
 # fourierrec gather/wrap, lprec gather); falls back to CAS where unsupported.
 wgpu = "30"
 pollster = "0.4"
-bytemuck = { version = "1", features = ["derive"] }
+# bytemuck core is proc-macro-free and also used unconditionally (the Zarr
+# writer's safe `<f4` byte cast); the heavier `derive` feature is enabled only
+# by tomoxide's `gpu-wgpu` feature, which needs `#[derive(Pod, Zeroable)]`.
+bytemuck = "1"
 
 [profile.release]
 opt-level = 3

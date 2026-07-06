@@ -18,10 +18,15 @@ name = "tomoxide"
 path = "src/main.rs"
 
 [dependencies]
-tomoxide.workspace = true
+tomoxide = { workspace = true, features = ["config"] }
 clap.workspace = true
 anyhow.workspace = true
 env_logger.workspace = true
 serde.workspace = true
 toml.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+# Tests build `Volume`s for the VolumeWriter tee; same workspace pin as
+# tomoxide so the array types unify.
+ndarray.workspace = true
