@@ -6,7 +6,7 @@
 # [workspace] + own Cargo.lock; build from this directory. See docs/GUI.md §3.1.
 [package]
 name = "tomoxide-gui"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.92"
 license = "BSD-3-Clause"
@@ -16,19 +16,22 @@ description = "tomoxide desktop GUI (rsplot/egui)"
 [workspace]
 
 [features]
-# CUDA on by default: the GUI targets the same beamline machines as the CLI.
-# sift-center on by default so the Center screen's SIFT method is always
-# there — pure-Rust lowe-sift, no system packages. The tomoxide LIBRARY
-# default stays featureless (the feature needs rustc ≥ 1.92, above the
-# library workspace's 1.82 MSRV; this crate already pins 1.92).
+# Published to crates.io, so the default is CPU-only: `cargo install
+# tomoxide-gui` and the docs.rs build must succeed without an NVIDIA toolkit.
+# Turn on the CUDA backend explicitly with `--features cuda` on beamline
+# machines. sift-center stays on by default so the Center screen's SIFT method
+# is always there — pure-Rust lowe-sift, no system packages (it needs
+# rustc ≥ 1.92, above the library workspace's 1.82 MSRV; this crate pins 1.92).
 # gpu-wgpu stays off — tomoxide's wgpu backend duplicates a second wgpu stack
 # next to rsplot's egui-wgpu and buys the GUI nothing (docs/GUI.md §3.2).
-default = ["cuda", "sift-center"]
+default = ["sift-center"]
 cuda = ["tomoxide/cuda"]
 sift-center = ["tomoxide/sift-center"]
 
 [dependencies]
-tomoxide = { path = "../tomoxide", features = ["config"] }
+# `version` (alongside `path`) is required to publish to crates.io: the
+# published crate depends on tomoxide 0.6.0 from crates.io; local builds use path.
+tomoxide = { path = "../tomoxide", version = "0.6.0", features = ["config"] }
 # Same major as tomoxide's workspace pin — its public API leaks ndarray types
 # (Tomo.array, find_center_pc's Array2), so both must resolve to one ndarray.
 ndarray = "0.16"
