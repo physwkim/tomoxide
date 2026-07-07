@@ -4,7 +4,7 @@ This document is the design for a desktop GUI for tomoxide: a new crate
 `crates/tomoxide-gui` built on [rsplot] (egui 0.34 + wgpu scientific plotting,
 a silx port) for every scientific view, and on rsplot's sibling crate `rsdm`
 (a PyDM-style EPICS display/data-engine layer) for live PVAccess data. It
-covers two workflows in one application:
+covers three workflows in one application:
 
 1. **Offline** — open a DXchange HDF5, tune parameters on a single-slice
    preview, find the rotation axis, reconstruct the full volume, browse the
@@ -12,6 +12,9 @@ covers two workflows in one application:
 2. **Live streaming** — subscribe to a tomoScanStream-style PVA projection
    stream and reconstruct ortho-slices continuously while the operator nudges
    the rotation center (the tomostream operating model).
+3. **Spectroscopic (XANES)** — take a stack of reconstructed volumes acquired
+   across an absorption edge, fit each voxel's spectrum, and map the chemical
+   state (edge-shift / white-line energy) in 3-D.
 
 [rsplot]: https://github.com/physwkim/rsplot
 
@@ -29,8 +32,8 @@ composition of rsplot widgets around tomoxide's actual API surface.
 
 An `eframe` application (wgpu renderer — required by rsplot) with:
 
-- a **left mode rail** (`egui::SidePanel`) selecting one of six modes:
-  **Data · Tune · Center · Run · Output · Live**;
+- a **left mode rail** (`egui::SidePanel`) selecting one of seven modes:
+  **Data · Tune · Center · Run · Output · Live · XANES**;
 - a **persistent bottom log pane** (collapsible): every job with its
   parameters, timing, and outcome — the session history;
 - a **status bar**: resolved backend (`Engine::name()`), GPU inventory
@@ -206,6 +209,112 @@ The tomostream operating model, in-process:
   v1 recomputes the displayed slices each loop, which analytic GPU recon
   sustains at interactive rates for typical detector widths.
 
+### 2.7 XANES — spectroscopic chemical mapping
+
+The post-reconstruction spectroscopy workflow of the existing `xanes_tools`
+pipeline, brought in-process. Input is a **stack of reconstructed volumes, one
+per photon energy** across an absorption edge (Fe / Co / Ni K-edge, …); output
+is a per-voxel **chemical-state map** — the fitted white-line / edge energy —
+modulated by the **edge jump** (absorber thickness/density).
+
+- **Input.** Either (a) the **native product of the Run screen's batch
+  queue** — one tomoxide output per energy (each a tiff directory / `.h5`
+  holding a single `/exchange/data` / `.zarr`) plus the energy list, or
+  (b) a **combined multi-energy HDF5** in the existing Python layouts
+  (`reconstructions/{energy}` or `entry_1/{energy}/recon` + `energies`).
+  Both are read as a lazy 4-D `(E, z, y, x)` stack via the Output screen's
+  `VolumeSource` + `read_h5_sizes`/`read_h5_frame`, extended with the energy
+  axis (§6 #12); per-energy frames load lazily through the worker channel.
+  An **export writer to `reconstructions/{energy}`** covers the handoff to
+  the external Python registration step, which consumes that layout. v1
+  assumes the stack is **already registered** across energies (see honesty
+  note).
+- **Producing the stack — preprocessing and recon are unchanged.** The stack is
+  the output of an **energy loop over the existing reconstruction path**, not a
+  new one. Data preprocessing (flat/dark, −log, stripe removal, binning) stays
+  exactly the current DXchange prep, and each energy is reconstructed by
+  tomoxide's **existing CUDA streaming pipeline, used as-is**
+  (`run_streaming_pipelined_range` — the same read‖compute‖write path the Run
+  screen drives), with the rotation center reused from a reference energy or
+  re-found per energy (the notebook's practice — the axis is shared, but the
+  energy-dependent magnification shifts it slightly in pixels). The only new
+  recon-side code is the outer energy loop; there is **no XANES-specific
+  preprocessing or reconstruction kernel**.
+- **Fit controls** (mirroring `xanes_fitting_3d.py`, one panel group each):
+  - *Edge jump* = mean(last `n_post` energies) − mean(first `n_pre` energies)
+    → a 3-D thickness map.
+  - *Mask* (which voxels to fit): intensity threshold — absolute or percentile
+    — over mean / max / post-edge / single-energy intensity; or the *advanced*
+    pipeline (median filter → loose threshold → binary closing + hole fill →
+    largest connected component).
+  - *Smoothing* along energy: savgol / median / 3-point / boxcar with
+    window + order.
+  - *Fit*: quadratic vertex or Gaussian center over a `fit_points` window
+    around each spectrum's max, restricted to an energy range → per-voxel peak
+    energy; *concentration* = `(peak − startE)/(stopE − startE)` clipped to
+    [0, 1].
+- **Compute.** The fit is the existing **`txm_pal_core`** Rust core (per-voxel
+  Levenberg–Marquardt + rayon, no GPU), reused as a plain library dependency
+  (§6 #11). Voxel fits are independent, so the fit streams in **z-bands**:
+  read the `(E, band, ny, nx)` slab, fit it, write the result rows, advance —
+  bounded memory. The Python script's materialize-everything approach does
+  not transfer: a 40-energy 500³ f64 stack is ~40 GB; a band is `E × ny × nx`.
+  The port takes `f32` views (the recon output dtype), converting
+  per-spectrum for the f64 LM solver. The fit runs on the rayon pool under
+  the same `CancelToken` as recon jobs (checked between bands) — **not** on
+  the frame-serving worker thread, so browsing stays responsive during a long
+  fit; per-band progress streams back the same way `InMemoryWriter`'s
+  `on_chunk` reports full-volume runs (§6 #2).
+- **Result views**:
+  - **2-D chemical maps**: `ImageView` of peak-energy / concentration /
+    edge-jump for the selected Z (and an orthogonal Y cut) under the XANES HSV
+    colormap — hue = concentration (red→yellow→green edge-shift ramp),
+    value = alpha = normalized edge jump, unfitted voxels transparent. The
+    RGBA mapping is pure arithmetic ported from the Python viewer.
+  - **Histogram**: `Plot1D` of the fitted peak energies with draggable
+    start / center / stop lines — the oxidation-window control; re-binning is
+    the interactive threshold.
+  - **Click-to-spectrum**: clicking a voxel in a map (rsplot `ImageView`
+    value-query gives `(z, y, x)`) plots that voxel's raw spectrum
+    `stack[:, z, y, x]` vs energy in a `Plot1D`, with the fitted peak marked —
+    the core diagnostic of the Python viewer.
+  - **3-D**: the central panel toggles between the 2-D slice browser and a
+    **direct volume rendering** of the chemical map through rsplot's
+    `VolumeRaycaster` — a GPU front-to-back alpha-composited ray-march (WGSL,
+    orbit / pan / wheel-zoom) that replaces the earlier `ScalarFieldView`
+    iso-surface plan with the Python viewer's VTK-style ray-cast. The transfer
+    function reuses the **same viridis peak-energy colormap as the 2-D map** for
+    hue, with fitted voxels opaque and unfitted (masked / out-of-window) voxels
+    transparent; an opacity slider scales the composite. The volume is decimated
+    to a bounded edge (≤192) so the RGBA8 texture upload stays small. (Alpha is
+    fitted-voxel presence in this cut; hue = chemistry + alpha = edge-jump
+    thickness is the next transfer-function refinement.)
+  - **Save**: results HDF5 with `peak_energies` / `concentration` /
+    `edge_jump` / `mask` / `energies` / `histogram`, matching the schema the
+    existing `xanes_viewer_3d.py` reads, so the two viewers interoperate.
+
+**Honesty note — registration and magnification are upstream in v1.** Two
+XANES-specific corrections precede fitting and are **not** in the v1 screen:
+(a) **energy-to-energy 3-D registration** — the reference pipeline uses
+SimpleITK rigid Mutual-Information, which has no pure-Rust equivalent, so v1
+consumes an **already-registered** stack (produced by the existing Python
+`register_volumes.py`), with in-GUI registration a staged addition
+(translation-only phase-correlation first — `txm_pal_core` already ships
+`phase_cross_correlation` — then rigid MI; §6 #13). (b) **Zone-plate
+magnification correction** (the energy-dependent focal length) is now an
+**in-GUI toggle** (§6 #14): a side-panel option applies
+`xanes::apply_magnification` per energy before fitting, with editable zone-plate
+geometry and a live factor-range preview. Because the correction scales the `z`
+axis it can't be applied to the streamed `z`-bands independently, so enabling it
+reads the whole stack into memory and fits from the corrected copy; the default
+path still streams a band at a time. Per-energy reconstruction itself is **not**
+new work — it reuses the existing CUDA streaming pipeline as-is (see "Producing
+the stack" above).
+
+**Provenance.** The fitting math and workflow are the existing `txm_pal_core`
+(Rust) and `xanes_tools` (Python) — reused, not re-derived; the
+white-line / edge-shift method is standard XANES analysis. No third-party IP.
+
 ---
 
 ## 3. Architecture
@@ -363,6 +472,10 @@ vice versa.
 | 8 | P2/P3 | **Incremental ring-buffer recon** | `obj += bp(new) − bp(old)` over the circular buffer for the live loop; only needed if per-loop recompute misses the frame budget on large detectors. |
 | 9 | P2 | **Dezinger prep** | tomostream exposes Dezinger (median radius 2/3/4); add to `prep` or document its omission from the live parameter set. |
 | 10 | P3 | Nice-to-haves | `estimate_run(...) -> {host, vram, disk}` for the pre-flight panel (GUI-side arithmetic is the v1 fallback); `open_volume(path)` readers for reconstructed tiff/h5/zarr (GUI-side loaders are the v1 fallback). |
+| 11 | P1 (XANES) | **XANES fitting module** | Port `txm_pal_core`'s PyO3-free core (`fit.rs` Levenberg–Marquardt quad/gaussian, `filter.rs` smoothing) into `tomoxide::xanes` behind a feature: per-voxel peak-energy fit taking banded `ArrayView4<f32>` (E,band,ny,nx — the recon dtype, converted per-spectrum for the f64 solver) + `ArrayView3<u8>` mask, CPU + rayon, `CancelToken`-aware between bands. Reuse, not rewrite — split a non-PyO3 math crate (or add an `rlib` target; `txm_pal_core` is `cdylib`-only today). Align ndarray (`txm_pal_core` 0.15 → tomoxide 0.16) and lift `levenberg-marquardt`/`nalgebra`/`savgol-rs`. |
+| 12 | P1 (XANES) | **Multi-energy stack reader** | Energy-axis-aware loader yielding a lazy, z-band-readable 4-D `(E,z,y,x)` view over **either** a set of per-energy tomoxide outputs (tiff dir / `/exchange/data` h5 / zarr each — the batch queue's native product) + energy list, **or** a combined H5 (`reconstructions/{energy}` / `entry_1/{energy}/recon` + `energies`); plus the edge-jump / mask / intensity reductions over the energy axis, and an export writer to `reconstructions/{energy}` for the Python-registration handoff. |
+| 13 | P2/P3 (XANES) | **Energy-to-energy 3-D registration** | Translation-only phase-correlation first (reuse `txm_pal_core::phase_cross_correlation`); rigid Mattes-Mutual-Information (SimpleITK parity) is the genuine gap with no Rust equivalent — reimplement or ITK FFI. Until then registration stays an external Python step. |
+| 14 | P3 (XANES) | **Zone-plate magnification correction** — *done*. | Energy-dependent affine scale (zone-plate focal length ∝ energy). Implemented in `tomoxide::xanes::magnification` (`magnification_corr_factors` + `apply_magnification`, ported from `magnification_correction.py`) and wired as an in-GUI toggle in the XANES screen (applied per energy before fitting). |
 
 ---
 
@@ -380,8 +493,27 @@ vice versa.
   `RowBandReader` (#5) unlocking phase/iterative previews; Vo stripe
   variants (#6); Output screen (browsing, ScalarFieldView 3D, rescale
   export); batch queue.
-- **M3 — Live streaming**: rsdm PVA source + ring buffer + Z-slice live
-  loop with live center tweak and per-loop parameter re-read; then the
-  ortho X/Y kernels (#7) for the full multi-pane click-to-set experience;
-  incremental recon (#8) and dezinger (#9) as performance/parity
-  follow-ups.
+- **M3 — Live streaming** *(first cut done)*: rsdm PVA source + ring buffer
+  + Z-slice live loop with live center tweak and per-loop parameter re-read
+  are implemented (`crates/tomoxide-gui/src/live/{ring,source,recon_loop}.rs`
+  + `views/live.rs`), verified against an in-process `epics_pva_rs::PvaServer`.
+  Because rsdm delivers a flat frame, the width comes from a companion width
+  PV or a manual value and the height is a PV, a manual value, or derived from
+  the frame length (`len / width` — only the width is required); the angle
+  comes from a theta PV or a manual constant step per frame. Each frame pairs
+  with the latest scalar angle (no NTNDArray `uniqueId` exposure). Remaining:
+  the ortho X/Y kernels (#7) for the full
+  multi-pane click-to-set experience; incremental recon (#8) and dezinger (#9)
+  as performance/parity follow-ups.
+- **M4 — XANES spectroscopic mapping**: multi-energy stack reader (#12) +
+  ported `txm_pal_core` fitting module (#11); XANES screen with the fit
+  controls, 2-D chemical maps + histogram + click-to-spectrum, and a
+  results-H5 save interoperable with the existing Python viewer. The
+  per-energy stack is produced by looping the **existing CUDA streaming recon**
+  over energies with the current DXchange preprocessing unchanged — no new
+  recon/prep work. The 3-D chemical map now renders through rsplot's
+  `VolumeRaycaster` (a GPU direct-volume ray-cast), and **zone-plate
+  magnification correction (#14) is an in-GUI toggle** (`xanes::magnification`).
+  Registration stays upstream (Python) in v1; in-GUI registration
+  (translation → rigid, #13) is the remaining follow-up, along with an
+  edge-jump / thickness alpha transfer function for the raycaster.
