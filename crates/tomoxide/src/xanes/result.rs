@@ -62,7 +62,11 @@ pub fn write_peak_map_h5(
         .write_raw(&edge_flat)
         .map_err(|e| Error::Io(format!("write edge_jump: {e}")))?;
 
-    // mask (z, y, x) u8: 1 where the fit produced a finite energy.
+    // mask (z, y, x) u8: 1 where the fit produced a finite energy. This is a
+    // finite-fit mask (the complement of the viewer's `isnan(peak_energies)`),
+    // NOT the reference fitter's pre-fit selection mask. The viewer ignores this
+    // dataset and recomputes its NaN mask from `peak_energies`, so the two agree
+    // by construction; it is written only for downstream tools that expect it.
     let mask: Vec<u8> = peak_flat.iter().map(|v| u8::from(v.is_finite())).collect();
     file.new_dataset::<u8>()
         .shape([nz, ny, nx])
