@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use ndarray::{Array1, Array3, Array4, s};
+use ndarray::{Array1, Array3, Array4, ArrayView3, ArrayView4, s};
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{Colormap, CurveData, ImageView, ItemHandle, Plot1D, VolumeRaycaster, egui};
 use tomoxide::CancelToken;
@@ -112,7 +112,7 @@ const EDGE_JUMP_N: usize = 3;
 /// per-voxel reduction over the energy axis (every band carries all energies),
 /// it is exact band-by-band — and it rides the same (possibly magnification-
 /// corrected) `volband` as the fit, so the two always agree.
-fn edge_jump_band(volband: ndarray::ArrayView4<f32>) -> Vec<f64> {
+fn edge_jump_band(volband: ArrayView4<f32>) -> Vec<f64> {
     let (ne, bh, byn, bxn) = volband.dim();
     let n = EDGE_JUMP_N.min(ne).max(1);
     let mut out = vec![0.0_f64; bh * byn * bxn];
@@ -170,6 +170,97 @@ fn build_corrected(
         out.slice_mut(s![e, .., .., ..]).assign(&corrected);
     }
     Ok(out)
+}
+
+/// Bilinearly sample the magnification-corrected value at output voxel
+/// `(oz, oy, ox)` from a z-band of one raw energy volume — the single-voxel
+/// inverse of [`apply_magnification`]. `band` holds source z-planes
+/// `[z_base, z_base + band.dim().0)` with full `(ny, nx)`; `nz`/`nx` are the
+/// whole volume's extents (the affine centres on them, so they must be the full
+/// sizes, not the band's). A source coordinate outside the volume reads as 0
+/// (constant fill). The caller must supply a band covering
+/// `floor(src_z)..=floor(src_z)+1`; any in-volume plane is guaranteed inside the
+/// band [`corrected_voxel_spectrum`] computes. Passing the full volume with
+/// `z_base == 0` reproduces `apply_magnification` exactly.
+fn sample_band(
+    band: ArrayView3<f32>,
+    z_base: usize,
+    nz: usize,
+    nx: usize,
+    cf: f64,
+    (oz, oy, ox): (usize, usize, usize),
+) -> f32 {
+    let src_z = cf * oz as f64 + (1.0 - cf) * nz as f64 / 2.0;
+    let src_x = cf * ox as f64 + (1.0 - cf) * nx as f64 / 2.0;
+    let z0f = src_z.floor();
+    let fz = (src_z - z0f) as f32;
+    let z0 = z0f as isize;
+    let x0f = src_x.floor();
+    let fx = (src_x - x0f) as f32;
+    let x0 = x0f as isize;
+    let bz = band.dim().0;
+    let at = |zi: isize, xi: isize| -> f32 {
+        if zi < 0 || xi < 0 || zi as usize >= nz || xi as usize >= nx {
+            return 0.0; // outside the volume → constant fill
+        }
+        let zu = zi as usize;
+        if zu < z_base || zu - z_base >= bz {
+            return 0.0; // outside the read band (only in-volume planes reach here)
+        }
+        band[[zu - z_base, oy, xi as usize]]
+    };
+    let top = at(z0, x0) * (1.0 - fx) + at(z0, x0 + 1) * fx;
+    let bot = at(z0 + 1, x0) * (1.0 - fx) + at(z0 + 1, x0 + 1) * fx;
+    top * (1.0 - fz) + bot * fz
+}
+
+/// The magnification-corrected absorption spectrum at output voxel
+/// `(z, row, col)`, so a click reads the same corrected values the fit saw
+/// rather than the raw volume. Reads only the thin z-band spanning every
+/// energy's pre-image plane (the correction factors sit near 1, so the band is a
+/// few planes) and samples each energy through [`sample_band`].
+fn corrected_voxel_spectrum(
+    vol: &MultiEnergyVolume,
+    energies: &[f64],
+    mag: &MagnificationParams,
+    z: usize,
+    row: usize,
+    col: usize,
+) -> Result<Vec<f64>, String> {
+    let (ne, nz, _ny, nx) = vol.dims();
+    let cf = magnification_corr_factors(energies, mag);
+    if cf.len() != ne {
+        return Err(format!(
+            "magnification: {} factors for {ne} energies",
+            cf.len()
+        ));
+    }
+    // Bracket every energy's source z (= cf·z + (1−cf)·nz/2), then read the band
+    // covering floor(min)..floor(max)+1 clamped to the volume.
+    let (mut min_sz, mut max_sz) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &c in &cf {
+        let sz = c * z as f64 + (1.0 - c) * nz as f64 / 2.0;
+        min_sz = min_sz.min(sz);
+        max_sz = max_sz.max(sz);
+    }
+    let z_lo = min_sz.floor().clamp(0.0, nz as f64) as usize;
+    let z_hi = (max_sz.floor() + 2.0).clamp(0.0, nz as f64) as usize;
+    if z_hi <= z_lo {
+        return Ok(vec![0.0; ne]); // every pre-image lands outside the volume
+    }
+    let band = vol.read_band(z_lo, z_hi).map_err(|e| e.to_string())?;
+    Ok((0..ne)
+        .map(|e| {
+            sample_band(
+                band.slice(s![e, .., .., ..]),
+                z_lo,
+                nz,
+                nx,
+                cf[e],
+                (z, row, col),
+            ) as f64
+        })
+        .collect())
 }
 
 pub struct XanesView {
@@ -562,20 +653,31 @@ impl XanesView {
     }
 
     /// Read the clicked voxel's absorption spectrum and plot energy vs value.
+    /// When magnification correction is on, the spectrum is sampled from the
+    /// corrected volume so it matches the fitted map rather than the raw stack.
     fn pick_spectrum(&mut self, z: usize, row: usize, col: usize, log: &mut Vec<String>) {
         let Some(vol) = &self.volume else { return };
-        let band = match vol.read_band(z, z + 1) {
-            Ok(b) => b,
-            Err(e) => {
-                log.push(format!("xanes: spectrum read failed — {e}"));
-                return;
-            }
-        };
-        let (ne, _b, ny, nx) = band.dim();
-        if row >= ny || col >= nx {
+        let (ne, nz, ny, nx) = vol.dims();
+        if z >= nz || row >= ny || col >= nx {
             return;
         }
-        let y: Vec<f64> = (0..ne).map(|e| band[[e, 0, row, col]] as f64).collect();
+        let y: Vec<f64> = if self.mag_correct {
+            match corrected_voxel_spectrum(vol, &self.energies, &self.mag, z, row, col) {
+                Ok(s) => s,
+                Err(e) => {
+                    log.push(format!("xanes: spectrum read failed — {e}"));
+                    return;
+                }
+            }
+        } else {
+            match vol.read_band(z, z + 1) {
+                Ok(band) => (0..ne).map(|e| band[[e, 0, row, col]] as f64).collect(),
+                Err(e) => {
+                    log.push(format!("xanes: spectrum read failed — {e}"));
+                    return;
+                }
+            }
+        };
         let curve = CurveData::new(self.energies.clone(), y, egui::Color32::LIGHT_BLUE);
         match self.spectrum_curve {
             Some(h) => {
@@ -982,5 +1084,31 @@ mod tests {
         assert_eq!((h, w), (1, 1));
         assert_eq!(d, big.div_ceil(3), "stride-3 decimation along z");
         assert_eq!(rgba.len(), d * h * w * 4);
+    }
+
+    /// `sample_band` over the full volume (`z_base == 0`) must reproduce
+    /// `apply_magnification` voxel for voxel — it is the per-voxel inverse the
+    /// corrected-spectrum click uses, so a drift here would silently mis-read
+    /// spectra under magnification correction.
+    #[test]
+    fn sample_band_matches_apply_magnification() {
+        let (nz, ny, nx) = (5, 3, 6);
+        let vol =
+            Array3::<f32>::from_shape_fn((nz, ny, nx), |(z, y, x)| (z * 100 + y * 10 + x) as f32);
+        for &cf in &[0.9_f64, 1.0, 1.15] {
+            let corrected = apply_magnification(vol.view(), cf);
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let got = sample_band(vol.view(), 0, nz, nx, cf, (z, y, x));
+                        let want = corrected[[z, y, x]];
+                        assert!(
+                            (got - want).abs() < 1e-4,
+                            "cf {cf} voxel ({z},{y},{x}): {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
