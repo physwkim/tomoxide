@@ -139,10 +139,15 @@ fn edge_jump_band(volband: ndarray::ArrayView4<f32>) -> Vec<f64> {
 /// sub-volume is scaled about its centre by that energy's correction factor
 /// (normalised to the first energy), matching the reference workflow that writes
 /// corrected `reconstructions/{energy}` datasets.
+///
+/// `cancel` is polled once per energy; a fired token aborts with
+/// [`tomoxide::Error::Cancelled`]'s message so the caller can Stop mid-build
+/// (this runs before the fit loop and can take a while on a large stack).
 fn build_corrected(
     vol: &MultiEnergyVolume,
     energies: &[f64],
     mag: &MagnificationParams,
+    cancel: &CancelToken,
 ) -> Result<Array4<f32>, String> {
     let (ne, nz, ny, nx) = vol.dims();
     let cf = magnification_corr_factors(energies, mag);
@@ -157,6 +162,9 @@ fn build_corrected(
     // Peak memory is the corrected stack plus a single energy volume, not a
     // second full copy of the whole stack.
     for (e, &factor) in cf.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
         let raw = vol.read_energy(e).map_err(|e| e.to_string())?;
         let corrected = apply_magnification(raw.view(), factor);
         out.slice_mut(s![e, .., .., ..]).assign(&corrected);
@@ -337,8 +345,13 @@ impl XanesView {
             // Build the band source: stream off disk, or read + magnification-
             // correct the whole stack up front (z-coupled, so not band-local).
             let source = if mag_correct {
-                match build_corrected(&vol, &energies, &mag) {
+                match build_corrected(&vol, &energies, &mag, &cancel) {
                     Ok(a) => FitSource::Corrected(a),
+                    Err(_) if cancel.is_cancelled() => {
+                        let _ = tx.send(FitMsg::Finished(Err("cancelled".into())));
+                        ctx.request_repaint();
+                        return;
+                    }
                     Err(e) => {
                         let _ = tx.send(FitMsg::Finished(Err(format!(
                             "magnification correction: {e}"
