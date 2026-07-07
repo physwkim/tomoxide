@@ -53,6 +53,15 @@ pub enum FitMethod {
 }
 
 /// Optional 1-D spectral smoother applied before peak finding.
+///
+/// One smoother is applied uniformly regardless of the [`FitMethod`]. This is a
+/// deliberate divergence from the reference `TXM-Pal-core` fitter, whose two
+/// fit functions key the median branch on different strings (`"median"` in the
+/// quadratic path, `"medfilt"` in the gaussian path). Because the app passes a
+/// single algorithm name, exactly one fit method there silently skips
+/// smoothing — e.g. with `"median"` the gaussian fits run unsmoothed. The
+/// enum here removes that string coupling so median smoothing always applies;
+/// do not "restore parity" by reintroducing the split keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SmoothAlgo {
     /// No smoothing.
