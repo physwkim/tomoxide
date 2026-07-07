@@ -4,13 +4,15 @@
 //!
 //! `PlotId` allocation convention (rsplot ids must not collide; some widgets
 //! reserve a small range): Data 0–29, Tune 30–49, Center 50–69, Run 70–89,
-//! Output 90–109.
+//! Output 90–109, XANES 110–129, Live 130–149.
 
 pub mod center;
 pub mod data;
+pub mod live;
 pub mod output;
 pub mod run;
 pub mod tune;
+pub mod xanes;
 
 /// Draw an [`rsplot::ImageView`] with its pixel-value readout pinned to the
 /// bottom of the current region and the image filling the space above.

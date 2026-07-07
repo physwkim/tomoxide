@@ -1,18 +1,20 @@
 //! tomoxide-gui — desktop front-end for tomoxide, built on rsplot (egui+wgpu).
 //!
-//! Design: docs/GUI.md. Six modes (Data / Tune / Center / Run / Output / Live)
-//! behind a left mode rail, with a session log pane and a status bar. M1
-//! implements the offline preview loop (Data, Tune, Center + recipes); Run,
-//! Output, and Live are placeholders until M2/M3.
+//! Design: docs/GUI.md. Seven modes (Data / Tune / Center / Run / Output /
+//! XANES / Live) behind a left mode rail, with a session log pane and a status
+//! bar. M1 implements the offline preview loop (Data, Tune, Center + recipes);
+//! M2 adds Run/Output; M4 adds the XANES chemical-mapping screen; Live is a
+//! placeholder until M3.
 
 mod app;
+mod live;
 mod project;
 mod views;
 mod worker;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    // `tomoxide-gui [FILE] [--mode data|tune|center|run|output|live]`:
+    // `tomoxide-gui [FILE] [--mode data|tune|center|run|output|xanes|live]`:
     // optionally open a DXchange .h5 and/or start on a specific mode.
     let mut open: Option<std::path::PathBuf> = None;
     let mut mode: Option<app::Mode> = None;
@@ -21,7 +23,7 @@ fn main() -> eframe::Result {
         if arg == "--mode" {
             match args.next().as_deref().map(app::Mode::from_name) {
                 Some(Some(m)) => mode = Some(m),
-                _ => log::warn!("--mode: expected data|tune|center|run|output|live"),
+                _ => log::warn!("--mode: expected data|tune|center|run|output|xanes|live"),
             }
         } else {
             open = Some(std::path::PathBuf::from(arg));

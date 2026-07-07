@@ -17,17 +17,20 @@ pub enum Mode {
     Run,
     /// Browse reconstruction results — M2.
     Output,
+    /// Per-voxel XANES peak-energy chemical mapping — M4.
+    Xanes,
     /// Live streaming reconstruction (EPICS PVA) — M3.
     Live,
 }
 
 impl Mode {
-    const ALL: [Mode; 6] = [
+    const ALL: [Mode; 7] = [
         Mode::Data,
         Mode::Tune,
         Mode::Center,
         Mode::Run,
         Mode::Output,
+        Mode::Xanes,
         Mode::Live,
     ];
 
@@ -38,6 +41,7 @@ impl Mode {
             Mode::Center => "Center",
             Mode::Run => "Run",
             Mode::Output => "Output",
+            Mode::Xanes => "XANES",
             Mode::Live => "Live",
         }
     }
@@ -84,6 +88,8 @@ pub struct App {
     center: crate::views::center::CenterView,
     run: crate::views::run::RunView,
     output: crate::views::output::OutputView,
+    xanes: crate::views::xanes::XanesView,
+    live: crate::views::live::LiveView,
 }
 
 impl App {
@@ -117,6 +123,8 @@ impl App {
             center: crate::views::center::CenterView::new(render_state),
             run: crate::views::run::RunView::new(render_state),
             output: crate::views::output::OutputView::new(render_state),
+            xanes: crate::views::xanes::XanesView::new(render_state),
+            live: crate::views::live::LiveView::new(render_state),
         }
     }
 
@@ -378,9 +386,19 @@ impl App {
                     self.log.push(m);
                 }
             }
+            Mode::Xanes => {
+                let mut msgs = Vec::new();
+                self.xanes.ui(ui, &mut msgs);
+                for m in msgs {
+                    self.log.push(m);
+                }
+            }
             Mode::Live => {
-                ui.heading("Live");
-                ui.label("Planned for M3 (docs/GUI.md §7): EPICS PVA streaming reconstruction.");
+                let mut msgs = Vec::new();
+                self.live.ui(ui, &mut msgs);
+                for m in msgs {
+                    self.log.push(m);
+                }
             }
         }
     }
