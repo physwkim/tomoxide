@@ -28,6 +28,10 @@ sift-center = ["dep:lowe-sift"]
 # Reconstruction Config (TOML): shared by the CLI (`--config`/`tomoxide init`)
 # and GUI recipes. Off by default so the core library stays serde-free.
 config = ["dep:serde", "dep:toml"]
+# Per-voxel XANES peak-energy fitting (chemical-state maps from multi-energy
+# recons). Ported from `txm_pal_core`; pulls a Levenberg–Marquardt solver +
+# smoothers. Off by default — an analysis add-on, not part of a recon.
+xanes = ["dep:levenberg-marquardt", "dep:nalgebra", "dep:savgol-rs", "dep:median"]
 
 [dependencies]
 # numerics
@@ -75,6 +79,13 @@ lowe-sift = { workspace = true, optional = true }
 # optional config-file support — only with `config`
 serde = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
+# optional XANES fitting — only with `xanes`. Versions pinned to the reference
+# pipeline (`txm_pal_core`) so the LM/nalgebra pairing and numerics match; LM
+# 0.13 constrains nalgebra to ^0.32.
+levenberg-marquardt = { version = "0.13", optional = true }
+nalgebra = { version = "0.32", optional = true }
+savgol-rs = { version = "0.1", optional = true }
+median = { version = "0.3.2", optional = true }
 
 [dev-dependencies]
 ndarray.workspace = true

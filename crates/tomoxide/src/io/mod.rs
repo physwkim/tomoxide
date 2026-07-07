@@ -388,6 +388,49 @@ pub fn read_h5_frame(
     Ok((ny, nx, data))
 }
 
+/// Read the slice band `[z0, z1)` of a 3-D `[n, ny, nx]` HDF5 dataset as
+/// `(band, ny, nx, row-major f32)` — one coalesced hyperslab read for the whole
+/// band, converting from any numeric on-disk dtype (same dispatch as
+/// [`read_h5_frame`]). The band read is the streaming entry point for
+/// multi-energy volume fitting: a caller reads matching `[z0, z1)` bands from
+/// each energy's recon and never holds the full stack. `data_path` may be
+/// absolute or relative.
+pub fn read_h5_band(
+    path: &str,
+    data_path: &str,
+    z0: usize,
+    z1: usize,
+) -> Result<(usize, usize, usize, Vec<f32>)> {
+    let file = H5File::open(path).map_err(|e| Error::Io(format!("open {path}: {e}")))?;
+    let key = data_path.strip_prefix('/').unwrap_or(data_path);
+    let ds = file
+        .dataset(key)
+        .map_err(|e| Error::Io(format!("dataset {data_path}: {e}")))?;
+    let shape = ds.shape();
+    let [n, ny, nx] = shape[..] else {
+        return Err(Error::ShapeMismatch {
+            expected: "[n, ny, nx] (3-D stack)".into(),
+            found: format!("{shape:?}"),
+        });
+    };
+    if z0 >= z1 || z1 > n {
+        return Err(Error::InvalidParam(format!(
+            "band [{z0}, {z1}) out of range (stack has {n} slices)"
+        )));
+    }
+    let band = z1 - z0;
+    let data = read_f32_slice(&ds, &[z0, 0, 0], &[band, ny, nx])?;
+    Ok((band, ny, nx, data))
+}
+
+/// Every dataset key in an HDF5 file (as the reader stores them). Used to
+/// discover per-energy volumes in a combined stack without guessing how the
+/// writer formatted the group names — the caller parses the keys it wants.
+pub fn list_h5_datasets(path: &str) -> Result<Vec<String>> {
+    let file = H5File::open(path).map_err(|e| Error::Io(format!("open {path}: {e}")))?;
+    Ok(file.dataset_names())
+}
+
 /// Shape `(n, ny, nx)` of a 3-D HDF5 dataset — the metadata probe paired with
 /// [`read_h5_frame`], so a volume browser can size itself without reading any
 /// frame. Errors on a non-3-D dataset. `data_path` may be absolute or relative.
