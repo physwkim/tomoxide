@@ -66,14 +66,15 @@ fn build_volume_rgba(map: &Array3<f64>, disp: (f32, f32)) -> (Vec<u8>, usize, us
 
 /// A completed `z`-band, progress tick, or terminal status from the fit thread.
 enum FitMsg {
-    /// One finished band `[z0, z0+band)` of the peak-energy map, row-major
-    /// `(band, ny, nx)`.
+    /// One finished band `[z0, z0+band)` of the peak-energy map plus its
+    /// edge-jump band, both row-major `(band, ny, nx)`.
     Band {
         z0: usize,
         band: usize,
         ny: usize,
         nx: usize,
         data: Vec<f64>,
+        edge: Vec<f64>,
     },
     /// Slices completed so far.
     Progress(usize),
@@ -99,6 +100,38 @@ impl FitSource {
             FitSource::Corrected(a) => Ok(a.slice(s![.., z0..z1, .., ..]).to_owned()),
         }
     }
+}
+
+/// Pre/post-edge image count for the edge-jump reduction (matches the reference
+/// `calculate_edge_jump` default of 3).
+const EDGE_JUMP_N: usize = 3;
+
+/// Compute the edge-jump band from a `(E, band, ny, nx)` volume band:
+/// `mean(last n energies) - mean(first n energies)` per voxel, row-major
+/// `(band, ny, nx)`. `n` is clamped to the energy count. Because edge jump is a
+/// per-voxel reduction over the energy axis (every band carries all energies),
+/// it is exact band-by-band — and it rides the same (possibly magnification-
+/// corrected) `volband` as the fit, so the two always agree.
+fn edge_jump_band(volband: ndarray::ArrayView4<f32>) -> Vec<f64> {
+    let (ne, bh, byn, bxn) = volband.dim();
+    let n = EDGE_JUMP_N.min(ne).max(1);
+    let mut out = vec![0.0_f64; bh * byn * bxn];
+    let mut i = 0;
+    for z in 0..bh {
+        for y in 0..byn {
+            for x in 0..bxn {
+                let mut pre = 0.0_f64;
+                let mut post = 0.0_f64;
+                for e in 0..n {
+                    pre += volband[[e, z, y, x]] as f64;
+                    post += volband[[ne - 1 - e, z, y, x]] as f64;
+                }
+                out[i] = post / n as f64 - pre / n as f64;
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Read the full stack and apply per-energy zone-plate magnification correction,
@@ -158,6 +191,9 @@ pub struct XanesView {
 
     // Result.
     map: Option<Array3<f64>>,
+    /// Edge-jump volume (post-edge minus pre-edge absorption), filled band by
+    /// band alongside `map`; the viewer's opacity/thickness channel.
+    edge_jump: Option<Array3<f64>>,
     map_z: usize,
     /// Display window for the peak-energy colormap.
     disp: (f32, f32),
@@ -211,6 +247,7 @@ impl XanesView {
             cancel: None,
             progress: (0, 0),
             map: None,
+            edge_jump: None,
             map_z: 0,
             disp: (0.0, 1.0),
             map_view,
@@ -287,6 +324,7 @@ impl XanesView {
         let cancel = CancelToken::new();
         self.cancel = Some(cancel.clone());
         self.map = Some(Array3::from_elem((nz, ny, nx), f64::NAN));
+        self.edge_jump = Some(Array3::from_elem((nz, ny, nx), f64::NAN));
         self.progress = (0, nz);
         let ctx = ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -365,12 +403,14 @@ impl XanesView {
                     }
                 };
                 let data: Vec<f64> = mapband.iter().copied().collect();
+                let edge = edge_jump_band(volband.view());
                 let _ = tx.send(FitMsg::Band {
                     z0,
                     band: bh,
                     ny: byn,
                     nx: bxn,
                     data,
+                    edge,
                 });
                 let _ = tx.send(FitMsg::Progress(z1));
                 ctx.request_repaint();
@@ -395,12 +435,18 @@ impl XanesView {
                     ny,
                     nx,
                     data,
+                    edge,
                 } => {
                     if let Some(map) = &mut self.map
                         && let Ok(slab) = Array3::from_shape_vec((band, ny, nx), data)
                     {
                         map.slice_mut(s![z0..z0 + band, .., ..]).assign(&slab);
                         got_band = true;
+                    }
+                    if let Some(ej) = &mut self.edge_jump
+                        && let Ok(slab) = Array3::from_shape_vec((band, ny, nx), edge)
+                    {
+                        ej.slice_mut(s![z0..z0 + band, .., ..]).assign(&slab);
                     }
                 }
                 FitMsg::Progress(done) => self.progress.0 = done,
@@ -823,11 +869,19 @@ impl XanesView {
 
     fn save(&mut self, log: &mut Vec<String>) {
         let Some(map) = &self.map else { return };
+        let Some(edge_jump) = &self.edge_jump else {
+            return;
+        };
         if self.save_path.is_empty() {
             log.push("xanes: set a save path first".into());
             return;
         }
-        match write_peak_map_h5(&self.save_path, &self.energies, map.view()) {
+        match write_peak_map_h5(
+            &self.save_path,
+            &self.energies,
+            map.view(),
+            edge_jump.view(),
+        ) {
             Ok(()) => log.push(format!("xanes: saved peak map → {}", self.save_path)),
             Err(e) => log.push(format!("xanes: save FAILED — {e}")),
         }
