@@ -157,8 +157,13 @@ pub fn fit_peak_energy(energy: &[f64], spectrum: &[f64], p: &FitParams) -> f64 {
                 poly_order: p.smooth_order,
                 derivative: 0,
             };
-            if let Ok(f) = savgol_filter(&input) {
-                slice = f;
+            // A silent fall-through to the unsmoothed spectrum would fit raw
+            // data while the caller believes smoothing is on (plausible but
+            // wrong). Surface it as NaN instead; the `fit_map` driver validates
+            // the parameters up front so this is unreachable on that path.
+            match savgol_filter(&input) {
+                Ok(f) => slice = f,
+                Err(_) => return f64::NAN,
             }
         }
         SmoothAlgo::Median => slice = medfilt(slice, p.smooth_width, "zeropadding"),
@@ -262,6 +267,26 @@ pub fn fit_map(
             expected: format!("mask {:?}", (nz, ny, nx)),
             found: format!("mask {:?}", mask.dim()),
         });
+    }
+    // Validate Savitzky–Golay parameters once, loudly. Per voxel a filter
+    // failure falls back to NaN (see `fit_peak_energy`); without this probe a
+    // bad window/order would silently NaN the entire map. Probe on a dummy
+    // spectrum of the real length — validity depends on length, not values.
+    if matches!(params.smooth, SmoothAlgo::SavGol) {
+        let probe = vec![0.0f64; ne];
+        let input = SavGolInput {
+            data: &probe,
+            window_length: params.smooth_width,
+            poly_order: params.smooth_order,
+            derivative: 0,
+        };
+        if let Err(e) = savgol_filter(&input) {
+            return Err(Error::InvalidParam(format!(
+                "Savitzky–Golay smoothing invalid for {ne} energies \
+                 (window {}, order {}): {e}",
+                params.smooth_width, params.smooth_order
+            )));
+        }
     }
     let energy = energy
         .as_slice()
@@ -446,6 +471,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fit_map_rejects_invalid_savgol() {
+        // An even Savitzky–Golay window is invalid. The driver must reject it
+        // loudly up front, not silently NaN every voxel.
+        let energy = energy_axis();
+        let ne = energy.len();
+        let volume = Array4::<f32>::zeros((ne, 1, 1, 2));
+        let mask = Array3::<u8>::ones((1, 1, 2));
+        let p = FitParams {
+            method: FitMethod::Quadratic,
+            points: 7,
+            start_e: 8.30,
+            stop_e: 8.40,
+            smooth: SmoothAlgo::SavGol,
+            smooth_width: 4, // even window → invalid
+            smooth_order: 2,
+        };
+        let r = fit_map(
+            Array1::from(energy).view(),
+            volume.view(),
+            mask.view(),
+            &p,
+            None,
+        );
+        assert!(
+            matches!(r, Err(Error::InvalidParam(_))),
+            "invalid SavGol window must be a loud error, got {r:?}"
+        );
     }
 
     #[test]
