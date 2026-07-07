@@ -145,7 +145,6 @@ fn build_corrected(
     mag: &MagnificationParams,
 ) -> Result<Array4<f32>, String> {
     let (ne, nz, ny, nx) = vol.dims();
-    let full = vol.read_band(0, nz).map_err(|e| e.to_string())?;
     let cf = magnification_corr_factors(energies, mag);
     if cf.len() != ne {
         return Err(format!(
@@ -154,8 +153,12 @@ fn build_corrected(
         ));
     }
     let mut out = Array4::<f32>::zeros((ne, nz, ny, nx));
+    // One energy resident at a time: read energy e, resample it, store, drop.
+    // Peak memory is the corrected stack plus a single energy volume, not a
+    // second full copy of the whole stack.
     for (e, &factor) in cf.iter().enumerate() {
-        let corrected = apply_magnification(full.slice(s![e, .., .., ..]), factor);
+        let raw = vol.read_energy(e).map_err(|e| e.to_string())?;
+        let corrected = apply_magnification(raw.view(), factor);
         out.slice_mut(s![e, .., .., ..]).assign(&corrected);
     }
     Ok(out)

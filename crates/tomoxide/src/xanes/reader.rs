@@ -153,6 +153,34 @@ impl MultiEnergyVolume {
         }
         Ok(out)
     }
+
+    /// Read one energy's full `(nz, ny, nx)` volume as `f32`. Magnification
+    /// correction resamples each energy's whole volume (the scale couples the
+    /// `z` axis, so it cannot stream a band), but it only needs one energy
+    /// resident at a time — reading per energy keeps peak memory at roughly one
+    /// energy over the corrected stack rather than a second full copy.
+    pub fn read_energy(&self, ie: usize) -> Result<Array3<f32>> {
+        let l = self.layers.get(ie).ok_or_else(|| {
+            Error::InvalidParam(format!(
+                "read_energy {ie} out of range ({} energies)",
+                self.layers.len()
+            ))
+        })?;
+        let p = path_str(&l.path)?;
+        let (b, ny, nx, data) = read_h5_band(p, &l.dataset, 0, self.nz)?;
+        if (b, ny, nx) != (self.nz, self.ny, self.nx) {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{:?}", (self.nz, self.ny, self.nx)),
+                found: format!("{:?} at energy {}", (b, ny, nx), l.energy),
+            });
+        }
+        Array3::from_shape_vec((self.nz, self.ny, self.nx), data).map_err(|e| {
+            Error::ShapeMismatch {
+                expected: format!("{:?}", (self.nz, self.ny, self.nx)),
+                found: format!("flat energy read: {e}"),
+            }
+        })
+    }
 }
 
 fn path_str(p: &Path) -> Result<&str> {
@@ -217,6 +245,34 @@ mod tests {
         // band-local z=1 (global z=2), y=1, x=2 → 2*100 + 1*10 + 2 = 212.
         assert_eq!(band[[0, 1, 1, 2]], 212.0);
         assert_eq!(band[[1, 1, 1, 2]], 1212.0);
+
+        let _ = std::fs::remove_file(&hi);
+        let _ = std::fs::remove_file(&lo);
+    }
+
+    #[test]
+    fn reads_one_energy_full_volume() {
+        let dir = std::env::temp_dir().join("tomoxide_mev_energy_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let (nz, ny, nx) = (4, 2, 3);
+        let hi = dir.join("re_hi.h5");
+        let lo = dir.join("re_lo.h5");
+        write_volume(&hi, nz, ny, nx, 1000.0);
+        write_volume(&lo, nz, ny, nx, 0.0);
+        let mev = MultiEnergyVolume::from_files(
+            &[(8.36, hi.clone()), (8.30, lo.clone())],
+            "/exchange/data",
+        )
+        .unwrap();
+
+        // Energy index follows the ascending sort: 0 = lo (tag 0), 1 = hi (1000).
+        let e0 = mev.read_energy(0).unwrap();
+        assert_eq!(e0.dim(), (nz, ny, nx));
+        assert_eq!(e0[[2, 1, 2]], 212.0); // 2*100 + 1*10 + 2
+        let e1 = mev.read_energy(1).unwrap();
+        assert_eq!(e1[[2, 1, 2]], 1212.0);
+        // Out-of-range energy is a loud error, not a panic.
+        assert!(matches!(mev.read_energy(2), Err(Error::InvalidParam(_))));
 
         let _ = std::fs::remove_file(&hi);
         let _ = std::fs::remove_file(&lo);
