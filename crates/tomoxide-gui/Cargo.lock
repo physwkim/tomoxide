@@ -3616,9 +3616,9 @@ dependencies = [
 
 [[package]]
 name = "rsdm"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed6290d85dcc6f978636aad1b7432662969e98ffcc5af6c9f66f2ef8b46d69b9"
+checksum = "9508ce1c61c4e016ace222ab536cbf1ba8b4a5fb573b85b298708f51074527ea"
 dependencies = [
  "arboard",
  "epics-pva-rs",
@@ -3635,9 +3635,9 @@ dependencies = [
 
 [[package]]
 name = "rsplot"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bc1db8aba5da951ffa8ebe5298a8fe00a071f9bb578ee7bcf318100f3aeef11"
+checksum = "ba13936594768dd98eaf8052effe372263c511585409aa572e3175400f7fc0f3"
 dependencies = [
  "arboard",
  "bytemuck",
