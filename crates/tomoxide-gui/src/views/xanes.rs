@@ -97,7 +97,8 @@ enum FitMsg {
 /// memory and bands are sliced from it. One `band()` call, two backings.
 ///
 /// Memory note: the corrected backing is a resident `f32` `(E, nz, ny, nx)`
-/// array — `E·nz·ny·nx·4` bytes (e.g. ~34 GB for 40 energies at 1024³). This is
+/// array — `E·nz·ny·nx·4` bytes (e.g. ~172 GB for 40 energies at 1024³, or
+/// ~34 GB at 1024×1024×200). This is
 /// the deliberate cost of the z-coupling above and the reason correction is an
 /// opt-in toggle rather than always on: the streamed path never holds more than
 /// one band. Streaming magnification would need a z-neighbourhood band reader
