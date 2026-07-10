@@ -116,10 +116,17 @@ const EDGE_JUMP_N: usize = 3;
 
 /// Compute the edge-jump band from a `(E, band, ny, nx)` volume band:
 /// `mean(last n energies) - mean(first n energies)` per voxel, row-major
-/// `(band, ny, nx)`. `n` is clamped to the energy count. Because edge jump is a
-/// per-voxel reduction over the energy axis (every band carries all energies),
-/// it is exact band-by-band — and it rides the same (possibly magnification-
-/// corrected) `volband` as the fit, so the two always agree.
+/// `(band, ny, nx)`. Because edge jump is a per-voxel reduction over the energy
+/// axis (every band carries all energies), it is exact band-by-band — and it
+/// rides the same (possibly magnification-corrected) `volband` as the fit, so
+/// the two always agree.
+///
+/// `n = min(EDGE_JUMP_N, ne)` reproduces the reference `calculate_edge_jump`
+/// numpy slicing (`volumes[:n_pre]` / `volumes[-n_post:]`, defaults 3/3) exactly,
+/// including its degenerate regime: when `ne <= EDGE_JUMP_N` the pre and post
+/// windows both span the whole stack, so `edge_jump == 0` for every voxel — the
+/// reference behaves identically and real XANES scans (dozens of energies) never
+/// enter it. Order within the post window is irrelevant because it is a mean.
 fn edge_jump_band(volband: ArrayView4<f32>) -> Vec<f64> {
     let (ne, bh, byn, bxn) = volband.dim();
     let n = EDGE_JUMP_N.min(ne).max(1);
