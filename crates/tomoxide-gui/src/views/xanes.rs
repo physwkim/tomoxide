@@ -405,6 +405,18 @@ impl XanesView {
     /// Adopt a freshly loaded stack: reset fit range to its energy span and
     /// clear any previous result.
     fn set_volume(&mut self, volume: MultiEnergyVolume, info: String) {
+        // Loading a new stack owns the teardown of any in-flight fit. Without
+        // this a fit spawned against the previous volume keeps running: its
+        // thread holds a clone of the old volume, and when it finishes poll()
+        // writes stale bands (wrong dims/energies) into self.map for the new
+        // stack, with the progress bar still tracking the old job. Fire the
+        // cancel token and drop the job/progress so the map starts clean.
+        if let Some(c) = self.cancel.take() {
+            c.cancel();
+        }
+        self.job = None;
+        self.progress = (0, 0);
+
         self.energies = volume.energies();
         if let (Some(&first), Some(&last)) = (self.energies.first(), self.energies.last()) {
             self.start_e = first;
@@ -415,6 +427,7 @@ impl XanesView {
         self.map = None;
         self.fit_mag = None;
         self.finite_acc.clear();
+        self.last_stats_refresh = None;
         self.picked = None;
         self.info = info;
         self.volume = Some(volume);
