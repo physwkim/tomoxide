@@ -15,7 +15,7 @@
 //! `y` the rotation axis — the correction scales `z` and `x` and leaves `y`
 //! untouched.
 
-use ndarray::{Array2, Array3, ArrayView3};
+use ndarray::{Array3, ArrayView3, ArrayViewMut2, Axis};
 use rayon::prelude::*;
 
 /// Zone-plate geometry for the focal-length model. Defaults match the reference
@@ -102,12 +102,17 @@ pub fn apply_magnification(vol: ArrayView3<f32>, cf: f64) -> Array3<f32> {
         }
     };
 
-    // Build each output z-plane independently (matches the fit driver's rayon
-    // granularity; `AxisIterMut` is not itself a parallel iterator).
-    let planes: Vec<Array2<f32>> = (0..nz)
+    // Write each output z-plane directly into `out`, in parallel over z (the
+    // same granularity as the fit driver). Collecting the mutable z-plane views
+    // keeps rayon parallelism without a second full-volume buffer + copy:
+    // `AxisIterMut` is not itself a parallel iterator, but a `Vec` of its views
+    // is (cf. `cpu::mod::project`).
+    let mut out = Array3::<f32>::zeros((nz, ny, nx));
+    let planes: Vec<ArrayViewMut2<f32>> = out.axis_iter_mut(Axis(0)).collect();
+    planes
         .into_par_iter()
-        .map(|oz| {
-            let mut plane = Array2::<f32>::zeros((ny, nx));
+        .enumerate()
+        .for_each(|(oz, mut plane)| {
             let src_z = cf * oz as f64 + off_z;
             let z0f = src_z.floor();
             let fz = (src_z - z0f) as f32;
@@ -128,14 +133,7 @@ pub fn apply_magnification(vol: ArrayView3<f32>, cf: f64) -> Array3<f32> {
                     plane[[oy, ox]] = top * (1.0 - fz) + bot * fz;
                 }
             }
-            plane
-        })
-        .collect();
-
-    let mut out = Array3::<f32>::zeros((nz, ny, nx));
-    for (oz, plane) in planes.into_iter().enumerate() {
-        out.slice_mut(ndarray::s![oz, .., ..]).assign(&plane);
-    }
+        });
     out
 }
 
