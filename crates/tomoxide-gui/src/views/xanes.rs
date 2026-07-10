@@ -285,6 +285,11 @@ pub struct XanesView {
     mag_correct: bool,
     /// Zone-plate geometry driving the magnification correction.
     mag: MagnificationParams,
+    /// The magnification config that produced the current `map`: `Some(mag)` if
+    /// the fit ran corrected, `None` if raw. Snapshotted at fit start so a click
+    /// samples the spectrum the same way the map was fit, even if the live
+    /// `mag_correct`/`mag` controls are edited afterward.
+    fit_mag: Option<MagnificationParams>,
 
     // Fit state.
     job: Option<Receiver<FitMsg>>,
@@ -345,6 +350,7 @@ impl XanesView {
             band_size: 16,
             mag_correct: false,
             mag: MagnificationParams::default(),
+            fit_mag: None,
             job: None,
             cancel: None,
             progress: (0, 0),
@@ -390,6 +396,7 @@ impl XanesView {
         let (_e, nz, _ny, _nx) = volume.dims();
         self.map_z = nz / 2;
         self.map = None;
+        self.fit_mag = None;
         self.picked = None;
         self.info = info;
         self.volume = Some(volume);
@@ -427,6 +434,9 @@ impl XanesView {
         self.cancel = Some(cancel.clone());
         self.map = Some(Array3::from_elem((nz, ny, nx), f64::NAN));
         self.edge_jump = Some(Array3::from_elem((nz, ny, nx), f64::NAN));
+        // Pin how this map is being fit so pick_spectrum samples the same way,
+        // regardless of later edits to the mag controls.
+        self.fit_mag = mag_correct.then_some(mag);
         self.progress = (0, nz);
         let ctx = ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -653,16 +663,18 @@ impl XanesView {
     }
 
     /// Read the clicked voxel's absorption spectrum and plot energy vs value.
-    /// When magnification correction is on, the spectrum is sampled from the
-    /// corrected volume so it matches the fitted map rather than the raw stack.
+    /// The spectrum is sampled the same way the current map was fit — through
+    /// the magnification correction if the fit ran corrected (`fit_mag`), else
+    /// from the raw stack — so the plotted curve always matches the displayed
+    /// map, even after the mag controls are edited post-fit.
     fn pick_spectrum(&mut self, z: usize, row: usize, col: usize, log: &mut Vec<String>) {
         let Some(vol) = &self.volume else { return };
         let (ne, nz, ny, nx) = vol.dims();
         if z >= nz || row >= ny || col >= nx {
             return;
         }
-        let y: Vec<f64> = if self.mag_correct {
-            match corrected_voxel_spectrum(vol, &self.energies, &self.mag, z, row, col) {
+        let y: Vec<f64> = if let Some(fit_mag) = self.fit_mag {
+            match corrected_voxel_spectrum(vol, &self.energies, &fit_mag, z, row, col) {
                 Ok(s) => s,
                 Err(e) => {
                     log.push(format!("xanes: spectrum read failed — {e}"));
