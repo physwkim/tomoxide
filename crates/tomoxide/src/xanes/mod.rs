@@ -138,6 +138,13 @@ fn argmin(xs: &[f64]) -> Option<usize> {
 /// `[start_e, stop_e]`, and a [`FitMethod`] curve is fitted to a `points`-wide
 /// window around it. A fitted centre outside `[start_e, stop_e]` (or a
 /// degenerate window) yields NaN so the caller can mask it out.
+///
+/// This is the low-level per-voxel core and does not *reject* bad parameters —
+/// [`fit_map`] is the driver that validates them loudly. But it must never
+/// panic on a direct caller's input: an invalid smoother width (SavGol failure,
+/// or a zero/even width for the odd-window `Median`/`Boxcar` filters) also
+/// yields NaN, honouring the same mask-it-out contract rather than panicking
+/// (`median::Filter::new(0)`) or fabricating a value (boxcar `1/0`).
 pub fn fit_peak_energy(energy: &[f64], spectrum: &[f64], p: &FitParams) -> f64 {
     let n = energy.len();
     if n < 2 || spectrum.len() != n {
@@ -175,9 +182,24 @@ pub fn fit_peak_energy(energy: &[f64], spectrum: &[f64], p: &FitParams) -> f64 {
                 Err(_) => return f64::NAN,
             }
         }
-        SmoothAlgo::Median => slice = medfilt(slice, p.smooth_width, "zeropadding"),
+        // Median and Boxcar are odd-window-only. A zero width panics medfilt
+        // (`median::Filter::new(0)`) / makes boxcar divide by zero, and an even
+        // width silently corrupts (tail zeros / (w+1)/w inflation). fit_map
+        // rejects both up front, but this pub path must mask an invalid width as
+        // NaN, not panic — the same way the SavGol arm surfaces its error.
+        SmoothAlgo::Median => {
+            if p.smooth_width == 0 || p.smooth_width % 2 == 0 {
+                return f64::NAN;
+            }
+            slice = medfilt(slice, p.smooth_width, "zeropadding");
+        }
         SmoothAlgo::ThreePoint => slice = multi_3point_average(&slice, p.smooth_width),
-        SmoothAlgo::Boxcar => slice = boxcar(&slice, p.smooth_width),
+        SmoothAlgo::Boxcar => {
+            if p.smooth_width == 0 || p.smooth_width % 2 == 0 {
+                return f64::NAN;
+            }
+            slice = boxcar(&slice, p.smooth_width);
+        }
     }
 
     // Peak within the energy window.
@@ -444,6 +466,45 @@ mod tests {
             (got - truth).abs() < 0.003,
             "gaussian peak {got} vs truth {truth}"
         );
+    }
+
+    #[test]
+    fn fit_peak_energy_masks_invalid_smoother_width_instead_of_panicking() {
+        // fit_peak_energy is pub and does not validate params (fit_map does), but
+        // it must honour its "degenerate -> NaN" contract rather than panicking:
+        // Median width 0 would panic medfilt (median::Filter::new(0)) and an even
+        // width silently corrupts; boxcar width 0 divides by zero. All must NaN.
+        let energy = energy_axis();
+        let spectrum = synth_spectrum(&energy, 8.352, 0.02);
+        for smooth in [SmoothAlgo::Median, SmoothAlgo::Boxcar] {
+            for width in [0usize, 2, 4] {
+                let p = FitParams {
+                    method: FitMethod::Quadratic,
+                    points: 7,
+                    start_e: 8.30,
+                    stop_e: 8.40,
+                    smooth,
+                    smooth_width: width,
+                    ..Default::default()
+                };
+                let got = fit_peak_energy(&energy, &spectrum, &p);
+                assert!(
+                    got.is_nan(),
+                    "{smooth:?} width={width} must yield NaN, got {got}"
+                );
+            }
+        }
+        // A valid odd width still fits (proves the guard is not over-broad).
+        let p = FitParams {
+            method: FitMethod::Quadratic,
+            points: 7,
+            start_e: 8.30,
+            stop_e: 8.40,
+            smooth: SmoothAlgo::Median,
+            smooth_width: 3,
+            ..Default::default()
+        };
+        assert!(fit_peak_energy(&energy, &spectrum, &p).is_finite());
     }
 
     #[test]
