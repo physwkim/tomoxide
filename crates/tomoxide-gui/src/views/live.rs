@@ -41,7 +41,6 @@ enum LiveEvent {
     ConnectFailed(String),
     Status {
         fill: usize,
-        cap: usize,
         connected: bool,
         det: (usize, usize),
         darkflat: bool,
@@ -173,13 +172,14 @@ impl LiveView {
                 }
                 LiveEvent::Status {
                     fill,
-                    cap,
                     connected,
                     det,
                     darkflat,
                 } => {
+                    // capacity is UI-owned (the DragValue below flows to the
+                    // thread via LiveCmd); do NOT echo the thread's copy back
+                    // into params.capacity or it fights the user's live edits.
                     self.fill = fill;
-                    self.params.capacity = cap;
                     self.connected = connected;
                     self.det = det;
                     self.darkflat = darkflat;
@@ -583,7 +583,6 @@ fn live_thread(
         if last_status != Some(status) {
             send(LiveEvent::Status {
                 fill: status.0,
-                cap: params.capacity,
                 connected: status.1,
                 det: status.2,
                 darkflat: status.3,
