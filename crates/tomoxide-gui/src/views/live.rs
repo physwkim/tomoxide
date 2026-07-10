@@ -10,8 +10,11 @@
 //!
 //! Threading: the live thread owns the rsdm engine, the ring buffer, and a
 //! tomoxide backend; it exchanges [`LiveCmd`]/[`LiveEvent`] with the UI over
-//! mpsc channels and calls `Context::request_repaint` after each event — the
-//! same self-contained pattern the Output/XANES views use, kept off the shared
+//! mpsc channels. It holds no egui `Context` and never drives repaints itself:
+//! the Live view's `ui()` schedules `request_repaint_after(200 ms)` while a
+//! session runs, so redraws happen only while the Live tab is the visible mode
+//! rather than continuously in the background. Otherwise it is the same
+//! self-contained pattern the Output/XANES views use, kept off the shared
 //! frame-serving worker (which owns `!Send` HDF5 handles).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -131,12 +134,11 @@ impl LiveView {
         });
         ui.separator();
 
-        let ctx = ui.ctx().clone();
         egui::Panel::left("live_controls")
             .resizable(true)
             .default_size(360.0)
             .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.control_panel(ui, &ctx, log));
+                egui::ScrollArea::vertical().show(ui, |ui| self.control_panel(ui, log));
             });
 
         // Central: the reconstructed slice with its cursor value readout.
@@ -234,7 +236,7 @@ impl LiveView {
         }
     }
 
-    fn control_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, log: &mut Vec<String>) {
+    fn control_panel(&mut self, ui: &mut egui::Ui, log: &mut Vec<String>) {
         let running = self.handle.is_some();
 
         ui.strong("Connection");
@@ -293,7 +295,7 @@ impl LiveView {
         ui.horizontal(|ui| {
             if !running {
                 if ui.button("Connect").clicked() {
-                    self.connect(ctx.clone(), log);
+                    self.connect(log);
                 }
             } else if ui.button("Disconnect").clicked() {
                 self.teardown();
@@ -387,7 +389,7 @@ impl LiveView {
         }
     }
 
-    fn connect(&mut self, ctx: egui::Context, log: &mut Vec<String>) {
+    fn connect(&mut self, log: &mut Vec<String>) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         let image = Arc::new(Mutex::new(None));
@@ -397,7 +399,7 @@ impl LiveView {
         let params = self.params.clone();
         let join = std::thread::Builder::new()
             .name("tomoxide-live".to_owned())
-            .spawn(move || live_thread(addrs, manual, params, cmd_rx, evt_tx, image_thread, ctx))
+            .spawn(move || live_thread(addrs, manual, params, cmd_rx, evt_tx, image_thread))
             .expect("spawning the live thread");
         self.handle = Some(LiveHandle {
             cmd: cmd_tx,
@@ -512,11 +514,15 @@ fn live_thread(
     cmd_rx: Receiver<LiveCmd>,
     evt_tx: Sender<LiveEvent>,
     image: Arc<Mutex<Option<LiveImage>>>,
-    ctx: egui::Context,
 ) {
+    // The thread deliberately holds no egui Context: repaint scheduling is
+    // owned solely by the Live view's ui(), which calls request_repaint_after
+    // every 200 ms while a session runs. A thread-driven request_repaint()
+    // would fire on every event/recon regardless of which mode is visible,
+    // forcing the whole app to repaint continuously while the Live tab is in
+    // the background. Dropping the Context makes that storm unconstructable.
     let send = |e: LiveEvent| {
         let _ = evt_tx.send(e);
-        ctx.request_repaint();
     };
 
     let engine = match Engine::new(BackendKind::Auto) {
@@ -604,7 +610,6 @@ fn live_thread(
                         ms: t0.elapsed().as_millis(),
                         nproj,
                     });
-                    ctx.request_repaint();
                 }
                 Err(e) => send(LiveEvent::Error(e.to_string())),
             }
