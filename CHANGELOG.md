@@ -57,8 +57,8 @@ All notable changes to this project are documented here. The format is based on
   always caller-supplied; the reader never guesses a combined file's per-energy
   naming scheme.
 - **`tomoxide::xanes::write_peak_map_h5`** + **`io::list_h5_datasets`**. The
-  results writer emits a fitted map (`peak_energies`, `energies`, finite-voxel
-  `mask`) in the layout the `xanes_tools` Python viewer reads; the dataset
+  results writer emits a fitted map (`peak_energies`, `energies`, `edge_jump`,
+  finite-voxel `mask`) in the layout the `xanes_tools` Python viewer reads; the dataset
   lister returns every key in a file so a combined-stack loader can discover
   per-energy volumes without guessing the writer's name formatting.
 - **`tomoxide::xanes` — zone-plate magnification correction** (M4 #14). Ports the
