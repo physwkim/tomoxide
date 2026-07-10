@@ -222,6 +222,9 @@ impl DataView {
                         }
                     });
                 ui.separator();
+                // Plot controls (zoom, invert, log, grid, save/copy) — the
+                // buttons self-apply to the plot.
+                let _ = self.theta_plot.show_toolbar(ui);
                 self.theta_plot.show(ui);
             });
 
@@ -244,6 +247,10 @@ impl DataView {
                         ui.spinner();
                     }
                 });
+                // ImageView toolbar: plot controls + interp/agg/alpha/colorbar/
+                // profile/mask buttons (fixed height, so the exact-height
+                // readout layout below stays a stable fixed point).
+                self.sino_plot.show_toolbar(ui);
                 super::show_image_view_with_value(ui, &mut self.sino_plot);
             });
 

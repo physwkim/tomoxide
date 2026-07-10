@@ -40,6 +40,10 @@ pub mod prep;
 pub mod recon;
 pub mod sim;
 
+// Analysis add-ons.
+#[cfg(feature = "xanes")]
+pub mod xanes;
+
 // High-level orchestration.
 pub mod engine;
 pub mod pipeline;
