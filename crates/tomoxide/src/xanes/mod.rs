@@ -324,16 +324,25 @@ pub fn fit_map(
                 "{algo} smoothing needs a window width >= 1 (got 0)"
             )));
         }
-        // `medfilt` is a centred, odd-window filter (SciPy `medfilt` semantics):
-        // its window radius is `width / 2`, so an even width mis-centres the
-        // window and the right-edge branch stores under-filled, zero-padded
-        // medians — silently corrupting and re-zeroing the high-energy tail.
-        // Reject even widths up front, like the SavGol branch above and like the
-        // reference pipeline (which forces odd windows). Boxcar tolerates an even
-        // width (an asymmetric but valid uniform mean), so it is not rejected.
-        SmoothAlgo::Median if params.smooth_width % 2 == 0 => {
+        // Median and Boxcar are both centred, odd-window filters. medfilt's
+        // radius is `width / 2`, so an even width mis-centres it and the
+        // right-edge branch stores zero-padded medians (re-zeroing the tail).
+        // boxcar sums `width + 1` samples for an even width — window
+        // `[i - width/2, i + width/2]` — but normalises by `1 / width`, so it
+        // inflates a constant signal by `(width + 1) / width` (e.g. ×1.25 at
+        // width 4) instead of preserving it. Neither has a canonical even-window
+        // form (SciPy `medfilt` rejects even kernels; the reference forces odd),
+        // so reject even widths up front, like the SavGol branch above.
+        // ThreePoint uses `smooth_width` as an iteration count (even is fine) and
+        // None does not smooth.
+        SmoothAlgo::Median | SmoothAlgo::Boxcar if params.smooth_width % 2 == 0 => {
+            let algo = if matches!(params.smooth, SmoothAlgo::Median) {
+                "median"
+            } else {
+                "boxcar"
+            };
             return Err(Error::InvalidParam(format!(
-                "median smoothing needs an odd window width (got {})",
+                "{algo} smoothing needs an odd window width (got {})",
                 params.smooth_width
             )));
         }
@@ -584,19 +593,41 @@ mod tests {
     }
 
     #[test]
-    fn fit_map_rejects_even_width_median() {
-        // medfilt is odd-window only (centred radius = width/2); an even width
-        // silently mis-centres the window and re-zeros the high-energy tail.
-        // fit_map must reject it up front, the same way it rejects even SavGol
-        // windows. Boxcar tolerates an even width, so it must still be accepted.
+    fn fit_map_rejects_even_width_median_and_boxcar() {
+        // medfilt (centred radius = width/2) mis-centres and re-zeros the tail
+        // for an even width; boxcar sums width+1 samples but divides by width,
+        // inflating a constant by (width+1)/width. Both are odd-window only, so
+        // fit_map must reject an even width up front, the way it rejects even
+        // SavGol windows.
         let energy = energy_axis();
         let ne = energy.len();
         let volume = Array4::<f32>::zeros((ne, 1, 1, 1));
         let mask = Array3::<u8>::ones((1, 1, 1));
-        for width in [2usize, 4, 6] {
+        for smooth in [SmoothAlgo::Median, SmoothAlgo::Boxcar] {
+            for width in [2usize, 4, 6] {
+                let p = FitParams {
+                    smooth,
+                    smooth_width: width,
+                    ..FitParams::default()
+                };
+                let r = fit_map(
+                    Array1::from(energy.clone()).view(),
+                    volume.view(),
+                    mask.view(),
+                    &p,
+                    None,
+                );
+                assert!(
+                    matches!(r, Err(Error::InvalidParam(_))),
+                    "{smooth:?} width={width} (even) must be a loud error, got {r:?}"
+                );
+            }
+        }
+        // An odd width is still accepted for both.
+        for smooth in [SmoothAlgo::Median, SmoothAlgo::Boxcar] {
             let p = FitParams {
-                smooth: SmoothAlgo::Median,
-                smooth_width: width,
+                smooth,
+                smooth_width: 5,
                 ..FitParams::default()
             };
             let r = fit_map(
@@ -607,24 +638,10 @@ mod tests {
                 None,
             );
             assert!(
-                matches!(r, Err(Error::InvalidParam(_))),
-                "Median width={width} (even) must be a loud error, got {r:?}"
+                r.is_ok(),
+                "{smooth:?} odd width must be accepted, got {r:?}"
             );
         }
-        // Boxcar with the same even width is fine (asymmetric but valid mean).
-        let p = FitParams {
-            smooth: SmoothAlgo::Boxcar,
-            smooth_width: 4,
-            ..FitParams::default()
-        };
-        let r = fit_map(
-            Array1::from(energy.clone()).view(),
-            volume.view(),
-            mask.view(),
-            &p,
-            None,
-        );
-        assert!(r.is_ok(), "Boxcar even width must be accepted, got {r:?}");
     }
 
     #[test]

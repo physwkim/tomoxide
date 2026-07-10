@@ -87,6 +87,12 @@ pub fn multi_3point_average(arr: &[f64], iteration: usize) -> Vec<f64> {
 }
 
 /// Centred boxcar (uniform) filter of width `kernel_size`.
+///
+/// `kernel_size` must be **odd**: the window is `[i - k/2, i + k/2]`, which spans
+/// `k + 1` samples for an even `k` while the weight stays `1 / k`, so an even
+/// width inflates a constant signal by `(k + 1) / k` instead of preserving it.
+/// As with [`medfilt`], the [`super::fit_map`] driver rejects even widths up
+/// front, so callers on that path never reach this with one.
 pub fn boxcar(arr: &[f64], kernel_size: usize) -> Vec<f64> {
     let kernel_weight: f64 = 1.0 / kernel_size as f64;
     let half_kernel: usize = kernel_size / 2;
