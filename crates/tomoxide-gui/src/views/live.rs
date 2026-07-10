@@ -311,7 +311,13 @@ impl LiveView {
             .num_columns(2)
             .show(ui, |ui| {
                 ui.label("slice z");
-                let zmax = self.det.0.saturating_sub(1).max(1);
+                // Valid slice indices are 0..ny (det.0 is the detector row count
+                // / recon Z extent), so the max index is ny - 1. The old `.max(1)`
+                // forced zmax >= 1 even when ny == 1, offering slice 1 for a
+                // single-row detector — out of range (reconstruct_slice then errs
+                // with "slice out of range" instead of reconstructing row 0). A
+                // zero-width 0..=0 range is fine for egui's Slider.
+                let zmax = self.det.0.saturating_sub(1);
                 ui.add(egui::Slider::new(&mut self.params.slice, 0..=zmax));
                 ui.end_row();
 
