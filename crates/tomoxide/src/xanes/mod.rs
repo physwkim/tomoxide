@@ -257,6 +257,15 @@ pub fn fit_peak_energy(energy: &[f64], spectrum: &[f64], p: &FitParams) -> f64 {
 ///
 /// Returns a `(z, y, x)` `f64` map of fitted peak energies (NaN where masked,
 /// unfittable, or out of the energy window).
+///
+/// Window contract: unlike the smoother parameters — which are rejected up
+/// front with [`Error::InvalidParam`] — an inconsistent search window is *not*
+/// an error. If `start_e >= stop_e`, or the window does not overlap `energy`
+/// (`start_e` past the last energy), every voxel falls out of the window and
+/// the whole map comes back NaN. This is by design (the NaN mask is the signal),
+/// but it means an all-NaN result is the caller's cue to check that
+/// `start_e < stop_e` and that `[start_e, stop_e]` overlaps the energy grid,
+/// not evidence of a fit failure.
 pub fn fit_map(
     energy: ArrayView1<f64>,
     volume: ArrayView4<f32>,
