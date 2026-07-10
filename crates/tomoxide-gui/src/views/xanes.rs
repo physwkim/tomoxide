@@ -95,6 +95,14 @@ enum FitMsg {
 /// `z` axis (each energy's volume is rescaled about its centre), so it cannot be
 /// applied band-by-band; when enabled the whole corrected stack is held in
 /// memory and bands are sliced from it. One `band()` call, two backings.
+///
+/// Memory note: the corrected backing is a resident `f32` `(E, nz, ny, nx)`
+/// array — `E·nz·ny·nx·4` bytes (e.g. ~34 GB for 40 energies at 1024³). This is
+/// the deliberate cost of the z-coupling above and the reason correction is an
+/// opt-in toggle rather than always on: the streamed path never holds more than
+/// one band. Streaming magnification would need a z-neighbourhood band reader
+/// (the affine only reaches `floor(src_z)..=floor(src_z)+1`); until then, large
+/// stacks with correction enabled are bounded by host RAM, not by disk.
 enum FitSource {
     Streamed(MultiEnergyVolume),
     Corrected(Array4<f32>),
