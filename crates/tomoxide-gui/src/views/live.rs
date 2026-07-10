@@ -15,6 +15,7 @@
 //! frame-serving worker (which owns `!Send` HDF5 handles).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,9 @@ enum LiveCmd {
     Stop,
 }
 
-/// Live thread → UI.
+/// Live thread → UI. Small, bounded control events only — the big
+/// reconstructed-slice payload rides a latest-wins slot ([`LiveImage`]), not this
+/// queue, so it cannot accumulate when the UI is not draining.
 enum LiveEvent {
     Connected,
     ConnectFailed(String),
@@ -43,20 +46,26 @@ enum LiveEvent {
         det: (usize, usize),
         darkflat: bool,
     },
-    Image {
-        ny: usize,
-        nx: usize,
-        data: Vec<f32>,
-        ms: u128,
-        nproj: usize,
-    },
     Error(String),
+}
+
+/// The latest reconstructed slice. Overwritten in place every loop — only the
+/// newest slice is meaningful — so a backgrounded Live tab holds at most one
+/// image (~one detector slice) instead of an unbounded queue of them.
+struct LiveImage {
+    ny: usize,
+    nx: usize,
+    data: Vec<f32>,
+    ms: u128,
+    nproj: usize,
 }
 
 /// A running live session: the command/event channels and the thread handle.
 struct LiveHandle {
     cmd: Sender<LiveCmd>,
     evt: Receiver<LiveEvent>,
+    /// Latest-wins slot for the reconstructed slice (see [`LiveImage`]).
+    image: Arc<Mutex<Option<LiveImage>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -175,20 +184,22 @@ impl LiveView {
                     self.det = det;
                     self.darkflat = darkflat;
                 }
-                LiveEvent::Image {
-                    ny,
-                    nx,
-                    data,
-                    ms,
-                    nproj,
-                } => {
-                    self.recon_ms = ms;
-                    self.last_nproj = nproj;
-                    self.image = Some((ny, nx, data));
-                    self.redraw();
-                }
                 LiveEvent::Error(e) => log.push(format!("live: {e}")),
             }
+        }
+
+        // Pull the latest reconstructed slice from the latest-wins slot. Only
+        // one is ever buffered, so this stays bounded even if the tab was
+        // inactive for the whole scan.
+        let latest = self
+            .handle
+            .as_ref()
+            .and_then(|h| h.image.lock().unwrap().take());
+        if let Some(img) = latest {
+            self.recon_ms = img.ms;
+            self.last_nproj = img.nproj;
+            self.image = Some((img.ny, img.nx, img.data));
+            self.redraw();
         }
     }
 
@@ -379,16 +390,19 @@ impl LiveView {
     fn connect(&mut self, ctx: egui::Context, log: &mut Vec<String>) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let image = Arc::new(Mutex::new(None));
+        let image_thread = Arc::clone(&image);
         let addrs = self.addrs.clone();
         let manual = self.manual.clone();
         let params = self.params.clone();
         let join = std::thread::Builder::new()
             .name("tomoxide-live".to_owned())
-            .spawn(move || live_thread(addrs, manual, params, cmd_rx, evt_tx, ctx))
+            .spawn(move || live_thread(addrs, manual, params, cmd_rx, evt_tx, image_thread, ctx))
             .expect("spawning the live thread");
         self.handle = Some(LiveHandle {
             cmd: cmd_tx,
             evt: evt_rx,
+            image,
             join: Some(join),
         });
         self.connecting = true;
@@ -497,6 +511,7 @@ fn live_thread(
     mut params: LiveReconParams,
     cmd_rx: Receiver<LiveCmd>,
     evt_tx: Sender<LiveEvent>,
+    image: Arc<Mutex<Option<LiveImage>>>,
     ctx: egui::Context,
 ) {
     let send = |e: LiveEvent| {
@@ -579,13 +594,19 @@ fn live_thread(
         if (n > 0 || changed) && ring.len() >= 2 {
             let t0 = Instant::now();
             match reconstruct_slice(&ring, &params, engine.backend()) {
-                Ok((ny, nx, data, nproj)) => send(LiveEvent::Image {
-                    ny,
-                    nx,
-                    data,
-                    ms: t0.elapsed().as_millis(),
-                    nproj,
-                }),
+                Ok((ny, nx, data, nproj)) => {
+                    // Overwrite the latest-wins slot rather than queueing: a
+                    // backgrounded UI keeps at most this one slice, not a
+                    // frame's worth per loop.
+                    *image.lock().unwrap() = Some(LiveImage {
+                        ny,
+                        nx,
+                        data,
+                        ms: t0.elapsed().as_millis(),
+                        nproj,
+                    });
+                    ctx.request_repaint();
+                }
                 Err(e) => send(LiveEvent::Error(e.to_string())),
             }
         }
