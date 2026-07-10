@@ -66,7 +66,12 @@ pub fn reconstruct_slice(
     let mut one = Tomo::new(sino, Layout::Sinogram);
     tomoxide::prep::remove_stripe(&mut one, params.stripe)?;
 
-    let mut geom = Geometry::parallel(Angles(ring.thetas()), nx, 1, 1.0);
+    // The ring stores angles in degrees (tomoScanStream/DXchange convention);
+    // `Angles` is radians. Convert at this boundary, mirroring
+    // `H5DxchangeReader::read_theta` (which owns the deg→rad conversion for the
+    // offline path) — otherwise a 0–180° sweep is reconstructed as 0–180 rad.
+    let thetas: Vec<f32> = ring.thetas().iter().map(|t| t.to_radians()).collect();
+    let mut geom = Geometry::parallel(Angles(thetas), nx, 1, 1.0);
     if let Some(c) = params.center {
         geom.center = Center::Scalar(c);
     }
@@ -122,5 +127,55 @@ mod tests {
         let ring = ProjRing::new(4);
         let err = reconstruct_slice(&ring, &LiveReconParams::default(), &backend);
         assert!(matches!(err, Err(Error::InvalidParam(_))));
+    }
+
+    /// Regression: the ring stores angles in degrees (tomoScanStream/DXchange
+    /// convention) but `Angles` is radians, so `reconstruct_slice` must convert
+    /// at the boundary — exactly as `H5DxchangeReader::read_theta` does. Feeding
+    /// degrees straight into `Angles` scrambles the sweep (0–180° read as
+    /// 0–180 rad ≈ 28 turns) and yields a different, wrong image. This pins the
+    /// output to a radian-converted reference recon; it fails if the conversion
+    /// is dropped.
+    #[test]
+    fn ring_angles_are_reconstructed_in_radians() {
+        use tomoxide::{Layout, ReconParams, Tomo, recon};
+        let backend = tomoxide::CpuBackend;
+        let nx = 32;
+        let nproj = 45;
+        let mut ring = ProjRing::new(nproj);
+        ring.set_geometry(1, nx);
+        for p in 0..nproj {
+            let mut frame = Array2::<f32>::from_elem((1, nx), 1.0);
+            for x in (nx / 2 - 3)..(nx / 2 + 3) {
+                frame[[0, x]] = 0.2;
+            }
+            ring.push(180.0 * p as f64 / nproj as f64, frame);
+        }
+        let params = LiveReconParams {
+            capacity: nproj,
+            ..Default::default()
+        };
+        let (_ny, _nx, got, _used) = reconstruct_slice(&ring, &params, &backend).unwrap();
+
+        // Reference: identical FBP but with the ring's degrees converted to
+        // radians (the fix's boundary conversion) done explicitly here.
+        let sino = ring.sinogram(0).unwrap();
+        let one = Tomo::new(sino, Layout::Sinogram);
+        let thetas: Vec<f32> = ring.thetas().iter().map(|t| t.to_radians()).collect();
+        let geom = Geometry::parallel(Angles(thetas), nx, 1, 1.0);
+        let rp = ReconParams {
+            num_gridx: Some(nx),
+            filter_name: params.filter,
+            ext_pad: params.ext_pad,
+            ..Default::default()
+        };
+        let vol = recon::recon(&one, &geom, params.algorithm, &rp, &backend).unwrap();
+        let want: Vec<f32> = vol.array.iter().copied().collect();
+
+        assert_eq!(got.len(), want.len());
+        assert!(
+            got.iter().zip(&want).all(|(g, w)| (g - w).abs() < 1e-4),
+            "reconstruct_slice must build Angles from radians, matching read_theta"
+        );
     }
 }
