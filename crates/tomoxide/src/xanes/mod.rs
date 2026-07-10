@@ -277,25 +277,45 @@ pub fn fit_map(
             found: format!("mask {:?}", mask.dim()),
         });
     }
-    // Validate Savitzky–Golay parameters once, loudly. Per voxel a filter
-    // failure falls back to NaN (see `fit_peak_energy`); without this probe a
-    // bad window/order would silently NaN the entire map. Probe on a dummy
-    // spectrum of the real length — validity depends on length, not values.
-    if matches!(params.smooth, SmoothAlgo::SavGol) {
-        let probe = vec![0.0f64; ne];
-        let input = SavGolInput {
-            data: &probe,
-            window_length: params.smooth_width,
-            poly_order: params.smooth_order,
-            derivative: 0,
-        };
-        if let Err(e) = savgol_filter(&input) {
+    // Validate the smoother parameters once, loudly, so no per-voxel smoother
+    // call can panic inside the rayon map (aborting the whole reconstruction)
+    // or silently NaN/inf the map. Per voxel a SavGol failure still falls back
+    // to NaN (see `fit_peak_energy`); the width-driven smoothers are guarded
+    // here by construction.
+    match params.smooth {
+        SmoothAlgo::SavGol => {
+            // Validity depends on length, not values; probe a dummy spectrum of
+            // the real length.
+            let probe = vec![0.0f64; ne];
+            let input = SavGolInput {
+                data: &probe,
+                window_length: params.smooth_width,
+                poly_order: params.smooth_order,
+                derivative: 0,
+            };
+            if let Err(e) = savgol_filter(&input) {
+                return Err(Error::InvalidParam(format!(
+                    "Savitzky–Golay smoothing invalid for {ne} energies \
+                     (window {}, order {}): {e}",
+                    params.smooth_width, params.smooth_order
+                )));
+            }
+        }
+        // Median builds a `median::Filter::new(width)` that panics on a
+        // zero-length window; Boxcar divides by `width` (→ inf). Both need a
+        // positive width. ThreePoint uses `smooth_width` as an iteration count,
+        // where 0 is a harmless no-op, and None does not smooth.
+        SmoothAlgo::Median | SmoothAlgo::Boxcar if params.smooth_width == 0 => {
+            let algo = if matches!(params.smooth, SmoothAlgo::Median) {
+                "median"
+            } else {
+                "boxcar"
+            };
             return Err(Error::InvalidParam(format!(
-                "Savitzky–Golay smoothing invalid for {ne} energies \
-                 (window {}, order {}): {e}",
-                params.smooth_width, params.smooth_order
+                "{algo} smoothing needs a window width >= 1 (got 0)"
             )));
         }
+        _ => {}
     }
     let energy = energy
         .as_slice()
@@ -510,6 +530,35 @@ mod tests {
             matches!(r, Err(Error::InvalidParam(_))),
             "invalid SavGol window must be a loud error, got {r:?}"
         );
+    }
+
+    #[test]
+    fn fit_map_rejects_zero_width_median_and_boxcar() {
+        // A zero window would panic per voxel (Median → median::Filter::new(0))
+        // or emit an all-inf map (Boxcar → 1/0). fit_map must reject it up
+        // front, the same way it does an invalid SavGol window.
+        let energy = energy_axis();
+        let ne = energy.len();
+        let volume = Array4::<f32>::zeros((ne, 1, 1, 1));
+        let mask = Array3::<u8>::ones((1, 1, 1));
+        for smooth in [SmoothAlgo::Median, SmoothAlgo::Boxcar] {
+            let p = FitParams {
+                smooth,
+                smooth_width: 0,
+                ..FitParams::default()
+            };
+            let r = fit_map(
+                Array1::from(energy.clone()).view(),
+                volume.view(),
+                mask.view(),
+                &p,
+                None,
+            );
+            assert!(
+                matches!(r, Err(Error::InvalidParam(_))),
+                "{smooth:?} width=0 must be a loud error, got {r:?}"
+            );
+        }
     }
 
     #[test]
