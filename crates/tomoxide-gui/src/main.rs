@@ -3,8 +3,8 @@
 //! Design: docs/GUI.md. Seven modes (Data / Tune / Center / Run / Output /
 //! XANES / Live) behind a left mode rail, with a session log pane and a status
 //! bar. M1 implements the offline preview loop (Data, Tune, Center + recipes);
-//! M2 adds Run/Output; M4 adds the XANES chemical-mapping screen; Live is a
-//! placeholder until M3.
+//! M2 adds Run/Output; M4 adds the XANES chemical-mapping screen; M3's first
+//! cut adds Live (rsdm PVA streaming Z-slice reconstruction).
 
 mod app;
 mod live;
