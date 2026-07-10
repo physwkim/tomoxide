@@ -11,6 +11,13 @@ use median::Filter;
 
 /// Sliding-window median filter, matching SciPy's `medfilt` shape.
 ///
+/// `window_size` must be **odd**: the window is centred with radius
+/// `window_size / 2`, so an even width mis-centres it and the right-edge branch
+/// stores under-filled, zero-padded medians (re-zeroing the tail). SciPy
+/// `medfilt` rejects even kernels outright; here the [`super::fit_map`] driver
+/// validates the width up front (like it does for Savitzky–Golay), so callers on
+/// that path never reach this with an even width.
+///
 /// `edge_mode` is `"extension"` (repeat the edge sample) or `"zeropadding"`
 /// (pad with 0) — the reference pipeline calls it with `"zeropadding"`.
 ///
