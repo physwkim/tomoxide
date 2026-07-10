@@ -65,6 +65,13 @@ fn build_volume_rgba(map: &Array3<f64>, disp: (f32, f32)) -> (Vec<u8>, usize, us
     (rgba, od, oh, ow)
 }
 
+/// Slack (in messages) on the bounded fit channel. Small on purpose: poll()
+/// drains it every frame while the XANES tab is active, so a few bands of
+/// buffer is ample headroom and the fit thread only ever blocks once the tab
+/// is switched away — the back-pressure that keeps undrained bands from
+/// doubling peak memory.
+const FIT_CHANNEL_BOUND: usize = 8;
+
 /// A completed `z`-band, progress tick, or terminal status from the fit thread.
 enum FitMsg {
     /// One finished band `[z0, z0+band)` of the peak-energy map plus its
@@ -452,7 +459,14 @@ impl XanesView {
         self.last_stats_refresh = None;
         self.progress = (0, nz);
         let ctx = ctx.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Bounded so the fit thread back-pressures instead of buffering the
+        // whole map: poll() drains this every frame while the XANES tab is
+        // active (so the thread never blocks in normal use), but switching to
+        // another tab leaves it undrained — an unbounded queue would then
+        // accumulate a full map's worth of f64 bands (on top of self.map +
+        // self.edge_jump) and roughly double peak memory. A few bands of slack
+        // is plenty of headroom for active draining.
+        let (tx, rx) = std::sync::mpsc::sync_channel(FIT_CHANNEL_BOUND);
         self.job = Some(rx);
 
         std::thread::spawn(move || {
