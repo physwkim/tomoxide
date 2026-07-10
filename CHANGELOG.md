@@ -8,10 +8,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
-- **`tomoxide-gui` now depends on `rsplot` / `rsdm` `=0.5.1`** (was `=0.5.0`).
-  0.5.1 adds the `VolumeRaycaster` widget the XANES 3-D chemical-map view uses;
-  the GUI builds against crates.io again, with the local-checkout
-  `[patch.crates-io]` block commented out.
+- **`tomoxide-gui` now depends on `rsplot` / `rsdm` `=0.5.2`** (was `=0.5.0`).
+  0.5.1 adds the `VolumeRaycaster` widget the XANES 3-D chemical-map view uses
+  and 0.5.2 hardens it; the GUI builds against crates.io again, with the
+  local-checkout `[patch.crates-io]` block commented out.
 
 ### Added
 
