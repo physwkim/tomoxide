@@ -11,6 +11,7 @@
 
 use std::path::Path;
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use ndarray::{Array1, Array3, Array4, ArrayView3, ArrayView4, s};
 use rsplot::egui_wgpu::RenderState;
@@ -302,6 +303,13 @@ pub struct XanesView {
     /// band alongside `map`; the viewer's opacity/thickness channel.
     edge_jump: Option<Array3<f64>>,
     map_z: usize,
+    /// Finite peak energies accumulated as bands land — the input to the colour
+    /// window and histogram. Grown once per band (not by rescanning the whole,
+    /// mostly-NaN, map every band), reset at each fit start.
+    finite_acc: Vec<f32>,
+    /// Last time the finite stats (colour window + histogram) were recomputed;
+    /// rate-limits that O(finite) work during streaming.
+    last_stats_refresh: Option<Instant>,
     /// Display window for the peak-energy colormap.
     disp: (f32, f32),
     map_view: ImageView,
@@ -357,6 +365,8 @@ impl XanesView {
             map: None,
             edge_jump: None,
             map_z: 0,
+            finite_acc: Vec::new(),
+            last_stats_refresh: None,
             disp: (0.0, 1.0),
             map_view,
             hist_plot,
@@ -397,6 +407,7 @@ impl XanesView {
         self.map_z = nz / 2;
         self.map = None;
         self.fit_mag = None;
+        self.finite_acc.clear();
         self.picked = None;
         self.info = info;
         self.volume = Some(volume);
@@ -437,6 +448,8 @@ impl XanesView {
         // Pin how this map is being fit so pick_spectrum samples the same way,
         // regardless of later edits to the mag controls.
         self.fit_mag = mag_correct.then_some(mag);
+        self.finite_acc.clear();
+        self.last_stats_refresh = None;
         self.progress = (0, nz);
         let ctx = ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -557,6 +570,11 @@ impl XanesView {
                     if let Some(map) = &mut self.map
                         && let Ok(slab) = Array3::from_shape_vec((band, ny, nx), data)
                     {
+                        // Accumulate this band's finite peaks once, so the
+                        // display stats never rescan the whole (mostly-NaN
+                        // early) map.
+                        self.finite_acc
+                            .extend(slab.iter().filter(|v| v.is_finite()).map(|&v| v as f32));
                         map.slice_mut(s![z0..z0 + band, .., ..]).assign(&slab);
                         got_band = true;
                     }
@@ -571,7 +589,19 @@ impl XanesView {
             }
         }
         if got_band {
-            self.refresh_display();
+            // The newly-filled slice is cheap to redraw every band; the
+            // O(finite) colour window + histogram recompute is rate-limited so
+            // a large streamed fit does not stall the UI thread per band.
+            self.redraw_slice();
+            self.vol_dirty = true;
+            let now = Instant::now();
+            let due = self
+                .last_stats_refresh
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(200));
+            if due {
+                self.recompute_stats();
+                self.last_stats_refresh = Some(now);
+            }
         }
         if let Some(result) = finished {
             match result {
@@ -580,28 +610,30 @@ impl XanesView {
             }
             self.job = None;
             self.cancel = None;
+            // Exact final stats over the whole accumulated finite set.
             self.refresh_display();
         }
     }
 
-    /// Recompute the colormap window + histogram from the finite peak energies
-    /// and redraw the current slice.
+    /// Recompute the colormap window + histogram from the accumulated finite
+    /// peak energies and redraw the current slice.
     fn refresh_display(&mut self) {
-        let Some(map) = &self.map else { return };
-        let finite: Vec<f32> = map
-            .iter()
-            .filter(|v| v.is_finite())
-            .map(|&v| v as f32)
-            .collect();
-        if !finite.is_empty() {
-            self.disp = {
-                let (lo, hi) = super::robust_range(&finite);
-                (lo as f32, hi as f32)
-            };
-        }
+        self.recompute_stats();
         self.redraw_slice();
-        self.rebuild_histogram(&finite);
         self.vol_dirty = true;
+    }
+
+    /// Recompute the colour window and histogram from the accumulated finite
+    /// peak energies (`finite_acc`). Taken out and restored to sidestep the
+    /// self borrow that `rebuild_histogram(&…)` would otherwise need.
+    fn recompute_stats(&mut self) {
+        let finite = std::mem::take(&mut self.finite_acc);
+        if !finite.is_empty() {
+            let (lo, hi) = super::robust_range(&finite);
+            self.disp = (lo as f32, hi as f32);
+        }
+        self.rebuild_histogram(&finite);
+        self.finite_acc = finite;
     }
 
     /// Rebuild and re-upload the 3-D volume texture from the current map and
