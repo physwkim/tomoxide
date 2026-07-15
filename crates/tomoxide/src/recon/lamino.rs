@@ -46,6 +46,7 @@
 use crate::backend::Fft;
 use crate::dtype::Complex32;
 use crate::error::Result;
+use rayon::prelude::*;
 use std::f32::consts::PI;
 
 /// Gridding accuracy target (tomocupy hardcodes `EPS = 1e-3`).
@@ -278,21 +279,40 @@ pub fn usfft1d_adj(
     let mut fdee = vec![Complex32::new(0.0, 0.0); ng * n1 * n0];
 
     // gather1d (adj): scatter each g sample into the oversampled grid.
+    // Parallel over ty (the in-plane y axis is independent): each ty gathers
+    // into its own contiguous `[ng, n0]` column, then the columns are placed
+    // into fdee's strided `ty*n0 + a*n0*n1` lanes. The per-ty tz-order is
+    // preserved, so the f32 accumulation is bit-identical to the serial path.
     let wscale = (PI / (mu2 * n0 as f32)).sqrt();
-    for tz in 0..deth {
-        let z0 = z[tz];
-        let base = (2.0 * n2 as f32 * z0).floor() as isize - m2 as isize;
-        for ty in 0..n1 {
-            for tx in 0..n0 {
-                let g0 = g[tx + tz * n0 + ty * n0 * deth];
-                for i2 in 0..2 * m2 + 1 {
-                    let ell2 = base + i2 as isize;
-                    let w2 = ell2 as f32 / (2.0 * n2 as f32) - z0;
-                    let w = wscale * (-PI * PI / mu2 * w2 * w2).exp();
-                    let a = (n2 as isize + m2 as isize + ell2) as usize;
-                    fdee[tx + ty * n0 + a * n0 * n1] += g0 * w;
+    let bases: Vec<isize> = z
+        .iter()
+        .map(|&z0| (2.0 * n2 as f32 * z0).floor() as isize - m2 as isize)
+        .collect();
+    let cols: Vec<Vec<Complex32>> = (0..n1)
+        .into_par_iter()
+        .map(|ty| {
+            let mut col = vec![Complex32::new(0.0, 0.0); ng * n0]; // [a, tx]
+            for tz in 0..deth {
+                let z0 = z[tz];
+                let base = bases[tz];
+                for tx in 0..n0 {
+                    let g0 = g[tx + tz * n0 + ty * n0 * deth];
+                    for i2 in 0..2 * m2 + 1 {
+                        let ell2 = base + i2 as isize;
+                        let w2 = ell2 as f32 / (2.0 * n2 as f32) - z0;
+                        let w = wscale * (-PI * PI / mu2 * w2 * w2).exp();
+                        let a = (n2 as isize + m2 as isize + ell2) as usize;
+                        col[a * n0 + tx] += g0 * w;
+                    }
                 }
             }
+            col
+        })
+        .collect();
+    for (ty, col) in cols.iter().enumerate() {
+        for a in 0..ng {
+            let dst = ty * n0 + a * n0 * n1;
+            fdee[dst..dst + n0].copy_from_slice(&col[a * n0..a * n0 + n0]);
         }
     }
 
@@ -460,31 +480,37 @@ pub fn usfft2d_adj(
     let mut fdee = vec![Complex32::new(0.0, 0.0); nky * gy * gx];
 
     // gather2d (adj): scatter each (θ, ky, kx) sample into the (x,y) grid.
+    // Parallel over ky: fdee splits into `nky` disjoint `gx*gy` sub-grids, one
+    // per ky, so workers never alias. The tz-outer / kx order inside each ky is
+    // unchanged, so every cell's `+=` sequence — and the f32 result — is
+    // identical to the serial path.
     let wpre = PI / (mu0 * mu1 * ntheta as f32).sqrt();
-    for tz in 0..ntheta {
-        for ky in 0..nky {
-            for kx in 0..detw {
-                let ind = kx + ky * detw + tz * detw * nky;
-                let (x0, y0) = (xs[ind], ys[ind]);
-                let g0 = g[ind];
-                let base0 = (2.0 * n0 as f32 * x0).floor() as isize - m0 as isize;
-                let base1 = (2.0 * n1 as f32 * y0).floor() as isize - m1 as isize;
-                for i1 in 0..2 * m1 + 1 {
-                    let ell1 = base1 + i1 as isize;
-                    let w1 = ell1 as f32 / (2.0 * n1 as f32) - y0;
-                    let ew1 = (-PI * PI / mu1 * w1 * w1).exp();
-                    let yg = (n1 as isize + m1 as isize + ell1) as usize;
-                    for i0 in 0..2 * m0 + 1 {
-                        let ell0 = base0 + i0 as isize;
-                        let w0 = ell0 as f32 / (2.0 * n0 as f32) - x0;
-                        let w = wpre * (-PI * PI / mu0 * w0 * w0).exp() * ew1;
-                        let xg = (n0 as isize + m0 as isize + ell0) as usize;
-                        fdee[xg + yg * gx + ky * gx * gy] += g0 * w;
+    fdee.par_chunks_mut(gx * gy)
+        .enumerate()
+        .for_each(|(ky, sub)| {
+            for tz in 0..ntheta {
+                for kx in 0..detw {
+                    let ind = kx + ky * detw + tz * detw * nky;
+                    let (x0, y0) = (xs[ind], ys[ind]);
+                    let g0 = g[ind];
+                    let base0 = (2.0 * n0 as f32 * x0).floor() as isize - m0 as isize;
+                    let base1 = (2.0 * n1 as f32 * y0).floor() as isize - m1 as isize;
+                    for i1 in 0..2 * m1 + 1 {
+                        let ell1 = base1 + i1 as isize;
+                        let w1 = ell1 as f32 / (2.0 * n1 as f32) - y0;
+                        let ew1 = (-PI * PI / mu1 * w1 * w1).exp();
+                        let yg = (n1 as isize + m1 as isize + ell1) as usize;
+                        for i0 in 0..2 * m0 + 1 {
+                            let ell0 = base0 + i0 as isize;
+                            let w0 = ell0 as f32 / (2.0 * n0 as f32) - x0;
+                            let w = wpre * (-PI * PI / mu0 * w0 * w0).exp() * ew1;
+                            let xg = (n0 as isize + m0 as isize + ell0) as usize;
+                            sub[xg + yg * gx] += g0 * w;
+                        }
                     }
                 }
             }
-        }
-    }
+        });
 
     // wrap2d (adj): fold the borders back into the interior in x and y.
     wrap2d(&mut fdee, n0, n1, nky, m0, m1, true);
