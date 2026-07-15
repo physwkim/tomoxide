@@ -15,6 +15,18 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **CUDA laminography now streams out-of-core, across all GPUs.** The tilted
+  back-projector previously built the whole filtered stack in one shot on a
+  single GPU, which overflowed the kernels' 32-bit index (`nz·nproj·ncols ≈
+  7.5e9 > 2³¹`, SIGSEGV) and exceeded VRAM at production resolutions. It now
+  mirrors tomocupy's laminography chunking: filter the stack once into host
+  memory (nz-sub-chunked so the padded scratch stays under VRAM and the index
+  ceiling), then a nested output-rh-tile × projection-angle-chunk loop uploads
+  each filtered angle chunk and accumulates its back-projection into the tile.
+  Multi-GPU shards the output rh axis across every selected device (the whole
+  stack is filtered once, then per-device back-projection shards read it
+  read-only). Chunk sizes are derived from free VRAM and the index ceiling. The
+  fits-in-one-chunk case stays byte-identical to the previous single-shot path.
 - **GUI: Live streaming reconstruction screen** (`tomoxide-gui`, the seventh
   mode wired up — docs/GUI.md §2.6, milestone M3 first cut). Connects a
   tomoScanStream-style pvAccess projection stream through rsdm's headless data
