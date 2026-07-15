@@ -79,6 +79,47 @@ pub fn selected_devices() -> Vec<i32> {
     }
 }
 
+/// Laminography output height `rh` for a detector-row count `nz` and tilt
+/// `lamino_angle_deg`: tomocupy's `ceil(nz / cos(angle) / 2) * 2` (even by
+/// construction). Pure geometry — no device needed — so a streaming caller can
+/// `reserve` the output before the first tile arrives. `params.lamino_rh`
+/// overrides it.
+pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
+    let c = (lamino_angle_deg * std::f32::consts::PI / 180.0).cos();
+    (((nz as f32 / c) / 2.0).ceil() as usize) * 2
+}
+
+/// Per-tile sink for [`reconstruct_lamino_streaming`]: called as `(rh0, tile)`
+/// where `tile` is the `[tlen, n, n]` output volume at rows `[rh0, rh0 + tlen)`
+/// (`tlen = tile.dims().0`). Invoked on a single thread in ascending row order,
+/// so a `VolumeWriter` sink never crosses threads.
+pub type LaminoTileFn<'a> = dyn FnMut(usize, &crate::data::Volume<f32>) -> Result<()> + 'a;
+
+/// Reconstruct a laminography volume on CUDA, streaming the output rh-tiles to
+/// `on_tile(rh0, tile)` instead of returning the whole `[rh, n, n]` volume — so
+/// an output larger than host RAM never has to be assembled. Returns
+/// `(rh, n, n)`. `on_tile` is called on a single thread in ascending row order,
+/// so the caller's writer never crosses threads. Errors without the `cuda`
+/// feature. The sinogram must already be prepped (flat/dark, minus-log, stripe
+/// removal) — [`crate::reconstruct_lamino_streaming`] runs that prep first.
+pub fn reconstruct_lamino_streaming(
+    sino: &crate::data::Tomo<f32>,
+    geom: &crate::geometry::Geometry,
+    algorithm: crate::params::Algorithm,
+    params: &crate::params::ReconParams,
+    on_tile: &mut LaminoTileFn,
+) -> Result<(usize, usize, usize)> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (sino, geom, algorithm, params, on_tile);
+        Err(Error::Backend("cuda feature not enabled".into()))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::reconstruct_lamino_streaming(sino, geom, algorithm, params, on_tile)
+    }
+}
+
 pub fn device_name() -> Option<String> {
     #[cfg(not(feature = "cuda"))]
     {
@@ -1772,14 +1813,6 @@ mod cuda_impl {
         let mut host = vec![0.0f32; rh * n * n];
         f.to_host_f32(&mut host)?;
         Ok(host)
-    }
-
-    /// Auto reconstruction height for laminography (tomocupy `reader.py`
-    /// `rh0 = ceil(nz / cos(lamino_angle) / 2) * 2`), with `nz` the detector-row
-    /// count after any cropping. Even by construction.
-    fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
-        let c = (lamino_angle_deg * std::f32::consts::PI / 180.0).cos();
-        (((nz as f32 / c) / 2.0).ceil() as usize) * 2
     }
 
     /// Largest projection-angle chunk (`ncproj`) for streamed laminography on the
@@ -4336,6 +4369,141 @@ mod cuda_impl {
         Ok(out)
     }
 
+    /// Disk-streaming laminography: reconstruct the output rh volume tile-by-tile
+    /// and hand each finished tile to `on_tile(rh0, tlen, data)` (`data` is
+    /// `[tlen, n, n]`) instead of assembling the whole `[rh, n, n]` volume in
+    /// host RAM. Returns `(rh, n, n)`.
+    ///
+    /// Lamino cannot band its *input* (the tilt couples every detector row into
+    /// every output voxel, so the whole nz stack is needed), so this streams the
+    /// *output*: filter the whole stack once into host memory, then process the
+    /// output rh-tiles in rounds of `k = device count` — each round back-projects
+    /// up to `k` tiles concurrently (one GPU each, reading the shared read-only
+    /// filtered stack), then `on_tile` is called on the **main thread** in row
+    /// order and each tile is dropped. Host peak is `sino + filtered stack + k
+    /// tiles`, never the whole output. `on_tile` runs single-threaded, so the
+    /// caller's writer never crosses threads (H5File is `!Send`).
+    ///
+    /// Numerically equal to the whole-volume [`CudaBackend::reconstruct`]
+    /// laminography path (same filter-to-host + accumulate-per-angle-chunk), which
+    /// itself matches the un-streamed single shot to the f32 floor.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reconstruct_lamino_streaming(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        algorithm: crate::params::Algorithm,
+        params: &crate::params::ReconParams,
+        on_tile: &mut super::LaminoTileFn,
+    ) -> Result<(usize, usize, usize)> {
+        use crate::params::Algorithm;
+
+        let Beam::Laminography { phi } = geom.beam else {
+            return Err(Error::InvalidParam(
+                "reconstruct_lamino_streaming requires a laminography beam".into(),
+            ));
+        };
+        if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
+            return Err(Error::InvalidParam(format!(
+                "cuda laminography supports Fbp/Linerec only; got {algorithm:?}"
+            )));
+        }
+        if params.dtype == crate::dtype::Dtype::F16 {
+            return Err(Error::InvalidParam(
+                "cuda laminography f16 path is not implemented; use the default f32 dtype".into(),
+            ));
+        }
+        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
+        let (nz, nproj, ncols) = s.array.dim();
+        let n = params.num_gridx.unwrap_or(ncols);
+        if n != ncols {
+            return Err(Error::InvalidParam(format!(
+                "cuda analytic reconstruct needs a square grid = detector width {ncols}; got {n}"
+            )));
+        }
+        let theta = &geom.angles.0;
+        if theta.len() != nproj {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{nproj} angles"),
+                found: theta.len().to_string(),
+            });
+        }
+        let raw = s
+            .array
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let pad = filter.len();
+        let pad_side = pad / 2 - ncols / 2;
+        let w = build_filter_w(&filter, geom, nz, ncols, pad);
+        let lamino_angle_deg = (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+        let rh = params
+            .lamino_rh
+            .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
+
+        let devices = selected_devices();
+        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        let (host_gf, angle_chunks) = lamino_filter_to_host(
+            raw,
+            &w,
+            nz,
+            nproj,
+            ncols,
+            pad,
+            pad_side,
+            device_free_bytes(),
+        )?;
+        let host_gf: &[Vec<f32>] = &host_gf;
+        let angle_chunks: &[(usize, usize)] = &angle_chunks;
+
+        // Tile the output rh axis (device-0 budget/index bound), then process the
+        // tiles in rounds of `k` — one tile per GPU per round.
+        let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        let ncz = lamino_ncz(n, nz, ncols, ncproj_max, device_free_bytes());
+        let tiles = even_z_chunks(rh, rh.div_ceil(ncz.max(1)).max(1));
+        let k = devices.len().max(1);
+
+        for round in tiles.chunks(k) {
+            let parts: Vec<Result<Vec<f32>>> = std::thread::scope(|scope| {
+                round
+                    .iter()
+                    .copied()
+                    .zip(devices.iter().copied())
+                    .map(|((tz0, tlen), dev)| {
+                        scope.spawn(move || -> Result<Vec<f32>> {
+                            unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                            lamino_backproject_shard(
+                                host_gf,
+                                angle_chunks,
+                                theta,
+                                nz,
+                                nproj,
+                                ncols,
+                                n,
+                                phi,
+                                tz0,
+                                tlen,
+                                device_free_bytes(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(Error::Backend("cuda lamino worker panicked".into()))
+                        })
+                    })
+                    .collect()
+            });
+            for (&(tz0, tlen), part) in round.iter().zip(parts) {
+                let arr = Array3::from_shape_vec((tlen, n, n), part?)
+                    .map_err(|e| Error::InvalidParam(format!("cuda lamino tile shape: {e}")))?;
+                on_tile(tz0, &Volume::new(arr))?;
+            }
+        }
+        Ok((rh, n, n))
+    }
+
     impl crate::backend::AnalyticReconstruct for CudaBackend {
         /// Fused, device-resident analytic reconstruction: upload the raw
         /// sinogram once, then pad → cuFFT filter → crop → back-projection
@@ -4411,7 +4579,7 @@ mod cuda_impl {
                     (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
                 let rh = params
                     .lamino_rh
-                    .unwrap_or_else(|| lamino_recon_height(nz, lamino_angle_deg));
+                    .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
                 let devices = selected_devices();
                 // Multi-GPU: shard the OUTPUT rh axis across devices. Unlike
                 // parallel-beam FBP (which shards detector rows = output slices),

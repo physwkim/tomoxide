@@ -52,6 +52,32 @@ pub fn reconstruct(
     crate::recon::recon(&sino, geom, algorithm, params, backend)
 }
 
+/// Laminography reconstruction that streams the output rh-tiles to `on_tile`
+/// instead of returning the whole `[rh, n, n]` volume — for outputs too large to
+/// assemble in host RAM. Runs the same projection-domain prep as [`reconstruct`]
+/// (flat/dark + minus-log, phase retrieval, stripe removal), then hands the
+/// prepped sinogram to the CUDA out-of-core laminography streamer
+/// ([`crate::cuda::reconstruct_lamino_streaming`], which filters the whole stack
+/// once and back-projects the output tile-by-tile). `on_tile(rh0, tile)` is
+/// called once per rh-tile on a single thread in ascending row order. CUDA-only:
+/// errors on other engines or without the `cuda` feature. Returns `(rh, n, n)`.
+pub fn reconstruct_lamino_streaming(
+    mut ds: Dataset<f32>,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+    engine: &Engine,
+    on_tile: &mut crate::cuda::LaminoTileFn,
+) -> Result<(usize, usize, usize)> {
+    let backend = engine.backend();
+    crate::prep::normalize_dataset(&mut ds, backend)?;
+    crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+    let mut sino = ds.data.to_layout(Layout::Sinogram);
+    crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+    crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, on_tile)
+}
+
 /// Cooperative cancellation flag for the chunked drivers.
 ///
 /// Clone the token, hand one clone to [`ReconSteps::with_cancel`], and call

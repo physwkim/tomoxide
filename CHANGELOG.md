@@ -27,6 +27,12 @@ All notable changes to this project are documented here. The format is based on
   stack is filtered once, then per-device back-projection shards read it
   read-only). Chunk sizes are derived from free VRAM and the index ceiling. The
   fits-in-one-chunk case stays byte-identical to the previous single-shot path.
+  The CLI now streams the result to disk as well: `reconstruct_lamino_streaming`
+  (library + pipeline) emits the output one rh-tile at a time through a callback,
+  so `tomoxide-cli` writes the volume tile-by-tile and never holds the whole
+  reconstruction in host RAM. Tiles are computed a round of GPUs at a time and
+  written from the main thread (the H5 writer is `!Send`), bounding host peak to
+  the sinogram plus the filtered host stack plus one in-flight tile per device.
 - **GUI: Live streaming reconstruction screen** (`tomoxide-gui`, the seventh
   mode wired up — docs/GUI.md §2.6, milestone M3 first cut). Connects a
   tomoScanStream-style pvAccess projection stream through rsdm's headless data

@@ -214,3 +214,91 @@ fn cuda_lamino_multi_gpu_matches_single_gpu() {
     );
     assert!(err < 1e-3, "multi-GPU lamino NRMSE too large: {err:.3e}");
 }
+
+/// The disk-streaming entry point (`cuda::reconstruct_lamino_streaming`) emits
+/// the output rh-tiles one at a time instead of returning the whole volume.
+/// Re-assemble the tiles and check they reproduce the whole-volume
+/// `reconstruct` output (same filter-to-host + accumulate machinery, so equal to
+/// the cuFFT floor). Also checks the tiles cover `[0, rh)` exactly once, in
+/// ascending order.
+#[test]
+fn cuda_lamino_streaming_tiles_match_whole_volume() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let vol = Volume::new(stack);
+    let angles = Angles::uniform(nproj, 0.0, std::f32::consts::PI);
+    let geom_p = Geometry::parallel(angles.clone(), n, nz, 1.0);
+    let sino = sim::project(&vol, &geom_p, &cpu).unwrap();
+
+    let lamino_angle_deg = 20.0f32;
+    let phi = std::f32::consts::FRAC_PI_2 + lamino_angle_deg * std::f32::consts::PI / 180.0;
+    let geom_lam = Geometry {
+        angles,
+        center: Center::Scalar(n as f32 / 2.0),
+        beam: Beam::Laminography { phi },
+        detector: Detector {
+            width: n,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    let rh = 48usize;
+    let params = ReconParams {
+        lamino_rh: Some(rh),
+        ..Default::default()
+    };
+
+    // Whole-volume reference.
+    let whole = recon::recon(&sino, &geom_lam, Algorithm::Linerec, &params, &cuda).unwrap();
+
+    // Force multiple rh-tiles per device with a tiny budget so the streaming path
+    // actually tiles (not one tile == whole volume).
+    std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
+    let mut streamed = vec![0.0f32; rh * n * n];
+    let mut covered = vec![0u8; rh];
+    let mut last_end = 0usize;
+    let result = tomoxide::cuda::reconstruct_lamino_streaming(
+        &sino,
+        &geom_lam,
+        Algorithm::Linerec,
+        &params,
+        &mut |rh0, tile| {
+            let tlen = tile.array.dim().0;
+            assert!(
+                rh0 >= last_end,
+                "tiles not ascending: rh0={rh0} last_end={last_end}"
+            );
+            last_end = rh0 + tlen;
+            for c in covered.iter_mut().skip(rh0).take(tlen) {
+                *c += 1;
+            }
+            let off = rh0 * n * n;
+            streamed[off..off + tlen * n * n].copy_from_slice(tile.array.as_slice().unwrap());
+            Ok(())
+        },
+    );
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    let (rrh, rn, _) = result.unwrap();
+    assert_eq!((rrh, rn), (rh, n));
+    assert!(
+        covered.iter().all(|&c| c == 1),
+        "rh rows not covered exactly once: {covered:?}"
+    );
+
+    let err = nrmse(&streamed, whole.array.as_slice().unwrap());
+    eprintln!("streamed-tiles vs whole-volume lamino: global NRMSE = {err:.3e}");
+    assert!(err < 1e-3, "streamed lamino NRMSE too large: {err:.3e}");
+}
