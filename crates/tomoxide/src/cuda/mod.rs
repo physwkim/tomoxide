@@ -1782,6 +1782,209 @@ mod cuda_impl {
         (((nz as f32 / c) / 2.0).ceil() as usize) * 2
     }
 
+    /// Largest projection-angle chunk (`ncproj`) for streamed laminography on the
+    /// current device. Unlike parallel-beam FBP — which chunks the *output* z axis
+    /// because each detector row maps to one output slice — laminography's tilt
+    /// couples every detector row into every output voxel, so the back-projection
+    /// of any output slab needs the **whole** `nz` filtered stack. The stack is
+    /// instead split along projection angles: `backprojection_ker` accumulates
+    /// (`f[...] += …`), so summing per-angle-chunk back-projections reproduces the
+    /// full sum. This is tomocupy's laminography strategy (`backproj_functions.py`,
+    /// "note ncproj,nz!"): filter with `(ncproj, nz)`, loop angle chunks inside the
+    /// output-tile loop.
+    ///
+    /// Bounded by (a) the 32-bit index ceiling in `backprojection_ker`, which
+    /// addresses the filtered stack as `ur + t·n + vr·n·ncproj` with `vr < nz`, so
+    /// `nz·n·ncproj` must stay under 2³¹; and (b) memory — the resident filtered
+    /// angle chunk `nz·ncproj·ncols`, kept to ≲40 % of the budget so the output
+    /// tile and the per-chunk filter scratch also fit. Always ≥ 1, ≤ `nproj`.
+    fn lamino_ncproj(
+        nz: usize,
+        ncols: usize,
+        n: usize,
+        nproj: usize,
+        pad: usize,
+        free_bytes: usize,
+    ) -> usize {
+        let fsz = std::mem::size_of::<f32>();
+        // (a) index: the kernel column stride is `n`; the analytic lamino path has
+        //     ncols == n, but take the larger for a conservative bound.
+        let stride = n.max(ncols);
+        let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (nz * stride).max(1);
+        // (b) memory: resident filtered angle chunk `nz·ncproj·ncols` ≤ 40% budget.
+        let per_ncproj = nz * ncols * fsz;
+        let by_mem = (free_bytes / 100 * 40) / per_ncproj.max(1);
+        // Filter must fit at ≥1 detector row per sub-chunk: 2·ncproj·pad ≤ 80% free.
+        let by_filter = (free_bytes / 100 * 80) / (2 * pad * fsz).max(1);
+        by_idx.min(by_mem).min(by_filter).min(nproj).max(1)
+    }
+
+    /// Largest output rh-tile (`ncz`) for streamed laminography, given the resident
+    /// filtered angle chunk already claims `nz·ncproj·ncols·4` bytes. Bounded by
+    /// (a) the 32-bit index ceiling on the output buffer `tz·n·n` (`tz < ncz`) and
+    /// (b) the memory left after the angle chunk. Always ≥ 1, ≤ `rh`.
+    fn lamino_ncz(n: usize, nz: usize, ncols: usize, ncproj: usize, free_bytes: usize) -> usize {
+        let fsz = std::mem::size_of::<f32>();
+        let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (n * n).max(1);
+        let gf_bytes = nz * ncproj * ncols * fsz;
+        let left = free_bytes.saturating_sub(gf_bytes);
+        let by_mem = (left / 100 * 80) / (n * n * fsz).max(1);
+        by_idx.min(by_mem).max(1)
+    }
+
+    /// Streamed (out-of-core) laminography FBP/Linerec on the current device.
+    /// Mirrors tomocupy's laminography chunking: filter once into a host-resident
+    /// filtered stack (nz-sub-chunked so the padded scratch stays within VRAM and
+    /// under the 32-bit index ceiling), laid out per projection-angle chunk; then a
+    /// nested loop — output rh-tiles (outer) × angle chunks (inner) — uploads each
+    /// filtered angle chunk and **accumulates** its back-projection into the tile
+    /// via the `sz` output-row offset, downloading each finished tile.
+    ///
+    /// When the whole stack fits one chunk in both memory and the 32-bit index,
+    /// delegates to [`analytic_lamino_chunk`] (byte-identical to the un-streamed
+    /// path). When chunked, the result is *not* bit-identical: the nz-sub-chunked
+    /// cuFFT filter picks its algorithm by batch size, and the angle-chunked
+    /// back-projection sums partial results in a different float order — both agree
+    /// with the single-shot path to the f32 rounding floor.
+    #[allow(clippy::too_many_arguments)]
+    fn analytic_lamino_stream(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+        phi: f32,
+        rh: usize,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
+        let free = device_free_bytes();
+
+        // Fast path: whole stack indexes < 2³¹ on every kernel (filter pad stride,
+        // filtered stack, output) AND fits one chunk in memory → single shot,
+        // byte-identical to the un-streamed reconstruction.
+        let idx_cap = I32_INDEX_LIMIT / 100 * 88;
+        let stride = n.max(ncols);
+        let idx_ok = nz.saturating_mul(nproj).saturating_mul(pad) < idx_cap
+            && nz.saturating_mul(nproj).saturating_mul(stride) < idx_cap
+            && rh.saturating_mul(n).saturating_mul(n) < idx_cap;
+        // Single-shot peak: sino + gpad + filter internal (≈ padded again) + gf +
+        // output volume, all coexisting until the function returns.
+        let single_shot = (2 * nz * nproj * ncols + 2 * nz * nproj * pad + rh * n * n) * fsz;
+        if idx_ok && single_shot <= free / 100 * 85 {
+            return analytic_lamino_chunk(
+                raw, w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh, 0,
+            );
+        }
+
+        // ---- Out-of-core path -------------------------------------------------
+        // Angle chunks (fixed count; even split ≤ ncproj so each stays under the
+        // index/memory bound) and output rh-tiles.
+        let ncproj = lamino_ncproj(nz, ncols, n, nproj, pad, free);
+        let ntchunk = nproj.div_ceil(ncproj);
+        let angle_chunks = even_z_chunks(nproj, ntchunk);
+        let ncz = lamino_ncz(n, nz, ncols, ncproj, free);
+        let nrchunk = rh.div_ceil(ncz);
+        let rh_tiles = even_z_chunks(rh, nrchunk);
+
+        // ---- Phase 1: filter the whole stack into host memory, angle-major ------
+        // host_gf[c] holds the filtered projections for angle chunk c as
+        // [nz, alen, ncols] (contiguous), the exact layout `backprojection_ker`
+        // reads. Filtering is nz-sub-chunked so the padded scratch is bounded.
+        let mut host_gf: Vec<Vec<f32>> = Vec::with_capacity(angle_chunks.len());
+        for &(a0, alen) in &angle_chunks {
+            let mut gf_host = vec![0.0f32; nz * alen * ncols];
+            let ztile = filter_tile_z(alen, pad, free).min(nz.max(1));
+            let zk = nz.div_ceil(ztile.max(1));
+            for &(z0, zlen) in &even_z_chunks(nz, zk.max(1)) {
+                // Gather raw[z0:z0+zlen, a0:a0+alen, :] into a contiguous stage.
+                let mut stage = vec![0.0f32; zlen * alen * ncols];
+                for z in 0..zlen {
+                    let src = ((z0 + z) * nproj + a0) * ncols;
+                    let dst = z * alen * ncols;
+                    stage[dst..dst + alen * ncols].copy_from_slice(&raw[src..src + alen * ncols]);
+                }
+                let sino_dev = DevBuf::from_host_f32(&stage)?;
+                let gpad = DevBuf::zeroed(zlen * alen * pad * fsz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_pad(
+                            sino_dev.ptr,
+                            gpad.ptr,
+                            zlen,
+                            alen,
+                            ncols,
+                            pad,
+                            pad_side,
+                            null,
+                        )
+                    },
+                    "pad",
+                )?;
+                // `w` is [nz, nfreq2], angle-independent (mulw indexes it by
+                // frequency and detector row only) → slice by z, reuse per chunk.
+                let w_dev = DevBuf::from_host_f32(&w[z0 * nfreq2..(z0 + zlen) * nfreq2])?;
+                let fh = unsafe { ffi::tomoxide_filter_new(alen, zlen, pad) };
+                if fh.is_null() {
+                    return Err(Error::Backend("cfunc_filter allocation failed".into()));
+                }
+                unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
+                unsafe { ffi::tomoxide_filter_free(fh) };
+                let gf_dev = DevBuf::zeroed(zlen * alen * ncols * fsz)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_crop(
+                            gpad.ptr, gf_dev.ptr, zlen, alen, ncols, pad, pad_side, null,
+                        )
+                    },
+                    "crop",
+                )?;
+                ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+                gf_dev.to_host_f32(&mut gf_host[z0 * alen * ncols..(z0 + zlen) * alen * ncols])?;
+            }
+            host_gf.push(gf_host);
+        }
+
+        // ---- Phase 2: rh-tile (outer) × angle-chunk (inner) back-projection -----
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let ncz_max = rh_tiles.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        let gf_dev = DevBuf::new(nz * ncproj_max.max(1) * ncols * fsz)?;
+        let f_dev = DevBuf::new(ncz_max.max(1) * n * n * fsz)?;
+        let mut out = vec![0.0f32; rh * n * n];
+        let gain = std::f32::consts::PI / nproj as f32; // analytic angular quadrature dθ
+
+        for &(tz0, tlen) in &rh_tiles {
+            // Zero the tile once; each angle chunk accumulates into it.
+            ck(
+                unsafe { ffi::tomoxide_cuda_memset(f_dev.ptr, 0, tlen * n * n * fsz) },
+                "memset f",
+            )?;
+            for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
+                gf_dev.copy_from_host_f32(&host_gf[c])?;
+                let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
+                let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, tlen) };
+                if h.is_null() {
+                    return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+                }
+                unsafe {
+                    ffi::tomoxide_linerec_backproject(
+                        h, f_dev.ptr, gf_dev.ptr, theta_ptr, phi, gain, tz0 as i32, null,
+                    );
+                }
+                unsafe { ffi::tomoxide_linerec_free(h) };
+            }
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+            f_dev.to_host_f32(&mut out[tz0 * n * n..(tz0 + tlen) * n * n])?;
+        }
+        Ok(out)
+    }
+
     /// Half-precision (`Dtype::F16`) FBP/Linerec on the **current** device, whole
     /// stack in one chunk. Mirrors [`analytic_fbp_chunk`] but the sinogram, filter
     /// weights, padded/filtered buffers and volume are `f16` (2 bytes/element) and
@@ -4082,7 +4285,7 @@ mod cuda_impl {
             use crate::params::Algorithm;
 
             // Parallel beam and laminography (tilted axis) are both handled here;
-            // cone beam is not. Laminography routes to a dedicated whole-stack
+            // cone beam is not. Laminography routes to a dedicated out-of-core
             // single-GPU path below (its output z-extent and detector-row coupling
             // break the per-slice chunking the parallel path uses).
             if !matches!(geom.beam, Beam::Parallel | Beam::Laminography { .. }) {
@@ -4116,12 +4319,14 @@ mod cuda_impl {
             let w = build_filter_w(&filter, geom, nz, ncols, pad);
             let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
 
-            // Laminography (tilted rotation axis): whole projection stack, single
-            // GPU, single output-z chunk. The tilt couples every detector row into
-            // every output voxel, so the parallel-beam per-slice/multi-GPU split
-            // does not apply; `rh` (recon height) differs from the detector-row
-            // count `nz`. Only Fbp/Linerec (the direct back-projector) and f32 are
-            // supported for now — fourierrec-lamino and f16 are not wired.
+            // Laminography (tilted rotation axis): single GPU, out-of-core via
+            // `analytic_lamino_stream`. The tilt couples every detector row into
+            // every output voxel, so the parallel-beam per-slice/multi-GPU z-split
+            // does not apply; the stack is instead chunked over projection angles
+            // (accumulated) and output rh-tiles, and `rh` (recon height) differs
+            // from the detector-row count `nz`. Only Fbp/Linerec (the direct
+            // back-projector) and f32 are supported for now — fourierrec-lamino and
+            // f16 are not wired.
             if let Beam::Laminography { phi } = geom.beam {
                 if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
                     return Err(Error::InvalidParam(format!(
@@ -4141,8 +4346,8 @@ mod cuda_impl {
                     .unwrap_or_else(|| lamino_recon_height(nz, lamino_angle_deg));
                 let devices = selected_devices();
                 unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-                let vol = analytic_lamino_chunk(
-                    raw, &w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh, 0,
+                let vol = analytic_lamino_stream(
+                    raw, &w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh,
                 )?;
                 return Ok(Volume::new(
                     Array3::from_shape_vec((rh, n, n), vol)
