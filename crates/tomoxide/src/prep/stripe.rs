@@ -8,7 +8,8 @@
 use crate::data::{Layout, Tomo};
 use crate::error::Result;
 use crate::params::StripeMethod;
-use ndarray::Array2;
+use ndarray::{Array2, Array3, ArrayViewMut2, Axis};
+use rayon::prelude::*;
 
 use crate::prep::{fft, wavelet};
 
@@ -39,6 +40,20 @@ pub fn remove_stripe(data: &mut Tomo<f32>, method: StripeMethod) -> Result<()> {
     }
 }
 
+/// Apply `f` to every detector-row sinogram slice `[nproj, ncol]` of a
+/// projection-layout stack `[nproj, nrows, ncol]`, in parallel over the row
+/// axis. Every method here processes `tomo[:, m, :]` slices independently
+/// (tomopy/tomocupy per-sinogram), so the per-slice numerics are unchanged —
+/// only the outer row loop is parallelised, which keeps the reference-parity the
+/// per-method doc-comments promise.
+fn par_over_rows<F>(arr: &mut Array3<f32>, f: F)
+where
+    F: Fn(ArrayViewMut2<f32>) + Sync + Send,
+{
+    let lanes: Vec<ArrayViewMut2<f32>> = arr.axis_iter_mut(Axis(1)).collect();
+    lanes.into_par_iter().for_each(f);
+}
+
 /// Smoothing-filter stripe removal — a direct port of tomopy
 /// `libtomo/prep/stripe.c::remove_stripe_sf`.
 ///
@@ -58,21 +73,21 @@ fn remove_stripe_sf(data: &mut Tomo<f32>, size: usize) -> Result<()> {
     if dx == 0 || dy == 0 || dz == 0 || size == 0 {
         return Ok(());
     }
-    let arr = &mut proj.array;
     let half = (size / 2) as isize; // C: `size / 2`, integer division
     let last = dz as isize - 1;
     let dxf = dx as f32;
     let sizef = size as f32;
-    let mut average_row = vec![0.0f32; dz];
-    let mut smooth_row = vec![0.0f32; dz];
 
-    for s in 0..dy {
+    par_over_rows(&mut proj.array, |mut lane| {
+        // `lane` is the `[proj, col]` sinogram for one reconstruction slice.
+        let mut average_row = vec![0.0f32; dz];
+        let mut smooth_row = vec![0.0f32; dz];
         // Average row: column-wise mean over projections (each term divided by
         // `dx` before summing, exactly as the C does, to match rounding).
         for j in 0..dz {
             let mut acc = 0.0f32;
             for p in 0..dx {
-                acc += arr[[p, s, j]] / dxf;
+                acc += lane[[p, j]] / dxf;
             }
             average_row[j] = acc;
         }
@@ -95,10 +110,10 @@ fn remove_stripe_sf(data: &mut Tomo<f32>, size: usize) -> Result<()> {
         // Subtract the column residual from every projection in this slice.
         for p in 0..dx {
             for j in 0..dz {
-                arr[[p, s, j]] -= average_row[j] - smooth_row[j];
+                lane[[p, j]] -= average_row[j] - smooth_row[j];
             }
         }
-    }
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -229,20 +244,11 @@ fn remove_stripe_fw(data: &mut Tomo<f32>, sigma: f32, level: Option<usize>) -> R
     let nx = nproj + nproj / 8; // pad=True
     let xshift = (nx - nproj) / 2;
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f64>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]] as f64;
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.mapv(|v| v as f64);
         let out = fw_slice(&sino, sigma, level, nx, xshift);
-        for p in 0..nproj {
-            for c in 0..ncol {
-                proj.array[[p, m, c]] = out[[p, c]] as f32;
-            }
-        }
-    }
+        lane.assign(&out.mapv(|v| v as f32));
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -468,13 +474,8 @@ fn remove_stripe_ti(data: &mut Tomo<f32>, beta: f32, nblock: usize) -> Result<()
     // tomopy `_remove_stripe_ti`: nblock==0 → `_ring`, else `_ringb` with
     // block size `int(nproj / nblock)` (the transposed N axis).
     let step = nproj.checked_div(nblock).unwrap_or(0);
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         let (d1, d2) = if nblock == 0 {
             (ti_ring(&sino, 1, 1), ti_ring(&sino, 2, 1))
         } else {
@@ -495,10 +496,10 @@ fn remove_stripe_ti(data: &mut Tomo<f32>, beta: f32, nblock: usize) -> Result<()
         let shift = beta * pmin.abs();
         for c in 0..ncol {
             for r in 0..nproj {
-                proj.array[[r, m, c]] = (p[[r, c]] + shift).sqrt();
+                lane[[r, c]] = (p[[r, c]] + shift).sqrt();
             }
         }
-    }
+    });
     *data = proj.to_layout(target);
     Ok(())
 }
@@ -903,22 +904,13 @@ fn remove_all_stripe(data: &mut Tomo<f32>, snr: f32, la_size: usize, sm_size: us
         return Ok(());
     }
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         // VoAll always runs the residual large-stripe pass (tomopy default norm=True).
         let sino = rs_dead(&sino, snr, la_size, true);
         let sino = rs_sort(&sino, sm_size);
-        for p in 0..nproj {
-            for c in 0..ncol {
-                proj.array[[p, m, c]] = sino[[p, c]];
-            }
-        }
-    }
+        lane.assign(&sino);
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -952,20 +944,11 @@ fn remove_large_stripe(
         return Ok(());
     }
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         let sino = rs_large(&sino, snr, size, drop_ratio, norm);
-        for p in 0..nproj {
-            for c in 0..ncol {
-                proj.array[[p, m, c]] = sino[[p, c]];
-            }
-        }
-    }
+        lane.assign(&sino);
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -992,20 +975,11 @@ fn remove_dead_stripe(data: &mut Tomo<f32>, snr: f32, size: usize, norm: bool) -
         return Ok(());
     }
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         let sino = rs_dead(&sino, snr, size, norm);
-        for p in 0..nproj {
-            for c in 0..ncol {
-                proj.array[[p, m, c]] = sino[[p, c]];
-            }
-        }
-    }
+        lane.assign(&sino);
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -1044,24 +1018,15 @@ fn remove_stripe_based_sorting(data: &mut Tomo<f32>, size: Option<usize>, dim: u
         return Ok(());
     }
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         let corrected = if dim == 1 {
             rs_sort(&sino, size)
         } else {
             rs_sort_with(&sino, |s| median_filter_2d(s, size))
         };
-        for p in 0..nproj {
-            for c in 0..ncol {
-                proj.array[[p, m, c]] = corrected[[p, c]];
-            }
-        }
-    }
+        lane.assign(&corrected);
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -1186,13 +1151,8 @@ fn remove_stripe_based_filtering(
         return Ok(());
     }
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         // Smooth (low-pass) component, then its sorting-based correction.
         let smooth = rs_filter_smooth(&sino, &window, pad);
         let smooth_cor = if dim == 1 {
@@ -1204,10 +1164,10 @@ fn remove_stripe_based_filtering(
         for p in 0..nproj {
             for c in 0..ncol {
                 let sharp = sino[[p, c]] - smooth[[p, c]];
-                proj.array[[p, m, c]] = smooth_cor[[p, c]] + sharp;
+                lane[[p, c]] = smooth_cor[[p, c]] + sharp;
             }
         }
-    }
+    });
 
     *data = proj.to_layout(target);
     Ok(())
@@ -1490,20 +1450,11 @@ fn remove_stripe_based_fitting(
     let win2d = create_2d_window(nproj, ncol, sigma, pad);
     let matsign = create_matsign(nproj, ncol, pad);
 
-    for m in 0..nrows {
-        let mut sino = Array2::<f32>::zeros((nproj, ncol));
-        for p in 0..nproj {
-            for c in 0..ncol {
-                sino[[p, c]] = proj.array[[p, m, c]];
-            }
-        }
+    par_over_rows(&mut proj.array, |mut lane| {
+        let sino = lane.to_owned();
         let fixed = rs_fit(&sino, order, &win2d, &matsign, pad);
-        for p in 0..nproj {
-            for c in 0..ncol {
-                proj.array[[p, m, c]] = fixed[[p, c]];
-            }
-        }
-    }
+        lane.assign(&fixed);
+    });
 
     *data = proj.to_layout(target);
     Ok(())
