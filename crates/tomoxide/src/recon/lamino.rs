@@ -97,23 +97,29 @@ fn centered_fft_axis0(
 ) -> Result<()> {
     let len = 2 * n;
     let mut lines = vec![Complex32::new(0.0, 0.0); batch * len];
-    for i in 0..len {
-        let s = sign(m + i);
-        let src = (m + i) * batch;
-        for b in 0..batch {
-            lines[b * len + i] = fdee[src + b] * s;
+    // Gather the interior window into b-major lines (parallel over b, disjoint
+    // length-len rows; fdee read strided). Element-wise, so order-independent.
+    lines.par_chunks_mut(len).enumerate().for_each(|(b, row)| {
+        for (i, slot) in row.iter_mut().enumerate() {
+            *slot = fdee[(m + i) * batch + b] * sign(m + i);
         }
-    }
+    });
     fft.fft_1d(&mut lines, len, batch, inverse)?;
     // cuFFT-style unnormalized inverse: undo tomoxide's 1/len.
     let renorm = if inverse { len as f32 } else { 1.0 };
-    for i in 0..len {
-        let s = sign(m + i) * renorm;
-        let dst = (m + i) * batch;
-        for b in 0..batch {
-            fdee[dst + b] = lines[b * len + i] * s;
-        }
-    }
+    // Scatter back into the interior window (parallel over grid rows; each row
+    // is a disjoint contiguous batch-run, lines read strided).
+    fdee.par_chunks_mut(batch)
+        .enumerate()
+        .for_each(|(grid, row)| {
+            if grid >= m && grid < m + len {
+                let i = grid - m;
+                let s = sign(m + i) * renorm;
+                for (b, slot) in row.iter_mut().enumerate() {
+                    *slot = lines[b * len + i] * s;
+                }
+            }
+        });
     Ok(())
 }
 
@@ -136,28 +142,32 @@ fn centered_fft2d(
     let gy = 2 * n1 + 2 * m1;
     let (wx, wy) = (2 * n0, 2 * n1);
     let mut win = vec![Complex32::new(0.0, 0.0); batch * wy * wx];
-    for b in 0..batch {
-        for iy in 0..wy {
-            let sy = sign(m1 + iy);
-            for ix in 0..wx {
-                let s = sign(m0 + ix) * sy;
-                let src = (m0 + ix) + (m1 + iy) * gx + b * gx * gy;
-                win[(b * wy + iy) * wx + ix] = fdee[src] * s;
+    // Extract the interior window per ky slice (parallel over the batch; win and
+    // fdee are both batch-major, so each slice is a disjoint chunk).
+    win.par_chunks_mut(wy * wx)
+        .zip(fdee.par_chunks(gx * gy))
+        .for_each(|(wslice, fslice)| {
+            for iy in 0..wy {
+                let sy = sign(m1 + iy);
+                for ix in 0..wx {
+                    let s = sign(m0 + ix) * sy;
+                    wslice[iy * wx + ix] = fslice[(m0 + ix) + (m1 + iy) * gx] * s;
+                }
             }
-        }
-    }
+        });
     fft.fft_2d(&mut win, wy, wx, batch, inverse)?;
     let renorm = if inverse { (wx * wy) as f32 } else { 1.0 };
-    for b in 0..batch {
-        for iy in 0..wy {
-            let sy = sign(m1 + iy);
-            for ix in 0..wx {
-                let s = sign(m0 + ix) * sy * renorm;
-                let dst = (m0 + ix) + (m1 + iy) * gx + b * gx * gy;
-                fdee[dst] = win[(b * wy + iy) * wx + ix] * s;
+    fdee.par_chunks_mut(gx * gy)
+        .zip(win.par_chunks(wy * wx))
+        .for_each(|(fslice, wslice)| {
+            for iy in 0..wy {
+                let sy = sign(m1 + iy);
+                for ix in 0..wx {
+                    let s = sign(m0 + ix) * sy * renorm;
+                    fslice[(m0 + ix) + (m1 + iy) * gx] = wslice[iy * wx + ix] * s;
+                }
             }
-        }
-    }
+        });
     Ok(())
 }
 
@@ -178,29 +188,31 @@ pub fn fft2d_fwd(
     fft: &dyn Fft,
 ) -> Result<Vec<Complex32>> {
     // rfftshiftc2d: modulate real input by sign(tx)·sign(ty), embed as complex.
+    // Parallel over projections (each owns a disjoint deth·detw chunk).
     let mut buf = vec![Complex32::new(0.0, 0.0); ntheta * deth * detw];
-    for tz in 0..ntheta {
-        for ty in 0..deth {
-            let sy = sign(ty);
-            for tx in 0..detw {
-                let s = sign(tx) * sy;
-                buf[(tz * deth + ty) * detw + tx] =
-                    Complex32::new(proj[(tz * deth + ty) * detw + tx] * s, 0.0);
+    buf.par_chunks_mut(deth * detw)
+        .zip(proj.par_chunks(deth * detw))
+        .for_each(|(bchunk, pchunk)| {
+            for ty in 0..deth {
+                let sy = sign(ty);
+                for tx in 0..detw {
+                    let s = sign(tx) * sy;
+                    bchunk[ty * detw + tx] = Complex32::new(pchunk[ty * detw + tx] * s, 0.0);
+                }
             }
-        }
-    }
+        });
     fft.fft_2d(&mut buf, deth, detw, ntheta, false)?;
     // irfftshiftc2d (negated sign) + mulc by 1/(deth·detw).
     let scale = 1.0 / (deth * detw) as f32;
-    for tz in 0..ntheta {
+    buf.par_chunks_mut(deth * detw).for_each(|bchunk| {
         for ty in 0..deth {
             let sy = sign(ty);
             for tx in 0..detw {
                 let s = -sign(tx) * sy * scale;
-                buf[(tz * deth + ty) * detw + tx] *= s;
+                bchunk[ty * detw + tx] *= s;
             }
         }
-    }
+    });
     Ok(buf)
 }
 
@@ -332,18 +344,21 @@ pub fn usfft1d_adj(
     // Centered inverse FFT along the depth-grid axis over the window [m2, m2+2n2).
     centered_fft_axis0(&mut fdee, n2, m2, n0 * n1, true, fft)?;
 
-    // divker1d (adj): deapodize, take real part → f[n1, n2, n0].
+    // divker1d (adj): deapodize, take real part → f[n1, n2, n0]. Parallel over
+    // ty (f is contiguous per ty; fdee read-only).
     let mut f = vec![0.0f32; n1 * n2 * n0];
-    for tz in 0..n2 {
-        let ker = (-mu2 * (tz as f32 - n2 as f32 / 2.0).powi(2)).exp();
-        let a = tz + n2 / 2 + m2;
-        for ty in 0..n1 {
-            for tx in 0..n0 {
-                let g_ind = tx + ty * n0 + a * n0 * n1;
-                f[tx + tz * n0 + ty * n0 * n2] = fdee[g_ind].re / ker / (2.0 * n2 as f32);
+    f.par_chunks_mut(n2 * n0)
+        .enumerate()
+        .for_each(|(ty, fchunk)| {
+            for tz in 0..n2 {
+                let ker = (-mu2 * (tz as f32 - n2 as f32 / 2.0).powi(2)).exp();
+                let a = tz + n2 / 2 + m2;
+                for tx in 0..n0 {
+                    let g_ind = tx + ty * n0 + a * n0 * n1;
+                    fchunk[tz * n0 + tx] = fdee[g_ind].re / ker / (2.0 * n2 as f32);
+                }
             }
-        }
-    }
+        });
     Ok(f)
 }
 
@@ -513,26 +528,29 @@ pub fn usfft2d_adj(
         });
 
     // wrap2d (adj): fold the borders back into the interior in x and y.
-    wrap2d(&mut fdee, n0, n1, nky, m0, m1, true);
+    wrap2d(&mut fdee, n0, n1, m0, m1, true);
 
     // Centered inverse 2-D FFT over the (x,y) window, per ky slice.
     centered_fft2d(&mut fdee, n0, n1, m0, m1, nky, true, fft)?;
 
     // divker2d (adj): deapodize → f[n1, nky, n0] (note the n1−ty−1 y-flip).
+    // Parallel over ty (f is contiguous per ty; fdee read-only).
     let mut f = vec![Complex32::new(0.0, 0.0); n1 * nky * n0];
-    for ky in 0..nky {
-        for ty in 0..n1 {
+    f.par_chunks_mut(nky * n0)
+        .enumerate()
+        .for_each(|(ty, fchunk)| {
             let yg = (n1 - ty - 1) + n1 / 2 + m1;
-            for tx in 0..n0 {
-                let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
-                    - mu1 * (ty as f32 - n1 as f32 / 2.0).powi(2))
-                .exp();
-                let xg = tx + n0 / 2 + m0;
-                let g_ind = xg + yg * gx + ky * gx * gy;
-                f[tx + ky * n0 + ty * n0 * nky] = fdee[g_ind] / ker / (n0 * n1) as f32;
+            for ky in 0..nky {
+                for tx in 0..n0 {
+                    let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
+                        - mu1 * (ty as f32 - n1 as f32 / 2.0).powi(2))
+                    .exp();
+                    let xg = tx + n0 / 2 + m0;
+                    let g_ind = xg + yg * gx + ky * gx * gy;
+                    fchunk[ky * n0 + tx] = fdee[g_ind] / ker / (n0 * n1) as f32;
+                }
             }
-        }
-    }
+        });
     Ok(f)
 }
 
@@ -578,7 +596,7 @@ pub fn usfft2d_fwd(
     centered_fft2d(&mut fdee, n0, n1, m0, m1, nky, false, fft)?;
 
     // wrap2d (fwd): copy interior into the borders.
-    wrap2d(&mut fdee, n0, n1, nky, m0, m1, false);
+    wrap2d(&mut fdee, n0, n1, m0, m1, false);
 
     // gather2d (fwd): interpolate the grid at the sample positions, summing
     // each (θ, ky, kx) from its (x,y) neighborhood.
@@ -614,35 +632,29 @@ pub fn usfft2d_fwd(
 
 /// Shared `wrap2d`: fold (adj) or copy (fwd) the `m`-wide borders of the
 /// oversampled `[nky, gy, gx]` grid in both x and y (tomocupy `wrap2d`).
-fn wrap2d(
-    fdee: &mut [Complex32],
-    n0: usize,
-    n1: usize,
-    nky: usize,
-    m0: usize,
-    m1: usize,
-    adj: bool,
-) {
+fn wrap2d(fdee: &mut [Complex32], n0: usize, n1: usize, m0: usize, m1: usize, adj: bool) {
     let gx = 2 * n0 + 2 * m0;
     let gy = 2 * n1 + 2 * m1;
-    for ky in 0..nky {
+    // Parallel over ky: each ky is a disjoint gx·gy sub-grid and the fold stays
+    // within it, so workers never alias.
+    fdee.par_chunks_mut(gx * gy).for_each(|slice| {
         for ty in 0..gy {
             for tx in 0..gx {
                 if tx < m0 || tx >= 2 * n0 + m0 || ty < m1 || ty >= 2 * n1 + m1 {
                     let tx0 = (tx + 2 * n0 - m0) % (2 * n0);
                     let ty0 = (ty + 2 * n1 - m1) % (2 * n1);
-                    let id1 = tx + ty * gx + ky * gx * gy;
-                    let id2 = (tx0 + m0) + (ty0 + m1) * gx + ky * gx * gy;
+                    let id1 = tx + ty * gx;
+                    let id2 = (tx0 + m0) + (ty0 + m1) * gx;
                     if adj {
-                        let v = fdee[id1];
-                        fdee[id2] += v;
+                        let v = slice[id1];
+                        slice[id2] += v;
                     } else {
-                        fdee[id1] = fdee[id2];
+                        slice[id1] = slice[id2];
                     }
                 }
             }
         }
-    }
+    });
 }
 
 // ===========================================================================
