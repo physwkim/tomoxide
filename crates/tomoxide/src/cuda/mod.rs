@@ -1861,8 +1861,6 @@ mod cuda_impl {
         rh: usize,
     ) -> Result<Vec<f32>> {
         let fsz = std::mem::size_of::<f32>();
-        let null = std::ptr::null_mut::<c_void>();
-        let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
         let free = device_free_bytes();
 
         // Fast path: whole stack indexes < 2³¹ on every kernel (filter pad stride,
@@ -1882,20 +1880,59 @@ mod cuda_impl {
             );
         }
 
-        // ---- Out-of-core path -------------------------------------------------
-        // Angle chunks (fixed count; even split ≤ ncproj so each stays under the
-        // index/memory bound) and output rh-tiles.
-        let ncproj = lamino_ncproj(nz, ncols, n, nproj, pad, free);
+        // ---- Out-of-core path: filter once to host, back-project the full rh ----
+        let (host_gf, angle_chunks) =
+            lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
+        lamino_backproject_shard(
+            &host_gf,
+            &angle_chunks,
+            theta,
+            nz,
+            nproj,
+            ncols,
+            n,
+            phi,
+            0,
+            rh,
+            free,
+        )
+    }
+
+    /// Host-resident filtered laminography stack, angle-major: `.0[c]` holds
+    /// angle chunk `c` as `[nz, alen, ncols]` (the layout `backprojection_ker`
+    /// reads), `.1[c] = (a0, alen)`. Produced by [`lamino_filter_to_host`] and
+    /// consumed read-only by [`lamino_backproject_shard`] (shared across GPUs).
+    type LaminoHostStack = (Vec<Vec<f32>>, Vec<(usize, usize)>);
+
+    /// Filter the whole projection stack into host memory, angle-major, for
+    /// streamed laminography. Returns `(host_gf, angle_chunks)` where
+    /// `host_gf[c]` is the filtered projections of angle chunk `c` as
+    /// `[nz, alen, ncols]` contiguous (the exact layout `backprojection_ker`
+    /// reads) and `angle_chunks[c] = (a0, alen)`. Filtering is nz-sub-chunked so
+    /// the padded scratch stays within VRAM and under the 32-bit index ceiling.
+    /// Runs on the **current** device; the host result is device-independent, so
+    /// a multi-GPU driver filters once here and shares it read-only across the
+    /// per-device back-projection shards.
+    #[allow(clippy::too_many_arguments)]
+    fn lamino_filter_to_host(
+        raw: &[f32],
+        w: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        pad: usize,
+        pad_side: usize,
+        free: usize,
+    ) -> Result<LaminoHostStack> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
+                                        // Angle chunks: fixed count, even split ≤ ncproj so each stays under the
+                                        // index/memory bound.
+        let ncproj = lamino_ncproj(nz, ncols, ncols, nproj, pad, free);
         let ntchunk = nproj.div_ceil(ncproj);
         let angle_chunks = even_z_chunks(nproj, ntchunk);
-        let ncz = lamino_ncz(n, nz, ncols, ncproj, free);
-        let nrchunk = rh.div_ceil(ncz);
-        let rh_tiles = even_z_chunks(rh, nrchunk);
 
-        // ---- Phase 1: filter the whole stack into host memory, angle-major ------
-        // host_gf[c] holds the filtered projections for angle chunk c as
-        // [nz, alen, ncols] (contiguous), the exact layout `backprojection_ker`
-        // reads. Filtering is nz-sub-chunked so the padded scratch is bounded.
         let mut host_gf: Vec<Vec<f32>> = Vec::with_capacity(angle_chunks.len());
         for &(a0, alen) in &angle_chunks {
             let mut gf_host = vec![0.0f32; nz * alen * ncols];
@@ -1949,22 +1986,53 @@ mod cuda_impl {
             }
             host_gf.push(gf_host);
         }
+        Ok((host_gf, angle_chunks))
+    }
 
-        // ---- Phase 2: rh-tile (outer) × angle-chunk (inner) back-projection -----
+    /// Back-project the global output rows `[rh0, rh0+rh_len)` from an
+    /// already-filtered host stack (`host_gf`/`angle_chunks` from
+    /// [`lamino_filter_to_host`]) on the **current** device, returning
+    /// `[rh_len, n, n]`. The shard is internally rh-tiled (bounded by memory and
+    /// the `ncz·n·n < 2³¹` index ceiling); each tile is zeroed once and every
+    /// angle chunk **accumulates** into it via the kernel's `+=`, with the global
+    /// row offset `sz = rh0 + tile_local_start` so the shard lands on the correct
+    /// output rows. This is the shardable unit: a multi-GPU driver runs one shard
+    /// per device over disjoint rh ranges reading the shared `host_gf`.
+    #[allow(clippy::too_many_arguments)]
+    fn lamino_backproject_shard(
+        host_gf: &[Vec<f32>],
+        angle_chunks: &[(usize, usize)],
+        theta: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        phi: f32,
+        rh0: usize,
+        rh_len: usize,
+        free: usize,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        let ncz = lamino_ncz(n, nz, ncols, ncproj_max, free);
+        let nrchunk = rh_len.div_ceil(ncz.max(1));
+        let rh_tiles = even_z_chunks(rh_len, nrchunk.max(1));
+
         let theta_dev = DevBuf::from_host_f32(theta)?;
         let ncz_max = rh_tiles.iter().map(|&(_, l)| l).max().unwrap_or(0);
-        let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
         let gf_dev = DevBuf::new(nz * ncproj_max.max(1) * ncols * fsz)?;
         let f_dev = DevBuf::new(ncz_max.max(1) * n * n * fsz)?;
-        let mut out = vec![0.0f32; rh * n * n];
+        let mut out = vec![0.0f32; rh_len * n * n];
         let gain = std::f32::consts::PI / nproj as f32; // analytic angular quadrature dθ
 
-        for &(tz0, tlen) in &rh_tiles {
+        for &(t_local, tlen) in &rh_tiles {
             // Zero the tile once; each angle chunk accumulates into it.
             ck(
                 unsafe { ffi::tomoxide_cuda_memset(f_dev.ptr, 0, tlen * n * n * fsz) },
                 "memset f",
             )?;
+            let sz = (rh0 + t_local) as i32;
             for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
                 gf_dev.copy_from_host_f32(&host_gf[c])?;
                 let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
@@ -1974,13 +2042,13 @@ mod cuda_impl {
                 }
                 unsafe {
                     ffi::tomoxide_linerec_backproject(
-                        h, f_dev.ptr, gf_dev.ptr, theta_ptr, phi, gain, tz0 as i32, null,
+                        h, f_dev.ptr, gf_dev.ptr, theta_ptr, phi, gain, sz, null,
                     );
                 }
                 unsafe { ffi::tomoxide_linerec_free(h) };
             }
             ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-            f_dev.to_host_f32(&mut out[tz0 * n * n..(tz0 + tlen) * n * n])?;
+            f_dev.to_host_f32(&mut out[t_local * n * n..(t_local + tlen) * n * n])?;
         }
         Ok(out)
     }
@@ -4345,10 +4413,74 @@ mod cuda_impl {
                     .lamino_rh
                     .unwrap_or_else(|| lamino_recon_height(nz, lamino_angle_deg));
                 let devices = selected_devices();
-                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-                let vol = analytic_lamino_stream(
-                    raw, &w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh,
+                // Multi-GPU: shard the OUTPUT rh axis across devices. Unlike
+                // parallel-beam FBP (which shards detector rows = output slices),
+                // laminography needs the whole nz filtered stack for any output
+                // slab, so filter ONCE on device 0 into a host-resident stack, then
+                // back-project disjoint rh ranges concurrently, one GPU each, each
+                // reading the shared (read-only) filtered stack. Like the FBP split
+                // this differs from single-GPU at the cuFFT floor (chunked filter
+                // batch) but is internally deterministic. Require ≥2 output rows per
+                // device so a tiny rh does not spawn idle threads.
+                let k = devices.len().min(rh / 2).max(1);
+                if k <= 1 {
+                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                    let vol = analytic_lamino_stream(
+                        raw, &w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh,
+                    )?;
+                    return Ok(Volume::new(
+                        Array3::from_shape_vec((rh, n, n), vol)
+                            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
+                    ));
+                }
+                unsafe { ffi::tomoxide_cuda_set_device(devices[0]) };
+                let (host_gf, angle_chunks) = lamino_filter_to_host(
+                    raw,
+                    &w,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    device_free_bytes(),
                 )?;
+                let host_gf: &[Vec<f32>] = &host_gf;
+                let angle_chunks: &[(usize, usize)] = &angle_chunks;
+                let parts: Vec<Result<Vec<f32>>> = std::thread::scope(|scope| {
+                    even_z_chunks(rh, k)
+                        .into_iter()
+                        .zip(devices.iter().copied())
+                        .map(|((rh0, rh_len), dev)| {
+                            scope.spawn(move || -> Result<Vec<f32>> {
+                                unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                                lamino_backproject_shard(
+                                    host_gf,
+                                    angle_chunks,
+                                    theta,
+                                    nz,
+                                    nproj,
+                                    ncols,
+                                    n,
+                                    phi,
+                                    rh0,
+                                    rh_len,
+                                    device_free_bytes(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                Err(Error::Backend("cuda lamino worker panicked".into()))
+                            })
+                        })
+                        .collect()
+                });
+                let mut vol = Vec::with_capacity(rh * n * n);
+                for p in parts {
+                    vol.extend(p?);
+                }
                 return Ok(Volume::new(
                     Array3::from_shape_vec((rh, n, n), vol)
                         .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,

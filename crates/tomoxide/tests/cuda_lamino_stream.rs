@@ -122,3 +122,95 @@ fn cuda_lamino_chunked_matches_single_shot() {
     eprintln!("chunked vs single-shot lamino: global NRMSE = {err:.3e}");
     assert!(err < 1e-3, "chunked lamino NRMSE too large: {err:.3e}");
 }
+
+/// Multi-GPU laminography shards the output rh axis across devices: the whole
+/// stack is filtered once (device 0) into a host-resident stack shared read-only
+/// by per-device back-projection shards over disjoint rh ranges. Pin the device
+/// set with `TOMOXIDE_CUDA_DEVICES` (each test runs in its own nextest process,
+/// so setting the env is race-free) and check the multi-GPU volume matches the
+/// single-GPU (whole-stack, fast-path) volume to the cuFFT floor. Skips unless
+/// ≥2 CUDA devices are visible.
+#[test]
+fn cuda_lamino_multi_gpu_matches_single_gpu() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let all = tomoxide::cuda::selected_devices();
+    if all.len() < 2 {
+        eprintln!(
+            "skipping multi-GPU lamino test: only {} device(s)",
+            all.len()
+        );
+        return;
+    }
+    let cpu = CpuBackend::new();
+
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let vol = Volume::new(stack);
+    let angles = Angles::uniform(nproj, 0.0, std::f32::consts::PI);
+    let geom_p = Geometry::parallel(angles.clone(), n, nz, 1.0);
+    let sino = sim::project(&vol, &geom_p, &cpu).unwrap();
+
+    let lamino_angle_deg = 20.0f32;
+    let phi = std::f32::consts::FRAC_PI_2 + lamino_angle_deg * std::f32::consts::PI / 180.0;
+    let geom_lam = Geometry {
+        angles,
+        center: Center::Scalar(n as f32 / 2.0),
+        beam: Beam::Laminography { phi },
+        detector: Detector {
+            width: n,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    let rh = 48usize;
+    let params = ReconParams {
+        lamino_rh: Some(rh),
+        ..Default::default()
+    };
+
+    // Single GPU (device 0): the whole stack fits → fast path = single-shot.
+    std::env::set_var("TOMOXIDE_CUDA_DEVICES", "0");
+    let single = recon::recon(&sino, &geom_lam, Algorithm::Linerec, &params, &cuda);
+    // All visible GPUs: rh sharded across devices.
+    let devs = all
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    std::env::set_var("TOMOXIDE_CUDA_DEVICES", &devs);
+    let multi = recon::recon(&sino, &geom_lam, Algorithm::Linerec, &params, &cuda);
+    std::env::remove_var("TOMOXIDE_CUDA_DEVICES");
+    let single = single.unwrap();
+    let multi = multi.unwrap();
+
+    assert_eq!(multi.array.dim(), single.array.dim());
+    assert_eq!(multi.array.dim(), (rh, n, n));
+    for z in 0..rh {
+        let a = single.array.index_axis(Axis(0), z).to_owned();
+        let b = multi.array.index_axis(Axis(0), z).to_owned();
+        let r = pearson(&a, &b);
+        assert!(
+            r > 0.999,
+            "multi-GPU lamino slice {z} disagrees with single-GPU: r = {r:.6}"
+        );
+    }
+    let err = nrmse(
+        multi.array.as_slice().unwrap(),
+        single.array.as_slice().unwrap(),
+    );
+    eprintln!(
+        "multi-GPU ({} devices) vs single-GPU lamino: global NRMSE = {err:.3e}",
+        all.len()
+    );
+    assert!(err < 1e-3, "multi-GPU lamino NRMSE too large: {err:.3e}");
+}
