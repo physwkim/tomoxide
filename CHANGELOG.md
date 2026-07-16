@@ -15,6 +15,19 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **`docs/LAMINOGRAPHY_ALIGNMENT.md` — how to find the laminography rotation
+  center and tilt.** A field-tested recipe, validated against a scan whose center
+  was already known independently. Leads with reading the center off the raw data
+  before reconstructing anything: the mean of all projections over 360° is a
+  bullseye of rings centred on the rotation axis, so the center column is
+  readable by eye (automated flip-registration measured 397.5 vs a known 396),
+  and rings that open into arcs instead of closing diagnose a scan that was
+  mis-aligned at acquisition. Also documents the reconstruction sweep that
+  follows (full projections, focus scored as the max over the whole z range, not
+  a sub-sample over a fixed band) and records the three methods that failed
+  validation — 0°/180° mirror registration (the tilted axis breaks the mirror
+  symmetry), 1-D column-profile symmetry (truncation destroys it), and
+  sub-sampled projections with a fixed z band.
 - **Fourier laminography (`LamFourierRec`) now honours `--filter`.** The
   Fourier/USFFT lamino path applied a plain `|f|` ramp and ignored the selected
   apodisation, unlike tomocupy's `LamFourierRec` (which filters with
