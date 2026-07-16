@@ -12,6 +12,187 @@ use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
 use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
 
+/// What [`find_center_rings`] found, and whether to believe it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingCenter {
+    /// Estimated rotation-axis column, sub-pixel.
+    pub center: f32,
+    /// Robust prominence of the registration peak, `(peak − median) / MAD` of the
+    /// correlation profile. This is the number that says whether `center` means
+    /// anything: a bullseye registers as a sharp peak, arcs that never close do
+    /// not peak at all. See [`find_center_rings`] for the two measured
+    /// calibration points.
+    pub prominence: f32,
+    /// `prominence >= 8.0`. False ⇒ **do not use `center`**: the scan is very
+    /// likely mis-aligned at acquisition, which no reconstruction geometry
+    /// repairs.
+    pub trustworthy: bool,
+}
+
+/// Rotation-axis column from the ring pattern of a 360° scan — the cheapest
+/// estimator here (one pass, no reconstruction) and the only one validated for
+/// **laminography**, where `find_center_vo`/`find_center_pc` do not apply.
+///
+/// Over a full turn every object point at radius `r` from the axis traces
+/// `x(θ) = c + r·cos(θ + φ)`, so the mean projection smears each point into a
+/// ring centred on the axis: a bullseye whose centre column is `c`. Rings are
+/// mirror-symmetric about that column, so registering the mean projection
+/// against its own left–right flip puts the axis at `dx = 2·(c − nx/2)`. `tomo`
+/// is the flat-corrected, minus-log projection stack; every `step`-th projection
+/// is averaged (`step = 10` over 1800 projections is plenty — the rings are a
+/// bulk feature).
+///
+/// **Why this exists when three other `find_center_*` do.** The laminographic
+/// tilt gives the axis a component along the beam, so a 180° rotation is not a
+/// mirror of the object and the 0°/180° symmetry every other estimator assumes is
+/// gone: on the scan below `find_center_pc`-style mirror registration scattered
+/// 395…607 against a known 396. The 2-D ring pattern does not depend on that
+/// symmetry. (A 1-D column profile of the same mean projection does not work
+/// either — it gave 847 — because the sample is wider than the field and
+/// truncation destroys the profile's symmetry while leaving the rings intact.)
+///
+/// **The estimate carries its own alibi.** `docs/LAMINOGRAPHY_ALIGNMENT.md`
+/// prescribes reading the bullseye by eye and treating eye-vs-correlation
+/// disagreement as the misalignment flag, because on a mis-aligned scan the
+/// lopsided arcs drag the correlation peak. That disagreement is measurable
+/// without the eye: the arcs do not merely move the peak, they leave no peak.
+/// Measured on the two scans that doc is written from (2048² binned 2×, 1800
+/// projections over 360°):
+///
+/// | scan | `center` | truth | `prominence` |
+/// |---|---|---|---|
+/// | 0.55 s, closed concentric rings | 397.4 | 396 | **16.2** |
+/// | 0.6 s, arcs that never close | 281.7 | 138 | **2.2** |
+///
+/// The mis-aligned scan's profile sits at 80 % of its own peak height even at the
+/// array edges — it is flat, and its `argmax` is noise. Hence
+/// [`RingCenter::trustworthy`], thresholded at 8.0: comfortably between the two,
+/// but **calibrated on exactly those two scans**. Treat a `prominence` near the
+/// threshold as "look at the mean projection yourself", not as a verdict.
+///
+/// (The doc quotes 397.5/281.1 and prominence 21.0/2.4 for its NumPy reference,
+/// which clips at `1e-4` before the log where this goes through
+/// [`prep::normalize`](crate::prep::normalize). The centre lands within 0.13 px
+/// either way; the prominence scale differs, so the numbers above — not the
+/// doc's — are the ones this function returns.)
+pub fn find_center_rings(
+    tomo: &Tomo<f32>,
+    backend: &dyn Backend,
+    step: usize,
+) -> Result<RingCenter> {
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    if step == 0 {
+        return Err(Error::InvalidParam(
+            "find_center_rings: step must be ≥1".into(),
+        ));
+    }
+    let p = tomo.as_layout(Layout::Projection); // [nproj, ny, nx]
+    let (nproj, ny, nx) = p.array.dim();
+    if nproj == 0 || ny < 5 || nx < 4 {
+        return Err(Error::InvalidParam(format!(
+            "find_center_rings needs ≥1 projection and ≥5×4 pixels; got {nproj}×{ny}×{nx}"
+        )));
+    }
+
+    // Mean projection over every `step`-th frame.
+    let mut mean = Array2::<f32>::zeros((ny, nx));
+    let mut cnt = 0usize;
+    for i in (0..nproj).step_by(step) {
+        mean += &p.array.index_axis(Axis(0), i);
+        cnt += 1;
+    }
+    mean /= cnt as f32;
+
+    let prof = flip_registration_profile(&mean, fft)?;
+    Ok(ring_center_from_profile(&prof, nx))
+}
+
+/// Row-summed cross-correlation of `m` against its own left–right flip.
+/// Rings put their signature on the middle rows, so only those are summed —
+/// following `docs/LAMINOGRAPHY_ALIGNMENT.md`.
+fn flip_registration_profile(m: &Array2<f32>, fft: &dyn Fft) -> Result<Vec<f32>> {
+    let (ny, nx) = m.dim();
+    let mean = m.sum() / (ny * nx) as f32;
+
+    // a = m − mean, b = mirror(a). Correlate: irfft2(rfft2(a) · conj(rfft2(b))).
+    // Done as a full C2C 2-D transform via the backend's 1-D FFT over each axis.
+    let mut a: Vec<Complex32> = m.iter().map(|&v| Complex32::new(v - mean, 0.0)).collect();
+    let mut b: Vec<Complex32> = Vec::with_capacity(ny * nx);
+    for y in 0..ny {
+        for x in 0..nx {
+            b.push(Complex32::new(m[[y, nx - 1 - x]] - mean, 0.0));
+        }
+    }
+    fft.fft_2d(&mut a, ny, nx, 1, false)?;
+    fft.fft_2d(&mut b, ny, nx, 1, false)?;
+    for (av, bv) in a.iter_mut().zip(b.iter()) {
+        *av *= bv.conj();
+    }
+    fft.fft_2d(&mut a, ny, nx, 1, true)?;
+
+    // fftshift along x, then sum the 5 middle rows (fftshifted along y too).
+    let mut prof = vec![0.0f32; nx];
+    for dy in 0..5usize {
+        let y_shifted = ny / 2 - 2 + dy;
+        let y = (y_shifted + ny.div_ceil(2)) % ny; // undo the y fftshift
+        for (x, p) in prof.iter_mut().enumerate() {
+            let xs = (x + nx.div_ceil(2)) % nx; // undo the x fftshift
+            *p += a[y * nx + xs].re;
+        }
+    }
+    Ok(prof)
+}
+
+/// Peak of the flip-registration profile → centre column + how much to trust it.
+fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
+    let i = prof
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (k, &v)| {
+            if v > bv {
+                (k, v)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0;
+    // Parabolic sub-pixel refinement, guarded at the ends and against a flat top
+    // (a mis-aligned scan's profile has no curvature to fit).
+    let d = if i == 0 || i + 1 >= prof.len() {
+        0.0
+    } else {
+        let (y0, y1, y2) = (prof[i - 1], prof[i], prof[i + 1]);
+        let den = 2.0 * (y0 - 2.0 * y1 + y2);
+        if den.abs() < f32::EPSILON {
+            0.0
+        } else {
+            (y0 - y2) / den
+        }
+    };
+    let center = nx as f32 / 2.0 + ((i as f32 + d) - (nx / 2) as f32) / 2.0;
+
+    // Robust prominence: (peak − median) / MAD.
+    let mut sorted: Vec<f32> = prof.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let mut dev: Vec<f32> = prof.iter().map(|v| (v - median).abs()).collect();
+    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = dev[dev.len() / 2];
+    let prominence = if mad > 0.0 {
+        (prof[i] - median) / mad
+    } else {
+        0.0
+    };
+    RingCenter {
+        center,
+        prominence,
+        trustworthy: prominence >= 8.0,
+    }
+}
+
 /// Entropy-based center finding (tomopy `rotation.py:82`).
 ///
 /// Reconstructs a single slice with gridrec at candidate centers and minimises
