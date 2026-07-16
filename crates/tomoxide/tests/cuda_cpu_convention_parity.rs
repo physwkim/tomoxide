@@ -15,9 +15,11 @@
 //! Laminography is deliberately NOT exercised here: the CUDA lamino path
 //! (`cfunc_linerec` tilted back-projector) and the CPU lamino path
 //! (`recon::lamino`, a USFFT algorithm) are *different reconstruction algorithms*
-//! with different filter frameworks, so they are not scale-comparable and are
-//! excluded from the unification (each is validated against its own reference —
-//! CUDA vs tomocupy, CPU vs wgpu). Both stay y-flipped, consistently.
+//! with different filter frameworks, so their amplitudes are not comparable and
+//! are excluded from the *scale* unification (each is validated against its own
+//! reference — CUDA vs tomocupy, CPU vs wgpu). Only the amplitude is exempt: both
+//! lamino paths emit the same CPU/tomopy handedness as the algorithms asserted
+//! below, so neither is y-flipped here.
 //!
 //! The pre-existing CUDA streaming tests only compared CUDA-streaming against
 //! CUDA-whole-volume (same convention) or against tomocupy — never against the

@@ -2265,14 +2265,16 @@ mod cuda_impl {
     /// (c) passes the chunk's global z-start `sz` so the kernel's
     /// `z = (tz + sz) − nz/2` lands on the right detector plane. The full
     /// projection stack (`nz` rows) is filtered once and back-projected into every
-    /// output slice. Returns the chunk volume `[rh, n, n]` with the kernel's
-    /// `(n−1−ty)` y-flip and `4/nproj` scale (tomocupy convention). Unlike the
-    /// parallel-beam analytic paths, laminography is **deliberately excluded** from
-    /// the CPU/tomopy convention unification: the CUDA lamino kernel and the CPU
-    /// `recon::lamino` USFFT algorithm are different reconstructions with different
-    /// filter frameworks, so they are not scale-comparable (see `docs/ARCHITECTURE.md
-    /// §4.1`). Each lamino path is validated against its own reference (CUDA vs
-    /// tomocupy, CPU vs wgpu). Both stay y-flipped, consistently.
+    /// output slice. Returns the chunk volume `[rh, n, n]` in the CPU/tomopy
+    /// handedness — no y-flip — at the `π/nproj` dθ gain the caller passes, the same
+    /// orientation and quadrature weight as every other analytic path here
+    /// (`backprojection_ker` lost tomocupy's `(n−1−ty)` write and baked-in `4/nproj`
+    /// in the Phase 1/2 unification). What laminography *is* excluded from is the
+    /// cross-backend **scale** unification: this kernel and the CPU `recon::lamino`
+    /// USFFT algorithm are different reconstructions with different filter
+    /// frameworks, so their amplitudes are not comparable (see
+    /// `docs/ARCHITECTURE.md` §4.1). Each lamino path is validated against its own
+    /// reference (CUDA vs tomocupy, CPU vs wgpu).
     #[allow(clippy::too_many_arguments)]
     fn analytic_lamino_chunk(
         raw: &[f32],
