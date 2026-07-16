@@ -122,7 +122,9 @@ int tomoxide_lam_ramp_crop(const void* buf, void* proj, long long nlines, int de
 // fft2d_fwd  (lamino.rs:183) — centered 2-D FFT of each projection, scaled 1/(deth*detw).
 //   pre:  real proj [ntheta,deth,detw] -> complex out * sign(tx)*sign(ty)
 //   (cuFFT 2d forward, batch=ntheta, in place)
-//   post: complex *= -sign(tx)*sign(ty)*scale
+//   post: complex *= sign(tx)*sign(ty)*scale
+//   (tomocupy's irfftshiftc −1 dropped so the reconstruction matches the
+//    positive-material convention of linerec/fbp/SIRT; mirrors lamino.rs fft2d_fwd)
 // ===========================================================================
 
 __global__ void lam_fft2d_pre_ker(const float* proj, float2* out, long long ntheta,
@@ -147,7 +149,7 @@ __global__ void lam_fft2d_post_ker(float2* out, long long ntheta, int deth, int 
   long long r = i % slice;
   int ty = (int)(r / detw);
   int tx = (int)(r - (long long)ty * detw);
-  float s = -lam_sign(tx) * lam_sign(ty) * scale;
+  float s = lam_sign(tx) * lam_sign(ty) * scale;
   out[i] = lam_cscale(out[i], s);
 }
 

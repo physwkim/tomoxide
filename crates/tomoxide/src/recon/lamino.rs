@@ -42,6 +42,14 @@
 //! `fft2d_inv(fft2d_fwd) == id` round-trip, and a self-consistent
 //! forward-project → reconstruct round-trip of a 3-D phantom (the matched
 //! [`lamino_project`] forward model and [`lamino`] reconstruction recover it).
+//!
+//! **Sign deviation from tomocupy:** tomocupy's `irfftshiftc` in `fft2d` carries
+//! a global −1 that leaves this reconstruction sign-inverted versus the physical
+//! (minus-log) convention used by every other tomoxide method (linerec/fbp/SIRT
+//! give positive attenuation for dense material). We drop that −1 (in [`fft2d_fwd`]
+//! and, symmetrically, [`fft2d_inv`]) so all lamino methods agree; the output thus
+//! differs from tomocupy's raw fourierrec by a global sign only. The self-consistent
+//! fwd/adj pair and the `fft2d_inv(fft2d_fwd) == id` round-trip are unaffected.
 
 use crate::backend::Fft;
 use crate::dtype::Complex32;
@@ -203,13 +211,21 @@ pub fn fft2d_fwd(
             }
         });
     fft.fft_2d(&mut buf, deth, detw, ntheta, false)?;
-    // irfftshiftc2d (negated sign) + mulc by 1/(deth·detw).
+    // irfftshiftc2d + mulc by 1/(deth·detw). tomocupy's irfftshiftc carries an
+    // extra global −1 that leaves the Fourier laminography reconstruction
+    // sign-inverted versus the physical (minus-log) convention every other
+    // tomoxide method uses — linerec/fbp (direct back-projection) and SIRT
+    // (physical forward model) all give positive attenuation for dense material,
+    // this path gave negative. We drop that −1 here and symmetrically in the
+    // paired `fft2d_inv` (below) so all lamino methods share the positive-material
+    // convention; the reconstruction now matches linerec/fbp/SIRT and diverges
+    // from tomocupy's raw fourierrec output by a global sign only (|value| equal).
     let scale = 1.0 / (deth * detw) as f32;
     buf.par_chunks_mut(deth * detw).for_each(|bchunk| {
         for ty in 0..deth {
             let sy = sign(ty);
             for tx in 0..detw {
-                let s = -sign(tx) * sy * scale;
+                let s = sign(tx) * sy * scale;
                 bchunk[ty * detw + tx] *= s;
             }
         }
@@ -230,13 +246,14 @@ pub fn fft2d_inv(
     detw: usize,
     fft: &dyn Fft,
 ) -> Result<Vec<f32>> {
-    // Undo irfftshiftc (×−sign·sign).
+    // Undo irfftshiftc (×sign·sign — matches the de-negated `fft2d_fwd` post so
+    // `fft2d_inv(fft2d_fwd) == id` still holds; see the sign note in `fft2d_fwd`).
     let mut buf = vec![Complex32::new(0.0, 0.0); ntheta * deth * detw];
     for tz in 0..ntheta {
         for ty in 0..deth {
             let sy = sign(ty);
             for tx in 0..detw {
-                let s = -sign(tx) * sy;
+                let s = sign(tx) * sy;
                 buf[(tz * deth + ty) * detw + tx] = g[(tz * deth + ty) * detw + tx] * s;
             }
         }

@@ -941,7 +941,7 @@ unsafe extern "C" {
         detw: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// fft2d_fwd post-modulation: complex `*= -sign(tx)*sign(ty)/(deth*detw)`.
+    /// fft2d_fwd post-modulation: complex `*= sign(tx)*sign(ty)/(deth*detw)`.
     pub fn tomoxide_lam_fft2d_post(
         out: *mut c_void,
         ntheta: i64,
