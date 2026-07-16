@@ -295,9 +295,9 @@ impl Backend for CudaBackend {
 mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
-        make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter, FilteredBackproject,
-        ForwardProject, FourierReconstruct, IterativeReconstruct, LpRecReconstruct, RampShape,
-        RayProject, RayRow, StreamingAnalytic,
+        lam_ramp_weights, make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter,
+        FilteredBackproject, ForwardProject, FourierReconstruct, IterativeReconstruct,
+        LpRecReconstruct, RampShape, RayProject, RayRow, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -4488,15 +4488,33 @@ mod cuda_impl {
     /// leaving the GPU idle during transfers. When the spectra fit in VRAM,
     /// [`analytic_lamino_fourierrec_device`] keeps them resident and is preferred;
     /// the dispatcher [`analytic_lamino_fourierrec`] chooses between them.
-    fn analytic_lamino_fourierrec_host(
-        proj: &[f32],
-        theta: &[f32],
+    ///
+    /// Fixed per-call parameters common to the three lamino-fourierrec entry
+    /// points (everything but the projection data and the optional fused
+    /// normalization): the tilt `phi`, the square grid `n`, the recon height
+    /// `rh`, the rotation `center`, and the FBP apodisation `filter`.
+    #[derive(Clone, Copy)]
+    struct LamFourierParams {
         phi: f32,
         n: usize,
         rh: usize,
         center: f32,
+        filter: FilterName,
+    }
+
+    fn analytic_lamino_fourierrec_host(
+        proj: &[f32],
+        theta: &[f32],
+        p: LamFourierParams,
         norm: Option<&super::LamNorm>,
     ) -> Result<Vec<f32>> {
+        let LamFourierParams {
+            phi,
+            n,
+            rh,
+            center,
+            filter,
+        } = p;
         let csz = 2 * std::mem::size_of::<f32>(); // bytes per complex
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -4522,6 +4540,9 @@ mod cuda_impl {
         let shift = detw as f32 / 2.0 - center; // rotation-center linear phase
 
         let theta_dev = DevBuf::from_host_f32(theta)?;
+        // FBP filter weights (ramp × apodisation window), uploaded once and
+        // reused across every theta-chunk's stage-1 ramp multiply.
+        let filt_dev = DevBuf::from_host_f32(&lam_ramp_weights(ne, filter))?;
 
         // Per-chunk device footprint bounds the chunk count to ≤30% of free VRAM.
         // The conveyor double-buffers each stage's streamed input and output slab
@@ -4598,7 +4619,14 @@ mod cuda_impl {
                     )?;
                     ck(
                         unsafe {
-                            ffi::tomoxide_lam_ramp_mul(rbuf.ptr, nlines, ne as i32, shift, null)
+                            ffi::tomoxide_lam_ramp_mul(
+                                rbuf.ptr,
+                                filt_dev.ptr as *const f32,
+                                nlines,
+                                ne as i32,
+                                shift,
+                                null,
+                            )
                         },
                         "lam_ramp_mul",
                     )?;
@@ -5154,12 +5182,16 @@ mod cuda_impl {
     fn analytic_lamino_fourierrec_device(
         proj: &[f32],
         theta: &[f32],
-        phi: f32,
-        n: usize,
-        rh: usize,
-        center: f32,
+        p: LamFourierParams,
         norm: Option<&super::LamNorm>,
     ) -> Result<Vec<f32>> {
+        let LamFourierParams {
+            phi,
+            n,
+            rh,
+            center,
+            filter,
+        } = p;
         let csz = 2 * std::mem::size_of::<f32>(); // bytes per complex
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -5184,6 +5216,9 @@ mod cuda_impl {
         let shift = detw as f32 / 2.0 - center; // rotation-center linear phase
 
         let theta_dev = DevBuf::from_host_f32(theta)?;
+        // FBP filter weights (ramp × apodisation window), uploaded once and
+        // reused across every theta-chunk's stage-1 ramp multiply.
+        let filt_dev = DevBuf::from_host_f32(&lam_ramp_weights(ne, filter))?;
 
         // Resident spectra (complex, interleaved f32 pairs). p00 is streamed to a
         // pinned host buffer in stage 3. No memset: stage 1 fully overwrites p22 and
@@ -5297,7 +5332,16 @@ mod cuda_impl {
                     "lam_ramp_fft",
                 )?;
                 ck(
-                    unsafe { ffi::tomoxide_lam_ramp_mul(rbuf.ptr, nlines, ne as i32, shift, null) },
+                    unsafe {
+                        ffi::tomoxide_lam_ramp_mul(
+                            rbuf.ptr,
+                            filt_dev.ptr as *const f32,
+                            nlines,
+                            ne as i32,
+                            shift,
+                            null,
+                        )
+                    },
                     "lam_ramp_mul",
                 )?;
                 ck(
@@ -5629,12 +5673,10 @@ mod cuda_impl {
     fn analytic_lamino_fourierrec(
         proj: &[f32],
         theta: &[f32],
-        phi: f32,
-        n: usize,
-        rh: usize,
-        center: f32,
+        p: LamFourierParams,
         norm: Option<&super::LamNorm>,
     ) -> Result<Vec<f32>> {
+        let n = p.n;
         let csz = 2 * std::mem::size_of::<f32>();
         let nproj = theta.len();
         let detw = n;
@@ -5652,9 +5694,9 @@ mod cuda_impl {
         let free = device_free_bytes();
         let force_host = std::env::var_os("TOMOXIDE_LAM_FOURIERREC_HOST").is_some_and(|v| v == "1");
         if !force_host && base.saturating_mul(5) <= free.saturating_mul(4) {
-            analytic_lamino_fourierrec_device(proj, theta, phi, n, rh, center, norm)
+            analytic_lamino_fourierrec_device(proj, theta, p, norm)
         } else {
-            analytic_lamino_fourierrec_host(proj, theta, phi, n, rh, center, norm)
+            analytic_lamino_fourierrec_host(proj, theta, p, norm)
         }
     }
 
@@ -5852,7 +5894,18 @@ mod cuda_impl {
                 .ok_or_else(|| Error::InvalidParam("non-contiguous projection stack".into()))?;
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-            let vol = analytic_lamino_fourierrec(proj, theta, phi, n, rh, geom.center.at(0), norm)?;
+            let vol = analytic_lamino_fourierrec(
+                proj,
+                theta,
+                LamFourierParams {
+                    phi,
+                    n,
+                    rh,
+                    center: geom.center.at(0),
+                    filter: params.filter_name,
+                },
+                norm,
+            )?;
             let arr = Array3::from_shape_vec((rh, n, n), vol)
                 .map_err(|e| Error::InvalidParam(format!("cuda lamino tile shape: {e}")))?;
             on_tile(0, &Volume::new(arr))?;
@@ -6035,10 +6088,13 @@ mod cuda_impl {
                     let vol = analytic_lamino_fourierrec(
                         proj,
                         theta,
-                        phi,
-                        n,
-                        rh,
-                        geom.center.at(0),
+                        LamFourierParams {
+                            phi,
+                            n,
+                            rh,
+                            center: geom.center.at(0),
+                            filter: params.filter_name,
+                        },
                         None,
                     )?;
                     return Ok(Volume::new(

@@ -64,18 +64,19 @@ __global__ void lam_ramp_pad_ker(const float* proj, float2* buf, long long nline
   buf[i] = make_float2(v, 0.0f);
 }
 
-// Multiply each frequency by the centered |f| ramp: (k<=ne/2 ? k : ne-k)/ne,
-// then by the rotation-center linear phase exp(-2*pi*i * t * shift) with
+// Multiply each frequency by the per-bin filter weight filt[k] (the ramp folded
+// with the chosen FBP apodisation window; see backend::lam_ramp_weights), then
+// by the rotation-center linear phase exp(-2*pi*i * t * shift) with
 // t = fftfreq(ne) and shift = detw/2 - center (tomocupy `fbp_filter_center`).
-// shift == 0 (center == detw/2) leaves the ramp unchanged.
-__global__ void lam_ramp_mul_ker(float2* buf, long long nlines, int ne, float shift) {
+// shift == 0 (center == detw/2) leaves the filter unchanged. filt has length ne.
+__global__ void lam_ramp_mul_ker(float2* buf, const float* filt, long long nlines,
+                                 int ne, float shift) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   long long total = nlines * (long long)ne;
   if (i >= total) return;
   long long l = i / ne;
   int k = (int)(i - l * ne);
-  float f = (k <= ne / 2) ? (float)k : (float)(ne - k);
-  float r = f / (float)ne;
+  float r = filt[k];
   // signed frequency t (Hermitian) so the center-shift phase keeps the crop real.
   float t = (k <= ne / 2) ? (float)k / (float)ne : (float)(k - ne) / (float)ne;
   float ang = -2.0f * LAM_PI * t * shift;
@@ -102,10 +103,11 @@ int tomoxide_lam_ramp_pad(const void* proj, void* buf, long long nlines, int det
       (const float*)proj, (float2*)buf, nlines, detw, ne, pad);
   return (int)cudaGetLastError();
 }
-int tomoxide_lam_ramp_mul(void* buf, long long nlines, int ne, float shift, void* stream) {
+int tomoxide_lam_ramp_mul(void* buf, const void* filt, long long nlines, int ne,
+                          float shift, void* stream) {
   int block = 256;
   lam_ramp_mul_ker<<<lam_grid(nlines * (long long)ne, block), block, 0, (cudaStream_t)stream>>>(
-      (float2*)buf, nlines, ne, shift);
+      (float2*)buf, (const float*)filt, nlines, ne, shift);
   return (int)cudaGetLastError();
 }
 int tomoxide_lam_ramp_crop(const void* buf, void* proj, long long nlines, int detw,

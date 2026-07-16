@@ -91,12 +91,22 @@ fn cuda_fourierrec_lamino_matches_cpu_golden() {
     assert_eq!(gpu.array.dim(), (rh, n, n));
 
     // CPU golden: the standalone 3-D `recon::lamino::lamino`, fed the SAME raw
-    // (unfiltered — both ramp-filter internally) projections in projection layout
-    // `[nproj, nz, n]`.
+    // (unfiltered — both apply the SAME FBP filter internally) projections in
+    // projection layout `[nproj, nz, n]`. Pass the params' filter so the CPU
+    // golden and the GPU path filter identically.
     let pj = sino.to_layout(Layout::Projection);
     let proj = pj.array.as_slice().unwrap();
     let theta = &angles.0;
-    let cpu_vol = recon::lamino::lamino(proj, theta, lamino_angle_deg, n, rh, &cpu).unwrap();
+    let cpu_vol = recon::lamino::lamino(
+        proj,
+        theta,
+        lamino_angle_deg,
+        n,
+        rh,
+        params.filter_name,
+        &cpu,
+    )
+    .unwrap();
     assert_eq!(cpu_vol.len(), rh * n * n);
     let cpu_arr = ndarray::Array3::from_shape_vec((rh, n, n), cpu_vol).unwrap();
 

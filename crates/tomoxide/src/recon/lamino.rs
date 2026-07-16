@@ -46,6 +46,7 @@
 use crate::backend::Fft;
 use crate::dtype::Complex32;
 use crate::error::Result;
+use crate::params::FilterName;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 
@@ -663,13 +664,16 @@ fn wrap2d(fdee: &mut [Complex32], n0: usize, n1: usize, m0: usize, m1: usize, ad
 
 /// Ramp-filter each projection along the detector-width (`detw`) axis, with
 /// `ne = 2·detw` edge-padding (tomocupy filters projections, not sinograms;
-/// this uses a plain `|f|` ramp with `center = detw/2`, no extra apodization
-/// window or sub-pixel shift).
+/// `center = detw/2`, no sub-pixel shift). `filter` selects the apodisation
+/// window folded into the ramp ([`crate::backend::lam_ramp_weights`]);
+/// `FilterName::Ramp` is the plain `|f|` ramp, `Parzen` (the tomocupy default)
+/// and the others match tomocupy's `LamFourierRec` FBP-filtered projections.
 fn ramp_filter_detw(
     proj: &mut [f32],
     ntheta: usize,
     deth: usize,
     detw: usize,
+    filter: FilterName,
     fft: &dyn Fft,
 ) -> Result<()> {
     let ne = 2 * detw;
@@ -691,17 +695,9 @@ fn ramp_filter_detw(
         }
     }
     fft.fft_1d(&mut buf, ne, nlines, false)?;
-    // |f| ramp on centered frequencies (DC..Nyquist..−1), magnitude in cycles.
-    let ramp: Vec<f32> = (0..ne)
-        .map(|k| {
-            let f = if k <= ne / 2 {
-                k as f32
-            } else {
-                (ne - k) as f32
-            };
-            f / ne as f32
-        })
-        .collect();
+    // Ramp × apodisation window on centered frequencies (DC..Nyquist..−1),
+    // magnitude in cycles. `Ramp` reduces to the plain `|f|/ne`.
+    let ramp: Vec<f32> = crate::backend::lam_ramp_weights(ne, filter);
     for l in 0..nlines {
         for k in 0..ne {
             buf[l * ne + k] *= ramp[k];
@@ -728,7 +724,9 @@ fn lamino_phi(lamino_angle_deg: f32) -> f32 {
 /// `proj` is `[nproj, nz, n]` row-major (projection, detector-row, detector-col),
 /// with a square `n × n` in-plane field; `theta` are the `nproj` rotation angles
 /// (radians); `lamino_angle_deg` is the tilt of the rotation axis from the
-/// beam-perpendicular plane; `rh` is the number of reconstructed depth slices.
+/// beam-perpendicular plane; `rh` is the number of reconstructed depth slices;
+/// `filter` is the FBP apodisation window folded into the projection ramp
+/// (`FilterName::Parzen` matches tomocupy's default, `Ramp` the plain ramp).
 /// Returns the volume `[rh, n, n]` (depth, y, x). All FFTs use the supplied
 /// [`Fft`] backend.
 pub fn lamino(
@@ -737,6 +735,7 @@ pub fn lamino(
     lamino_angle_deg: f32,
     n: usize,
     rh: usize,
+    filter: FilterName,
     fft: &dyn Fft,
 ) -> Result<Vec<f32>> {
     let nproj = theta.len();
@@ -748,9 +747,10 @@ pub fn lamino(
     );
     let phi = lamino_phi(lamino_angle_deg);
 
-    // FBP ramp filter on projections, then the three chained USFFT operators.
+    // FBP ramp (+ apodisation) filter on projections, then the three chained
+    // USFFT operators.
     let mut filtered = proj.to_vec();
-    ramp_filter_detw(&mut filtered, nproj, deth, detw, fft)?;
+    ramp_filter_detw(&mut filtered, nproj, deth, detw, filter, fft)?;
     let p22 = fft2d_fwd(&filtered, nproj, deth, detw, fft)?;
     let p11 = usfft2d_adj(&p22, detw, n, deth, nproj, detw, theta, phi, fft)?;
     let p00 = usfft1d_adj(&p11, detw, n, rh, deth, phi, fft)?;
@@ -935,7 +935,7 @@ mod tests {
         sphere(&mut vol, 5.0, 10.0, 9.0, 1.8, 0.6);
 
         let proj = lamino_project(&vol, &theta, lamino_angle, n, nz, &cpu).unwrap();
-        let rec = lamino(&proj, &theta, lamino_angle, n, rh, &cpu).unwrap();
+        let rec = lamino(&proj, &theta, lamino_angle, n, rh, FilterName::Ramp, &cpu).unwrap();
 
         let corr = pearson(&rec, &vol);
         eprintln!("lamino round-trip corr = {corr:.4}");

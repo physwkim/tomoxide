@@ -910,9 +910,12 @@ unsafe extern "C" {
         pad: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// Multiply complex lines `[nlines, ne]` by the centered `|f|` ramp.
+    /// Multiply complex lines `[nlines, ne]` by the per-bin filter weights
+    /// `filt [ne]` (ramp folded with the FBP apodisation window) and the
+    /// rotation-center phase.
     pub fn tomoxide_lam_ramp_mul(
         buf: *mut c_void,
+        filt: *const f32,
         nlines: i64,
         ne: i32,
         shift: f32,
