@@ -25,7 +25,7 @@ pub mod vector;
 use crate::backend::{Backend, FilteredBackproject, ForwardProject, RayProject, RayRow};
 use crate::data::{Layout, Tomo, Volume};
 use crate::error::{Error, Result};
-use crate::geometry::{Angles, Center, Geometry};
+use crate::geometry::{Angles, Beam, Center, Geometry};
 use crate::params::{Algorithm, ReconParams};
 use ndarray::{Array3, Axis};
 
@@ -218,6 +218,25 @@ fn iterative(
         }
     }
 
+    // Laminography is not slice-separable — the tilted axis couples every
+    // detector row into every output voxel. The generic solvers whose step size
+    // is a per-slice scalar (CGLS/GRAD/TIKH treat each detector row ↔ its own
+    // independent output slice, a parallel-beam optimization) therefore do not
+    // converge for a tilted axis. Reject them explicitly rather than returning a
+    // silently-wrong volume; the structurally-global solvers (SIRT/MLEM/OSEM/
+    // OSPML/PML/TV — per-voxel/per-ray diagonal weights) handle laminography.
+    if matches!(geom.beam, Beam::Laminography { .. })
+        && matches!(
+            algorithm,
+            Algorithm::Cgls | Algorithm::Grad | Algorithm::Tikh
+        )
+    {
+        return Err(Error::InvalidParam(format!(
+            "laminography iterative reconstruction does not support {algorithm:?}: its \
+             per-slice step size assumes parallel-beam slice-separability; use \
+             SIRT/MLEM/OSEM/OSPML/PML/TV"
+        )));
+    }
     let proj = backend
         .projector()
         .ok_or_else(|| missing("ForwardProject", backend))?;

@@ -13,6 +13,7 @@ use std::path::Path;
 use crate::data::{Dataset, Frames, Layout, Tomo, Volume};
 use crate::error::{Error, Result};
 use ndarray::{Array3, Axis};
+use rayon::prelude::*;
 use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, Hdf5Error, VarLenUnicode};
 use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
 
@@ -683,6 +684,19 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
         .datatype()
         .map_err(|e| Error::Io(format!("datatype: {e}")))?;
     let raw = |e: Hdf5Error| Error::Io(format!("read: {e}"));
+    // cast<T> reads the whole dataset as on-disk type T and casts each element to
+    // f32 in parallel. The single-threaded `x as f32` over a whole projection
+    // stack (billions of elements) was ~10 s of a 2048² × 1800 read; rayon splits
+    // it across cores. `collect` into `Vec` preserves element order.
+    macro_rules! cast {
+        ($t:ty) => {
+            ds.read_raw::<$t>()
+                .map_err(raw)?
+                .into_par_iter()
+                .map(|x| x as f32)
+                .collect()
+        };
+    }
     let v: Vec<f32> = match dt {
         DatatypeMessage::FloatingPoint {
             size: 4,
@@ -698,32 +712,18 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<f64>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(f64)
         }
         DatatypeMessage::FixedPoint {
             size: 1,
             signed: false,
             ..
-        } => ds
-            .read_raw::<u8>()
-            .map_err(raw)?
-            .into_iter()
-            .map(|x| x as f32)
-            .collect(),
+        } => cast!(u8),
         DatatypeMessage::FixedPoint {
             size: 1,
             signed: true,
             ..
-        } => ds
-            .read_raw::<i8>()
-            .map_err(raw)?
-            .into_iter()
-            .map(|x| x as f32)
-            .collect(),
+        } => cast!(i8),
         DatatypeMessage::FixedPoint {
             size: 2,
             signed: false,
@@ -731,11 +731,7 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<u16>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(u16)
         }
         DatatypeMessage::FixedPoint {
             size: 2,
@@ -744,11 +740,7 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<i16>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(i16)
         }
         DatatypeMessage::FixedPoint {
             size: 4,
@@ -757,11 +749,7 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<u32>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(u32)
         }
         DatatypeMessage::FixedPoint {
             size: 4,
@@ -770,11 +758,7 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<i32>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(i32)
         }
         DatatypeMessage::FixedPoint {
             size: 8,
@@ -783,11 +767,7 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<u64>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(u64)
         }
         DatatypeMessage::FixedPoint {
             size: 8,
@@ -796,11 +776,7 @@ fn read_f32_vec(ds: &H5Dataset) -> Result<Vec<f32>> {
             ..
         } => {
             ensure_le(byte_order)?;
-            ds.read_raw::<i64>()
-                .map_err(raw)?
-                .into_iter()
-                .map(|x| x as f32)
-                .collect()
+            cast!(i64)
         }
         other => {
             return Err(Error::Io(format!(
@@ -821,12 +797,13 @@ fn read_f32_slice(ds: &H5Dataset, starts: &[usize], counts: &[usize]) -> Result<
         .datatype()
         .map_err(|e| Error::Io(format!("datatype: {e}")))?;
     let raw = |e: Hdf5Error| Error::Io(format!("read: {e}"));
-    // cast<T> reads the slice as on-disk type T and casts each element to f32.
+    // cast<T> reads the slice as on-disk type T and casts each element to f32 in
+    // parallel (order-preserving; same rationale as read_f32_vec).
     macro_rules! cast {
         ($t:ty) => {
             ds.read_slice::<$t>(starts, counts)
                 .map_err(raw)?
-                .into_iter()
+                .into_par_iter()
                 .map(|x| x as f32)
                 .collect()
         };

@@ -15,6 +15,37 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Fourier laminography (`LamFourierRec`) now honours `--filter`.** The
+  Fourier/USFFT lamino path applied a plain `|f|` ramp and ignored the selected
+  apodisation, unlike tomocupy's `LamFourierRec` (which filters with
+  `args.fbp_filter`, default parzen) and unlike tomoxide's own fbp/linerec lamino
+  paths. The apodisation window is now folded into the projection ramp on all
+  three paths (CPU golden, CUDA host, CUDA device) from a single window
+  definition shared with `make_fbp_filter`. The default is parzen (tomocupy
+  parity); pass `--filter ramp` for the previous plain-ramp behaviour.
+- **Multi-GPU angle-split SIRT for laminography.** Laminographic SIRT can now run
+  across multiple GPUs by partitioning the projection angles into contiguous
+  per-device chunks; each GPU holds the full volume and its angle chunk and
+  contributes a partial tilted back-projection, with the correction all-reduced
+  each iteration. The result is bit-identical to single-device SIRT.
+- **CUDA laminography now streams out-of-core, across all GPUs.** The tilted
+  back-projector previously built the whole filtered stack in one shot on a
+  single GPU, which overflowed the kernels' 32-bit index (`nz·nproj·ncols ≈
+  7.5e9 > 2³¹`, SIGSEGV) and exceeded VRAM at production resolutions. It now
+  mirrors tomocupy's laminography chunking: filter the stack once into host
+  memory (nz-sub-chunked so the padded scratch stays under VRAM and the index
+  ceiling), then a nested output-rh-tile × projection-angle-chunk loop uploads
+  each filtered angle chunk and accumulates its back-projection into the tile.
+  Multi-GPU shards the output rh axis across every selected device (the whole
+  stack is filtered once, then per-device back-projection shards read it
+  read-only). Chunk sizes are derived from free VRAM and the index ceiling. The
+  fits-in-one-chunk case stays byte-identical to the previous single-shot path.
+  The CLI now streams the result to disk as well: `reconstruct_lamino_streaming`
+  (library + pipeline) emits the output one rh-tile at a time through a callback,
+  so `tomoxide-cli` writes the volume tile-by-tile and never holds the whole
+  reconstruction in host RAM. Tiles are computed a round of GPUs at a time and
+  written from the main thread (the H5 writer is `!Send`), bounding host peak to
+  the sinogram plus the filtered host stack plus one in-flight tile per device.
 - **GUI: Live streaming reconstruction screen** (`tomoxide-gui`, the seventh
   mode wired up — docs/GUI.md §2.6, milestone M3 first cut). Connects a
   tomoScanStream-style pvAccess projection stream through rsdm's headless data
@@ -109,6 +140,20 @@ All notable changes to this project are documented here. The format is based on
   DXchange preprocessing unchanged — no new recon or prep code. Energy-to-energy
   3-D registration (SimpleITK rigid Mutual-Information) has no pure-Rust
   equivalent and stays an upstream Python step in v1.
+
+### Fixed
+
+- **Fourier laminography reconstruction sign corrected.** The Fourier/USFFT
+  lamino path (`recon::lamino::lamino` and its CUDA analytic mirror) reconstructed
+  dense material as **negative** attenuation — inverted versus the physical
+  minus-log convention that linerec/fbp (direct back-projection) and SIRT (physical
+  forward model) follow. The cause was a global `-1` in tomocupy's `irfftshiftc`
+  fft2d step, ported faithfully; it is a pure sign, independent of the fftshift
+  centering. It is now dropped in `fft2d_fwd` and, symmetrically, in the paired
+  `fft2d_inv`, so the reconstruction matches linerec/fbp/SIRT (positive material)
+  while the `fft2d_inv(fft2d_fwd) == id` round-trip and CPU↔CUDA parity are
+  preserved. Output now differs from tomocupy's raw fourierrec by a global sign
+  only (magnitudes identical).
 
 ## [0.6.0] - 2026-07-06
 

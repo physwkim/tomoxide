@@ -52,6 +52,66 @@ pub fn reconstruct(
     crate::recon::recon(&sino, geom, algorithm, params, backend)
 }
 
+/// Laminography reconstruction that streams the output rh-tiles to `on_tile`
+/// instead of returning the whole `[rh, n, n]` volume — for outputs too large to
+/// assemble in host RAM. Runs the same projection-domain prep as [`reconstruct`]
+/// (flat/dark + minus-log, phase retrieval, stripe removal), then hands the
+/// prepped sinogram to the CUDA out-of-core laminography streamer
+/// ([`crate::cuda::reconstruct_lamino_streaming`], which filters the whole stack
+/// once and back-projects the output tile-by-tile). `on_tile(rh0, tile)` is
+/// called once per rh-tile on a single thread in ascending row order. CUDA-only:
+/// errors on other engines or without the `cuda` feature. Returns `(rh, n, n)`.
+pub fn reconstruct_lamino_streaming(
+    mut ds: Dataset<f32>,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+    engine: &Engine,
+    on_tile: &mut crate::cuda::LaminoTileFn,
+) -> Result<(usize, usize, usize)> {
+    let backend = engine.backend();
+    // Fuse flat/dark + minus-log into the fourierrec stage-1 upload when no
+    // host-domain projection prep needs the normalized data first: the recon
+    // normalizes each projection chunk it already uploads for stage 1, so the
+    // standalone full-stack darkflat/minus-log GPU round-trip (upload → normalize
+    // → download, then re-upload chunk by chunk) is skipped. Fourierrec-only —
+    // Fbp/Linerec have no stage-1 upload to fuse into and keep the explicit
+    // `normalize_dataset` below. Phase/stripe both consume the normalized stack
+    // on the host, so a fused (deferred) normalization would starve them.
+    if algorithm == Algorithm::Fourierrec
+        && prep.phase == PhaseMethod::None
+        && prep.stripe == StripeMethod::None
+    {
+        let norm = crate::cuda::LamNorm::from_dataset(&ds)?;
+        return crate::cuda::reconstruct_lamino_streaming(
+            &ds.data,
+            geom,
+            algorithm,
+            params,
+            Some(&norm),
+            on_tile,
+        );
+    }
+    crate::prep::normalize_dataset(&mut ds, backend)?;
+    crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+    // Stripe removal is the only sinogram-domain prep step here. When it is
+    // disabled (`StripeMethod::None`), hand the recon the native projection stack
+    // instead of transposing to sinogram order: the CUDA fourierrec laminography
+    // path wants projection order anyway, so the old unconditional
+    // `to_layout(Sinogram)` was a wasted round-trip — transpose the whole stack to
+    // sinogram order, then transpose it straight back to projection order inside
+    // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
+    // nothing. Fbp/Linerec still transpose to sinogram once inside the recon.
+    if prep.stripe == StripeMethod::None {
+        crate::cuda::reconstruct_lamino_streaming(&ds.data, geom, algorithm, params, None, on_tile)
+    } else {
+        let mut sino = ds.data.to_layout(Layout::Sinogram);
+        crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+        crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, None, on_tile)
+    }
+}
+
 /// Cooperative cancellation flag for the chunked drivers.
 ///
 /// Clone the token, hand one clone to [`ReconSteps::with_cancel`], and call

@@ -444,8 +444,10 @@ fn lamino_recon_matches_cpu_on_gpu() {
 
     // Forward-project once on the CPU, then reconstruct on both backends.
     let proj = recon::lamino::lamino_project(&vol, &theta, lamino_angle, n, nz, cfft).unwrap();
-    let rc = recon::lamino::lamino(&proj, &theta, lamino_angle, n, rh, cfft).unwrap();
-    let rg = recon::lamino::lamino(&proj, &theta, lamino_angle, n, rh, gfft).unwrap();
+    let rc =
+        recon::lamino::lamino(&proj, &theta, lamino_angle, n, rh, FilterName::Ramp, cfft).unwrap();
+    let rg =
+        recon::lamino::lamino(&proj, &theta, lamino_angle, n, rh, FilterName::Ramp, gfft).unwrap();
 
     // GPU reconstruction recovers the phantom.
     let corr = pearson_vec(&rg, &vol);

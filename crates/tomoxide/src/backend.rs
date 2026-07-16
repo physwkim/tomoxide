@@ -439,7 +439,6 @@ pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<V
         ));
     }
     let pad = (4 * n).next_power_of_two();
-    let pi = std::f32::consts::PI;
     let nhalf = pad / 2 + 1;
     const ORDER: usize = 12;
     // The order-12 overlap quadrature needs at least `2·(ORDER−1)+1` samples for
@@ -477,36 +476,69 @@ pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<V
             continue;
         }
         let ramp = ramp_half[fk];
-        let mut v = match name {
-            FilterName::None => unreachable!(),
-            FilterName::Ramp => ramp,
-            FilterName::Shepp => {
-                let x = pi * r / 2.0;
-                if x == 0.0 {
-                    ramp
-                } else {
-                    ramp * (x.sin() / x)
-                }
-            }
-            FilterName::Cosine => ramp * (pi * r / 2.0).cos(),
-            FilterName::Cosine2 => {
-                let c = (pi * r / 2.0).cos();
-                ramp * c * c
-            }
-            FilterName::Hamming => ramp * (0.54 + 0.46 * (pi * r).cos()),
-            FilterName::Hann => ramp * 0.5 * (1.0 + (pi * r).cos()),
-            FilterName::Parzen => ramp * (1.0 - r).powi(3),
-        };
-        // tomocupy clamps the windowed ramp to ≥0 and doubles the DC bin.
-        if v < 0.0 {
-            v = 0.0;
-        }
+        // tomocupy doubles the DC bin (the ≥0 clamp lives in `apodize`).
+        let mut v = apodize(name, ramp, r);
         if k == 0 {
             v *= 2.0;
         }
         *slot = v;
     }
     Ok(f)
+}
+
+/// Apply the `name` apodisation window to a base ramp value at normalised
+/// frequency `r ∈ [0, 1]` (`1` = Nyquist), clamped to ≥ 0. This is the window
+/// *shape* only — the caller supplies the base `ramp` and handles the DC bin and
+/// the `None` = identity case. Shared by [`make_fbp_filter`] and the
+/// laminography ramp filter ([`lam_ramp_weights`]) so the window definitions
+/// have a single source of truth.
+pub(crate) fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let v = match name {
+        // No window: plain ramp. (`make_fbp_filter` treats `None` as full
+        // identity — no ramp either — before it ever calls here.)
+        FilterName::None | FilterName::Ramp => ramp,
+        FilterName::Shepp => {
+            let x = pi * r / 2.0;
+            if x == 0.0 {
+                ramp
+            } else {
+                ramp * (x.sin() / x)
+            }
+        }
+        FilterName::Cosine => ramp * (pi * r / 2.0).cos(),
+        FilterName::Cosine2 => {
+            let c = (pi * r / 2.0).cos();
+            ramp * c * c
+        }
+        FilterName::Hamming => ramp * (0.54 + 0.46 * (pi * r).cos()),
+        FilterName::Hann => ramp * 0.5 * (1.0 + (pi * r).cos()),
+        FilterName::Parzen => ramp * (1.0 - r).powi(3),
+    };
+    if v < 0.0 {
+        0.0
+    } else {
+        v
+    }
+}
+
+/// Per-frequency real multiplier for the laminography projection ramp filter,
+/// length `ne` (the edge-padded FFT length `2·detw`). Bin `k` maps to the
+/// centred frequency `f = min(k, ne−k)`; the base is the plain linear ramp
+/// `f/ne` (tomoxide's lamino ramp convention — no wint quadrature), apodised by
+/// `name`. `Ramp`/`None` leave the plain ramp unchanged (the prior behaviour);
+/// `Parzen` (the default) and the others match tomocupy's `LamFourierRec`, which
+/// filters projections with the selected FBP filter. Applied on the FFT'd,
+/// edge-padded projection lines in place of the old hard-coded `|f|/ne` ramp.
+pub(crate) fn lam_ramp_weights(ne: usize, name: FilterName) -> Vec<f32> {
+    (0..ne)
+        .map(|k| {
+            let fk = if k <= ne / 2 { k } else { ne - k };
+            let ramp = fk as f32 / ne as f32;
+            let r = 2.0 * fk as f32 / ne as f32;
+            apodize(name, ramp, r)
+        })
+        .collect()
 }
 
 /// Fused, device-resident analytic reconstruction (raw sinogram → volume):

@@ -42,10 +42,20 @@
 //! `fft2d_inv(fft2d_fwd) == id` round-trip, and a self-consistent
 //! forward-project → reconstruct round-trip of a 3-D phantom (the matched
 //! [`lamino_project`] forward model and [`lamino`] reconstruction recover it).
+//!
+//! **Sign deviation from tomocupy:** tomocupy's `irfftshiftc` in `fft2d` carries
+//! a global −1 that leaves this reconstruction sign-inverted versus the physical
+//! (minus-log) convention used by every other tomoxide method (linerec/fbp/SIRT
+//! give positive attenuation for dense material). We drop that −1 (in [`fft2d_fwd`]
+//! and, symmetrically, [`fft2d_inv`]) so all lamino methods agree; the output thus
+//! differs from tomocupy's raw fourierrec by a global sign only. The self-consistent
+//! fwd/adj pair and the `fft2d_inv(fft2d_fwd) == id` round-trip are unaffected.
 
 use crate::backend::Fft;
 use crate::dtype::Complex32;
 use crate::error::Result;
+use crate::params::FilterName;
+use rayon::prelude::*;
 use std::f32::consts::PI;
 
 /// Gridding accuracy target (tomocupy hardcodes `EPS = 1e-3`).
@@ -96,23 +106,29 @@ fn centered_fft_axis0(
 ) -> Result<()> {
     let len = 2 * n;
     let mut lines = vec![Complex32::new(0.0, 0.0); batch * len];
-    for i in 0..len {
-        let s = sign(m + i);
-        let src = (m + i) * batch;
-        for b in 0..batch {
-            lines[b * len + i] = fdee[src + b] * s;
+    // Gather the interior window into b-major lines (parallel over b, disjoint
+    // length-len rows; fdee read strided). Element-wise, so order-independent.
+    lines.par_chunks_mut(len).enumerate().for_each(|(b, row)| {
+        for (i, slot) in row.iter_mut().enumerate() {
+            *slot = fdee[(m + i) * batch + b] * sign(m + i);
         }
-    }
+    });
     fft.fft_1d(&mut lines, len, batch, inverse)?;
     // cuFFT-style unnormalized inverse: undo tomoxide's 1/len.
     let renorm = if inverse { len as f32 } else { 1.0 };
-    for i in 0..len {
-        let s = sign(m + i) * renorm;
-        let dst = (m + i) * batch;
-        for b in 0..batch {
-            fdee[dst + b] = lines[b * len + i] * s;
-        }
-    }
+    // Scatter back into the interior window (parallel over grid rows; each row
+    // is a disjoint contiguous batch-run, lines read strided).
+    fdee.par_chunks_mut(batch)
+        .enumerate()
+        .for_each(|(grid, row)| {
+            if grid >= m && grid < m + len {
+                let i = grid - m;
+                let s = sign(m + i) * renorm;
+                for (b, slot) in row.iter_mut().enumerate() {
+                    *slot = lines[b * len + i] * s;
+                }
+            }
+        });
     Ok(())
 }
 
@@ -135,28 +151,32 @@ fn centered_fft2d(
     let gy = 2 * n1 + 2 * m1;
     let (wx, wy) = (2 * n0, 2 * n1);
     let mut win = vec![Complex32::new(0.0, 0.0); batch * wy * wx];
-    for b in 0..batch {
-        for iy in 0..wy {
-            let sy = sign(m1 + iy);
-            for ix in 0..wx {
-                let s = sign(m0 + ix) * sy;
-                let src = (m0 + ix) + (m1 + iy) * gx + b * gx * gy;
-                win[(b * wy + iy) * wx + ix] = fdee[src] * s;
+    // Extract the interior window per ky slice (parallel over the batch; win and
+    // fdee are both batch-major, so each slice is a disjoint chunk).
+    win.par_chunks_mut(wy * wx)
+        .zip(fdee.par_chunks(gx * gy))
+        .for_each(|(wslice, fslice)| {
+            for iy in 0..wy {
+                let sy = sign(m1 + iy);
+                for ix in 0..wx {
+                    let s = sign(m0 + ix) * sy;
+                    wslice[iy * wx + ix] = fslice[(m0 + ix) + (m1 + iy) * gx] * s;
+                }
             }
-        }
-    }
+        });
     fft.fft_2d(&mut win, wy, wx, batch, inverse)?;
     let renorm = if inverse { (wx * wy) as f32 } else { 1.0 };
-    for b in 0..batch {
-        for iy in 0..wy {
-            let sy = sign(m1 + iy);
-            for ix in 0..wx {
-                let s = sign(m0 + ix) * sy * renorm;
-                let dst = (m0 + ix) + (m1 + iy) * gx + b * gx * gy;
-                fdee[dst] = win[(b * wy + iy) * wx + ix] * s;
+    fdee.par_chunks_mut(gx * gy)
+        .zip(win.par_chunks(wy * wx))
+        .for_each(|(fslice, wslice)| {
+            for iy in 0..wy {
+                let sy = sign(m1 + iy);
+                for ix in 0..wx {
+                    let s = sign(m0 + ix) * sy * renorm;
+                    fslice[(m0 + ix) + (m1 + iy) * gx] = wslice[iy * wx + ix] * s;
+                }
             }
-        }
-    }
+        });
     Ok(())
 }
 
@@ -177,29 +197,39 @@ pub fn fft2d_fwd(
     fft: &dyn Fft,
 ) -> Result<Vec<Complex32>> {
     // rfftshiftc2d: modulate real input by sign(tx)·sign(ty), embed as complex.
+    // Parallel over projections (each owns a disjoint deth·detw chunk).
     let mut buf = vec![Complex32::new(0.0, 0.0); ntheta * deth * detw];
-    for tz in 0..ntheta {
-        for ty in 0..deth {
-            let sy = sign(ty);
-            for tx in 0..detw {
-                let s = sign(tx) * sy;
-                buf[(tz * deth + ty) * detw + tx] =
-                    Complex32::new(proj[(tz * deth + ty) * detw + tx] * s, 0.0);
+    buf.par_chunks_mut(deth * detw)
+        .zip(proj.par_chunks(deth * detw))
+        .for_each(|(bchunk, pchunk)| {
+            for ty in 0..deth {
+                let sy = sign(ty);
+                for tx in 0..detw {
+                    let s = sign(tx) * sy;
+                    bchunk[ty * detw + tx] = Complex32::new(pchunk[ty * detw + tx] * s, 0.0);
+                }
             }
-        }
-    }
+        });
     fft.fft_2d(&mut buf, deth, detw, ntheta, false)?;
-    // irfftshiftc2d (negated sign) + mulc by 1/(deth·detw).
+    // irfftshiftc2d + mulc by 1/(deth·detw). tomocupy's irfftshiftc carries an
+    // extra global −1 that leaves the Fourier laminography reconstruction
+    // sign-inverted versus the physical (minus-log) convention every other
+    // tomoxide method uses — linerec/fbp (direct back-projection) and SIRT
+    // (physical forward model) all give positive attenuation for dense material,
+    // this path gave negative. We drop that −1 here and symmetrically in the
+    // paired `fft2d_inv` (below) so all lamino methods share the positive-material
+    // convention; the reconstruction now matches linerec/fbp/SIRT and diverges
+    // from tomocupy's raw fourierrec output by a global sign only (|value| equal).
     let scale = 1.0 / (deth * detw) as f32;
-    for tz in 0..ntheta {
+    buf.par_chunks_mut(deth * detw).for_each(|bchunk| {
         for ty in 0..deth {
             let sy = sign(ty);
             for tx in 0..detw {
-                let s = -sign(tx) * sy * scale;
-                buf[(tz * deth + ty) * detw + tx] *= s;
+                let s = sign(tx) * sy * scale;
+                bchunk[ty * detw + tx] *= s;
             }
         }
-    }
+    });
     Ok(buf)
 }
 
@@ -216,13 +246,14 @@ pub fn fft2d_inv(
     detw: usize,
     fft: &dyn Fft,
 ) -> Result<Vec<f32>> {
-    // Undo irfftshiftc (×−sign·sign).
+    // Undo irfftshiftc (×sign·sign — matches the de-negated `fft2d_fwd` post so
+    // `fft2d_inv(fft2d_fwd) == id` still holds; see the sign note in `fft2d_fwd`).
     let mut buf = vec![Complex32::new(0.0, 0.0); ntheta * deth * detw];
     for tz in 0..ntheta {
         for ty in 0..deth {
             let sy = sign(ty);
             for tx in 0..detw {
-                let s = -sign(tx) * sy;
+                let s = sign(tx) * sy;
                 buf[(tz * deth + ty) * detw + tx] = g[(tz * deth + ty) * detw + tx] * s;
             }
         }
@@ -278,21 +309,40 @@ pub fn usfft1d_adj(
     let mut fdee = vec![Complex32::new(0.0, 0.0); ng * n1 * n0];
 
     // gather1d (adj): scatter each g sample into the oversampled grid.
+    // Parallel over ty (the in-plane y axis is independent): each ty gathers
+    // into its own contiguous `[ng, n0]` column, then the columns are placed
+    // into fdee's strided `ty*n0 + a*n0*n1` lanes. The per-ty tz-order is
+    // preserved, so the f32 accumulation is bit-identical to the serial path.
     let wscale = (PI / (mu2 * n0 as f32)).sqrt();
-    for tz in 0..deth {
-        let z0 = z[tz];
-        let base = (2.0 * n2 as f32 * z0).floor() as isize - m2 as isize;
-        for ty in 0..n1 {
-            for tx in 0..n0 {
-                let g0 = g[tx + tz * n0 + ty * n0 * deth];
-                for i2 in 0..2 * m2 + 1 {
-                    let ell2 = base + i2 as isize;
-                    let w2 = ell2 as f32 / (2.0 * n2 as f32) - z0;
-                    let w = wscale * (-PI * PI / mu2 * w2 * w2).exp();
-                    let a = (n2 as isize + m2 as isize + ell2) as usize;
-                    fdee[tx + ty * n0 + a * n0 * n1] += g0 * w;
+    let bases: Vec<isize> = z
+        .iter()
+        .map(|&z0| (2.0 * n2 as f32 * z0).floor() as isize - m2 as isize)
+        .collect();
+    let cols: Vec<Vec<Complex32>> = (0..n1)
+        .into_par_iter()
+        .map(|ty| {
+            let mut col = vec![Complex32::new(0.0, 0.0); ng * n0]; // [a, tx]
+            for tz in 0..deth {
+                let z0 = z[tz];
+                let base = bases[tz];
+                for tx in 0..n0 {
+                    let g0 = g[tx + tz * n0 + ty * n0 * deth];
+                    for i2 in 0..2 * m2 + 1 {
+                        let ell2 = base + i2 as isize;
+                        let w2 = ell2 as f32 / (2.0 * n2 as f32) - z0;
+                        let w = wscale * (-PI * PI / mu2 * w2 * w2).exp();
+                        let a = (n2 as isize + m2 as isize + ell2) as usize;
+                        col[a * n0 + tx] += g0 * w;
+                    }
                 }
             }
+            col
+        })
+        .collect();
+    for (ty, col) in cols.iter().enumerate() {
+        for a in 0..ng {
+            let dst = ty * n0 + a * n0 * n1;
+            fdee[dst..dst + n0].copy_from_slice(&col[a * n0..a * n0 + n0]);
         }
     }
 
@@ -312,18 +362,21 @@ pub fn usfft1d_adj(
     // Centered inverse FFT along the depth-grid axis over the window [m2, m2+2n2).
     centered_fft_axis0(&mut fdee, n2, m2, n0 * n1, true, fft)?;
 
-    // divker1d (adj): deapodize, take real part → f[n1, n2, n0].
+    // divker1d (adj): deapodize, take real part → f[n1, n2, n0]. Parallel over
+    // ty (f is contiguous per ty; fdee read-only).
     let mut f = vec![0.0f32; n1 * n2 * n0];
-    for tz in 0..n2 {
-        let ker = (-mu2 * (tz as f32 - n2 as f32 / 2.0).powi(2)).exp();
-        let a = tz + n2 / 2 + m2;
-        for ty in 0..n1 {
-            for tx in 0..n0 {
-                let g_ind = tx + ty * n0 + a * n0 * n1;
-                f[tx + tz * n0 + ty * n0 * n2] = fdee[g_ind].re / ker / (2.0 * n2 as f32);
+    f.par_chunks_mut(n2 * n0)
+        .enumerate()
+        .for_each(|(ty, fchunk)| {
+            for tz in 0..n2 {
+                let ker = (-mu2 * (tz as f32 - n2 as f32 / 2.0).powi(2)).exp();
+                let a = tz + n2 / 2 + m2;
+                for tx in 0..n0 {
+                    let g_ind = tx + ty * n0 + a * n0 * n1;
+                    fchunk[tz * n0 + tx] = fdee[g_ind].re / ker / (2.0 * n2 as f32);
+                }
             }
-        }
-    }
+        });
     Ok(f)
 }
 
@@ -460,53 +513,62 @@ pub fn usfft2d_adj(
     let mut fdee = vec![Complex32::new(0.0, 0.0); nky * gy * gx];
 
     // gather2d (adj): scatter each (θ, ky, kx) sample into the (x,y) grid.
+    // Parallel over ky: fdee splits into `nky` disjoint `gx*gy` sub-grids, one
+    // per ky, so workers never alias. The tz-outer / kx order inside each ky is
+    // unchanged, so every cell's `+=` sequence — and the f32 result — is
+    // identical to the serial path.
     let wpre = PI / (mu0 * mu1 * ntheta as f32).sqrt();
-    for tz in 0..ntheta {
-        for ky in 0..nky {
-            for kx in 0..detw {
-                let ind = kx + ky * detw + tz * detw * nky;
-                let (x0, y0) = (xs[ind], ys[ind]);
-                let g0 = g[ind];
-                let base0 = (2.0 * n0 as f32 * x0).floor() as isize - m0 as isize;
-                let base1 = (2.0 * n1 as f32 * y0).floor() as isize - m1 as isize;
-                for i1 in 0..2 * m1 + 1 {
-                    let ell1 = base1 + i1 as isize;
-                    let w1 = ell1 as f32 / (2.0 * n1 as f32) - y0;
-                    let ew1 = (-PI * PI / mu1 * w1 * w1).exp();
-                    let yg = (n1 as isize + m1 as isize + ell1) as usize;
-                    for i0 in 0..2 * m0 + 1 {
-                        let ell0 = base0 + i0 as isize;
-                        let w0 = ell0 as f32 / (2.0 * n0 as f32) - x0;
-                        let w = wpre * (-PI * PI / mu0 * w0 * w0).exp() * ew1;
-                        let xg = (n0 as isize + m0 as isize + ell0) as usize;
-                        fdee[xg + yg * gx + ky * gx * gy] += g0 * w;
+    fdee.par_chunks_mut(gx * gy)
+        .enumerate()
+        .for_each(|(ky, sub)| {
+            for tz in 0..ntheta {
+                for kx in 0..detw {
+                    let ind = kx + ky * detw + tz * detw * nky;
+                    let (x0, y0) = (xs[ind], ys[ind]);
+                    let g0 = g[ind];
+                    let base0 = (2.0 * n0 as f32 * x0).floor() as isize - m0 as isize;
+                    let base1 = (2.0 * n1 as f32 * y0).floor() as isize - m1 as isize;
+                    for i1 in 0..2 * m1 + 1 {
+                        let ell1 = base1 + i1 as isize;
+                        let w1 = ell1 as f32 / (2.0 * n1 as f32) - y0;
+                        let ew1 = (-PI * PI / mu1 * w1 * w1).exp();
+                        let yg = (n1 as isize + m1 as isize + ell1) as usize;
+                        for i0 in 0..2 * m0 + 1 {
+                            let ell0 = base0 + i0 as isize;
+                            let w0 = ell0 as f32 / (2.0 * n0 as f32) - x0;
+                            let w = wpre * (-PI * PI / mu0 * w0 * w0).exp() * ew1;
+                            let xg = (n0 as isize + m0 as isize + ell0) as usize;
+                            sub[xg + yg * gx] += g0 * w;
+                        }
                     }
                 }
             }
-        }
-    }
+        });
 
     // wrap2d (adj): fold the borders back into the interior in x and y.
-    wrap2d(&mut fdee, n0, n1, nky, m0, m1, true);
+    wrap2d(&mut fdee, n0, n1, m0, m1, true);
 
     // Centered inverse 2-D FFT over the (x,y) window, per ky slice.
     centered_fft2d(&mut fdee, n0, n1, m0, m1, nky, true, fft)?;
 
     // divker2d (adj): deapodize → f[n1, nky, n0] (note the n1−ty−1 y-flip).
+    // Parallel over ty (f is contiguous per ty; fdee read-only).
     let mut f = vec![Complex32::new(0.0, 0.0); n1 * nky * n0];
-    for ky in 0..nky {
-        for ty in 0..n1 {
+    f.par_chunks_mut(nky * n0)
+        .enumerate()
+        .for_each(|(ty, fchunk)| {
             let yg = (n1 - ty - 1) + n1 / 2 + m1;
-            for tx in 0..n0 {
-                let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
-                    - mu1 * (ty as f32 - n1 as f32 / 2.0).powi(2))
-                .exp();
-                let xg = tx + n0 / 2 + m0;
-                let g_ind = xg + yg * gx + ky * gx * gy;
-                f[tx + ky * n0 + ty * n0 * nky] = fdee[g_ind] / ker / (n0 * n1) as f32;
+            for ky in 0..nky {
+                for tx in 0..n0 {
+                    let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
+                        - mu1 * (ty as f32 - n1 as f32 / 2.0).powi(2))
+                    .exp();
+                    let xg = tx + n0 / 2 + m0;
+                    let g_ind = xg + yg * gx + ky * gx * gy;
+                    fchunk[ky * n0 + tx] = fdee[g_ind] / ker / (n0 * n1) as f32;
+                }
             }
-        }
-    }
+        });
     Ok(f)
 }
 
@@ -552,7 +614,7 @@ pub fn usfft2d_fwd(
     centered_fft2d(&mut fdee, n0, n1, m0, m1, nky, false, fft)?;
 
     // wrap2d (fwd): copy interior into the borders.
-    wrap2d(&mut fdee, n0, n1, nky, m0, m1, false);
+    wrap2d(&mut fdee, n0, n1, m0, m1, false);
 
     // gather2d (fwd): interpolate the grid at the sample positions, summing
     // each (θ, ky, kx) from its (x,y) neighborhood.
@@ -588,35 +650,29 @@ pub fn usfft2d_fwd(
 
 /// Shared `wrap2d`: fold (adj) or copy (fwd) the `m`-wide borders of the
 /// oversampled `[nky, gy, gx]` grid in both x and y (tomocupy `wrap2d`).
-fn wrap2d(
-    fdee: &mut [Complex32],
-    n0: usize,
-    n1: usize,
-    nky: usize,
-    m0: usize,
-    m1: usize,
-    adj: bool,
-) {
+fn wrap2d(fdee: &mut [Complex32], n0: usize, n1: usize, m0: usize, m1: usize, adj: bool) {
     let gx = 2 * n0 + 2 * m0;
     let gy = 2 * n1 + 2 * m1;
-    for ky in 0..nky {
+    // Parallel over ky: each ky is a disjoint gx·gy sub-grid and the fold stays
+    // within it, so workers never alias.
+    fdee.par_chunks_mut(gx * gy).for_each(|slice| {
         for ty in 0..gy {
             for tx in 0..gx {
                 if tx < m0 || tx >= 2 * n0 + m0 || ty < m1 || ty >= 2 * n1 + m1 {
                     let tx0 = (tx + 2 * n0 - m0) % (2 * n0);
                     let ty0 = (ty + 2 * n1 - m1) % (2 * n1);
-                    let id1 = tx + ty * gx + ky * gx * gy;
-                    let id2 = (tx0 + m0) + (ty0 + m1) * gx + ky * gx * gy;
+                    let id1 = tx + ty * gx;
+                    let id2 = (tx0 + m0) + (ty0 + m1) * gx;
                     if adj {
-                        let v = fdee[id1];
-                        fdee[id2] += v;
+                        let v = slice[id1];
+                        slice[id2] += v;
                     } else {
-                        fdee[id1] = fdee[id2];
+                        slice[id1] = slice[id2];
                     }
                 }
             }
         }
-    }
+    });
 }
 
 // ===========================================================================
@@ -625,13 +681,16 @@ fn wrap2d(
 
 /// Ramp-filter each projection along the detector-width (`detw`) axis, with
 /// `ne = 2·detw` edge-padding (tomocupy filters projections, not sinograms;
-/// this uses a plain `|f|` ramp with `center = detw/2`, no extra apodization
-/// window or sub-pixel shift).
+/// `center = detw/2`, no sub-pixel shift). `filter` selects the apodisation
+/// window folded into the ramp ([`crate::backend::lam_ramp_weights`]);
+/// `FilterName::Ramp` is the plain `|f|` ramp, `Parzen` (the tomocupy default)
+/// and the others match tomocupy's `LamFourierRec` FBP-filtered projections.
 fn ramp_filter_detw(
     proj: &mut [f32],
     ntheta: usize,
     deth: usize,
     detw: usize,
+    filter: FilterName,
     fft: &dyn Fft,
 ) -> Result<()> {
     let ne = 2 * detw;
@@ -653,17 +712,9 @@ fn ramp_filter_detw(
         }
     }
     fft.fft_1d(&mut buf, ne, nlines, false)?;
-    // |f| ramp on centered frequencies (DC..Nyquist..−1), magnitude in cycles.
-    let ramp: Vec<f32> = (0..ne)
-        .map(|k| {
-            let f = if k <= ne / 2 {
-                k as f32
-            } else {
-                (ne - k) as f32
-            };
-            f / ne as f32
-        })
-        .collect();
+    // Ramp × apodisation window on centered frequencies (DC..Nyquist..−1),
+    // magnitude in cycles. `Ramp` reduces to the plain `|f|/ne`.
+    let ramp: Vec<f32> = crate::backend::lam_ramp_weights(ne, filter);
     for l in 0..nlines {
         for k in 0..ne {
             buf[l * ne + k] *= ramp[k];
@@ -690,7 +741,9 @@ fn lamino_phi(lamino_angle_deg: f32) -> f32 {
 /// `proj` is `[nproj, nz, n]` row-major (projection, detector-row, detector-col),
 /// with a square `n × n` in-plane field; `theta` are the `nproj` rotation angles
 /// (radians); `lamino_angle_deg` is the tilt of the rotation axis from the
-/// beam-perpendicular plane; `rh` is the number of reconstructed depth slices.
+/// beam-perpendicular plane; `rh` is the number of reconstructed depth slices;
+/// `filter` is the FBP apodisation window folded into the projection ramp
+/// (`FilterName::Parzen` matches tomocupy's default, `Ramp` the plain ramp).
 /// Returns the volume `[rh, n, n]` (depth, y, x). All FFTs use the supplied
 /// [`Fft`] backend.
 pub fn lamino(
@@ -699,6 +752,7 @@ pub fn lamino(
     lamino_angle_deg: f32,
     n: usize,
     rh: usize,
+    filter: FilterName,
     fft: &dyn Fft,
 ) -> Result<Vec<f32>> {
     let nproj = theta.len();
@@ -710,9 +764,10 @@ pub fn lamino(
     );
     let phi = lamino_phi(lamino_angle_deg);
 
-    // FBP ramp filter on projections, then the three chained USFFT operators.
+    // FBP ramp (+ apodisation) filter on projections, then the three chained
+    // USFFT operators.
     let mut filtered = proj.to_vec();
-    ramp_filter_detw(&mut filtered, nproj, deth, detw, fft)?;
+    ramp_filter_detw(&mut filtered, nproj, deth, detw, filter, fft)?;
     let p22 = fft2d_fwd(&filtered, nproj, deth, detw, fft)?;
     let p11 = usfft2d_adj(&p22, detw, n, deth, nproj, detw, theta, phi, fft)?;
     let p00 = usfft1d_adj(&p11, detw, n, rh, deth, phi, fft)?;
@@ -897,7 +952,7 @@ mod tests {
         sphere(&mut vol, 5.0, 10.0, 9.0, 1.8, 0.6);
 
         let proj = lamino_project(&vol, &theta, lamino_angle, n, nz, &cpu).unwrap();
-        let rec = lamino(&proj, &theta, lamino_angle, n, rh, &cpu).unwrap();
+        let rec = lamino(&proj, &theta, lamino_angle, n, rh, FilterName::Ramp, &cpu).unwrap();
 
         let corr = pearson(&rec, &vol);
         eprintln!("lamino round-trip corr = {corr:.4}");

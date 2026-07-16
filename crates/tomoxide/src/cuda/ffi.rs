@@ -74,6 +74,16 @@ unsafe extern "C" {
         bytes: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// `cudaEventCreateWithFlags(cudaEventDisableTiming)` — opaque event or null.
+    pub fn tomoxide_cuda_event_create() -> *mut c_void;
+    /// `cudaEventDestroy`.
+    pub fn tomoxide_cuda_event_destroy(e: *mut c_void);
+    /// `cudaEventRecord(e, stream)` (null stream = per-thread compute stream); 0 ok.
+    pub fn tomoxide_cuda_event_record(e: *mut c_void, stream: *mut c_void) -> i32;
+    /// `cudaStreamWaitEvent(stream, e, 0)` — `stream` defers until `e` fires; 0 ok.
+    pub fn tomoxide_cuda_stream_wait_event(stream: *mut c_void, e: *mut c_void) -> i32;
+    /// `cudaEventSynchronize(e)` — block the host until `e` fires; 0 ok.
+    pub fn tomoxide_cuda_event_sync(e: *mut c_void) -> i32;
 
     // --- linerec (cfunc_linerec) ---
     /// `cfunc_linerec(nproj, nz, n, ncproj, ncz)`.
@@ -110,6 +120,8 @@ unsafe extern "C" {
         f: *const c_void,
         theta: *const f32,
         phi: f32,
+        sz: i32,
+        ncz: i32,
         nz: i32,
         n: i32,
         nproj: i32,
@@ -867,4 +879,218 @@ unsafe extern "C" {
     /// Consumes the half-complex spectrum `[rows, cols/2+1]` and writes the
     /// row-padded real image `[rows, 2*(cols/2+1)]` per image in place.
     pub fn tomoxide_fft_2d_c2r(data: *mut c_void, rows: usize, cols: usize, batch: usize) -> i32;
+
+    /// Async (non-syncing) C2C variants of [`tomoxide_fft_1d`]/[`tomoxide_fft_2d`]:
+    /// they enqueue the transform (+ inverse `1/n` scale) on `cudaStreamPerThread`
+    /// and return without a host sync, so the caller's host thread can run CPU work
+    /// concurrently. Used only by the host laminography conveyor, whose stage
+    /// kernels also run on the null (per-thread) stream and so stay serialized with
+    /// the FFT on the device. Returns 0 on success.
+    pub fn tomoxide_fft_1d_async(data: *mut c_void, n: usize, batch: usize, inverse: i32) -> i32;
+    pub fn tomoxide_fft_2d_async(
+        data: *mut c_void,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        inverse: i32,
+    ) -> i32;
+
+    // --- Fourier/USFFT laminography (LamFourierRec) gridding + modulation ---
+    // Device-resident, full-complex mirror of the CPU host loops in
+    // `recon/lamino.rs`; the Rust orchestrator drives `tomoxide_fft_1d/2d`
+    // between these stages. All complex buffers are interleaved float2.
+    /// ramp_filter_detw: edge-replicate real `proj [nlines, detw]` into complex
+    /// lines `[nlines, ne]` (`ne = 2*detw`, `pad = (ne-detw)/2`).
+    pub fn tomoxide_lam_ramp_pad(
+        proj: *const c_void,
+        buf: *mut c_void,
+        nlines: i64,
+        detw: i32,
+        ne: i32,
+        pad: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Multiply complex lines `[nlines, ne]` by the per-bin filter weights
+    /// `filt [ne]` (ramp folded with the FBP apodisation window) and the
+    /// rotation-center phase.
+    pub fn tomoxide_lam_ramp_mul(
+        buf: *mut c_void,
+        filt: *const f32,
+        nlines: i64,
+        ne: i32,
+        shift: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Crop complex lines `[nlines, ne]` back to real `proj [nlines, detw]`.
+    pub fn tomoxide_lam_ramp_crop(
+        buf: *const c_void,
+        proj: *mut c_void,
+        nlines: i64,
+        detw: i32,
+        ne: i32,
+        pad: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// fft2d_fwd pre-modulation: real `proj [ntheta,deth,detw]` -> complex
+    /// `out * sign(tx)*sign(ty)`.
+    pub fn tomoxide_lam_fft2d_pre(
+        proj: *const c_void,
+        out: *mut c_void,
+        ntheta: i64,
+        deth: i32,
+        detw: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// fft2d_fwd post-modulation: complex `*= sign(tx)*sign(ty)/(deth*detw)`.
+    pub fn tomoxide_lam_fft2d_post(
+        out: *mut c_void,
+        ntheta: i64,
+        deth: i32,
+        detw: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft2d take_x: in-plane frequency sample positions `xs,ys [ntheta,nky,detw]`.
+    pub fn tomoxide_lam_takexy2d(
+        theta: *const c_void,
+        xs: *mut c_void,
+        ys: *mut c_void,
+        ntheta: i64,
+        nky: i32,
+        detw: i32,
+        phi: f32,
+        ky0: i32,
+        deth: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft2d gather (adj): scatter `g [ntheta,nky,detw]` into `fdee [nky,gy,gx]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tomoxide_lam_gather2d_adj(
+        g: *const c_void,
+        xs: *const c_void,
+        ys: *const c_void,
+        fdee: *mut c_void,
+        ntheta: i64,
+        nky: i32,
+        detw: i32,
+        n0: i32,
+        n1: i32,
+        m0: i32,
+        m1: i32,
+        mu0: f32,
+        mu1: f32,
+        gdeth: i32,
+        ky0: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft2d wrap (adj): fold m-wide borders into the interior in x and y.
+    pub fn tomoxide_lam_wrap2d_adj(
+        fdee: *mut c_void,
+        nky: i32,
+        n0: i32,
+        n1: i32,
+        m0: i32,
+        m1: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft2d centered inverse FFT window extract: `fdee [nky,gy,gx]` -> `win [nky,2n1,2n0]`.
+    pub fn tomoxide_lam_win2d_extract(
+        fdee: *const c_void,
+        win: *mut c_void,
+        nky: i32,
+        n0: i32,
+        n1: i32,
+        m0: i32,
+        m1: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft2d centered inverse FFT window scatter (applies `wx*wy` renorm).
+    pub fn tomoxide_lam_win2d_scatter(
+        fdee: *mut c_void,
+        win: *const c_void,
+        nky: i32,
+        n0: i32,
+        n1: i32,
+        m0: i32,
+        m1: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft2d divker (adj): deapodize -> `f [n1,nky,n0]` complex (n1-ty-1 y-flip).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tomoxide_lam_divker2d_adj(
+        fdee: *const c_void,
+        f: *mut c_void,
+        n1: i32,
+        nky: i32,
+        n0: i32,
+        m0: i32,
+        m1: i32,
+        mu0: f32,
+        mu1: f32,
+        fdeth: i32,
+        ky0: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft1d take_x: depth sample positions `z [deth]`.
+    pub fn tomoxide_lam_takez1d(z: *mut c_void, deth: i32, phi: f32, stream: *mut c_void) -> i32;
+    /// usfft1d gather (adj): scatter `g [n1,deth,n0]` into `fdee [ng,n1,n0]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tomoxide_lam_gather1d_adj(
+        g: *const c_void,
+        z: *const c_void,
+        fdee: *mut c_void,
+        n1: i32,
+        deth: i32,
+        n0: i32,
+        n2: i32,
+        m2: i32,
+        mu2: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft1d wrap (adj): fold m2-wide borders into the interior along the depth grid.
+    pub fn tomoxide_lam_wrap1d_adj(
+        fdee: *mut c_void,
+        n0: i32,
+        n1: i32,
+        n2: i32,
+        m2: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft1d centered inverse FFT window extract: `fdee [ng,batch]` -> `lines [batch,2n2]`.
+    pub fn tomoxide_lam_win1d_extract(
+        fdee: *const c_void,
+        lines: *mut c_void,
+        batch: i64,
+        n2: i32,
+        m2: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft1d centered inverse FFT window scatter (applies `2n2` renorm).
+    pub fn tomoxide_lam_win1d_scatter(
+        fdee: *mut c_void,
+        lines: *const c_void,
+        batch: i64,
+        n2: i32,
+        m2: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// usfft1d divker (adj): deapodize, take real part -> `f [n1,n2,n0]` real.
+    pub fn tomoxide_lam_divker1d_adj(
+        fdee: *const c_void,
+        f: *mut c_void,
+        n1: i32,
+        n2: i32,
+        n0: i32,
+        m2: i32,
+        mu2: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// copyTransposed: `p00 [n1,rh,n2]` -> `vol [rh,n1,n2]`.
+    pub fn tomoxide_lam_transpose(
+        p00: *const c_void,
+        vol: *mut c_void,
+        n1: i32,
+        rh: i32,
+        n2: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }

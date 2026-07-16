@@ -118,17 +118,7 @@ impl Elementwise for CpuBackend {
     ///
     /// Ports tomocupy `proc_functions.darkflat_correction` (proc_functions.py:55).
     fn darkflat(&self, data: &mut Tomo<f32>, flat: &Frames<f32>, dark: &Frames<f32>) -> Result<()> {
-        let dark2d = dark
-            .array
-            .mean_axis(Axis(0))
-            .ok_or_else(|| Error::InvalidParam("empty dark stack".into()))?;
-        let flat2d = flat
-            .array
-            .mean_axis(Axis(0))
-            .ok_or_else(|| Error::InvalidParam("empty flat stack".into()))?;
-        let mut denom = &flat2d - &dark2d;
-        // Guard against divide-by-zero where flat == dark.
-        denom.mapv_inplace(|v| if v.abs() < 1e-6 { 1.0 } else { v });
+        let (dark2d, denom) = crate::prep::normalize::darkflat_frames(flat, dark)?;
 
         // Process in projection layout so each slab is [row, col].
         let restore = data.layout == Layout::Sinogram;

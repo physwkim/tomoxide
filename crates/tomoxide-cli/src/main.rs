@@ -890,21 +890,48 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     reader.read_all()?
                 };
-                let vol =
-                    tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
-                let mut writer = maybe_progress(
-                    tomoxide::io::create_writer(&out, save_format)?,
-                    common.progress_json,
-                );
-                let nz = vol.dims().0;
-                if banded {
-                    writer.reserve(nz_total)?;
-                    writer.write_chunk(&vol, z0, z0 + nz)?;
+                if let Some(deg) = lamino_angle.filter(|_| engine.name() == "cuda") {
+                    // Laminography on CUDA: disk-stream the OUTPUT. Reconstruct the
+                    // rh volume tile-by-tile and write each tile as it lands, so
+                    // the whole [rh, n, n] volume never sits in host RAM. The tilt
+                    // still forces the *input* to be read whole (lamino can't band
+                    // its detector rows); banded is always false for lamino
+                    // (row_band rejects it), so tiles map 1:1 to the output rows.
+                    let rh = params
+                        .lamino_rh
+                        .unwrap_or_else(|| tomoxide::cuda::lamino_recon_height(nz_total, deg));
+                    let mut writer = maybe_progress(
+                        tomoxide::io::create_writer(&out, save_format)?,
+                        common.progress_json,
+                    );
+                    writer.reserve(rh)?;
+                    tomoxide::reconstruct_lamino_streaming(
+                        ds,
+                        &geom,
+                        plan.algo,
+                        &params,
+                        &plan.prep,
+                        &engine,
+                        &mut |rh0, tile| writer.write_chunk(tile, rh0, rh0 + tile.dims().0),
+                    )?;
+                    writer.finalize()?;
                 } else {
-                    writer.reserve(nz)?;
-                    writer.write_chunk(&vol, 0, nz)?;
+                    let vol =
+                        tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
+                    let mut writer = maybe_progress(
+                        tomoxide::io::create_writer(&out, save_format)?,
+                        common.progress_json,
+                    );
+                    let nz = vol.dims().0;
+                    if banded {
+                        writer.reserve(nz_total)?;
+                        writer.write_chunk(&vol, z0, z0 + nz)?;
+                    } else {
+                        writer.reserve(nz)?;
+                        writer.write_chunk(&vol, 0, nz)?;
+                    }
+                    writer.finalize()?;
                 }
-                writer.finalize()?;
             }
             println!("wrote reconstruction to {out}");
         }
