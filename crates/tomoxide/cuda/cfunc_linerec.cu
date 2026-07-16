@@ -103,5 +103,8 @@ void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta
     dim3 GS3d0;  
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
     size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
-    backprojection_try_lamino_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 4.0f/nproj, sz, ncz, n, nz, ncproj);
-}                                            
+    // π/nproj — the FBP angular quadrature dθ, as `backprojection_try` uses and
+    // as the analytic call sites pass to `backprojection`. tomocupy's 4/nproj
+    // predates the scale unification.
+    backprojection_try_lamino_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, ncz, n, nz, ncproj);
+}

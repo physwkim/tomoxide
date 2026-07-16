@@ -264,5 +264,12 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
                     
         }
     }
-    f[tx + (n-ty-1) * n + tz * n * n] += static_cast<real>((float)f0*c);          
-}    
+    // No y-flip and the caller's dθ gain, like every other kernel here: tomocupy
+    // writes `(n-ty-1)` and scales by 4/nproj, and this file's ports were moved
+    // off both by the cross-backend convention unification (see
+    // `backprojection_ker`, `docs/ARCHITECTURE.md` §4.1). This kernel kept the
+    // upstream convention only because nothing called it; a tilt probe whose
+    // slice is flipped and 4/π off against every volume tomoxide reconstructs
+    // would be comparing against an image the user never sees.
+    f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
+}

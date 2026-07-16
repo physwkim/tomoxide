@@ -124,6 +124,44 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
     (((nz as f32 / c) / 2.0).ceil() as usize) * 2
 }
 
+/// Reconstruct the single output slice `sz` at every tilt in `tilts_deg`, in one
+/// pass over the filtered projection stack. Returns `[tilts_deg.len(), n, n]`,
+/// one candidate image per tilt, in the row order given.
+///
+/// This is the primitive a laminography tilt search should sit on.
+/// `cfunc_linerec`'s `backprojection_try_lamino` indexes `phi` per output slot,
+/// so `N` tilts cost one launch over one filtered stack. Sweeping tilts by
+/// reconstructing with [`crate::recon::recon`] instead costs `N` filter passes
+/// and `N` whole `[rh, n, n]` volumes, of which the search keeps one slice each
+/// — for the 1024² pouch scans that is ~1400 slices of work per tilt discarded.
+///
+/// The images carry the same orientation and dθ scale as `Algorithm::Linerec`
+/// laminography, so a slice here is the slice that reconstruction produces at
+/// that tilt, and a focus metric ranks the real thing.
+///
+/// `sino` must already be prepped (flat/dark, minus-log, stripe removal), like
+/// every other analytic CUDA entry point. The rotation center comes from
+/// `geom.center`; `geom.beam` is ignored, since `tilts_deg` supplies the tilt.
+/// `sz` indexes the tilted volume's output z, offset as the analytic lamino path
+/// offsets it. Errors without the `cuda` feature.
+pub fn lamino_tilt_probe(
+    sino: &crate::data::Tomo<f32>,
+    geom: &crate::geometry::Geometry,
+    params: &crate::params::ReconParams,
+    tilts_deg: &[f32],
+    sz: i32,
+) -> Result<ndarray::Array3<f32>> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (sino, geom, params, tilts_deg, sz);
+        Err(Error::Backend("cuda feature not enabled".into()))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::lamino_tilt_probe(sino, geom, params, tilts_deg, sz)
+    }
+}
+
 /// Per-tile sink for [`reconstruct_lamino_streaming`]: called as `(rh0, tile)`
 /// where `tile` is the `[tlen, n, n]` output volume at rows `[rh0, rh0 + tlen)`
 /// (`tlen = tile.dims().0`). Invoked on a single thread in ascending row order,
@@ -2305,6 +2343,142 @@ mod cuda_impl {
         let mut host = vec![0.0f32; rh * n * n];
         f.to_host_f32(&mut host)?;
         Ok(host)
+    }
+
+    /// One slice `sz` back-projected at every tilt in `phi`, in a single launch.
+    ///
+    /// Same pad → cuFFT filter → crop as [`analytic_lamino_chunk`] — so the
+    /// candidate images are the reconstruction, not an approximation of it — but
+    /// the back-projection uses `cfunc_linerec`'s `backprojection_try_lamino`,
+    /// whose `phi` is indexed per output slot. The handle's `ncz` is therefore
+    /// the tilt count and the result is `[ntilt, n, n]`: one image per tilt from
+    /// one pass over the filtered stack, where sweeping tilts through
+    /// [`analytic_lamino_chunk`] reconstructs a whole `rh`-slice volume per tilt
+    /// and throws all but one slice away.
+    #[allow(clippy::too_many_arguments)]
+    fn lamino_try_chunk(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        phi: &[f32],
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+        sz: i32,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let ntilt = phi.len();
+        let sino_dev = DevBuf::from_host_f32(raw)?;
+        let w_dev = DevBuf::from_host_f32(w)?;
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let phi_dev = DevBuf::from_host_f32(phi)?;
+        let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
+        ck(
+            unsafe {
+                ffi::tomoxide_pad(
+                    sino_dev.ptr,
+                    gpad.ptr,
+                    nz,
+                    nproj,
+                    ncols,
+                    pad,
+                    pad_side,
+                    null,
+                )
+            },
+            "pad",
+        )?;
+        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
+        if fh.is_null() {
+            return Err(Error::Backend("cfunc_filter allocation failed".into()));
+        }
+        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
+        unsafe { ffi::tomoxide_filter_free(fh) };
+        let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
+        ck(
+            unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
+            "crop",
+        )?;
+        // ncz = ntilt: the kernel's output index selects the TILT, not a z row.
+        let f = DevBuf::zeroed(ntilt * n * n * fsz)?;
+        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, ntilt) };
+        if h.is_null() {
+            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+        }
+        unsafe {
+            ffi::tomoxide_linerec_backproject_try_lamino(
+                h,
+                f.ptr,
+                gf.ptr,
+                theta_dev.ptr as *const f32,
+                phi_dev.ptr as *const f32,
+                sz,
+                null,
+            );
+        }
+        unsafe { ffi::tomoxide_linerec_free(h) };
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        let mut host = vec![0.0f32; ntilt * n * n];
+        f.to_host_f32(&mut host)?;
+        Ok(host)
+    }
+
+    /// See [`super::lamino_tilt_probe`].
+    pub(super) fn lamino_tilt_probe(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        params: &crate::params::ReconParams,
+        tilts_deg: &[f32],
+        sz: i32,
+    ) -> Result<Array3<f32>> {
+        use crate::backend::make_fbp_filter;
+
+        if tilts_deg.is_empty() {
+            return Err(Error::InvalidParam(
+                "lamino_tilt_probe needs ≥1 tilt".into(),
+            ));
+        }
+        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
+        let (nz, nproj, ncols) = s.array.dim();
+        let n = params.num_gridx.unwrap_or(ncols);
+        if n != ncols {
+            return Err(Error::InvalidParam(format!(
+                "cuda lamino_tilt_probe needs a square grid = detector width {ncols}; got {n}"
+            )));
+        }
+        let theta = &geom.angles.0;
+        if theta.len() != nproj {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{nproj} angles"),
+                found: theta.len().to_string(),
+            });
+        }
+        let raw = s
+            .array
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+        // The rotation center rides in the filter (as every analytic CUDA path
+        // does), so it comes from `geom`; only the tilt is swept here, and
+        // `geom.beam` is ignored because these tilts replace it.
+        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let pad = filter.len();
+        let pad_side = pad / 2 - ncols / 2;
+        let w = build_filter_w(&filter, geom, nz, ncols, pad);
+        let phi: Vec<f32> = tilts_deg
+            .iter()
+            .map(|d| std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0)
+            .collect();
+
+        let devices = selected_devices();
+        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        let out = lamino_try_chunk(raw, &w, theta, &phi, nz, nproj, ncols, n, pad, pad_side, sz)?;
+        Array3::from_shape_vec((phi.len(), n, n), out)
+            .map_err(|e| Error::InvalidParam(format!("cuda tilt-probe shape: {e}")))
     }
 
     /// Largest projection-angle chunk (`ncproj`) for streamed laminography on the

@@ -108,6 +108,23 @@ unsafe extern "C" {
         sz: i32,
         stream: *mut c_void,
     );
+    /// Laminography tilt probe: back-project the single detector row `sz` at
+    /// every tilt in `phi` (device `[ntilt]`, radians, `π/2` = untilted) in one
+    /// launch, writing `f` as `[ntilt, n, n]` — one candidate slice per tilt.
+    /// The handle must be built with `ncz == ntilt`; `g` is the filtered
+    /// sinogram `[nz, nproj, n]`; `f` must be pre-zeroed (the kernel `+=`s).
+    /// Carries the FBP dθ gain, so a slice matches the corresponding
+    /// `Algorithm::Linerec` laminography reconstruction, not merely its shape.
+    pub fn tomoxide_linerec_backproject_try_lamino(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        theta: *const f32,
+        phi: *const f32,
+        sz: i32,
+        stream: *mut c_void,
+    );
+
     pub fn tomoxide_linerec_free(handle: *mut c_void);
 
     // --- forward projection (adjoint of cfunc_linerec back-projection) ---
