@@ -232,3 +232,54 @@ fn cuda_lamino_tilt_probe_finds_the_same_peak_as_full_recons() {
         );
     }
 }
+
+/// Same defect, same fix, other probe: the padded stack used to be one device
+/// allocation, so a real 1800×1024×1024 scan asked for 30 GB and the probe died
+/// on exactly the data it was written for. Filtering runs through
+/// `lamino_filter_to_host` in angle chunks now and the try kernel accumulates.
+/// Forcing that path must not move the images, and therefore must not move the
+/// tilt a focus metric picks.
+#[test]
+fn cuda_lamino_tilt_probe_is_unchanged_when_the_stack_is_angle_chunked() {
+    // `cuda::lamino_tilt_probe` selects the device itself; this only asks
+    // whether there is one to select.
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping CUDA test: {e}");
+        return;
+    }
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let (sino, angles) = lamino_sino(n, nproj, nz, &cpu);
+    let rh = 48usize;
+    let params = ReconParams {
+        lamino_rh: Some(rh),
+        ..Default::default()
+    };
+    let z = 17usize;
+    let tilts = [12.0f32, 20.0, 31.5];
+    let geom = geom_lamino(&angles, n, nz, 0.0);
+
+    let single = cuda::lamino_tilt_probe(&sino, &geom, &params, &tilts, z as i32).unwrap();
+
+    std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
+    let chunked = cuda::lamino_tilt_probe(&sino, &geom, &params, &tilts, z as i32);
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    let chunked = chunked.unwrap();
+
+    assert_eq!(chunked.dim(), single.dim());
+    for (i, &t) in tilts.iter().enumerate() {
+        let a = single.index_axis(Axis(0), i).to_owned();
+        let b = chunked.index_axis(Axis(0), i).to_owned();
+        let peak = a.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(peak > 0.0, "reference tilt {t} slice is all zeros");
+        let d = a
+            .iter()
+            .zip(b.iter())
+            .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
+        assert!(
+            d / peak < 1e-4,
+            "tilt {t}: angle-chunked probe differs from single-chunk by {:.2e} of peak",
+            d / peak
+        );
+    }
+}

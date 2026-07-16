@@ -297,3 +297,51 @@ fn cuda_center_probe_sweep_argmax_matches_full_recons() {
         );
     }
 }
+
+/// The probe must not depend on the whole padded stack fitting the device.
+///
+/// It used to: the padded stack was one `cudaMalloc`, which at 1800×1024×1024
+/// with a 4096 pad asks for 30 GB and fails outright — on the very dataset the
+/// probe was written to align. Filtering now runs through `lamino_filter_to_host`
+/// in angle chunks and the try kernel accumulates each chunk into one output.
+/// This forces that path with a tiny memory budget and requires the answer not to
+/// move: the candidate images, and therefore the centre the sweep picks, are the
+/// same whether the stack took one chunk or many.
+#[test]
+fn cuda_center_probe_is_unchanged_when_the_stack_is_angle_chunked() {
+    let cpu = CpuBackend::new();
+    // `cuda::center_probe` selects the device itself; this only asks whether
+    // there is one to select.
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping: no CUDA device ({e})");
+        return;
+    }
+    let (sino, angles) = setup(&cpu);
+    let nominal = N as f32 / 2.0;
+    let cands: Vec<f32> = (-4..=4).map(|k| nominal + k as f32).collect();
+    let params = ReconParams::default();
+
+    // Real budget: `lamino_ncproj` returns nproj → a single angle chunk.
+    let single =
+        cuda::center_probe(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32).unwrap();
+
+    // Tiny budget: ncproj < nproj → the accumulate-per-angle-chunk path.
+    std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
+    let chunked = cuda::center_probe(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32);
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    let chunked = chunked.unwrap();
+
+    assert_eq!(chunked.dim(), single.dim());
+    for (i, &c) in cands.iter().enumerate() {
+        let a = single.index_axis(Axis(0), i).to_owned();
+        let b = chunked.index_axis(Axis(0), i).to_owned();
+        // Chunking changes only the float summation order of the angle sum and
+        // the cuFFT batch algorithm, so this is a rounding-level bound, not a
+        // correlation one.
+        let rel = interior_rel(&a, &b);
+        assert!(
+            rel < 1e-4,
+            "candidate {c}: angle-chunked probe differs from single-chunk by {rel:.2e} of peak"
+        );
+    }
+}

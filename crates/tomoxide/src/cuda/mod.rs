@@ -2440,87 +2440,52 @@ mod cuda_impl {
     /// one pass over the filtered stack, where sweeping tilts through
     /// [`analytic_lamino_chunk`] reconstructs a whole `rh`-slice volume per tilt
     /// and throws all but one slice away.
-    #[allow(clippy::too_many_arguments)]
-    fn lamino_try_chunk(
-        raw: &[f32],
-        w: &[f32],
-        theta: &[f32],
-        phi: &[f32],
-        nz: usize,
-        nproj: usize,
-        ncols: usize,
-        n: usize,
-        pad: usize,
-        pad_side: usize,
-        sz: i32,
-    ) -> Result<Vec<f32>> {
-        let fsz = std::mem::size_of::<f32>();
-        let null = std::ptr::null_mut::<c_void>();
-        let ntilt = phi.len();
-        let sino_dev = DevBuf::from_host_f32(raw)?;
-        let w_dev = DevBuf::from_host_f32(w)?;
-        let theta_dev = DevBuf::from_host_f32(theta)?;
-        let phi_dev = DevBuf::from_host_f32(phi)?;
-        let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
-        ck(
-            unsafe {
-                ffi::tomoxide_pad(
-                    sino_dev.ptr,
-                    gpad.ptr,
-                    nz,
-                    nproj,
-                    ncols,
-                    pad,
-                    pad_side,
-                    null,
-                )
-            },
-            "pad",
-        )?;
-        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter allocation failed".into()));
-        }
-        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_free(fh) };
-        let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
-        ck(
-            unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
-            "crop",
-        )?;
-        // ncz = ntilt: the kernel's output index selects the TILT, not a z row.
-        let f = DevBuf::zeroed(ntilt * n * n * fsz)?;
-        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, ntilt) };
-        if h.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
-        unsafe {
-            ffi::tomoxide_linerec_backproject_try_lamino(
-                h,
-                f.ptr,
-                gf.ptr,
-                theta_dev.ptr as *const f32,
-                phi_dev.ptr as *const f32,
-                sz,
-                null,
-            );
-        }
-        unsafe { ffi::tomoxide_linerec_free(h) };
-        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-        let mut host = vec![0.0f32; ntilt * n * n];
-        f.to_host_f32(&mut host)?;
-        Ok(host)
+    /// Which axis a probe sweeps, and the per-candidate parameter that sweeps it.
+    ///
+    /// The two try kernels differ only here: one indexes a back-projection shift
+    /// per output slot, the other a tilt. Everything around them — filtering,
+    /// angle chunking, accumulation — is identical, so it lives once in
+    /// [`try_probe_chunk`] rather than in two copies that can drift apart.
+    enum TrySweep<'a> {
+        /// Centre candidates as back-projection shifts; `phi` fixed for all.
+        Center { sh: &'a [f32], phi: f32 },
+        /// Tilt candidates as per-slot `phi`; the centre rides in the filter.
+        Tilt { phi: &'a [f32] },
     }
 
-    /// `lamino_try_chunk`'s centre-axis twin: one launch, `sh.len()` candidate
-    /// slices, `phi` scalar. See [`super::center_probe`].
+    impl TrySweep<'_> {
+        /// Number of candidates = the handle's `ncz` = the output's slot count.
+        fn len(&self) -> usize {
+            match self {
+                TrySweep::Center { sh, .. } => sh.len(),
+                TrySweep::Tilt { phi } => phi.len(),
+            }
+        }
+
+        fn host(&self) -> &[f32] {
+            match self {
+                TrySweep::Center { sh, .. } => sh,
+                TrySweep::Tilt { phi } => phi,
+            }
+        }
+    }
+
+    /// One slice `sz`, reconstructed at every candidate at once: `[ncand, n, n]`.
+    ///
+    /// Filtering goes through [`lamino_filter_to_host`] — the same owner the
+    /// streaming reconstruction uses — so the padded stack is never materialised
+    /// whole on the device. That is not a nicety: at 1800×1024×1024 with a 4096
+    /// pad it is a single 30 GB `cudaMalloc`, and the probe existed to be cheap.
+    /// The try kernels accumulate (`f[...] += ...`) and take the loop bound and
+    /// data stride (`ncproj`) separately from the quadrature scale (`π/nproj`),
+    /// so summing angle chunks into one zeroed output is exact, not approximate:
+    /// each chunk contributes its own angles at the global `dθ` weight.
     #[allow(clippy::too_many_arguments)]
-    fn center_try_chunk(
+    fn try_probe_chunk(
         raw: &[f32],
         w: &[f32],
         theta: &[f32],
-        sh: &[f32],
-        phi: f32,
+        sweep: TrySweep<'_>,
         nz: usize,
         nproj: usize,
         ncols: usize,
@@ -2531,60 +2496,58 @@ mod cuda_impl {
     ) -> Result<Vec<f32>> {
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
-        let nshift = sh.len();
-        let sino_dev = DevBuf::from_host_f32(raw)?;
-        let w_dev = DevBuf::from_host_f32(w)?;
+        let ncand = sweep.len();
+        let free = device_free_bytes();
+        let (host_gf, angle_chunks) =
+            lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
+        let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
+
         let theta_dev = DevBuf::from_host_f32(theta)?;
-        let sh_dev = DevBuf::from_host_f32(sh)?;
-        let gpad = DevBuf::zeroed(nz * nproj * pad * fsz)?;
-        ck(
-            unsafe {
-                ffi::tomoxide_pad(
-                    sino_dev.ptr,
-                    gpad.ptr,
-                    nz,
-                    nproj,
-                    ncols,
-                    pad,
-                    pad_side,
-                    null,
-                )
-            },
-            "pad",
-        )?;
-        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter allocation failed".into()));
+        let cand_dev = DevBuf::from_host_f32(sweep.host())?;
+        let gf_dev = DevBuf::new(nz * ncproj_max.max(1) * ncols * fsz)?;
+        // ncz = ncand: the kernel's output index selects the CANDIDATE, not a z
+        // row. Zeroed once; every angle chunk accumulates into it.
+        let f_dev = DevBuf::zeroed(ncand * n * n * fsz)?;
+
+        for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
+            gf_dev.copy_from_host_f32(&host_gf[c])?;
+            let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
+            // `nproj` global (fixes the π/nproj quadrature scale), `alen` local
+            // (the kernel's angle loop bound and its `data` stride).
+            let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, ncand) };
+            if h.is_null() {
+                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+            }
+            match sweep {
+                TrySweep::Center { phi, .. } => unsafe {
+                    ffi::tomoxide_linerec_backproject_try(
+                        h,
+                        f_dev.ptr,
+                        gf_dev.ptr,
+                        theta_ptr,
+                        cand_dev.ptr as *const f32,
+                        phi,
+                        sz,
+                        null,
+                    );
+                },
+                TrySweep::Tilt { .. } => unsafe {
+                    ffi::tomoxide_linerec_backproject_try_lamino(
+                        h,
+                        f_dev.ptr,
+                        gf_dev.ptr,
+                        theta_ptr,
+                        cand_dev.ptr as *const f32,
+                        sz,
+                        null,
+                    );
+                },
+            }
+            unsafe { ffi::tomoxide_linerec_free(h) };
         }
-        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_free(fh) };
-        let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
-        ck(
-            unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
-            "crop",
-        )?;
-        // ncz = nshift: the kernel's output index selects the CANDIDATE, not a z row.
-        let f = DevBuf::zeroed(nshift * n * n * fsz)?;
-        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, nshift) };
-        if h.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
-        unsafe {
-            ffi::tomoxide_linerec_backproject_try(
-                h,
-                f.ptr,
-                gf.ptr,
-                theta_dev.ptr as *const f32,
-                sh_dev.ptr as *const f32,
-                phi,
-                sz,
-                null,
-            );
-        }
-        unsafe { ffi::tomoxide_linerec_free(h) };
         ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
-        let mut host = vec![0.0f32; nshift * n * n];
-        f.to_host_f32(&mut host)?;
+        let mut host = vec![0.0f32; ncand * n * n];
+        f_dev.to_host_f32(&mut host)?;
         Ok(host)
     }
 
@@ -2658,8 +2621,18 @@ mod cuda_impl {
 
         let devices = selected_devices();
         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-        let out = center_try_chunk(
-            raw, &w, theta, &sh, phi, nz, nproj, ncols, n, pad, pad_side, sz,
+        let out = try_probe_chunk(
+            raw,
+            &w,
+            theta,
+            TrySweep::Center { sh: &sh, phi },
+            nz,
+            nproj,
+            ncols,
+            n,
+            pad,
+            pad_side,
+            sz,
         )?;
         Array3::from_shape_vec((centers.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
@@ -2779,7 +2752,19 @@ mod cuda_impl {
 
         let devices = selected_devices();
         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-        let out = lamino_try_chunk(raw, &w, theta, &phi, nz, nproj, ncols, n, pad, pad_side, sz)?;
+        let out = try_probe_chunk(
+            raw,
+            &w,
+            theta,
+            TrySweep::Tilt { phi: &phi },
+            nz,
+            nproj,
+            ncols,
+            n,
+            pad,
+            pad_side,
+            sz,
+        )?;
         Array3::from_shape_vec((phi.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda tilt-probe shape: {e}")))
     }
