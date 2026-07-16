@@ -4524,7 +4524,7 @@ mod cuda_impl {
                     let (t0, tc) = chunks1[ci];
                     let base = t0 * deth * detw;
                     let len = tc * deth * detw;
-                    slab[..len].copy_from_slice(&proj[base..base + len]);
+                    par_copy(&mut slab[..len], &proj[base..base + len]);
                 },
                 |din, dout, ci| {
                     let tc = chunks1[ci].1;
@@ -4606,7 +4606,7 @@ mod cuda_impl {
                     let (t0, tc) = chunks1[ci];
                     let base = t0 * deth * detw * 2;
                     let len = tc * deth * detw * 2;
-                    p22[base..base + len].copy_from_slice(&slab[..len]);
+                    par_copy(&mut p22[base..base + len], &slab[..len]);
                 },
             )?;
         }
@@ -4629,12 +4629,16 @@ mod cuda_impl {
                 n1 * n0 * csz,
                 |slab, ci| {
                     let (k0, kc) = chunks2[ci];
-                    for tz in 0..nproj {
-                        let src = (tz * deth + k0) * detw * 2;
-                        let dst = tz * kc * detw * 2;
-                        slab[dst..dst + kc * detw * 2]
-                            .copy_from_slice(&p22[src..src + kc * detw * 2]);
-                    }
+                    // Strided gather p22[:, k0..k0+kc, :] → contiguous [nproj, kc, detw]
+                    // slab; each tz-row is disjoint, so split the rows across cores.
+                    let row = kc * detw * 2;
+                    slab[..nproj * row]
+                        .par_chunks_mut(row)
+                        .enumerate()
+                        .for_each(|(tz, out)| {
+                            let src = (tz * deth + k0) * detw * 2;
+                            out.copy_from_slice(&p22[src..src + row]);
+                        });
                 },
                 |din, dout, ci| {
                     let kc = chunks2[ci].1;
@@ -4730,11 +4734,15 @@ mod cuda_impl {
                 },
                 |slab, ci| {
                     let (k0, kc) = chunks2[ci];
-                    for ty in 0..n1 {
-                        let src = ty * kc * n0 * 2;
-                        let dst = (ty * deth + k0) * n0 * 2;
-                        p11[dst..dst + kc * n0 * 2].copy_from_slice(&slab[src..src + kc * n0 * 2]);
-                    }
+                    // Strided scatter contiguous [n1, kc, n0] slab → p11[:, k0..k0+kc, :].
+                    // p11 is n1 blocks of deth*n0*2; each ty-block is disjoint.
+                    let blk = deth * n0 * 2;
+                    let seg = kc * n0 * 2;
+                    let off = k0 * n0 * 2;
+                    p11.par_chunks_mut(blk).enumerate().for_each(|(ty, block)| {
+                        let src = ty * seg;
+                        block[off..off + seg].copy_from_slice(&slab[src..src + seg]);
+                    });
                 },
             )?;
         }
@@ -4760,7 +4768,7 @@ mod cuda_impl {
                     let (y0, yc) = chunks3[ci];
                     let base = y0 * deth * n0 * 2;
                     let len = yc * deth * n0 * 2;
-                    slab[..len].copy_from_slice(&p11[base..base + len]);
+                    par_copy(&mut slab[..len], &p11[base..base + len]);
                 },
                 |din, dout, ci| {
                     let yc = chunks3[ci].1;
@@ -4833,7 +4841,7 @@ mod cuda_impl {
                     let (y0, yc) = chunks3[ci];
                     let base = y0 * rh * n0;
                     let len = yc * rh * n0;
-                    p00[base..base + len].copy_from_slice(&slab[..len]);
+                    par_copy(&mut p00[base..base + len], &slab[..len]);
                 },
             )?;
         }
@@ -4841,14 +4849,29 @@ mod cuda_impl {
 
         // --- copyTransposed: p00 [n1, rh, n2] -> vol [rh, n1, n2] (host) ---
         let mut vol = vec![0.0f32; rh * n1 * n];
-        for tz in 0..rh {
-            for ty in 0..n1 {
-                let src = (ty * rh + tz) * n;
-                let dst = (tz * n1 + ty) * n;
-                vol[dst..dst + n].copy_from_slice(&p00[src..src + n]);
-            }
-        }
+        // vol is rh blocks of n1*n; each tz-plane is disjoint, so transpose planes
+        // across cores (the gather from p00 within a plane stays strided).
+        vol.par_chunks_mut(n1 * n)
+            .enumerate()
+            .for_each(|(tz, plane)| {
+                for ty in 0..n1 {
+                    let src = (ty * rh + tz) * n;
+                    plane[ty * n..ty * n + n].copy_from_slice(&p00[src..src + n]);
+                }
+            });
         Ok(vol)
+    }
+
+    /// Parallel `dst.copy_from_slice(src)` for the large contiguous host-spectrum
+    /// copies in the laminography conveyor. Single-threaded memcpy of the ~100 GB
+    /// host spectra (the `prep_in`/`finalize` gather/scatter) is the host path's
+    /// dominant cost — the GPU sits idle waiting on it — so these copies are split
+    /// across cores. `dst` and `src` must have equal length.
+    fn par_copy(dst: &mut [f32], src: &[f32]) {
+        const CH: usize = 1 << 21; // 2 Mi f32 = 8 MiB per rayon task
+        dst.par_chunks_mut(CH)
+            .zip(src.par_chunks(CH))
+            .for_each(|(d, s)| d.copy_from_slice(s));
     }
 
     /// Split `0..total` into consecutive `[start, count)` chunks of at most `step`
@@ -5462,13 +5485,16 @@ mod cuda_impl {
         // --- copyTransposed: p00 [n1, rh, n2] -> vol [rh, n1, n2] (host) ---
         let p00 = pin_p00.as_slice();
         let mut vol = vec![0.0f32; rh * n1 * n];
-        for tz in 0..rh {
-            for ty in 0..n1 {
-                let src = (ty * rh + tz) * n;
-                let dst = (tz * n1 + ty) * n;
-                vol[dst..dst + n].copy_from_slice(&p00[src..src + n]);
-            }
-        }
+        // vol is rh blocks of n1*n; each tz-plane is disjoint, so transpose planes
+        // across cores (the gather from p00 within a plane stays strided).
+        vol.par_chunks_mut(n1 * n)
+            .enumerate()
+            .for_each(|(tz, plane)| {
+                for ty in 0..n1 {
+                    let src = (ty * rh + tz) * n;
+                    plane[ty * n..ty * n + n].copy_from_slice(&p00[src..src + n]);
+                }
+            });
         Ok(vol)
     }
 
