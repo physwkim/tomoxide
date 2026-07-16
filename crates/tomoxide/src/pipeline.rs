@@ -73,9 +73,21 @@ pub fn reconstruct_lamino_streaming(
     let backend = engine.backend();
     crate::prep::normalize_dataset(&mut ds, backend)?;
     crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
-    let mut sino = ds.data.to_layout(Layout::Sinogram);
-    crate::prep::remove_stripe(&mut sino, prep.stripe)?;
-    crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, on_tile)
+    // Stripe removal is the only sinogram-domain prep step here. When it is
+    // disabled (`StripeMethod::None`), hand the recon the native projection stack
+    // instead of transposing to sinogram order: the CUDA fourierrec laminography
+    // path wants projection order anyway, so the old unconditional
+    // `to_layout(Sinogram)` was a wasted round-trip — transpose the whole stack to
+    // sinogram order, then transpose it straight back to projection order inside
+    // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
+    // nothing. Fbp/Linerec still transpose to sinogram once inside the recon.
+    if prep.stripe == StripeMethod::None {
+        crate::cuda::reconstruct_lamino_streaming(&ds.data, geom, algorithm, params, on_tile)
+    } else {
+        let mut sino = ds.data.to_layout(Layout::Sinogram);
+        crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+        crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, on_tile)
+    }
 }
 
 /// Cooperative cancellation flag for the chunked drivers.
