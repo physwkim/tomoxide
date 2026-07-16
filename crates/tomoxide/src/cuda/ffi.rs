@@ -108,6 +108,29 @@ unsafe extern "C" {
         sz: i32,
         stream: *mut c_void,
     );
+    /// Rotation-centre probe: back-project the single detector row `sz` once per
+    /// entry of `sh` (device `[nshift]`, detector columns) in one launch, writing
+    /// `f` as `[nshift, n, n]` — one candidate slice per shift. `phi` is the
+    /// scalar tilt (`π/2` = untilted), so this serves parallel-beam and
+    /// laminography alike. The handle must be built with `ncz == nshift`; `g` is
+    /// the filtered sinogram `[nz, nproj, n]`; `f` must be pre-zeroed.
+    ///
+    /// The shift is applied to the back-projection sampling coordinate
+    /// (`u -= sh[k]`) with **linear interpolation**, whereas a full
+    /// reconstruction applies its centre as a Fourier linear phase in the filter.
+    /// The two are therefore not bit-identical away from integer shifts — see
+    /// [`super::center_probe`], which owns the shift↔centre mapping and documents
+    /// the consequence.
+    pub fn tomoxide_linerec_backproject_try(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        theta: *const f32,
+        sh: *const f32,
+        phi: f32,
+        sz: i32,
+        stream: *mut c_void,
+    );
     /// Laminography tilt probe: back-project the single detector row `sz` at
     /// every tilt in `phi` (device `[ntilt]`, radians, `π/2` = untilted) in one
     /// launch, writing `f` as `[ntilt, n, n]` — one candidate slice per tilt.

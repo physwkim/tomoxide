@@ -155,6 +155,12 @@ void tomoxide_linerec_backproject(void* h, void* f, const void* g, const float* 
 // `phi[tz]`, so the handle's `ncz` is the number of tilts and `f` comes back as
 // [ncz, n, n] — one candidate image per tilt from a single launch, rather than
 // one full volume per tilt.
+void tomoxide_linerec_backproject_try(void* h, void* f, const void* g, const float* theta,
+                                      const float* sh, float phi, int sz, void* stream) {
+  static_cast<cfunc_linerec*>(h)->backprojection_try(as_size(f), as_size(g), as_size(theta),
+                                                     as_size(sh), phi, sz, as_size(stream));
+}
+
 void tomoxide_linerec_backproject_try_lamino(void* h, void* f, const void* g, const float* theta,
                                              const float* phi, int sz, void* stream) {
   static_cast<cfunc_linerec*>(h)->backprojection_try_lamino(as_size(f), as_size(g), as_size(theta),
