@@ -5,9 +5,12 @@
 //! if a probe image IS the slice the reconstruction produces at that tilt: a
 //! focus metric ranking a differently-scaled or y-flipped proxy would pick a
 //! tilt for the wrong image. tomocupy's kernel writes `(n-ty-1)` and scales by
-//! 4/nproj; this file's other kernels were moved off both by the convention
-//! unification (`docs/ARCHITECTURE.md` §4.1) while this one, being uncalled,
-//! was not — so equality against `Algorithm::Linerec` is the thing to pin.
+//! 4/nproj; the convention unification (`docs/ARCHITECTURE.md` §4.1) moved this
+//! file's other kernels off both and left the lamino one behind — not because it
+//! was uncalled (`backprojection_try_ker` is uncalled too and was migrated) but
+//! because §4.1 then declared laminography exempt. So equality against
+//! `Algorithm::Linerec` is the thing to pin: it is the assertion that does not
+//! care why the two ever diverged.
 #![cfg(feature = "cuda")]
 
 use ndarray::{Array2, Axis};
