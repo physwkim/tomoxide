@@ -13,6 +13,7 @@
 //! a distinct recon-height `rh` is a separate solver change.
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
+#![cfg(feature = "cuda")]
 
 use tomoxide::{
     recon, Algorithm, Angles, Beam, Center, CudaBackend, Detector, ForwardProject, Geometry,

@@ -8,6 +8,7 @@
 //! detector-row count), which exercises the `sz`/`ncz` generalization.
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
+#![cfg(feature = "cuda")]
 
 use tomoxide::{
     Angles, Beam, Center, CudaBackend, Detector, FilteredBackproject, ForwardProject, Geometry,
