@@ -895,6 +895,13 @@ unsafe extern "C" {
         inverse: i32,
     ) -> i32;
 
+    /// The sub-batch the `tomoxide_fft_*` entry points above would run
+    /// `(rank, n0, n1, batch, type)` in: `batch` itself when cuFFT's scratch for
+    /// the whole batch already fits the per-plan cap, and a smaller divisor when
+    /// it must be split so the scratch stays bounded (see `cuda/fft.cu`).
+    /// `type`: 0 = C2C, 1 = R2C, 2 = C2R. Creates nothing — a pure query.
+    pub fn tomoxide_fft_plan_split(rank: i32, n0: i32, n1: i32, batch: i32, r#type: i32) -> i32;
+
     // --- Fourier/USFFT laminography (LamFourierRec) gridding + modulation ---
     // Device-resident, full-complex mirror of the CPU host loops in
     // `recon/lamino.rs`; the Rust orchestrator drives `tomoxide_fft_1d/2d`

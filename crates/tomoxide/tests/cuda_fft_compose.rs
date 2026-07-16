@@ -64,6 +64,61 @@ fn cuda_fft_roundtrips() {
     }
 }
 
+/// A batch too large for one plan's scratch is run in sub-batches, and doing so
+/// changes nothing about the result.
+///
+/// cuFFT needs no scratch for a smooth length but falls back to Bluestein for
+/// any other, where the scratch scales with `batch` — a laminography `2*rh` of
+/// 5988 (= 2²·3·499) asked for 8.8 GiB and `cufftMakePlanMany` failed outright.
+/// The transforms are contiguous, so splitting the batch is exact; this pins
+/// that. `TOMOXIDE_CUFFT_MAX_WORK_MB` forces the split at a size that fits a
+/// test — without it, reaching the real 512 MiB cap would take gigabytes, and
+/// the test would pass while never touching the path it exists to cover.
+#[test]
+fn cuda_fft_split_batch_matches_unsplit() {
+    let Some(cuda) = cuda_or_skip() else { return };
+    let len = 4099usize; // prime and large enough that cuFFT goes Bluestein here
+    let batch = 512usize;
+
+    let split_of = |cap_mb: Option<&str>| -> i32 {
+        match cap_mb {
+            Some(v) => std::env::set_var("TOMOXIDE_CUFFT_MAX_WORK_MB", v),
+            None => std::env::remove_var("TOMOXIDE_CUFFT_MAX_WORK_MB"),
+        }
+        unsafe { tomoxide::cuda::ffi::tomoxide_fft_plan_split(1, len as i32, 0, batch as i32, 0) }
+    };
+
+    // The cap is what decides: uncapped this shape runs in one plan, and at
+    // 1 MiB it cannot. Assert both, so a cuFFT whose scratch no longer behaves
+    // this way fails here rather than silently skipping the split below.
+    assert_eq!(split_of(None), batch as i32, "unsplit baseline");
+    let sub = split_of(Some("1"));
+    assert!(
+        sub < batch as i32 && sub >= 1,
+        "cap of 1 MiB must split: {sub}"
+    );
+
+    let orig: Vec<tomoxide::Complex32> = (0..len * batch)
+        .map(|k| {
+            let x = k as f32 * 0.017;
+            tomoxide::Complex32::new(x.sin(), (x * 0.6).cos())
+        })
+        .collect();
+
+    let mut got = orig.clone();
+    Fft::fft_1d(&cuda, &mut got, len, batch, false).unwrap(); // split (cap still 1 MiB)
+    std::env::remove_var("TOMOXIDE_CUFFT_MAX_WORK_MB");
+    let mut want = orig.clone();
+    Fft::fft_1d(&cuda, &mut want, len, batch, false).unwrap(); // one plan
+
+    let d = max_rel(
+        &want.iter().flat_map(|c| [c.re, c.im]).collect::<Vec<_>>(),
+        &got.iter().flat_map(|c| [c.re, c.im]).collect::<Vec<_>>(),
+    );
+    eprintln!("fft_1d split(sub={sub}) ↔ unsplit(batch={batch}) max rel = {d:e}");
+    assert!(d < 1e-6, "split batch changed the transform: rel {d}");
+}
+
 fn sino(n: usize, nang: usize, nz: usize, cpu: &CpuBackend) -> (Tomo<f32>, Geometry, Array2<f32>) {
     let phantom = sim::shepp2d(n).unwrap();
     let mut stack = Array3::<f32>::zeros((nz, n, n));
