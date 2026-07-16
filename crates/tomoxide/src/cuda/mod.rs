@@ -4544,7 +4544,7 @@ mod cuda_impl {
                         "lam_ramp_pad",
                     )?;
                     ck(
-                        unsafe { ffi::tomoxide_fft_1d(rbuf.ptr, ne, nlines as usize, 0) },
+                        unsafe { ffi::tomoxide_fft_1d_async(rbuf.ptr, ne, nlines as usize, 0) },
                         "lam_ramp_fft",
                     )?;
                     ck(
@@ -4554,7 +4554,7 @@ mod cuda_impl {
                         "lam_ramp_mul",
                     )?;
                     ck(
-                        unsafe { ffi::tomoxide_fft_1d(rbuf.ptr, ne, nlines as usize, 1) },
+                        unsafe { ffi::tomoxide_fft_1d_async(rbuf.ptr, ne, nlines as usize, 1) },
                         "lam_ramp_ifft",
                     )?;
                     ck(
@@ -4585,7 +4585,7 @@ mod cuda_impl {
                         "lam_fft2d_pre",
                     )?;
                     ck(
-                        unsafe { ffi::tomoxide_fft_2d(dout, deth, detw, tc, 0) },
+                        unsafe { ffi::tomoxide_fft_2d_async(dout, deth, detw, tc, 0) },
                         "lam_fft2d",
                     )?;
                     ck(
@@ -4705,7 +4705,7 @@ mod cuda_impl {
                         "lam_win2d_extract",
                     )?;
                     ck(
-                        unsafe { ffi::tomoxide_fft_2d(win.ptr, wy, wx, kc, 1) },
+                        unsafe { ffi::tomoxide_fft_2d_async(win.ptr, wy, wx, kc, 1) },
                         "lam_usfft2d_ifft",
                     )?;
                     ck(
@@ -4807,7 +4807,7 @@ mod cuda_impl {
                         "lam_win1d_extract",
                     )?;
                     ck(
-                        unsafe { ffi::tomoxide_fft_1d(lines.ptr, len, batch as usize, 1) },
+                        unsafe { ffi::tomoxide_fft_1d_async(lines.ptr, len, batch as usize, 1) },
                         "lam_usfft1d_ifft",
                     )?;
                     ck(
@@ -4866,43 +4866,40 @@ mod cuda_impl {
         v
     }
 
-    /// Drive a worker-overlapped conveyor over `chunks` for one host-resident
-    /// laminography stage. The dominant cost of the host path is not the H2D/D2H
-    /// transfers but the single-threaded CPU gather/scatter that shuttles the
-    /// ~100 GB host spectra through the pinned staging slabs. That CPU work runs on a
-    /// dedicated worker thread so it overlaps the GPU compute (which host-blocks the
-    /// main thread on its FFT syncs) instead of stalling the GPU between chunks.
+    /// Drive a single-thread, async-overlapped conveyor over `chunks` for one
+    /// host-resident laminography stage. The dominant cost of the host path is not
+    /// the H2D/D2H transfers but the single-threaded CPU gather/scatter that
+    /// shuttles the ~100 GB host spectra through the pinned staging slabs. Because
+    /// `compute` issues its stage kernels and FFTs **asynchronously** on the
+    /// per-thread stream (the `tomoxide_fft_*_async` variants enqueue without a host
+    /// sync), the host returns from it immediately and runs the CPU gather (chunk
+    /// `k`) and scatter (chunk `k-2`) while the GPU computes chunk `k-1` — the same
+    /// overlap CuPy gives tomocupy's `*_chunks` loops for free, without the extra
+    /// worker thread the blocking-FFT design required.
     ///
-    /// - `prep_in(slab, idx)` (worker) fills the pinned input slab for chunk `idx`
+    /// - `prep_in(slab, idx)` fills the pinned input slab for chunk `idx`
     ///   (a contiguous or strided gather from the host spectrum).
-    /// - `compute(din, dout, idx)` (main) issues the stage kernels on the
+    /// - `compute(din, dout, idx)` issues the stage kernels + async FFTs on the
     ///   per-thread/null stream, reading device input `din`, writing `dout`.
-    /// - `finalize(slab, idx)` (worker) stores the drained pinned output slab for
-    ///   chunk `idx` (a contiguous or strided scatter into the host spectrum).
+    /// - `finalize(slab, idx)` stores the drained pinned output slab for chunk
+    ///   `idx` (a contiguous or strided scatter into the host spectrum).
     ///
     /// `in_stride`/`out_stride` are the per-chunk-unit byte sizes: chunk `idx`
-    /// transfers `chunks[idx].1 * stride` bytes; device/pinned buffers are sized
-    /// `max_count * stride`. Both threads address the double-buffered pinned slabs
-    /// through raw pointers; the job/ack protocol keeps their accesses disjoint:
-    ///
-    /// - `Prep(ci+1)` is dispatched just before the main thread computes `ci`, so the
-    ///   worker fills `pin_in[nslot]` during that compute; the main thread waits its
-    ///   ack before the `ci+1` H2D. A prior H2D out of that slab (chunk `ci-1`) has
-    ///   completed because the intervening `compute` host-synced its FFTs after
-    ///   `ev_up.wait_compute()` made the per-thread stream wait on the H2D.
-    /// - `Finalize(ci)` is dispatched right after the `ci` D2H is issued; the worker
-    ///   `cudaEventSynchronize`s `ev_drained[slot]` before reading the slab, and the
-    ///   main thread waits `Finalize(ci-2)`'s ack before the `ci` D2H reuses it.
-    /// - `ev_done[slot]` gates device-buffer reuse: the copy stream waits it before an
-    ///   H2D refills `dev_in[slot]`, and `compute(ci)` re-records it so the following
-    ///   D2H reads `dev_out[slot]` only after the kernels have written it.
+    /// transfers `chunks[idx].1 * stride` bytes; the double-buffered device/pinned
+    /// slabs are sized `max_count * stride`. The loop is a 3-deep software pipeline
+    /// (compute `k-1` ∥ upload `k` ∥ drain `k-2`). Within one iteration the async
+    /// compute overlaps both CPU copies and the two transfers; the end-of-iteration
+    /// barrier (`ev_done` + `cstream.sync`) then bounds every buffer reuse to two
+    /// slots, so no cross-stream reuse event is needed. The one device→host order
+    /// the host awaits mid-iteration is `ev_drained` (chunk `k-2`'s D2H) before its
+    /// scatter, so that scatter overlaps `compute(k-1)` instead of the barrier.
     fn run_lam_conveyor(
         chunks: &[(usize, usize)],
         in_stride: usize,
         out_stride: usize,
-        prep_in: impl FnMut(&mut [f32], usize) + Send,
+        mut prep_in: impl FnMut(&mut [f32], usize),
         mut compute: impl FnMut(*mut c_void, *mut c_void, usize) -> Result<()>,
-        finalize: impl FnMut(&[f32], usize) + Send,
+        mut finalize: impl FnMut(&[f32], usize),
     ) -> Result<()> {
         let n = chunks.len();
         if n == 0 {
@@ -4918,144 +4915,89 @@ mod cuda_impl {
             DevBuf::new(maxc * out_stride)?,
             DevBuf::new(maxc * out_stride)?,
         ];
-        // Pinned staging: owned here (alive for the whole scope) but addressed by both
-        // threads through raw pointers; the handoff protocol keeps accesses disjoint.
-        let pin_in = [
+        let mut pin_in = [
             PinnedBuf::<f32>::new(maxc * in_stride / fsz)?,
             PinnedBuf::<f32>::new(maxc * in_stride / fsz)?,
         ];
+        // D2H writes into pin_out through its raw `ptr`, so the binding need not be
+        // `mut` (we only ever `as_slice` it on the host to read the drained chunk).
         let pin_out = [
             PinnedBuf::<f32>::new(maxc * out_stride / fsz)?,
             PinnedBuf::<f32>::new(maxc * out_stride / fsz)?,
         ];
-        let pin_in_addr = [pin_in[0].ptr as usize, pin_in[1].ptr as usize];
-        let pin_out_addr = [pin_out[0].ptr as usize, pin_out[1].ptr as usize];
-        let pin_in_len = maxc * in_stride / fsz;
-        let pin_out_len = maxc * out_stride / fsz;
         let cstream = Stream::new()?;
-        let ev_up = [Event::new()?, Event::new()?];
-        let ev_done = [Event::new()?, Event::new()?];
-        let ev_drained = [Event::new()?, Event::new()?];
-        let ev_drained_addr = [ev_drained[0].ptr as usize, ev_drained[1].ptr as usize];
+        let ev_done = [Event::new()?, Event::new()?]; // compute(slot) finished
+        let ev_drained = [Event::new()?, Event::new()?]; // D2H(slot) finished
 
-        enum Job {
-            Prep(usize, usize),
-            Finalize(usize, usize),
-            Stop,
-        }
-        let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
-        let (pack_tx, pack_rx) = std::sync::mpsc::channel::<()>();
-        let (fack_tx, fack_rx) = std::sync::mpsc::channel::<Result<()>>();
-
-        std::thread::scope(|s| -> Result<()> {
-            // Worker: CPU-side staging only (no stream work besides an event sync).
-            // The raw-pointer slabs are valid for the scope; the protocol keeps the
-            // worker's access to a slot disjoint from the main thread's transfers.
-            let mut prep_in = prep_in;
-            let mut finalize = finalize;
-            s.spawn(move || {
-                for job in job_rx.iter() {
-                    match job {
-                        Job::Prep(ci, slot) => {
-                            let slab = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    pin_in_addr[slot] as *mut f32,
-                                    pin_in_len,
-                                )
-                            };
-                            prep_in(slab, ci);
-                            let _ = pack_tx.send(());
-                        }
-                        Job::Finalize(ci, slot) => {
-                            let rc = unsafe {
-                                ffi::tomoxide_cuda_event_sync(ev_drained_addr[slot] as *mut c_void)
-                            };
-                            if rc != 0 {
-                                let _ = fack_tx.send(Err(Error::Backend(format!(
-                                    "cudaEventSynchronize failed ({rc})"
-                                ))));
-                                continue;
-                            }
-                            let slab = unsafe {
-                                std::slice::from_raw_parts(
-                                    pin_out_addr[slot] as *const f32,
-                                    pin_out_len,
-                                )
-                            };
-                            finalize(slab, ci);
-                            let _ = fack_tx.send(Ok(()));
-                        }
-                        Job::Stop => break,
-                    }
-                }
-            });
-
-            let dead = || Error::Backend("lam conveyor worker died".into());
-            let recv_pack = || pack_rx.recv().map_err(|_| dead());
-            let recv_fack = || fack_rx.recv().map_err(|_| dead())?;
-
-            // Prime: stage chunk 0 on the worker, wait until it is filled.
-            job_tx.send(Job::Prep(0, 0)).ok();
-            recv_pack()?;
-
-            for (ci, &(_, count)) in chunks.iter().enumerate() {
-                let slot = ci % 2;
-                // pin_in[slot] filled: chunk 0 primed above; ci>0 acked below.
-                if ci > 0 {
-                    recv_pack()?;
-                }
-                // dev_in[slot] free once compute(ci-2) has consumed it.
-                if ci >= 2 {
-                    cstream.wait_event(&ev_done[slot])?;
-                }
-                ck(
-                    unsafe {
-                        ffi::tomoxide_cuda_memcpy_h2d_async(
-                            dev_in[slot].ptr,
-                            pin_in_addr[slot] as *const c_void,
-                            count * in_stride,
-                            cstream.ptr,
-                        )
-                    },
-                    "lam_conv_h2d",
-                )?;
-                ev_up[slot].record_on(&cstream)?;
-                // Stage chunk ci+1 on the worker while this chunk computes.
-                if ci + 1 < n {
-                    job_tx.send(Job::Prep(ci + 1, (ci + 1) % 2)).ok();
-                }
-                // Compute this chunk (host-blocks on the FFT syncs).
-                ev_up[slot].wait_compute()?;
-                compute(dev_in[slot].ptr, dev_out[slot].ptr, ci)?;
-                ev_done[slot].record_compute()?;
-                // pin_out[slot] free once Finalize(ci-2) has read it.
-                if ci >= 2 {
-                    recv_fack()?;
-                }
-                cstream.wait_event(&ev_done[slot])?;
+        for k in 0..n + 2 {
+            // Launch compute(k-1) on the per-thread stream; the async FFTs mean this
+            // returns at once, freeing the host to run the CPU copies below.
+            if (1..=n).contains(&k) {
+                let c = k - 1;
+                let s = c % 2;
+                compute(dev_in[s].ptr, dev_out[s].ptr, c)?;
+                ev_done[s].record_compute()?;
+            }
+            // Drain chunk k-2's device output to its pinned slab (its compute was
+            // completed by the previous iteration's barrier).
+            if k >= 2 {
+                let c = k - 2;
+                let s = c % 2;
+                let count = chunks[c].1;
                 ck(
                     unsafe {
                         ffi::tomoxide_cuda_memcpy_d2h_async(
-                            pin_out_addr[slot] as *mut c_void,
-                            dev_out[slot].ptr as *const c_void,
+                            pin_out[s].ptr,
+                            dev_out[s].ptr as *const c_void,
                             count * out_stride,
                             cstream.ptr,
                         )
                     },
                     "lam_conv_d2h",
                 )?;
-                ev_drained[slot].record_on(&cstream)?;
-                // Scatter chunk ci to the host spectrum on the worker (overlaps the
-                // next compute); the worker waits ev_drained[slot] first.
-                job_tx.send(Job::Finalize(ci, slot)).ok();
+                ev_drained[s].record_on(&cstream)?;
             }
-            // Drain the finalizes not yet acked in the loop (the last min(n, 2)).
-            for _ in 0..n.min(2) {
-                recv_fack()?;
+            // Gather chunk k into its pinned slab (CPU — overlaps compute(k-1)), then
+            // upload it. dev_in[s]/pin_in[s] last held chunk k-2, whose compute/H2D
+            // the previous barriers completed, so the reuse is safe.
+            if k < n {
+                let s = k % 2;
+                let count = chunks[k].1;
+                prep_in(pin_in[s].as_mut_slice(), k);
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_h2d_async(
+                            dev_in[s].ptr,
+                            pin_in[s].ptr as *const c_void,
+                            count * in_stride,
+                            cstream.ptr,
+                        )
+                    },
+                    "lam_conv_h2d",
+                )?;
             }
-            job_tx.send(Job::Stop).ok();
-            Ok(())
-        })
+            // Scatter chunk k-2 to the host spectrum once its D2H has landed (CPU —
+            // overlaps compute(k-1)).
+            if k >= 2 {
+                let c = k - 2;
+                let s = c % 2;
+                ck(
+                    unsafe { ffi::tomoxide_cuda_event_sync(ev_drained[s].ptr) },
+                    "lam_conv_drain",
+                )?;
+                finalize(pin_out[s].as_slice(), c);
+            }
+            // Barrier: compute(k-1) and this iteration's copies (H2D k, D2H k-2) must
+            // finish before their two-slot buffers are reused two iterations on.
+            if (1..=n).contains(&k) {
+                ck(
+                    unsafe { ffi::tomoxide_cuda_event_sync(ev_done[(k - 1) % 2].ptr) },
+                    "lam_conv_compute_sync",
+                )?;
+            }
+            cstream.sync()?;
+        }
+        Ok(())
     }
 
     /// Device-resident Fourier/USFFT laminography: the two large intermediate

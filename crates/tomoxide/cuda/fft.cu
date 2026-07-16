@@ -180,4 +180,42 @@ int tomoxide_fft_2d_c2r(void* data, size_t rows, size_t cols, size_t batch) {
   return (int) cudaStreamSynchronize(cudaStreamPerThread);
 }
 
+// ---- async (non-syncing) C2C variants ----
+// Identical to `tomoxide_fft_1d`/`tomoxide_fft_2d` but they only *enqueue* the
+// transform (+ inverse scale) on `cudaStreamPerThread` and return without a host
+// sync. The caller is then responsible for ordering: because the laminography
+// stage kernels also run on the null (== per-thread) stream, the FFT stays
+// correctly serialized with them on the device, while the host thread is free to
+// run the CPU gather/scatter concurrently — the overlap the host-syncing variants
+// above cannot give. Only C2C is exposed here (the lamino path uses 1-D and 2-D
+// C2C exclusively); the R2C/C2R and every other `Fft` consumer keep the syncing
+// variants, so their "result ready on return" contract is unchanged.
+int tomoxide_fft_1d_async(void* data, size_t n, size_t batch, int inverse) {
+  PlanKey key{1, (int) n, 0, (int) batch, 0};
+  cufftHandle plan;
+  if (get_plan(key, &plan) != 0) return -1;
+  if (cufftExecC2C(plan, (cufftComplex*) data, (cufftComplex*) data,
+                   inverse ? CUFFT_INVERSE : CUFFT_FORWARD) != CUFFT_SUCCESS)
+    return -2;
+  if (inverse) {
+    long long cnt = 2ll * (long long) n * (long long) batch;
+    run_scale(data, cnt, 1.0f / (float) n);
+  }
+  return (int) cudaGetLastError();
+}
+
+int tomoxide_fft_2d_async(void* data, size_t rows, size_t cols, size_t batch, int inverse) {
+  PlanKey key{2, (int) rows, (int) cols, (int) batch, 0};
+  cufftHandle plan;
+  if (get_plan(key, &plan) != 0) return -1;
+  if (cufftExecC2C(plan, (cufftComplex*) data, (cufftComplex*) data,
+                   inverse ? CUFFT_INVERSE : CUFFT_FORWARD) != CUFFT_SUCCESS)
+    return -2;
+  if (inverse) {
+    long long cnt = 2ll * (long long) rows * (long long) cols * (long long) batch;
+    run_scale(data, cnt, 1.0f / (float) (rows * cols));
+  }
+  return (int) cudaGetLastError();
+}
+
 }  // extern "C"

@@ -880,6 +880,21 @@ unsafe extern "C" {
     /// row-padded real image `[rows, 2*(cols/2+1)]` per image in place.
     pub fn tomoxide_fft_2d_c2r(data: *mut c_void, rows: usize, cols: usize, batch: usize) -> i32;
 
+    /// Async (non-syncing) C2C variants of [`tomoxide_fft_1d`]/[`tomoxide_fft_2d`]:
+    /// they enqueue the transform (+ inverse `1/n` scale) on `cudaStreamPerThread`
+    /// and return without a host sync, so the caller's host thread can run CPU work
+    /// concurrently. Used only by the host laminography conveyor, whose stage
+    /// kernels also run on the null (per-thread) stream and so stay serialized with
+    /// the FFT on the device. Returns 0 on success.
+    pub fn tomoxide_fft_1d_async(data: *mut c_void, n: usize, batch: usize, inverse: i32) -> i32;
+    pub fn tomoxide_fft_2d_async(
+        data: *mut c_void,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        inverse: i32,
+    ) -> i32;
+
     // --- Fourier/USFFT laminography (LamFourierRec) gridding + modulation ---
     // Device-resident, full-complex mirror of the CPU host loops in
     // `recon/lamino.rs`; the Rust orchestrator drives `tomoxide_fft_1d/2d`
