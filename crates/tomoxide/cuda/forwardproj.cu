@@ -28,9 +28,13 @@
 
 // Scatter transpose of backprojection_ker (see file header). `g` is the output
 // sinogram [nz][nproj][n] (must be pre-zeroed; the kernel only atomic-adds),
-// `f` the input volume [nz][n][n].
+// `f` the input volume [ncz][n][n]. `ncz` is the volume z-extent (== nz for the
+// parallel beam; == the laminography recon height `rh` otherwise) and `sz` the
+// global z-offset of this volume block — both matching backprojection_ker so the
+// pair {A, Aᵀ} stays an exact transpose for a tilted axis (phi ≠ π/2) and an
+// output height that differs from the detector-row count.
 static __global__ void forwardprojection_ker(float *g, const float *f, const float *theta,
-                                             float phi, int n, int nz, int nproj)
+                                             float phi, int sz, int ncz, int n, int nz, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -49,7 +53,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
         }
     }
     __syncthreads();
-    if (tx >= n || ty >= n || tz >= nz)
+    if (tx >= n || ty >= n || tz >= ncz)
         return;
 
     // Same (un-flipped) row and centre as the back-projector's accumulation index.
@@ -67,7 +71,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
         R[0] = ctheta;       R[1] = stheta;        R[2] = 0;
         R[3] = stheta * cphi; R[4] = -ctheta * cphi; R[5] = sphi;
         float u = R[0] * (tx - n / 2) + R[1] * (ty - n / 2) + n / 2;
-        float v = R[3] * (tx - n / 2) + R[4] * (ty - n / 2) + R[5] * (tz - nz / 2) + nz / 2;
+        float v = R[3] * (tx - n / 2) + R[4] * (ty - n / 2) + R[5] * (tz + sz - nz / 2) + nz / 2;
 
         int ur = (int)(u - 1e-5f);
         int vr = (int)(v - 1e-5f);
@@ -94,12 +98,14 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 // and wgpu forward projectors, so the iterative suite is scale-unified across
 // backends at the physical μ. The launch geometry mirrors
 // cfunc_linerec::backprojection.
+// `ncz` = volume z-extent (== `nz` parallel beam, == recon height `rh` for
+// laminography), `sz` = the volume block's global z-offset, `nz` = detector rows.
 extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
-                                        int nz, int n, int nproj, void *stream)
+                                        int sz, int ncz, int nz, int n, int nproj, void *stream)
 {
     dim3 dimBlock(32, 32, 1);
-    dim3 grid((unsigned)ceil(n / 32.0), (unsigned)ceil(n / 32.0), (unsigned)nz);
+    dim3 grid((unsigned)ceil(n / 32.0), (unsigned)ceil(n / 32.0), (unsigned)ncz);
     size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
     forwardprojection_ker<<<grid, dimBlock, shmem, (cudaStream_t)stream>>>(
-        (float *)g, (const float *)f, theta, phi, n, nz, nproj);
+        (float *)g, (const float *)f, theta, phi, sz, ncz, n, nz, nproj);
 }

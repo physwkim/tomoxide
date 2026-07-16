@@ -115,6 +115,32 @@ int tomoxide_cuda_memcpy_d2h_async(void* dst, const void* src, size_t bytes, voi
 int tomoxide_cuda_memset_async(void* p, int value, size_t bytes, void* stream) {
   return (int) cudaMemsetAsync(p, value, bytes, static_cast<cudaStream_t>(stream));
 }
+// Events for cross-stream ordering in the conveyor: record on the compute
+// (per-thread) stream, then make a copy stream wait for it (or vice versa), so a
+// double-buffered transfer overlaps compute without a host-side device sync.
+// cudaEventDisableTiming = lighter (no timestamp bookkeeping). stream == nullptr
+// records/waits on the per-thread default stream (this TU is compiled with
+// --default-stream per-thread, so 0 == cudaStreamPerThread — the FFT's stream).
+void* tomoxide_cuda_event_create() {
+  cudaEvent_t e = nullptr;
+  if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+  return reinterpret_cast<void*>(e);
+}
+void tomoxide_cuda_event_destroy(void* e) {
+  if (e) cudaEventDestroy(static_cast<cudaEvent_t>(e));
+}
+int tomoxide_cuda_event_record(void* e, void* stream) {
+  return (int) cudaEventRecord(static_cast<cudaEvent_t>(e), static_cast<cudaStream_t>(stream));
+}
+int tomoxide_cuda_stream_wait_event(void* stream, void* e) {
+  return (int) cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(e), 0);
+}
+// Block the calling host thread until `e` has fired. Lets the host finalize a
+// specific deferred copy (e.g. a drained D2H staging slab) without syncing the
+// whole copy stream, which would stall copies still overlapping compute.
+int tomoxide_cuda_event_sync(void* e) {
+  return (int) cudaEventSynchronize(static_cast<cudaEvent_t>(e));
+}
 
 // ---- linerec (cfunc_linerec) ----
 void* tomoxide_linerec_new(size_t nproj, size_t nz, size_t n, size_t ncproj, size_t ncz) {

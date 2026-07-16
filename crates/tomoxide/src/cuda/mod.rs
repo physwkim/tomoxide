@@ -498,11 +498,74 @@ mod cuda_impl {
             }
             Ok(())
         }
+
+        /// Defer all work subsequently enqueued on this stream until `e` fires
+        /// (device-side; the host is not blocked). Used to make a copy stream wait
+        /// for a compute-stream event before reusing/reading a double buffer.
+        fn wait_event(&self, e: &Event) -> Result<()> {
+            let rc = unsafe { ffi::tomoxide_cuda_stream_wait_event(self.ptr, e.ptr) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaStreamWaitEvent failed ({rc})")));
+            }
+            Ok(())
+        }
     }
 
     impl Drop for Stream {
         fn drop(&mut self) {
             unsafe { ffi::tomoxide_cuda_stream_destroy(self.ptr) };
+        }
+    }
+
+    /// A CUDA event used only for cross-stream ordering (timing disabled). Record
+    /// it on one stream, `Stream::wait_event` it on another.
+    struct Event {
+        ptr: *mut c_void,
+    }
+
+    impl Event {
+        fn new() -> Result<Self> {
+            let ptr = unsafe { ffi::tomoxide_cuda_event_create() };
+            if ptr.is_null() {
+                return Err(Error::Backend("cudaEventCreate failed".into()));
+            }
+            Ok(Event { ptr })
+        }
+
+        /// Record on the **compute** (per-thread) stream — the one the FFTs and the
+        /// `null`-stream kernels run on (this build uses `--default-stream
+        /// per-thread`, so a null stream handle *is* `cudaStreamPerThread`).
+        fn record_compute(&self) -> Result<()> {
+            let rc = unsafe { ffi::tomoxide_cuda_event_record(self.ptr, std::ptr::null_mut()) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaEventRecord failed ({rc})")));
+            }
+            Ok(())
+        }
+
+        /// Record on the copy `stream`.
+        fn record_on(&self, stream: &Stream) -> Result<()> {
+            let rc = unsafe { ffi::tomoxide_cuda_event_record(self.ptr, stream.ptr) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaEventRecord failed ({rc})")));
+            }
+            Ok(())
+        }
+
+        /// Defer subsequent **compute** (per-thread) work until this event fires.
+        fn wait_compute(&self) -> Result<()> {
+            let rc =
+                unsafe { ffi::tomoxide_cuda_stream_wait_event(std::ptr::null_mut(), self.ptr) };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cudaStreamWaitEvent failed ({rc})")));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            unsafe { ffi::tomoxide_cuda_event_destroy(self.ptr) };
         }
     }
 
@@ -592,22 +655,20 @@ mod cuda_impl {
             geom: &Geometry,
             out: &mut Volume<f32>,
         ) -> Result<()> {
-            if geom.beam != Beam::Parallel {
-                return Err(Error::InvalidParam(
-                    "cuda back-projection supports parallel beam only".into(),
-                ));
-            }
+            let phi_lam = match geom.beam {
+                Beam::Parallel => None,
+                Beam::Laminography { phi } => Some(phi),
+                _ => {
+                    return Err(Error::InvalidParam(
+                        "cuda back-projection supports parallel beam and laminography only".into(),
+                    ));
+                }
+            };
             let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let nz = s.n_rows();
             let nproj = s.n_angles();
             let ncols = s.n_cols();
             let (oz, ny, nx) = out.dims();
-            if oz != nz {
-                return Err(Error::ShapeMismatch {
-                    expected: format!("{nz} sinogram rows"),
-                    found: oz.to_string(),
-                });
-            }
             if ny != ncols || nx != ncols {
                 return Err(Error::InvalidParam(format!(
                     "cuda back-projection needs a square grid = detector width {ncols}; got {ny}x{nx}"
@@ -618,6 +679,52 @@ mod cuda_impl {
                 return Err(Error::ShapeMismatch {
                     expected: format!("{nproj} angles"),
                     found: theta.len().to_string(),
+                });
+            }
+            // Laminography: back-project the `[nz, nproj, n]` sinogram into the
+            // `[rh, n, n]` volume (rh = output height) with the tilted geometry
+            // (sz = 0, ncz = rh). Pure adjoint `Wᵀ` — the exact transpose of the
+            // tilted forward projector, so {A, Aᵀ} is a true adjoint pair.
+            if let Some(phi) = phi_lam {
+                let rh = oz;
+                let sino_std = s.array.as_standard_layout();
+                let sino_slice = sino_std
+                    .as_slice()
+                    .expect("as_standard_layout is C-contiguous");
+                let g = DevBuf::from_host_f32(sino_slice)?;
+                let theta_d = DevBuf::from_host_f32(theta)?;
+                let f = DevBuf::zeroed(rh * ncols * ncols * std::mem::size_of::<f32>())?;
+                let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, rh) };
+                if handle.is_null() {
+                    return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+                }
+                unsafe {
+                    ffi::tomoxide_linerec_backproject(
+                        handle,
+                        f.ptr,
+                        g.ptr,
+                        theta_d.ptr as *const f32,
+                        phi,
+                        1.0, // pure adjoint Wᵀ
+                        0,   // sz
+                        std::ptr::null_mut(),
+                    );
+                }
+                let rc = unsafe { ffi::tomoxide_cuda_sync() };
+                unsafe { ffi::tomoxide_linerec_free(handle) };
+                if rc != 0 {
+                    return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+                }
+                let mut host = vec![0.0f32; rh * ncols * ncols];
+                f.to_host_f32(&mut host)?;
+                out.array = Array3::from_shape_vec((rh, ncols, ncols), host)
+                    .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
+                return Ok(());
+            }
+            if oz != nz {
+                return Err(Error::ShapeMismatch {
+                    expected: format!("{nz} sinogram rows"),
+                    found: oz.to_string(),
                 });
             }
             // Materialize a C-contiguous host buffer for the flat D2H upload:
@@ -693,12 +800,17 @@ mod cuda_impl {
         /// the detector width equals the grid `n`. Output is `[nz, nproj, n]` in
         /// `Sinogram` layout.
         fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
-            if geom.beam != Beam::Parallel {
-                return Err(Error::InvalidParam(
-                    "cuda forward projection supports parallel beam only".into(),
-                ));
-            }
-            let (nz, ny, nx) = vol.dims();
+            let phi = match geom.beam {
+                Beam::Parallel => std::f32::consts::FRAC_PI_2,
+                Beam::Laminography { phi } => phi,
+                _ => {
+                    return Err(Error::InvalidParam(
+                        "cuda forward projection supports parallel beam and laminography only"
+                            .into(),
+                    ));
+                }
+            };
+            let (rh, ny, nx) = vol.dims(); // volume z-extent (== detector rows for parallel)
             if ny != nx {
                 return Err(Error::InvalidParam(format!(
                     "cuda forward projection needs a square grid; got {ny}x{nx}"
@@ -712,6 +824,10 @@ mod cuda_impl {
                     "cuda forward projection needs detector width = grid {n}; got {ncols}"
                 )));
             }
+            // Detector rows: for the parallel beam this equals the volume height;
+            // for laminography the tilted axis makes `rh != nz`, so the detector
+            // row count comes from the geometry.
+            let nz = geom.detector.height;
             let theta = &geom.angles.0;
             if theta.len() != nproj {
                 return Err(Error::ShapeMismatch {
@@ -719,10 +835,48 @@ mod cuda_impl {
                     found: theta.len().to_string(),
                 });
             }
-            // Materialize a C-contiguous host buffer for the flat D2H upload
-            // (borrowed when already contiguous, copied otherwise), so the
-            // iterative solvers may hand any array layout — symmetric with the
-            // back-projector's sinogram handling.
+            // Laminography: forward-project the whole `[rh, n, n]` volume into the
+            // `[nz, nproj, n]` sinogram with the tilted geometry (sz = 0, ncz = rh).
+            // The exact transpose of the `cfunc_linerec` back-projector used by the
+            // analytic/iterative lamino paths, so {A, Aᵀ} is a true adjoint pair.
+            if let Beam::Laminography { .. } = geom.beam {
+                let vol_std = vol.array.as_standard_layout();
+                let vol_slice = vol_std
+                    .as_slice()
+                    .expect("as_standard_layout is C-contiguous");
+                let f = DevBuf::from_host_f32(vol_slice)?;
+                let theta_d = DevBuf::from_host_f32(theta)?;
+                let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
+                unsafe {
+                    ffi::tomoxide_forwardproject(
+                        g.ptr,
+                        f.ptr,
+                        theta_d.ptr as *const f32,
+                        phi,
+                        0,
+                        rh as i32,
+                        nz as i32,
+                        n as i32,
+                        nproj as i32,
+                        std::ptr::null_mut(),
+                    );
+                }
+                let rc = unsafe { ffi::tomoxide_cuda_sync() };
+                if rc != 0 {
+                    return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+                }
+                let mut host = vec![0.0f32; nz * nproj * n];
+                g.to_host_f32(&mut host)?;
+                let array = Array3::from_shape_vec((nz, nproj, n), host)
+                    .map_err(|e| Error::InvalidParam(format!("cuda sinogram shape: {e}")))?;
+                *out = Tomo::new(array, Layout::Sinogram);
+                return Ok(());
+            }
+            let nz = rh; // parallel beam: volume height == detector rows
+                         // Materialize a C-contiguous host buffer for the flat D2H upload
+                         // (borrowed when already contiguous, copied otherwise), so the
+                         // iterative solvers may hand any array layout — symmetric with the
+                         // back-projector's sinogram handling.
             let vol_std = vol.array.as_standard_layout();
             let vol_slice = vol_std
                 .as_slice()
@@ -747,13 +901,14 @@ mod cuda_impl {
             let theta_d = DevBuf::from_host_f32(theta)?;
             let g = DevBuf::zeroed(nz_run * nproj * n * std::mem::size_of::<f32>())?;
 
-            let phi = std::f32::consts::FRAC_PI_2; // parallel beam
             unsafe {
                 ffi::tomoxide_forwardproject(
                     g.ptr,
                     f.ptr,
                     theta_d.ptr as *const f32,
-                    phi,
+                    phi, // π/2 (parallel beam)
+                    0,
+                    nz_run as i32,
                     nz_run as i32,
                     n as i32,
                     nproj as i32,
@@ -808,6 +963,8 @@ mod cuda_impl {
             f,
             theta,
             std::f32::consts::FRAC_PI_2,
+            0,         // sz: whole volume, no offset
+            nz as i32, // ncz: parallel beam volume height == detector rows
             nz as i32,
             n as i32,
             nproj as i32,
@@ -4246,6 +4403,1175 @@ mod cuda_impl {
         Ok(host)
     }
 
+    /// Gaussian-USFFT half-width `m` and shape `mu` (tomocupy `EPS = 1e-3`),
+    /// identical to `recon::lamino::usfft_params` so the GPU grids match the CPU
+    /// golden exactly.
+    fn lam_usfft_params(n: usize) -> (usize, f32) {
+        let nf = n as f64;
+        let neg_log_eps = -(1e-3_f64).ln();
+        let mu = neg_log_eps / (2.0 * nf * nf);
+        let inside = mu * neg_log_eps + (mu * nf) * (mu * nf) / 4.0;
+        let m = (2.0 * nf / std::f64::consts::PI * inside.sqrt()).ceil() as usize;
+        (m, mu as f32)
+    }
+
+    /// Device-resident Fourier/USFFT laminography (tomocupy `LamFourierRec`) — a
+    /// full-complex GPU mirror of the CPU golden [`crate::recon::lamino::lamino`].
+    /// The gridding + modulation stages run as the `tomoxide_lam_*` kernels and
+    /// the FFTs reuse the device-resident `tomoxide_fft_1d/2d`, so the whole
+    /// pipeline stays on the GPU. `proj` is `[nproj, deth, detw]` (projection
+    /// layout, `detw == n`); returns the volume `[rh, n, n]`.
+    ///
+    /// Whole-volume (no streaming / no R2C-half), like the CPU port: the
+    /// oversampled `(x,y)` grid `fdee2 [deth, gy, gx]` dominates VRAM, so this is
+    /// bounded to grids that fit one device (≈ ≤512³ on a 16 GB card). Chunking to
+    /// production scale (tomocupy's deth/ntheta/n1 streaming) is a follow-up.
+    #[allow(clippy::too_many_arguments)]
+    /// Streaming (chunked) Fourier/USFFT laminography, mirroring tomocupy's
+    /// `BackprojLamFourierParallel` memory model: the full spectra (`p22`, `p11`)
+    /// and output (`p00`) live in **host** RAM, and only chunk-sized slabs of the
+    /// oversampled USFFT grids are ever resident on the GPU. This bounds peak VRAM
+    /// to a fraction of a single grid (the whole-volume `fdee2` alone is ~30 GB at
+    /// 1024², which no 32 GB card can hold). Each stage chunks along its own
+    /// independent axis:
+    ///   - stage 1 (ramp + centered 2-D FFT): over projections (`ntheta`),
+    ///   - stage 2 (usfft2d_adj): over depth-frequency slices (`deth`/`nky`),
+    ///   - stage 3 (usfft1d_adj): over the y-frequency rows (`n1`).
+    ///
+    /// `center` is applied in the ramp as tomocupy's `fbp_filter_center` linear
+    /// phase (`shift = detw/2 - center`); `center == detw/2` ⇒ `shift == 0` and the
+    /// result is bit-identical to the earlier whole-volume path (the golden anchor).
+    ///
+    /// This host-resident path bounds peak VRAM to a fraction of one grid but pays
+    /// full-volume PCIe (`p22`/`p11`/`p00` shuttle host↔device between stages),
+    /// leaving the GPU idle during transfers. When the spectra fit in VRAM,
+    /// [`analytic_lamino_fourierrec_device`] keeps them resident and is preferred;
+    /// the dispatcher [`analytic_lamino_fourierrec`] chooses between them.
+    fn analytic_lamino_fourierrec_host(
+        proj: &[f32],
+        theta: &[f32],
+        phi: f32,
+        n: usize,
+        rh: usize,
+        center: f32,
+    ) -> Result<Vec<f32>> {
+        let csz = 2 * std::mem::size_of::<f32>(); // bytes per complex
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+
+        let nproj = theta.len();
+        let detw = n;
+        let deth = proj.len() / (nproj * n);
+        if proj.len() != nproj * deth * detw {
+            return Err(Error::InvalidParam(
+                "lamino fourierrec: proj shape != [nproj, nz, n]".into(),
+            ));
+        }
+        // usfft2d in-plane params (n0 = detw = n, n1 = n) and usfft1d depth params.
+        let (n0, n1) = (detw, n);
+        let (m0, mu0) = lam_usfft_params(n0);
+        let (m1, mu1) = lam_usfft_params(n1);
+        let (m2, mu2) = lam_usfft_params(rh);
+        let gx = 2 * n0 + 2 * m0;
+        let gy = 2 * n1 + 2 * m1;
+        let ng = 2 * rh + 2 * m2;
+        let ne = 2 * detw;
+        let pad = (ne - detw) / 2;
+        let shift = detw as f32 / 2.0 - center; // rotation-center linear phase
+
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+
+        // Per-chunk device footprint bounds the chunk count to ≤30% of free VRAM.
+        // The conveyor double-buffers each stage's streamed input and output slab
+        // (a copy stream uploads chunk ci+1 / drains chunk ci-1 while ci computes),
+        // so those two slabs are counted twice; the compute scratch is single.
+        let budget = (device_free_bytes() / 100 * 30).max(1);
+        // stage 1: 2×dev_in (real) + rbuf + 2×dev_out (complex).
+        let per_theta = 2 * deth * detw * fsz + deth * ne * csz + 2 * deth * detw * csz;
+        let nthetac = (budget / per_theta.max(1)).clamp(1, nproj);
+        // stage 2: 2×g_dev + xs/ys + fdee2 + win + 2×f11.
+        let per_ky = gy * gx * csz
+            + (2 * n1) * (2 * n0) * csz
+            + 2 * n1 * n0 * csz
+            + 2 * nproj * detw * csz
+            + 2 * nproj * detw * fsz;
+        let dethc = (budget / per_ky.max(1)).clamp(1, deth);
+        // stage 3: 2×g_dev + fdee1 + lines + 2×f00.
+        let per_ty = ng * n0 * csz + n0 * (2 * rh) * csz + 2 * deth * n0 * csz + 2 * rh * n0 * fsz;
+        let n1c = (budget / per_ty.max(1)).clamp(1, n1);
+
+        // Host-resident spectra / output (complex stored as interleaved f32 pairs).
+        let mut p22 = vec![0.0f32; nproj * deth * detw * 2]; // [nproj, deth, detw]
+        let mut p11 = vec![0.0f32; n1 * deth * n0 * 2]; // [n1, deth, n0]
+        let mut p00 = vec![0.0f32; n1 * rh * n0]; // [n1, rh, n0] real
+
+        // Per-stage chunk plans (each axis is independent; last chunk may be short).
+        let chunks1 = chunk_ranges(nproj, nthetac);
+        let chunks2 = chunk_ranges(deth, dethc);
+        let chunks3 = chunk_ranges(n1, n1c);
+
+        // --- stage 1: ramp_filter_center + centered 2-D FFT, chunked over ntheta ---
+        // prep uploads a contiguous [tc, deth, detw] projection slab; compute runs the
+        // ramp+2-D FFT in place; finalize stores the [tc, deth, detw] p22 slab. The
+        // conveyor overlaps the next upload / previous download with this compute.
+        {
+            let rbuf = DevBuf::new(nthetac * deth * ne * csz)?;
+            run_lam_conveyor(
+                &chunks1,
+                deth * detw * fsz,
+                deth * detw * csz,
+                |slab, ci| {
+                    let (t0, tc) = chunks1[ci];
+                    let base = t0 * deth * detw;
+                    let len = tc * deth * detw;
+                    slab[..len].copy_from_slice(&proj[base..base + len]);
+                },
+                |din, dout, ci| {
+                    let tc = chunks1[ci].1;
+                    let nlines = (tc * deth) as i64;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_ramp_pad(
+                                din,
+                                rbuf.ptr,
+                                nlines,
+                                detw as i32,
+                                ne as i32,
+                                pad as i32,
+                                null,
+                            )
+                        },
+                        "lam_ramp_pad",
+                    )?;
+                    ck(
+                        unsafe { ffi::tomoxide_fft_1d(rbuf.ptr, ne, nlines as usize, 0) },
+                        "lam_ramp_fft",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_ramp_mul(rbuf.ptr, nlines, ne as i32, shift, null)
+                        },
+                        "lam_ramp_mul",
+                    )?;
+                    ck(
+                        unsafe { ffi::tomoxide_fft_1d(rbuf.ptr, ne, nlines as usize, 1) },
+                        "lam_ramp_ifft",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_ramp_crop(
+                                rbuf.ptr,
+                                din,
+                                nlines,
+                                detw as i32,
+                                ne as i32,
+                                pad as i32,
+                                null,
+                            )
+                        },
+                        "lam_ramp_crop",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_fft2d_pre(
+                                din,
+                                dout,
+                                tc as i64,
+                                deth as i32,
+                                detw as i32,
+                                null,
+                            )
+                        },
+                        "lam_fft2d_pre",
+                    )?;
+                    ck(
+                        unsafe { ffi::tomoxide_fft_2d(dout, deth, detw, tc, 0) },
+                        "lam_fft2d",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_fft2d_post(
+                                dout,
+                                tc as i64,
+                                deth as i32,
+                                detw as i32,
+                                null,
+                            )
+                        },
+                        "lam_fft2d_post",
+                    )?;
+                    Ok(())
+                },
+                |slab, ci| {
+                    let (t0, tc) = chunks1[ci];
+                    let base = t0 * deth * detw * 2;
+                    let len = tc * deth * detw * 2;
+                    p22[base..base + len].copy_from_slice(&slab[..len]);
+                },
+            )?;
+        }
+
+        // --- stage 2: usfft2d_adj, chunked over depth-frequency ky (deth) ---
+        // prep gathers p22[:, k0..k0+kc, :] into a contiguous [nproj, kc, detw] slab
+        // (strided host copy); finalize scatters the [n1, kc, n0] f11 slab back into
+        // p11[:, k0..k0+kc, :]. Compute scratch (xs/ys/fdee2/win) is allocated once,
+        // sized for the largest chunk, with the accumulation grid async-zeroed per
+        // chunk (gather2d atomicAdd-accumulates into it).
+        {
+            let (wy, wx) = (2 * n1, 2 * n0);
+            let xs = DevBuf::new(nproj * dethc * detw * fsz)?;
+            let ys = DevBuf::new(nproj * dethc * detw * fsz)?;
+            let fdee2 = DevBuf::new(dethc * gy * gx * csz)?;
+            let win = DevBuf::new(dethc * wy * wx * csz)?;
+            run_lam_conveyor(
+                &chunks2,
+                nproj * detw * csz,
+                n1 * n0 * csz,
+                |slab, ci| {
+                    let (k0, kc) = chunks2[ci];
+                    for tz in 0..nproj {
+                        let src = (tz * deth + k0) * detw * 2;
+                        let dst = tz * kc * detw * 2;
+                        slab[dst..dst + kc * detw * 2]
+                            .copy_from_slice(&p22[src..src + kc * detw * 2]);
+                    }
+                },
+                |din, dout, ci| {
+                    let kc = chunks2[ci].1;
+                    let k0 = chunks2[ci].0;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_takexy2d(
+                                theta_dev.ptr,
+                                xs.ptr,
+                                ys.ptr,
+                                nproj as i64,
+                                kc as i32,
+                                detw as i32,
+                                phi,
+                                k0 as i32,
+                                deth as i32,
+                                null,
+                            )
+                        },
+                        "lam_takexy2d",
+                    )?;
+                    // Zero only the kc grid; gather2d accumulates (atomicAdd) into it.
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_cuda_memset_async(fdee2.ptr, 0, kc * gy * gx * csz, null)
+                        },
+                        "lam_fdee2_zero",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_gather2d_adj(
+                                din,
+                                xs.ptr,
+                                ys.ptr,
+                                fdee2.ptr,
+                                nproj as i64,
+                                kc as i32,
+                                detw as i32,
+                                n0 as i32,
+                                n1 as i32,
+                                m0 as i32,
+                                m1 as i32,
+                                mu0,
+                                mu1,
+                                kc as i32, // g is a contiguous [nproj, kc, detw] chunk
+                                0,
+                                null,
+                            )
+                        },
+                        "lam_gather2d_adj",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_wrap2d_adj(
+                                fdee2.ptr, kc as i32, n0 as i32, n1 as i32, m0 as i32, m1 as i32,
+                                null,
+                            )
+                        },
+                        "lam_wrap2d_adj",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_win2d_extract(
+                                fdee2.ptr, win.ptr, kc as i32, n0 as i32, n1 as i32, m0 as i32,
+                                m1 as i32, null,
+                            )
+                        },
+                        "lam_win2d_extract",
+                    )?;
+                    ck(
+                        unsafe { ffi::tomoxide_fft_2d(win.ptr, wy, wx, kc, 1) },
+                        "lam_usfft2d_ifft",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_win2d_scatter(
+                                fdee2.ptr, win.ptr, kc as i32, n0 as i32, n1 as i32, m0 as i32,
+                                m1 as i32, null,
+                            )
+                        },
+                        "lam_win2d_scatter",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_divker2d_adj(
+                                fdee2.ptr, dout, n1 as i32, kc as i32, n0 as i32, m0 as i32,
+                                m1 as i32, mu0, mu1, kc as i32, 0, null,
+                            )
+                        },
+                        "lam_divker2d_adj",
+                    )?;
+                    Ok(())
+                },
+                |slab, ci| {
+                    let (k0, kc) = chunks2[ci];
+                    for ty in 0..n1 {
+                        let src = ty * kc * n0 * 2;
+                        let dst = (ty * deth + k0) * n0 * 2;
+                        p11[dst..dst + kc * n0 * 2].copy_from_slice(&slab[src..src + kc * n0 * 2]);
+                    }
+                },
+            )?;
+        }
+        drop(p22);
+
+        // --- stage 3: usfft1d_adj, chunked over y-frequency rows (n1) ---
+        // Each n1-chunk is a contiguous slab of p11 (prep) → a contiguous [yc, rh, n0]
+        // real slab into p00 (finalize). `z` is chunk-independent, computed once;
+        // fdee1 async-zeroed per chunk (gather1d atomicAdd-accumulates into it).
+        {
+            let z = DevBuf::new(deth * fsz)?;
+            ck(
+                unsafe { ffi::tomoxide_lam_takez1d(z.ptr, deth as i32, phi, null) },
+                "lam_takez1d",
+            )?;
+            let fdee1 = DevBuf::new(ng * n1c * n0 * csz)?;
+            let lines = DevBuf::new(n1c * n0 * (2 * rh) * csz)?;
+            run_lam_conveyor(
+                &chunks3,
+                deth * n0 * csz,
+                rh * n0 * fsz,
+                |slab, ci| {
+                    let (y0, yc) = chunks3[ci];
+                    let base = y0 * deth * n0 * 2;
+                    let len = yc * deth * n0 * 2;
+                    slab[..len].copy_from_slice(&p11[base..base + len]);
+                },
+                |din, dout, ci| {
+                    let yc = chunks3[ci].1;
+                    // Zero only the yc grid; gather1d accumulates (atomicAdd) into it.
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_cuda_memset_async(fdee1.ptr, 0, ng * yc * n0 * csz, null)
+                        },
+                        "lam_fdee1_zero",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_gather1d_adj(
+                                din,
+                                z.ptr,
+                                fdee1.ptr,
+                                yc as i32,
+                                deth as i32,
+                                n0 as i32,
+                                rh as i32,
+                                m2 as i32,
+                                mu2,
+                                null,
+                            )
+                        },
+                        "lam_gather1d_adj",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_wrap1d_adj(
+                                fdee1.ptr, n0 as i32, yc as i32, rh as i32, m2 as i32, null,
+                            )
+                        },
+                        "lam_wrap1d_adj",
+                    )?;
+                    let batch = (n0 * yc) as i64;
+                    let len = 2 * rh;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_win1d_extract(
+                                fdee1.ptr, lines.ptr, batch, rh as i32, m2 as i32, null,
+                            )
+                        },
+                        "lam_win1d_extract",
+                    )?;
+                    ck(
+                        unsafe { ffi::tomoxide_fft_1d(lines.ptr, len, batch as usize, 1) },
+                        "lam_usfft1d_ifft",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_win1d_scatter(
+                                fdee1.ptr, lines.ptr, batch, rh as i32, m2 as i32, null,
+                            )
+                        },
+                        "lam_win1d_scatter",
+                    )?;
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_lam_divker1d_adj(
+                                fdee1.ptr, dout, yc as i32, rh as i32, n0 as i32, m2 as i32, mu2,
+                                null,
+                            )
+                        },
+                        "lam_divker1d_adj",
+                    )?;
+                    Ok(())
+                },
+                |slab, ci| {
+                    let (y0, yc) = chunks3[ci];
+                    let base = y0 * rh * n0;
+                    let len = yc * rh * n0;
+                    p00[base..base + len].copy_from_slice(&slab[..len]);
+                },
+            )?;
+        }
+        drop(p11);
+
+        // --- copyTransposed: p00 [n1, rh, n2] -> vol [rh, n1, n2] (host) ---
+        let mut vol = vec![0.0f32; rh * n1 * n];
+        for tz in 0..rh {
+            for ty in 0..n1 {
+                let src = (ty * rh + tz) * n;
+                let dst = (tz * n1 + ty) * n;
+                vol[dst..dst + n].copy_from_slice(&p00[src..src + n]);
+            }
+        }
+        Ok(vol)
+    }
+
+    /// Split `0..total` into consecutive `[start, count)` chunks of at most `step`
+    /// (the last is short when `total` is not a multiple of `step`). Used to plan
+    /// each laminography stage's independent chunk axis.
+    fn chunk_ranges(total: usize, step: usize) -> Vec<(usize, usize)> {
+        let step = step.max(1);
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < total {
+            let c = step.min(total - i);
+            v.push((i, c));
+            i += c;
+        }
+        v
+    }
+
+    /// Drive a worker-overlapped conveyor over `chunks` for one host-resident
+    /// laminography stage. The dominant cost of the host path is not the H2D/D2H
+    /// transfers but the single-threaded CPU gather/scatter that shuttles the
+    /// ~100 GB host spectra through the pinned staging slabs. That CPU work runs on a
+    /// dedicated worker thread so it overlaps the GPU compute (which host-blocks the
+    /// main thread on its FFT syncs) instead of stalling the GPU between chunks.
+    ///
+    /// - `prep_in(slab, idx)` (worker) fills the pinned input slab for chunk `idx`
+    ///   (a contiguous or strided gather from the host spectrum).
+    /// - `compute(din, dout, idx)` (main) issues the stage kernels on the
+    ///   per-thread/null stream, reading device input `din`, writing `dout`.
+    /// - `finalize(slab, idx)` (worker) stores the drained pinned output slab for
+    ///   chunk `idx` (a contiguous or strided scatter into the host spectrum).
+    ///
+    /// `in_stride`/`out_stride` are the per-chunk-unit byte sizes: chunk `idx`
+    /// transfers `chunks[idx].1 * stride` bytes; device/pinned buffers are sized
+    /// `max_count * stride`. Both threads address the double-buffered pinned slabs
+    /// through raw pointers; the job/ack protocol keeps their accesses disjoint:
+    ///
+    /// - `Prep(ci+1)` is dispatched just before the main thread computes `ci`, so the
+    ///   worker fills `pin_in[nslot]` during that compute; the main thread waits its
+    ///   ack before the `ci+1` H2D. A prior H2D out of that slab (chunk `ci-1`) has
+    ///   completed because the intervening `compute` host-synced its FFTs after
+    ///   `ev_up.wait_compute()` made the per-thread stream wait on the H2D.
+    /// - `Finalize(ci)` is dispatched right after the `ci` D2H is issued; the worker
+    ///   `cudaEventSynchronize`s `ev_drained[slot]` before reading the slab, and the
+    ///   main thread waits `Finalize(ci-2)`'s ack before the `ci` D2H reuses it.
+    /// - `ev_done[slot]` gates device-buffer reuse: the copy stream waits it before an
+    ///   H2D refills `dev_in[slot]`, and `compute(ci)` re-records it so the following
+    ///   D2H reads `dev_out[slot]` only after the kernels have written it.
+    fn run_lam_conveyor(
+        chunks: &[(usize, usize)],
+        in_stride: usize,
+        out_stride: usize,
+        prep_in: impl FnMut(&mut [f32], usize) + Send,
+        mut compute: impl FnMut(*mut c_void, *mut c_void, usize) -> Result<()>,
+        finalize: impl FnMut(&[f32], usize) + Send,
+    ) -> Result<()> {
+        let n = chunks.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let fsz = std::mem::size_of::<f32>();
+        let maxc = chunks.iter().map(|c| c.1).max().unwrap_or(0);
+        let dev_in = [
+            DevBuf::new(maxc * in_stride)?,
+            DevBuf::new(maxc * in_stride)?,
+        ];
+        let dev_out = [
+            DevBuf::new(maxc * out_stride)?,
+            DevBuf::new(maxc * out_stride)?,
+        ];
+        // Pinned staging: owned here (alive for the whole scope) but addressed by both
+        // threads through raw pointers; the handoff protocol keeps accesses disjoint.
+        let pin_in = [
+            PinnedBuf::<f32>::new(maxc * in_stride / fsz)?,
+            PinnedBuf::<f32>::new(maxc * in_stride / fsz)?,
+        ];
+        let pin_out = [
+            PinnedBuf::<f32>::new(maxc * out_stride / fsz)?,
+            PinnedBuf::<f32>::new(maxc * out_stride / fsz)?,
+        ];
+        let pin_in_addr = [pin_in[0].ptr as usize, pin_in[1].ptr as usize];
+        let pin_out_addr = [pin_out[0].ptr as usize, pin_out[1].ptr as usize];
+        let pin_in_len = maxc * in_stride / fsz;
+        let pin_out_len = maxc * out_stride / fsz;
+        let cstream = Stream::new()?;
+        let ev_up = [Event::new()?, Event::new()?];
+        let ev_done = [Event::new()?, Event::new()?];
+        let ev_drained = [Event::new()?, Event::new()?];
+        let ev_drained_addr = [ev_drained[0].ptr as usize, ev_drained[1].ptr as usize];
+
+        enum Job {
+            Prep(usize, usize),
+            Finalize(usize, usize),
+            Stop,
+        }
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+        let (pack_tx, pack_rx) = std::sync::mpsc::channel::<()>();
+        let (fack_tx, fack_rx) = std::sync::mpsc::channel::<Result<()>>();
+
+        std::thread::scope(|s| -> Result<()> {
+            // Worker: CPU-side staging only (no stream work besides an event sync).
+            // The raw-pointer slabs are valid for the scope; the protocol keeps the
+            // worker's access to a slot disjoint from the main thread's transfers.
+            let mut prep_in = prep_in;
+            let mut finalize = finalize;
+            s.spawn(move || {
+                for job in job_rx.iter() {
+                    match job {
+                        Job::Prep(ci, slot) => {
+                            let slab = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    pin_in_addr[slot] as *mut f32,
+                                    pin_in_len,
+                                )
+                            };
+                            prep_in(slab, ci);
+                            let _ = pack_tx.send(());
+                        }
+                        Job::Finalize(ci, slot) => {
+                            let rc = unsafe {
+                                ffi::tomoxide_cuda_event_sync(ev_drained_addr[slot] as *mut c_void)
+                            };
+                            if rc != 0 {
+                                let _ = fack_tx.send(Err(Error::Backend(format!(
+                                    "cudaEventSynchronize failed ({rc})"
+                                ))));
+                                continue;
+                            }
+                            let slab = unsafe {
+                                std::slice::from_raw_parts(
+                                    pin_out_addr[slot] as *const f32,
+                                    pin_out_len,
+                                )
+                            };
+                            finalize(slab, ci);
+                            let _ = fack_tx.send(Ok(()));
+                        }
+                        Job::Stop => break,
+                    }
+                }
+            });
+
+            let dead = || Error::Backend("lam conveyor worker died".into());
+            let recv_pack = || pack_rx.recv().map_err(|_| dead());
+            let recv_fack = || fack_rx.recv().map_err(|_| dead())?;
+
+            // Prime: stage chunk 0 on the worker, wait until it is filled.
+            job_tx.send(Job::Prep(0, 0)).ok();
+            recv_pack()?;
+
+            for (ci, &(_, count)) in chunks.iter().enumerate() {
+                let slot = ci % 2;
+                // pin_in[slot] filled: chunk 0 primed above; ci>0 acked below.
+                if ci > 0 {
+                    recv_pack()?;
+                }
+                // dev_in[slot] free once compute(ci-2) has consumed it.
+                if ci >= 2 {
+                    cstream.wait_event(&ev_done[slot])?;
+                }
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_h2d_async(
+                            dev_in[slot].ptr,
+                            pin_in_addr[slot] as *const c_void,
+                            count * in_stride,
+                            cstream.ptr,
+                        )
+                    },
+                    "lam_conv_h2d",
+                )?;
+                ev_up[slot].record_on(&cstream)?;
+                // Stage chunk ci+1 on the worker while this chunk computes.
+                if ci + 1 < n {
+                    job_tx.send(Job::Prep(ci + 1, (ci + 1) % 2)).ok();
+                }
+                // Compute this chunk (host-blocks on the FFT syncs).
+                ev_up[slot].wait_compute()?;
+                compute(dev_in[slot].ptr, dev_out[slot].ptr, ci)?;
+                ev_done[slot].record_compute()?;
+                // pin_out[slot] free once Finalize(ci-2) has read it.
+                if ci >= 2 {
+                    recv_fack()?;
+                }
+                cstream.wait_event(&ev_done[slot])?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_d2h_async(
+                            pin_out_addr[slot] as *mut c_void,
+                            dev_out[slot].ptr as *const c_void,
+                            count * out_stride,
+                            cstream.ptr,
+                        )
+                    },
+                    "lam_conv_d2h",
+                )?;
+                ev_drained[slot].record_on(&cstream)?;
+                // Scatter chunk ci to the host spectrum on the worker (overlaps the
+                // next compute); the worker waits ev_drained[slot] first.
+                job_tx.send(Job::Finalize(ci, slot)).ok();
+            }
+            // Drain the finalizes not yet acked in the loop (the last min(n, 2)).
+            for _ in 0..n.min(2) {
+                recv_fack()?;
+            }
+            job_tx.send(Job::Stop).ok();
+            Ok(())
+        })
+    }
+
+    /// Device-resident Fourier/USFFT laminography: the two large intermediate
+    /// spectra `p22` (post-2-D-FFT projections) and `p11` (post-usfft2d) stay
+    /// resident on the GPU across all three stages, so the only host↔device traffic
+    /// is the input projections in and the output slabs out. This removes the
+    /// ~48 GB of intermediate `p22`/`p11` shuttling that the host-resident path
+    /// pays between stages — the shuttling is exactly what leaves the GPU idle in
+    /// bursts — so utilization stays high without the tomocupy conveyor's explicit
+    /// stream/double-buffer plumbing.
+    ///
+    /// `p00` is streamed to the host per stage-3 chunk rather than kept resident:
+    /// the final transpose to `vol` runs on the host anyway, and holding only
+    /// `p22`+`p11` (~24 GB at 1024²) leaves comfortable headroom for large grid
+    /// chunks and cuFFT plan scratch, where all-three-resident (~30 GB) would leave
+    /// almost none. The dispatcher [`analytic_lamino_fourierrec`] falls back to
+    /// [`analytic_lamino_fourierrec_host`] when `p22`+`p11` do not fit.
+    ///
+    /// Numerically identical to the host path (same kernels, same chunk-independent
+    /// axes); the strided `gdeth`/`ky0` gather2d/divker2d parameters let stage 2
+    /// read and write the resident spectra in place instead of a contiguous copy.
+    fn analytic_lamino_fourierrec_device(
+        proj: &[f32],
+        theta: &[f32],
+        phi: f32,
+        n: usize,
+        rh: usize,
+        center: f32,
+    ) -> Result<Vec<f32>> {
+        let csz = 2 * std::mem::size_of::<f32>(); // bytes per complex
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+
+        let nproj = theta.len();
+        let detw = n;
+        let deth = proj.len() / (nproj * n);
+        if proj.len() != nproj * deth * detw {
+            return Err(Error::InvalidParam(
+                "lamino fourierrec: proj shape != [nproj, nz, n]".into(),
+            ));
+        }
+        let (n0, n1) = (detw, n);
+        let (m0, mu0) = lam_usfft_params(n0);
+        let (m1, mu1) = lam_usfft_params(n1);
+        let (m2, mu2) = lam_usfft_params(rh);
+        let gx = 2 * n0 + 2 * m0;
+        let gy = 2 * n1 + 2 * m1;
+        let ng = 2 * rh + 2 * m2;
+        let ne = 2 * detw;
+        let pad = (ne - detw) / 2;
+        let shift = detw as f32 / 2.0 - center; // rotation-center linear phase
+
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+
+        // Resident spectra (complex, interleaved f32 pairs). p00 is streamed to a
+        // pinned host buffer in stage 3. No memset: stage 1 fully overwrites p22 and
+        // stage 2 fully overwrites p11.
+        let p22 = DevBuf::new(nproj * deth * detw * csz)?; // [nproj, deth, detw]
+        let p11 = DevBuf::new(n1 * deth * n0 * csz)?; // [n1, deth, n0]
+
+        // Chunk sizes are bounded by what is left after the resident spectra: only
+        // the transient USFFT grids and the input/output slabs compete for it. The
+        // stage-1 input and stage-3 output slabs are double-buffered for the copy
+        // conveyor, so their per-chunk cost counts two slabs (the doubled slab is
+        // inside the budget, so cuFFT plan scratch keeps the same untracked margin).
+        let budget = (device_free_bytes() / 100 * 60).max(1);
+        let per_theta = 2 * deth * detw * fsz + deth * ne * csz;
+        let nthetac = (budget / per_theta.max(1)).clamp(1, nproj);
+        let per_ky = gy * gx * csz + (2 * n1) * (2 * n0) * csz + 2 * nproj * detw * fsz;
+        let dethc = (budget / per_ky.max(1)).clamp(1, deth);
+        let per_ty = ng * n0 * csz + n0 * (2 * rh) * csz + 2 * rh * n0 * fsz;
+        let n1c = (budget / per_ty.max(1)).clamp(1, n1);
+
+        // --- stage 1: ramp_filter_center + centered 2-D FFT, chunked over ntheta ---
+        // Conveyor: chunk ci+1's projections upload on a copy stream while chunk ci's
+        // ramp+FFT runs on the compute (per-thread) stream; CUDA events order the
+        // shared double buffer so a copy never overwrites a slab still being read.
+        // Each theta-chunk is a contiguous slab of p22, written in place (no download).
+        {
+            let chunks: Vec<(usize, usize)> = {
+                let (mut v, mut t0) = (Vec::new(), 0);
+                while t0 < nproj {
+                    let tc = nthetac.min(nproj - t0);
+                    v.push((t0, tc));
+                    t0 += tc;
+                }
+                v
+            };
+            let mut pin_proj = PinnedBuf::<f32>::new(nproj * deth * detw)?;
+            pin_proj.as_mut_slice().copy_from_slice(proj);
+            let dev_in = [
+                DevBuf::new(nthetac * deth * detw * fsz)?,
+                DevBuf::new(nthetac * deth * detw * fsz)?,
+            ];
+            let rbuf = DevBuf::new(nthetac * deth * ne * csz)?;
+            let cstream = Stream::new()?;
+            let ev_uploaded = [Event::new()?, Event::new()?];
+            let ev_consumed = [Event::new()?, Event::new()?];
+
+            // H2D one theta-chunk into `dev_in[slot]` on the copy stream.
+            let h2d = |slot: usize, t0: usize, tc: usize| -> Result<()> {
+                let bytes = tc * deth * detw * fsz;
+                let src = unsafe {
+                    (pin_proj.ptr as *const u8).add(t0 * deth * detw * fsz) as *const c_void
+                };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_h2d_async(
+                            dev_in[slot].ptr,
+                            src,
+                            bytes,
+                            cstream.ptr,
+                        )
+                    },
+                    "lam_s1_h2d",
+                )
+            };
+
+            // Prime: upload chunk 0.
+            let (t0, tc) = chunks[0];
+            h2d(0, t0, tc)?;
+            ev_uploaded[0].record_on(&cstream)?;
+
+            for (ci, &(t0, tc)) in chunks.iter().enumerate() {
+                let slot = ci % 2;
+                // Prefetch the next chunk into the other slot while we compute this.
+                if ci + 1 < chunks.len() {
+                    let nslot = (ci + 1) % 2;
+                    let (nt0, ntc) = chunks[ci + 1];
+                    // Don't overwrite a slab whose compute has not consumed it yet.
+                    if ci + 1 >= 2 {
+                        cstream.wait_event(&ev_consumed[nslot])?;
+                    }
+                    h2d(nslot, nt0, ntc)?;
+                    ev_uploaded[nslot].record_on(&cstream)?;
+                }
+                // Compute waits for this chunk's upload, then runs on the per-thread stream.
+                ev_uploaded[slot].wait_compute()?;
+                let din = &dev_in[slot];
+                let nlines = (tc * deth) as i64;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_ramp_pad(
+                            din.ptr,
+                            rbuf.ptr,
+                            nlines,
+                            detw as i32,
+                            ne as i32,
+                            pad as i32,
+                            null,
+                        )
+                    },
+                    "lam_ramp_pad",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_1d(rbuf.ptr, ne, nlines as usize, 0) },
+                    "lam_ramp_fft",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_lam_ramp_mul(rbuf.ptr, nlines, ne as i32, shift, null) },
+                    "lam_ramp_mul",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_1d(rbuf.ptr, ne, nlines as usize, 1) },
+                    "lam_ramp_ifft",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_ramp_crop(
+                            rbuf.ptr,
+                            din.ptr,
+                            nlines,
+                            detw as i32,
+                            ne as i32,
+                            pad as i32,
+                            null,
+                        )
+                    },
+                    "lam_ramp_crop",
+                )?;
+                // Offset pointer into resident p22 for this theta-chunk.
+                let p22_off =
+                    unsafe { (p22.ptr as *mut u8).add(t0 * deth * detw * csz) as *mut c_void };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_fft2d_pre(
+                            din.ptr,
+                            p22_off,
+                            tc as i64,
+                            deth as i32,
+                            detw as i32,
+                            null,
+                        )
+                    },
+                    "lam_fft2d_pre",
+                )?;
+                // din is fully consumed; let the copy stream reuse this slot.
+                ev_consumed[slot].record_compute()?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_2d(p22_off, deth, detw, tc, 0) },
+                    "lam_fft2d",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_fft2d_post(
+                            p22_off,
+                            tc as i64,
+                            deth as i32,
+                            detw as i32,
+                            null,
+                        )
+                    },
+                    "lam_fft2d_post",
+                )?;
+            }
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        }
+
+        // --- stage 2: usfft2d_adj, chunked over depth-frequency ky (deth) ---
+        // gather2d reads the resident p22 in place with (gdeth=deth, ky0=k0) and
+        // divker2d writes the resident p11 in place with (fdeth=deth, ky0=k0); no
+        // host gather/scatter copies. All buffers are allocated once (sized for the
+        // largest chunk) and reused, with an async zero of the accumulation grid per
+        // chunk — the per-chunk malloc/free was a source of the inter-chunk GPU stall.
+        {
+            let (wy, wx) = (2 * n1, 2 * n0);
+            let xs = DevBuf::new(nproj * dethc * detw * fsz)?;
+            let ys = DevBuf::new(nproj * dethc * detw * fsz)?;
+            let fdee2 = DevBuf::new(dethc * gy * gx * csz)?;
+            let win = DevBuf::new(dethc * wy * wx * csz)?;
+            let mut k0 = 0;
+            while k0 < deth {
+                let kc = dethc.min(deth - k0);
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_takexy2d(
+                            theta_dev.ptr,
+                            xs.ptr,
+                            ys.ptr,
+                            nproj as i64,
+                            kc as i32,
+                            detw as i32,
+                            phi,
+                            k0 as i32,
+                            deth as i32,
+                            null,
+                        )
+                    },
+                    "lam_takexy2d",
+                )?;
+                // Zero only the kc grid; gather2d accumulates (atomicAdd) into it.
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memset_async(fdee2.ptr, 0, kc * gy * gx * csz, null)
+                    },
+                    "lam_fdee2_zero",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_gather2d_adj(
+                            p22.ptr,
+                            xs.ptr,
+                            ys.ptr,
+                            fdee2.ptr,
+                            nproj as i64,
+                            kc as i32,
+                            detw as i32,
+                            n0 as i32,
+                            n1 as i32,
+                            m0 as i32,
+                            m1 as i32,
+                            mu0,
+                            mu1,
+                            deth as i32, // p22 is the full [nproj, deth, detw] spectrum
+                            k0 as i32,
+                            null,
+                        )
+                    },
+                    "lam_gather2d_adj",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_wrap2d_adj(
+                            fdee2.ptr, kc as i32, n0 as i32, n1 as i32, m0 as i32, m1 as i32, null,
+                        )
+                    },
+                    "lam_wrap2d_adj",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_win2d_extract(
+                            fdee2.ptr, win.ptr, kc as i32, n0 as i32, n1 as i32, m0 as i32,
+                            m1 as i32, null,
+                        )
+                    },
+                    "lam_win2d_extract",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_2d(win.ptr, wy, wx, kc, 1) },
+                    "lam_usfft2d_ifft",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_win2d_scatter(
+                            fdee2.ptr, win.ptr, kc as i32, n0 as i32, n1 as i32, m0 as i32,
+                            m1 as i32, null,
+                        )
+                    },
+                    "lam_win2d_scatter",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_divker2d_adj(
+                            fdee2.ptr,
+                            p11.ptr,
+                            n1 as i32,
+                            kc as i32,
+                            n0 as i32,
+                            m0 as i32,
+                            m1 as i32,
+                            mu0,
+                            mu1,
+                            deth as i32,
+                            k0 as i32,
+                            null,
+                        )
+                    },
+                    "lam_divker2d_adj",
+                )?;
+                k0 += kc;
+            }
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        }
+
+        // --- stage 3: usfft1d_adj, chunked over y-frequency rows (n1) ---
+        // Conveyor mirror of stage 1: chunk ci's finished f00 slab drains to pinned
+        // host memory on a copy stream while chunk ci+1 computes; events guard the
+        // double-buffered f00 slabs. Each n1-chunk is a contiguous slab of the
+        // resident p11, read in place at its offset (no upload).
+        let pin_p00 = PinnedBuf::<f32>::new(n1 * rh * n0)?; // [n1, rh, n0] real
+        {
+            let z = DevBuf::new(deth * fsz)?;
+            ck(
+                unsafe { ffi::tomoxide_lam_takez1d(z.ptr, deth as i32, phi, null) },
+                "lam_takez1d",
+            )?;
+            let chunks: Vec<(usize, usize)> = {
+                let (mut v, mut y0) = (Vec::new(), 0);
+                while y0 < n1 {
+                    let yc = n1c.min(n1 - y0);
+                    v.push((y0, yc));
+                    y0 += yc;
+                }
+                v
+            };
+            let fdee1 = DevBuf::new(ng * n1c * n0 * csz)?;
+            let lines = DevBuf::new(n1c * n0 * (2 * rh) * csz)?;
+            let f00 = [
+                DevBuf::new(n1c * rh * n0 * fsz)?,
+                DevBuf::new(n1c * rh * n0 * fsz)?,
+            ];
+            let cstream = Stream::new()?;
+            let ev_computed = [Event::new()?, Event::new()?];
+            let ev_drained = [Event::new()?, Event::new()?];
+
+            for (ci, &(y0, yc)) in chunks.iter().enumerate() {
+                let slot = ci % 2;
+                // Don't overwrite an f00 slab still draining to the host.
+                if ci >= 2 {
+                    ev_drained[slot].wait_compute()?;
+                }
+                let g_off =
+                    unsafe { (p11.ptr as *mut u8).add(y0 * deth * n0 * csz) as *mut c_void };
+                // Zero only the yc grid; gather1d accumulates (atomicAdd) into it.
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memset_async(fdee1.ptr, 0, ng * yc * n0 * csz, null)
+                    },
+                    "lam_fdee1_zero",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_gather1d_adj(
+                            g_off,
+                            z.ptr,
+                            fdee1.ptr,
+                            yc as i32,
+                            deth as i32,
+                            n0 as i32,
+                            rh as i32,
+                            m2 as i32,
+                            mu2,
+                            null,
+                        )
+                    },
+                    "lam_gather1d_adj",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_wrap1d_adj(
+                            fdee1.ptr, n0 as i32, yc as i32, rh as i32, m2 as i32, null,
+                        )
+                    },
+                    "lam_wrap1d_adj",
+                )?;
+                let batch = (n0 * yc) as i64;
+                let len = 2 * rh;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_win1d_extract(
+                            fdee1.ptr, lines.ptr, batch, rh as i32, m2 as i32, null,
+                        )
+                    },
+                    "lam_win1d_extract",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_fft_1d(lines.ptr, len, batch as usize, 1) },
+                    "lam_usfft1d_ifft",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_win1d_scatter(
+                            fdee1.ptr, lines.ptr, batch, rh as i32, m2 as i32, null,
+                        )
+                    },
+                    "lam_win1d_scatter",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_lam_divker1d_adj(
+                            fdee1.ptr,
+                            f00[slot].ptr,
+                            yc as i32,
+                            rh as i32,
+                            n0 as i32,
+                            m2 as i32,
+                            mu2,
+                            null,
+                        )
+                    },
+                    "lam_divker1d_adj",
+                )?;
+                // f00[slot] is ready; drain it to the host on the copy stream.
+                ev_computed[slot].record_compute()?;
+                cstream.wait_event(&ev_computed[slot])?;
+                let bytes = yc * rh * n0 * fsz;
+                let dst =
+                    unsafe { (pin_p00.ptr as *mut u8).add(y0 * rh * n0 * fsz) as *mut c_void };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_d2h_async(dst, f00[slot].ptr, bytes, cstream.ptr)
+                    },
+                    "lam_s3_d2h",
+                )?;
+                ev_drained[slot].record_on(&cstream)?;
+            }
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        }
+        drop(p11);
+        drop(p22);
+
+        // --- copyTransposed: p00 [n1, rh, n2] -> vol [rh, n1, n2] (host) ---
+        let p00 = pin_p00.as_slice();
+        let mut vol = vec![0.0f32; rh * n1 * n];
+        for tz in 0..rh {
+            for ty in 0..n1 {
+                let src = (ty * rh + tz) * n;
+                let dst = (tz * n1 + ty) * n;
+                vol[dst..dst + n].copy_from_slice(&p00[src..src + n]);
+            }
+        }
+        Ok(vol)
+    }
+
+    /// Fourier/USFFT laminography dispatcher: prefers the device-resident path
+    /// ([`analytic_lamino_fourierrec_device`]) — spectra stay on the GPU, GPU
+    /// utilization stays high — whenever the two resident spectra (`p22`+`p11`)
+    /// fit in ~80 % of free VRAM (leaving ≥20 % for the transient USFFT grids and
+    /// cuFFT plan scratch). Otherwise it falls back to the host-resident streaming
+    /// path ([`analytic_lamino_fourierrec_host`]), which bounds peak VRAM to a
+    /// fraction of one grid at the cost of full-volume PCIe shuttling.
+    ///
+    /// Setting `TOMOXIDE_LAM_FOURIERREC_HOST=1` forces the host-resident path
+    /// regardless of the fit test — an escape hatch for a shared card where the
+    /// device path's ~95 % VRAM peak would collide with another process.
+    fn analytic_lamino_fourierrec(
+        proj: &[f32],
+        theta: &[f32],
+        phi: f32,
+        n: usize,
+        rh: usize,
+        center: f32,
+    ) -> Result<Vec<f32>> {
+        let csz = 2 * std::mem::size_of::<f32>();
+        let nproj = theta.len();
+        let detw = n;
+        let deth = proj.len() / (nproj * n).max(1);
+        // p22 [nproj, deth, detw] + p11 [n1=n, deth, n0=detw], both complex.
+        let base = nproj
+            .saturating_mul(deth)
+            .saturating_mul(detw)
+            .saturating_mul(csz)
+            .saturating_add(
+                n.saturating_mul(deth)
+                    .saturating_mul(detw)
+                    .saturating_mul(csz),
+            );
+        let free = device_free_bytes();
+        let force_host = std::env::var_os("TOMOXIDE_LAM_FOURIERREC_HOST").is_some_and(|v| v == "1");
+        if !force_host && base.saturating_mul(5) <= free.saturating_mul(4) {
+            analytic_lamino_fourierrec_device(proj, theta, phi, n, rh, center)
+        } else {
+            analytic_lamino_fourierrec_host(proj, theta, phi, n, rh, center)
+        }
+    }
+
     /// Half-precision (`Dtype::F16`) Fourierrec on the **current** device, whole
     /// stack in one chunk. Mirrors [`analytic_fourierrec`] with `f16` buffers and a
     /// half-precision cuFFT filter (`pad` must be a power of two; enforced by the
@@ -4402,11 +5728,6 @@ mod cuda_impl {
                 "reconstruct_lamino_streaming requires a laminography beam".into(),
             ));
         };
-        if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
-            return Err(Error::InvalidParam(format!(
-                "cuda laminography supports Fbp/Linerec only; got {algorithm:?}"
-            )));
-        }
         if params.dtype == crate::dtype::Dtype::F16 {
             return Err(Error::InvalidParam(
                 "cuda laminography f16 path is not implemented; use the default f32 dtype".into(),
@@ -4426,6 +5747,34 @@ mod cuda_impl {
                 expected: format!("{nproj} angles"),
                 found: theta.len().to_string(),
             });
+        }
+        // Fourier/USFFT laminography is whole-volume (not slice/tile separable):
+        // reconstruct the entire volume once, then emit it as a single tile so the
+        // disk-streaming caller still works. (Output-tile streaming for this
+        // algorithm is the same follow-up as its input chunking.)
+        if matches!(algorithm, Algorithm::Fourierrec) {
+            let lamino_angle_deg =
+                (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+            let rh = params
+                .lamino_rh
+                .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
+            let pj = sino.as_layout(Layout::Projection); // [nproj, nz, ncols]
+            let proj = pj
+                .array
+                .as_slice()
+                .ok_or_else(|| Error::InvalidParam("non-contiguous projection stack".into()))?;
+            let devices = selected_devices();
+            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+            let vol = analytic_lamino_fourierrec(proj, theta, phi, n, rh, geom.center.at(0))?;
+            let arr = Array3::from_shape_vec((rh, n, n), vol)
+                .map_err(|e| Error::InvalidParam(format!("cuda lamino tile shape: {e}")))?;
+            on_tile(0, &Volume::new(arr))?;
+            return Ok((rh, n, n));
+        }
+        if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
+            return Err(Error::InvalidParam(format!(
+                "cuda laminography supports Fbp/Linerec/Fourierrec only; got {algorithm:?}"
+            )));
         }
         let raw = s
             .array
@@ -4564,16 +5913,40 @@ mod cuda_impl {
             // back-projector) and f32 are supported for now — fourierrec-lamino and
             // f16 are not wired.
             if let Beam::Laminography { phi } = geom.beam {
-                if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
-                    return Err(Error::InvalidParam(format!(
-                        "cuda laminography supports Fbp/Linerec only; got {algorithm:?}"
-                    )));
-                }
                 if params.dtype == crate::dtype::Dtype::F16 {
                     return Err(Error::InvalidParam(
                         "cuda laminography f16 path is not implemented; use the default f32 dtype"
                             .into(),
                     ));
+                }
+                // Fourier/USFFT laminography (tomocupy `LamFourierRec`) — a distinct
+                // whole-volume algorithm (not the linerec back-projector), so it
+                // routes to its own device-resident orchestrator with the raw
+                // (unfiltered; it ramp-filters internally) projections in projection
+                // layout `[nproj, nz, n]`.
+                if matches!(algorithm, Algorithm::Fourierrec) {
+                    let lamino_angle_deg =
+                        (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+                    let rh = params
+                        .lamino_rh
+                        .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
+                    let pj = sino.as_layout(Layout::Projection); // [nproj, nz, ncols]
+                    let proj = pj.array.as_slice().ok_or_else(|| {
+                        Error::InvalidParam("non-contiguous projection stack".into())
+                    })?;
+                    let devices = selected_devices();
+                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                    let vol =
+                        analytic_lamino_fourierrec(proj, theta, phi, n, rh, geom.center.at(0))?;
+                    return Ok(Volume::new(
+                        Array3::from_shape_vec((rh, n, n), vol)
+                            .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
+                    ));
+                }
+                if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
+                    return Err(Error::InvalidParam(format!(
+                        "cuda laminography supports Fbp/Linerec/Fourierrec only; got {algorithm:?}"
+                    )));
                 }
                 let lamino_angle_deg =
                     (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
