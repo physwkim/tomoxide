@@ -18,6 +18,31 @@ fn elementwise(backend: &dyn Backend) -> Result<&dyn crate::backend::Elementwise
     })
 }
 
+/// The two broadcast operands of dark/flat correction: `dark2d = mean(dark)`
+/// and `denom = flat2d − dark2d`, each `[nrow, ncol]`, with `denom` clamped to
+/// `1.0` wherever `|denom| < 1e-6` (the flat == dark divide-by-zero guard).
+///
+/// Factored out so every consumer — the CPU/CUDA [`darkflat`](crate::backend::Elementwise::darkflat)
+/// kernels and the laminography fourierrec path that fuses the correction into
+/// its stage-1 upload — averages the frames identically (one owner, no drift).
+pub(crate) fn darkflat_frames(
+    flat: &Frames<f32>,
+    dark: &Frames<f32>,
+) -> Result<(Array2<f32>, Array2<f32>)> {
+    let dark2d = dark
+        .array
+        .mean_axis(ndarray::Axis(0))
+        .ok_or_else(|| Error::InvalidParam("empty dark stack".into()))?;
+    let flat2d = flat
+        .array
+        .mean_axis(ndarray::Axis(0))
+        .ok_or_else(|| Error::InvalidParam("empty flat stack".into()))?;
+    let mut denom = &flat2d - &dark2d;
+    // Guard against divide-by-zero where flat == dark.
+    denom.mapv_inplace(|v| if v.abs() < 1e-6 { 1.0 } else { v });
+    Ok((dark2d, denom))
+}
+
 /// `(data − dark) / (flat − dark)` (tomopy `normalize.py:98`).
 pub fn normalize(
     data: &mut Tomo<f32>,

@@ -8,10 +8,10 @@
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
 
-use ndarray::{Array2, Axis};
+use ndarray::{s, Array2, Array3, Axis};
 use tomoxide::{
-    recon, sim, Algorithm, Angles, Beam, Center, CpuBackend, CudaBackend, Detector, Geometry,
-    Layout, ReconParams, Volume,
+    recon, sim, Algorithm, Angles, Beam, Center, CpuBackend, CudaBackend, Dataset, Detector,
+    Frames, Geometry, Layout, ReconParams, Tomo, Volume,
 };
 
 fn pearson(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
@@ -119,5 +119,152 @@ fn cuda_fourierrec_lamino_matches_cpu_golden() {
     assert!(
         err < 5e-3,
         "GPU lamino NRMSE too large vs CPU golden: {err:.3e}"
+    );
+}
+
+/// Fusing flat/dark + minus-log into the fourierrec stage-1 upload
+/// (`LamNorm`, the streaming path) must produce the same volume as running the
+/// standalone `normalize_dataset` first and reconstructing the normalized stack:
+/// the fused correction uses the identical (elementwise, deterministic) darkflat
+/// and minus-log kernels — just applied per stage-1 chunk instead of once over
+/// the whole stack — so the two agree to the recon's `atomicAdd`/`expf` floor.
+#[test]
+fn cuda_fourierrec_lamino_fused_normalize_matches_separate() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let angles = Angles::uniform(nproj, 0.0, std::f32::consts::PI);
+    let geom_p = Geometry::parallel(angles.clone(), n, nz, 1.0);
+    let sino = sim::project(&Volume::new(stack), &geom_p, &cpu).unwrap();
+
+    // Synthesize raw counts + per-pixel flat/dark so darkflat+minus-log is a real,
+    // non-trivial correction: raw = dark + (flat − dark)·exp(−atten), atten the
+    // projected sinogram in projection layout [nproj, nz, n]. Multiple identical
+    // frames per flat/dark exercise the mean-over-frames reduction; per-pixel
+    // spatial variation exercises the [nz, n] broadcast.
+    let atten = sino.to_layout(Layout::Projection);
+    let dark_frame = Array2::from_shape_fn((nz, n), |(y, x)| {
+        0.05 + 0.001 * y as f32 + 0.0005 * x as f32
+    });
+    let flat_frame =
+        Array2::from_shape_fn((nz, n), |(y, x)| 1.8 + 0.002 * x as f32 - 0.001 * y as f32);
+    let mut dark = Array3::<f32>::zeros((2, nz, n));
+    for k in 0..2 {
+        dark.index_axis_mut(Axis(0), k).assign(&dark_frame);
+    }
+    let mut flat = Array3::<f32>::zeros((3, nz, n));
+    for k in 0..3 {
+        flat.index_axis_mut(Axis(0), k).assign(&flat_frame);
+    }
+    let mut raw = atten.array.clone();
+    for p in 0..nproj {
+        for y in 0..nz {
+            for x in 0..n {
+                let a = raw[[p, y, x]];
+                raw[[p, y, x]] =
+                    dark_frame[[y, x]] + (flat_frame[[y, x]] - dark_frame[[y, x]]) * (-a).exp();
+            }
+        }
+    }
+    let ds = Dataset {
+        data: Tomo::new(raw, Layout::Projection),
+        flat: Some(Frames::new(flat)),
+        dark: Some(Frames::new(dark)),
+        theta: angles.0.clone(),
+    };
+
+    let lamino_angle_deg = 20.0f32;
+    let phi = std::f32::consts::FRAC_PI_2 + lamino_angle_deg * std::f32::consts::PI / 180.0;
+    let geom_lam = Geometry {
+        angles: angles.clone(),
+        center: Center::Scalar(n as f32 / 2.0),
+        beam: Beam::Laminography { phi },
+        detector: Detector {
+            width: n,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    let rh = 48usize;
+    let params = ReconParams {
+        lamino_rh: Some(rh),
+        ..Default::default()
+    };
+
+    // Reference: standalone GPU normalize (darkflat + minus-log over the whole
+    // stack), then reconstruct the normalized stack with no fused correction.
+    let mut ds_ref = ds.clone();
+    tomoxide::prep::normalize_dataset(&mut ds_ref, &cuda).unwrap();
+    let mut ref_vol = Array3::<f32>::zeros((rh, n, n));
+    tomoxide::cuda::reconstruct_lamino_streaming(
+        &ds_ref.data,
+        &geom_lam,
+        Algorithm::Fourierrec,
+        &params,
+        None,
+        &mut |rh0, tile| {
+            let tlen = tile.array.dim().0;
+            ref_vol
+                .slice_mut(s![rh0..rh0 + tlen, .., ..])
+                .assign(&tile.array);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    // Fused: hand the recon the RAW stack + LamNorm; stage 1 normalizes each chunk.
+    let norm = tomoxide::cuda::LamNorm::from_dataset(&ds).unwrap();
+    let mut fused_vol = Array3::<f32>::zeros((rh, n, n));
+    tomoxide::cuda::reconstruct_lamino_streaming(
+        &ds.data,
+        &geom_lam,
+        Algorithm::Fourierrec,
+        &params,
+        Some(&norm),
+        &mut |rh0, tile| {
+            let tlen = tile.array.dim().0;
+            fused_vol
+                .slice_mut(s![rh0..rh0 + tlen, .., ..])
+                .assign(&tile.array);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let scale = ref_vol
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(v.abs()))
+        .max(1e-6);
+    let max_diff = ref_vol
+        .iter()
+        .zip(fused_vol.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let mid = pearson(
+        &ref_vol.index_axis(Axis(0), rh / 2).to_owned(),
+        &fused_vol.index_axis(Axis(0), rh / 2).to_owned(),
+    );
+    eprintln!(
+        "fused vs separate normalize: max|diff| = {max_diff:.3e} (scale {scale:.3e}), mid-slice Pearson = {mid:.6}"
+    );
+    assert!(
+        max_diff <= 1e-3 * scale,
+        "fused normalize diverges from separate: max|diff| = {max_diff:.3e}, scale = {scale:.3e}"
+    );
+    assert!(
+        mid > 0.9999,
+        "fused normalize mid-slice disagrees: r = {mid:.6}"
     );
 }

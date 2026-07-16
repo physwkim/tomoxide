@@ -275,6 +275,7 @@ fn cuda_lamino_streaming_tiles_match_whole_volume() {
         &geom_lam,
         Algorithm::Linerec,
         &params,
+        None,
         &mut |rh0, tile| {
             let tlen = tile.array.dim().0;
             assert!(

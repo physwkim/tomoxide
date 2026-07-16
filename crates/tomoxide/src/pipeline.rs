@@ -71,6 +71,28 @@ pub fn reconstruct_lamino_streaming(
     on_tile: &mut crate::cuda::LaminoTileFn,
 ) -> Result<(usize, usize, usize)> {
     let backend = engine.backend();
+    // Fuse flat/dark + minus-log into the fourierrec stage-1 upload when no
+    // host-domain projection prep needs the normalized data first: the recon
+    // normalizes each projection chunk it already uploads for stage 1, so the
+    // standalone full-stack darkflat/minus-log GPU round-trip (upload → normalize
+    // → download, then re-upload chunk by chunk) is skipped. Fourierrec-only —
+    // Fbp/Linerec have no stage-1 upload to fuse into and keep the explicit
+    // `normalize_dataset` below. Phase/stripe both consume the normalized stack
+    // on the host, so a fused (deferred) normalization would starve them.
+    if algorithm == Algorithm::Fourierrec
+        && prep.phase == PhaseMethod::None
+        && prep.stripe == StripeMethod::None
+    {
+        let norm = crate::cuda::LamNorm::from_dataset(&ds)?;
+        return crate::cuda::reconstruct_lamino_streaming(
+            &ds.data,
+            geom,
+            algorithm,
+            params,
+            Some(&norm),
+            on_tile,
+        );
+    }
     crate::prep::normalize_dataset(&mut ds, backend)?;
     crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
     // Stripe removal is the only sinogram-domain prep step here. When it is
@@ -82,11 +104,11 @@ pub fn reconstruct_lamino_streaming(
     // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
     // nothing. Fbp/Linerec still transpose to sinogram once inside the recon.
     if prep.stripe == StripeMethod::None {
-        crate::cuda::reconstruct_lamino_streaming(&ds.data, geom, algorithm, params, on_tile)
+        crate::cuda::reconstruct_lamino_streaming(&ds.data, geom, algorithm, params, None, on_tile)
     } else {
         let mut sino = ds.data.to_layout(Layout::Sinogram);
         crate::prep::remove_stripe(&mut sino, prep.stripe)?;
-        crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, on_tile)
+        crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, None, on_tile)
     }
 }
 

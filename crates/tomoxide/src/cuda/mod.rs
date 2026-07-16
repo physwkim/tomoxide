@@ -60,6 +60,41 @@ impl CudaBackend {
     }
 }
 
+/// Pre-averaged flat/dark correction to **fuse** into the laminography
+/// fourierrec stage-1 upload, instead of a standalone full-stack GPU round-trip
+/// (`normalize_dataset` uploads the whole projection stack, runs darkflat +
+/// minus-log, downloads it, then the recon re-uploads it chunk by chunk — three
+/// wasted full-stack PCIe copies). When [`crate::reconstruct_lamino_streaming`]
+/// can defer normalization to the recon (Fourierrec, no host-domain phase/stripe
+/// prep between), it hands the recon a `LamNorm` and the recon applies the
+/// correction to each projection chunk it already uploads for stage 1.
+///
+/// `darkflat` carries `(mean(dark), denom)` — each `[deth·detw]`, the exact
+/// operands [`crate::prep::normalize::darkflat_frames`] produces — or `None`
+/// when the dataset had no flat/dark (already-normalized input); minus-log is
+/// always applied, matching `normalize_dataset`.
+pub struct LamNorm {
+    darkflat: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+impl LamNorm {
+    /// Build the fused correction from a dataset's flat/dark frames, matching
+    /// `normalize_dataset` (darkflat when both are present, minus-log always).
+    pub fn from_dataset(ds: &crate::data::Dataset<f32>) -> Result<Self> {
+        let darkflat = match (&ds.flat, &ds.dark) {
+            (Some(flat), Some(dark)) => {
+                let (dark2d, denom) = crate::prep::normalize::darkflat_frames(flat, dark)?;
+                Some((
+                    dark2d.into_raw_vec_and_offset().0,
+                    denom.into_raw_vec_and_offset().0,
+                ))
+            }
+            _ => None,
+        };
+        Ok(Self { darkflat })
+    }
+}
+
 /// Name of the active CUDA device (e.g. `"NVIDIA RTX 5000 Ada Generation"`),
 /// or `None` without the `cuda` feature or when the query fails. Used to key the
 /// chunk-tuning cache so a chunk tuned on one GPU is not reused on another model.
@@ -101,22 +136,28 @@ pub type LaminoTileFn<'a> = dyn FnMut(usize, &crate::data::Volume<f32>) -> Resul
 /// `(rh, n, n)`. `on_tile` is called on a single thread in ascending row order,
 /// so the caller's writer never crosses threads. Errors without the `cuda`
 /// feature. The sinogram must already be prepped (flat/dark, minus-log, stripe
-/// removal) — [`crate::reconstruct_lamino_streaming`] runs that prep first.
+/// removal) — [`crate::reconstruct_lamino_streaming`] runs that prep first,
+/// **unless** it passes `norm`: for the Fourierrec path with no host-domain prep
+/// it defers flat/dark + minus-log into the recon's stage-1 upload (see
+/// [`LamNorm`]), so `sino` is then the raw (un-normalized) projection stack.
+/// `norm` is honoured only by the Fourierrec path; Fbp/Linerec always require a
+/// pre-normalized `sino` (`norm = None`).
 pub fn reconstruct_lamino_streaming(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     algorithm: crate::params::Algorithm,
     params: &crate::params::ReconParams,
+    norm: Option<&LamNorm>,
     on_tile: &mut LaminoTileFn,
 ) -> Result<(usize, usize, usize)> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, algorithm, params, on_tile);
+        let _ = (sino, geom, algorithm, params, norm, on_tile);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::reconstruct_lamino_streaming(sino, geom, algorithm, params, on_tile)
+        cuda_impl::reconstruct_lamino_streaming(sino, geom, algorithm, params, norm, on_tile)
     }
 }
 
@@ -4454,6 +4495,7 @@ mod cuda_impl {
         n: usize,
         rh: usize,
         center: f32,
+        norm: Option<&super::LamNorm>,
     ) -> Result<Vec<f32>> {
         let csz = 2 * std::mem::size_of::<f32>(); // bytes per complex
         let fsz = std::mem::size_of::<f32>();
@@ -4516,6 +4558,9 @@ mod cuda_impl {
         // conveyor overlaps the next upload / previous download with this compute.
         {
             let rbuf = DevBuf::new(nthetac * deth * ne * csz)?;
+            // Fused flat/dark + minus-log frames, uploaded once (broadcast over
+            // every theta-chunk). `Some(_)` ⟹ normalize each raw chunk in stage 1.
+            let fused = lam_upload_norm(norm, deth, detw)?;
             run_lam_conveyor(
                 &chunks1,
                 deth * detw * fsz,
@@ -4529,6 +4574,10 @@ mod cuda_impl {
                 |din, dout, ci| {
                     let tc = chunks1[ci].1;
                     let nlines = (tc * deth) as i64;
+                    // Normalize the raw projection chunk in place before filtering.
+                    if let Some(df) = &fused {
+                        lam_fuse_normalize(din, tc, deth, detw, df.as_ref().map(|(d, e)| (d, e)))?;
+                    }
                     ck(
                         unsafe {
                             ffi::tomoxide_lam_ramp_pad(
@@ -4874,6 +4923,66 @@ mod cuda_impl {
             .for_each(|(d, s)| d.copy_from_slice(s));
     }
 
+    /// Fused flat/dark + minus-log on a raw projection chunk `din`
+    /// (`[tc, deth, detw]`, projection layout) in place, on the per-thread stream,
+    /// immediately before ramp filtering. These are the same darkflat/minus-log
+    /// kernels `normalize_dataset` runs on the whole stack, applied per stage-1
+    /// chunk so the standalone full-stack GPU round-trip (upload → normalize →
+    /// download → re-upload) is skipped. `darkflat` is the uploaded `[deth·detw]`
+    /// `(dark2d, denom)` frames (broadcast over the `tc` projections) or `None`
+    /// for already-normalized input; minus-log always runs (matching
+    /// `normalize_dataset`). Enqueued on the same null/per-thread stream as the
+    /// ramp kernels, so it is ordered before them without an extra sync.
+    fn lam_fuse_normalize(
+        din: *mut c_void,
+        tc: usize,
+        deth: usize,
+        detw: usize,
+        darkflat: Option<(&DevBuf, &DevBuf)>,
+    ) -> Result<()> {
+        let null = std::ptr::null_mut::<c_void>();
+        if let Some((dark, denom)) = darkflat {
+            ck(
+                unsafe { ffi::tomoxide_darkflat(din, dark.ptr, denom.ptr, tc, deth, detw, null) },
+                "lam_fuse_darkflat",
+            )?;
+        }
+        ck(
+            unsafe { ffi::tomoxide_minuslog(din, tc * deth * detw, null) },
+            "lam_fuse_minuslog",
+        )?;
+        Ok(())
+    }
+
+    /// Upload a [`LamNorm`]'s darkflat frames to the device once (they broadcast
+    /// over every theta-chunk), validating their `[deth·detw]` shape. `Some(_)` ⟹
+    /// stage 1 applies minus-log; the inner `Option` is the uploaded darkflat
+    /// frames. Returns `None` when no fused normalization was requested.
+    #[allow(clippy::type_complexity)]
+    fn lam_upload_norm(
+        norm: Option<&super::LamNorm>,
+        deth: usize,
+        detw: usize,
+    ) -> Result<Option<Option<(DevBuf, DevBuf)>>> {
+        match norm {
+            None => Ok(None),
+            Some(nrm) => match &nrm.darkflat {
+                None => Ok(Some(None)),
+                Some((dark2d, denom)) => {
+                    if dark2d.len() != deth * detw || denom.len() != deth * detw {
+                        return Err(Error::InvalidParam(
+                            "lamino fused normalize: dark2d/denom must be [deth, detw]".into(),
+                        ));
+                    }
+                    Ok(Some(Some((
+                        DevBuf::from_host_f32(dark2d)?,
+                        DevBuf::from_host_f32(denom)?,
+                    ))))
+                }
+            },
+        }
+    }
+
     /// Split `0..total` into consecutive `[start, count)` chunks of at most `step`
     /// (the last is short when `total` is not a multiple of `step`). Used to plan
     /// each laminography stage's independent chunk axis.
@@ -5049,6 +5158,7 @@ mod cuda_impl {
         n: usize,
         rh: usize,
         center: f32,
+        norm: Option<&super::LamNorm>,
     ) -> Result<Vec<f32>> {
         let csz = 2 * std::mem::size_of::<f32>(); // bytes per complex
         let fsz = std::mem::size_of::<f32>();
@@ -5116,6 +5226,9 @@ mod cuda_impl {
                 DevBuf::new(nthetac * deth * detw * fsz)?,
             ];
             let rbuf = DevBuf::new(nthetac * deth * ne * csz)?;
+            // Fused flat/dark + minus-log frames, uploaded once (broadcast over
+            // every theta-chunk). `Some(_)` ⟹ normalize each raw chunk in stage 1.
+            let fused = lam_upload_norm(norm, deth, detw)?;
             let cstream = Stream::new()?;
             let ev_uploaded = [Event::new()?, Event::new()?];
             let ev_consumed = [Event::new()?, Event::new()?];
@@ -5161,6 +5274,10 @@ mod cuda_impl {
                 ev_uploaded[slot].wait_compute()?;
                 let din = &dev_in[slot];
                 let nlines = (tc * deth) as i64;
+                // Normalize the raw projection chunk in place before filtering.
+                if let Some(df) = &fused {
+                    lam_fuse_normalize(din.ptr, tc, deth, detw, df.as_ref().map(|(d, e)| (d, e)))?;
+                }
                 ck(
                     unsafe {
                         ffi::tomoxide_lam_ramp_pad(
@@ -5516,6 +5633,7 @@ mod cuda_impl {
         n: usize,
         rh: usize,
         center: f32,
+        norm: Option<&super::LamNorm>,
     ) -> Result<Vec<f32>> {
         let csz = 2 * std::mem::size_of::<f32>();
         let nproj = theta.len();
@@ -5534,9 +5652,9 @@ mod cuda_impl {
         let free = device_free_bytes();
         let force_host = std::env::var_os("TOMOXIDE_LAM_FOURIERREC_HOST").is_some_and(|v| v == "1");
         if !force_host && base.saturating_mul(5) <= free.saturating_mul(4) {
-            analytic_lamino_fourierrec_device(proj, theta, phi, n, rh, center)
+            analytic_lamino_fourierrec_device(proj, theta, phi, n, rh, center, norm)
         } else {
-            analytic_lamino_fourierrec_host(proj, theta, phi, n, rh, center)
+            analytic_lamino_fourierrec_host(proj, theta, phi, n, rh, center, norm)
         }
     }
 
@@ -5687,6 +5805,7 @@ mod cuda_impl {
         geom: &Geometry,
         algorithm: crate::params::Algorithm,
         params: &crate::params::ReconParams,
+        norm: Option<&super::LamNorm>,
         on_tile: &mut super::LaminoTileFn,
     ) -> Result<(usize, usize, usize)> {
         use crate::params::Algorithm;
@@ -5733,7 +5852,7 @@ mod cuda_impl {
                 .ok_or_else(|| Error::InvalidParam("non-contiguous projection stack".into()))?;
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-            let vol = analytic_lamino_fourierrec(proj, theta, phi, n, rh, geom.center.at(0))?;
+            let vol = analytic_lamino_fourierrec(proj, theta, phi, n, rh, geom.center.at(0), norm)?;
             let arr = Array3::from_shape_vec((rh, n, n), vol)
                 .map_err(|e| Error::InvalidParam(format!("cuda lamino tile shape: {e}")))?;
             on_tile(0, &Volume::new(arr))?;
@@ -5743,6 +5862,13 @@ mod cuda_impl {
             return Err(Error::InvalidParam(format!(
                 "cuda laminography supports Fbp/Linerec/Fourierrec only; got {algorithm:?}"
             )));
+        }
+        // Fbp/Linerec have no stage-1 upload to fuse into; they require a
+        // pre-normalized sinogram (the caller runs `normalize_dataset` for them).
+        if norm.is_some() {
+            return Err(Error::InvalidParam(
+                "cuda laminography fused normalization (LamNorm) is Fourierrec-only".into(),
+            ));
         }
         let raw = s
             .array
@@ -5904,8 +6030,17 @@ mod cuda_impl {
                     })?;
                     let devices = selected_devices();
                     unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-                    let vol =
-                        analytic_lamino_fourierrec(proj, theta, phi, n, rh, geom.center.at(0))?;
+                    // In-memory AnalyticReconstruct receives an already-normalized
+                    // sinogram, so no fused correction (norm = None).
+                    let vol = analytic_lamino_fourierrec(
+                        proj,
+                        theta,
+                        phi,
+                        n,
+                        rh,
+                        geom.center.at(0),
+                        None,
+                    )?;
                     return Ok(Volume::new(
                         Array3::from_shape_vec((rh, n, n), vol)
                             .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
@@ -6769,16 +6904,7 @@ mod cuda_impl {
             flat: &Frames<f32>,
             dark: &Frames<f32>,
         ) -> Result<()> {
-            let dark2d = dark
-                .array
-                .mean_axis(Axis(0))
-                .ok_or_else(|| Error::InvalidParam("empty dark stack".into()))?;
-            let flat2d = flat
-                .array
-                .mean_axis(Axis(0))
-                .ok_or_else(|| Error::InvalidParam("empty flat stack".into()))?;
-            let mut denom = &flat2d - &dark2d;
-            denom.mapv_inplace(|v| if v.abs() < 1e-6 { 1.0 } else { v });
+            let (dark2d, denom) = crate::prep::normalize::darkflat_frames(flat, dark)?;
 
             let restore = data.layout == Layout::Sinogram;
             if restore {
