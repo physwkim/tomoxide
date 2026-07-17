@@ -80,10 +80,21 @@ enum Command {
         #[arg(long, default_value_t = 0.25)]
         center_step: f32,
         /// Laminography tilt in DEGREES. Builds the geometry the centre is scored
-        /// under; `align` does NOT search it — see the note the run prints. Omit
-        /// for parallel-beam.
+        /// under, and is the starting guess for `--tilt_width`. Omit for
+        /// parallel-beam.
         #[arg(long)]
         lamino_angle: Option<f32>,
+        /// Search the tilt too: half-width in DEGREES around `--lamino_angle`.
+        /// **This costs one full reconstruction per candidate** — a fixed slice
+        /// cannot rank tilts (the in-focus layer moves in z with the tilt), so
+        /// there is no probe shortcut. Omitted = the centre only, seconds not
+        /// minutes.
+        #[arg(long)]
+        tilt_width: Option<f32>,
+        /// Tilt search step, in degrees. Below ~0.5° the ~2 %/° response is not
+        /// worth the reconstruction each step costs.
+        #[arg(long, default_value_t = 1.0)]
+        tilt_step: f32,
         /// Ignore the ring estimate's misalignment flag and refine anyway.
         #[arg(long)]
         force: bool,
@@ -726,69 +737,24 @@ fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {
     })
 }
 
-/// Mean |∇|² inside a 0.92-FOV disk — the score `docs/LAMINOGRAPHY_ALIGNMENT.md`
-/// §2 prescribes.
-///
-/// The disk is not cosmetic. A centre probe shifts the back-projection sampling
-/// coordinate, so it moves where the sampling leaves the detector: outside the
-/// reconstructed disk a probe slice differs from the real reconstruction by ~12 %
-/// of peak at any shift, while inside it agrees to round-off. Scoring the full
-/// frame scores that boundary, and it is enough to flip the ranking.
-fn focus_disk(img: &ndarray::ArrayView2<f32>) -> f64 {
-    let (ny, nx) = img.dim();
-    let (cy, cx) = (ny as f32 / 2.0, nx as f32 / 2.0);
-    let r = 0.46 * nx.min(ny) as f32; // 0.92 FOV across
-    let (mut acc, mut cnt) = (0.0f64, 0usize);
-    for y in 1..ny - 1 {
-        for x in 1..nx - 1 {
-            let rr = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
-            if rr >= r {
-                continue;
-            }
-            let gx = (img[[y, x + 1]] - img[[y, x - 1]]) as f64;
-            let gy = (img[[y + 1, x]] - img[[y - 1, x]]) as f64;
-            acc += gx * gx + gy * gy;
-            cnt += 1;
-        }
-    }
-    acc / cnt.max(1) as f64
-}
-
-fn argmax(v: &[f64]) -> usize {
-    v.iter()
-        .enumerate()
-        .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &x)| {
-            if x > bv {
-                (i, x)
-            } else {
-                (bi, bv)
-            }
-        })
-        .0
-}
-
-/// Pick the sharpest candidate, and refuse to call a boundary an optimum.
-///
-/// A maximum on the first or last candidate means the search stopped before the
-/// metric did: the true peak is at the edge or beyond it, and there is no way to
-/// tell which from inside the range. Reporting it as the answer is how one bad
-/// axis poisons the next — a tilt railed at the top of its range moved the
-/// centre re-sweep 1.7 px away from the value the un-railed sweep had found.
-/// So this is an error the caller must handle, not a note in a footer.
+/// `recon::center::pick_interior_max`, with a railed sweep made the caller's
+/// problem: a boundary maximum is the range running out, not an answer, and
+/// reporting it in a footer is how one bad axis poisons the next.
 fn pick(axis: &str, cands: &[f32], focus: &[f64], widen: &str) -> anyhow::Result<f32> {
-    let i = argmax(focus);
-    if cands.len() > 2 && (i == 0 || i == cands.len() - 1) {
+    let p = tomoxide::recon::center::pick_interior_max(cands, focus)
+        .ok_or_else(|| anyhow!("the {axis} sweep has no candidates to pick from"))?;
+    if p.railed {
         anyhow::bail!(
             "the {axis} sweep peaked at {:.2}, the {} of its own search range \
              [{:.2}, {:.2}].\nThat is the range running out, not an optimum: widen it with \
              {widen}, or recentre the range on a better starting guess.",
-            cands[i],
-            if i == 0 { "bottom" } else { "top" },
+            p.value,
+            if p.index == 0 { "bottom" } else { "top" },
             cands[0],
             cands[cands.len() - 1],
         );
     }
-    Ok(cands[i])
+    Ok(p.value)
 }
 
 fn grid(center: f32, half_width: f32, step: f32) -> Vec<f32> {
@@ -810,12 +776,25 @@ fn run_align(
     center_width: f32,
     center_step: f32,
     lamino_angle: Option<f32>,
+    tilt_width: Option<f32>,
+    tilt_step: f32,
     force: bool,
 ) -> anyhow::Result<()> {
     use tomoxide::geometry::{Angles, Beam, Center, Detector, Geometry};
     use tomoxide::prep::normalize::{minus_log, normalize_dataset};
-    use tomoxide::recon::center::find_center_rings;
+    use tomoxide::recon::center::{find_center_rings, lamino_tilt_scan, slice_focus};
     use tomoxide::ReconParams;
+
+    // The tilt scan reconstructs at `--lamino_angle ± --tilt_width`, so without a
+    // tilt there is nothing to search around — and a parallel-beam scan has no
+    // tilt to find. Say that before spending a read on the file.
+    if tilt_width.is_some() && lamino_angle.is_none() {
+        anyhow::bail!(
+            "--tilt_width searches around --lamino_angle, which was not given.\n\
+             Pass the tilt you believe the scan was taken at; parallel-beam scans have\n\
+             no tilt to search."
+        );
+    }
 
     let path = file.to_string_lossy().to_string();
     let engine = Engine::new(backend_kind)?;
@@ -867,9 +846,12 @@ fn run_align(
         );
     }
     let p = ds.data.as_layout(tomoxide::data::Layout::Projection);
-    let (_nproj, nz, nx) = p.array.dim();
-    // Only `filter_name` and `num_gridx` reach the probes; each reconstructs a
-    // single plane, so the laminography depth `rh` never enters.
+    let (nproj, nz, nx) = p.array.dim();
+    // Defaults are the tuned analytic path (parzen filter), which is what the
+    // laminography goldens reconstruct with. The centre probes read only
+    // `filter_name` and `num_gridx` — each does a single plane, so `lamino_rh`
+    // never enters. Leaving it `None` also lets the tilt scan give every tilt its
+    // own natural depth, which is the point of scoring the max over all of it.
     let params = ReconParams::default();
     let mk_geom = |center: f32, tilt_deg: Option<f32>| Geometry {
         angles: Angles(theta.clone()),
@@ -932,27 +914,97 @@ fn run_align(
         sz,
     )?;
     let f: Vec<f64> = (0..cands.len())
-        .map(|i| focus_disk(&probe.index_axis(ndarray::Axis(0), i)))
+        .map(|i| slice_focus(&probe.index_axis(ndarray::Axis(0), i)))
         .collect();
     curve(&cands, &f, "");
     let center = pick("centre", &cands, &f, "--center_width")?;
+    println!(
+        "  centre {center:.2}   (ring estimate {:.2}, refined by {:+.2} px)",
+        ring.center,
+        center - ring.center
+    );
+
+    // --- step 3: the tilt, if asked for. Centre first, tilt second (§4). ---
+    // No probe here, and that is not an omission. The tilt moves the in-focus
+    // layer in z, so ranking tilts means taking the max over every z — which
+    // needs every (tilt, z) pair, i.e. exactly the full reconstruction the probe
+    // exists to avoid. See `lamino_tilt_scan`.
+    let tilt = match (lamino_angle, tilt_width) {
+        (Some(t0), Some(w)) => {
+            let tilts = grid(t0, w, tilt_step);
+            println!(
+                "\nscanning {} tilts around {t0:.2}° at centre {center:.2}",
+                tilts.len()
+            );
+            println!(
+                "  Each candidate is a FULL reconstruction ({nproj} projections, \
+                 {nx}×{nx}×~{depth}) scored\n  by the max focus over every one of its \
+                 slices. Minutes per tilt, not seconds."
+            );
+            let t_start = Instant::now();
+            let scores = lamino_tilt_scan(
+                &ds.data,
+                &mk_geom(center, Some(t0)), // beam ignored — `tilts` supplies it
+                Algorithm::Fourierrec,
+                &params,
+                &tilts,
+                // The winning slice is `align`'s to ignore: it prints, and
+                // docs/LAMINOGRAPHY_ALIGNMENT.md §3 says confirm on a montage.
+                &mut |r, _slice| {
+                    println!(
+                        "    {:6.2}°  focus {:.4e}  z_peak {} of {}   [{:.0} s elapsed]",
+                        r.tilt_deg,
+                        r.focus,
+                        r.z_peak,
+                        r.depth,
+                        t_start.elapsed().as_secs_f32()
+                    );
+                    Ok(())
+                },
+            )?;
+            let tf: Vec<f64> = scores.iter().map(|r| r.focus).collect();
+            curve(&tilts, &tf, "°");
+            let best = pick("tilt", &tilts, &tf, "--tilt_width")?;
+            // Each tilt's score is one number off a whole reconstruction, and an
+            // argmax alone cannot say whether it sits on a hump over the sample or
+            // on a spike at a z-edge, where few projections contribute and the
+            // streaks are the gradient. The scan kept the profile; show it.
+            if let Some(w) = scores.iter().find(|r| r.tilt_deg == best) {
+                let step = (w.depth / 48).max(1);
+                let z: Vec<f32> = (0..w.depth).step_by(step).map(|z| z as f32).collect();
+                let f: Vec<f64> = z.iter().map(|&z| w.focus_by_z[z as usize]).collect();
+                println!(
+                    "\n  focus by slice at {best:.2}° (every {step} of {} slices; peak at {})",
+                    w.depth, w.z_peak
+                );
+                curve(&z, &f, "");
+            }
+            Some(best)
+        }
+        _ => lamino_angle,
+    };
 
     println!("\nresult:");
     println!("  --center {center:.2}");
-    if let Some(t) = lamino_angle {
-        println!("  --lamino_angle {t:.2}   (as given — align does not search it, see below)");
+    match (tilt, tilt_width) {
+        (Some(t), Some(_)) => println!("  --lamino_angle {t:.2}"),
+        (Some(t), None) => {
+            println!("  --lamino_angle {t:.2}   (as given — pass --tilt_width to search it)")
+        }
+        _ => {}
     }
     println!(
-        "\nThe centre is scored on one detector row by mean |∇|² over a 0.92-FOV disk.\n\
-         That is sound for the centre and only for the centre: the centre is an in-plane\n\
-         shift, so it does not move the in-focus layer, and its response is sharp\n\
-         (~40 % per 50 px). The tilt is the opposite on both counts — its response is\n\
-         broad (~2 % per 1°) and the in-focus layer moves in z with it (measured:\n\
-         z_peak 800 -> 1120 as tilt went 40° -> 58°), so a fixed row scores the wrong\n\
-         plane by more than the tilt signal is worth. Finding the tilt needs the max\n\
-         over the whole z range of a full reconstruction per tilt — docs/\n\
-         LAMINOGRAPHY_ALIGNMENT.md §2 and §4. Re-run with -v for the focus curve, and\n\
-         confirm on a montage before committing a full reconstruction (§3)."
+        "\nThe centre is scored on one output slice, the tilt on the best slice of a whole\n\
+         reconstruction, and the asymmetry is the physics rather than an optimisation that\n\
+         was skipped. The centre is an in-plane shift: it leaves the in-focus layer where\n\
+         it is, and its response is sharp (~40 % per 50 px), so one slice ranks it and a\n\
+         probe sweeps every candidate in a single launch. The tilt is the opposite on both\n\
+         counts — ~2 % per 1°, and it drags the in-focus layer through z (measured: z_peak\n\
+         800 -> 1120 as tilt went 40° -> 58°) — so a fixed slice scores a plane whose error\n\
+         swamps the signal, and only the max over the whole z range ranks it.\n\
+         docs/LAMINOGRAPHY_ALIGNMENT.md §2 and §4. If the tilt moved far, the centre was\n\
+         scored under the old one: re-run with the new --lamino_angle. Use -v for the focus\n\
+         curves, and confirm on a montage before committing a full reconstruction (§3)."
     );
     Ok(())
 }
@@ -1002,6 +1054,8 @@ fn main() -> anyhow::Result<()> {
             center_width,
             center_step,
             lamino_angle,
+            tilt_width,
+            tilt_step,
             force,
         } => {
             run_align(
@@ -1014,6 +1068,8 @@ fn main() -> anyhow::Result<()> {
                 center_width,
                 center_step,
                 lamino_angle,
+                tilt_width,
+                tilt_step,
                 force,
             )?;
         }
