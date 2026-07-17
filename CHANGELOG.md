@@ -32,17 +32,55 @@ All notable changes to this project are documented here. The format is based on
   `center_probe_sweep` removes that by construction, issuing one probe per
   fractional lattice, and never producing the biased slices at all. End to end on
   the aligned pouch scan: `--center 395.87` against a known 396.
-  `align` deliberately does **not** search the tilt. A fixed slice is sound for
-  the centre — an in-plane shift does not move the in-focus layer, and the centre
-  response is sharp (~40 % per 50 px) — and unsound for the tilt, whose response
-  is broad (~2 % per degree) while the in-focus layer moves in z with it (`z_peak`
-  800 → 1120 as tilt went 40° → 58°), so a fixed slice scores the wrong plane by
-  more than the tilt signal is worth. Measured: a fixed-slice tilt sweep returns
-  48° at one slice and rails to the top of any range at another. The tilt needs
-  the max over the whole z range of a full reconstruction per tilt
-  (`docs/LAMINOGRAPHY_ALIGNMENT.md` §2/§4) — which needs every (tilt, z) pair, and
-  so is exactly the work `lamino_tilt_probe` skips. `lamino_tilt_probe` remains
-  for the case its saving is real: a plane that is already known.
+  The two axes are searched by different machinery, and the asymmetry is physics,
+  not an optimisation left undone. A fixed slice is sound for the centre — an
+  in-plane shift does not move the in-focus layer, and the centre response is
+  sharp (~40 % per 50 px) — and unsound for the tilt, whose response is broad
+  (~2 % per degree) while the in-focus layer moves in z with it (`z_peak` 800 →
+  1120 as tilt went 40° → 58°), so a fixed slice scores the wrong plane by more
+  than the tilt signal is worth. Measured: a fixed-slice tilt sweep returns 48° at
+  one slice and rails to the top of any range at another. Hence
+  `recon::center::lamino_tilt_scan` (`--tilt_width` / `--tilt_step`), which does
+  what `docs/LAMINOGRAPHY_ALIGNMENT.md` §2/§4 validates: one **full**
+  reconstruction per candidate, scored by the max `slice_focus` over the whole z
+  range. That needs every (tilt, z) pair, which is exactly the work
+  `lamino_tilt_probe` skips — so the probe buys nothing there and remains for the
+  case its saving is real, a plane that is already known. The scan streams the
+  volume, so its memory cost is one rh-tile regardless of depth, and it keeps what
+  the reconstruction already computed: the winning slice (§3 confirms by eye) and
+  `focus_by_z`, the focus of every slice. The profile is what separates a real
+  optimum from the failure §2 names — "a MONOTONE focus surface with the argmax
+  pinned to a grid corner" — and on the aligned pouch scan at 44° it shows a broad
+  hump rising to 1.96e-5 at slice 292 of 1424, not an edge spike.
+- **`recon::center::pick_interior_max`** — the argmax of a sweep, plus whether the
+  sweep earned the right to call it an optimum. A maximum on the first or last
+  candidate is the range running out, and there is no way to tell from inside the
+  range whether the true peak is at the edge or beyond it. Both `align` and the
+  GUI refuse to adopt a railed pick; measured worth: it caught a real tilt scan
+  railing at 47° on the pouch scan, and a centre sweep flat to 1.8 % and railing
+  when pointed at an empty slice.
+- **`recon::center::slice_focus` and `mean_projection`** — the two measurements
+  the alignment method is written in, as library functions rather than copies in
+  each consumer. `slice_focus` is §2's score (mean |∇|² inside a 0.92-FOV disk;
+  the disk matters — reconstruction geometry decides where the sampling leaves the
+  detector, so scoring the full frame scores a boundary that moves with the
+  parameter being scored). `mean_projection` is the bullseye `find_center_rings`
+  measures, exposed because §1 makes *looking* at it step one and treats
+  eye-vs-correlation disagreement as the misalignment flag — which needs the
+  image, not only the number.
+- **`tomoxide-gui`: laminography alignment on the Center screen** (Beam:
+  Parallel | Laminography). The toggle is not a display option: under a
+  laminographic tilt the axis leans along the beam, so 0°/180° is not a mirror of
+  the object and `find_center_vo` / `_pc` / `_sift` all lose the symmetry they
+  assume (mirror registration scattered 395…607 against a known 396). It picks the
+  estimator family valid for the beam. The three steps are the doc's, and each is
+  a picture the CLI can only summarise as a number: **1 Rings** shows the mean
+  projection itself, so closed rings versus arcs that never close is a thing you
+  see rather than a prominence you trust; **2 Centre** is the probe sweep as a
+  montage plus a focus curve with click-to-pick; **3 Tilt** streams one result per
+  full reconstruction — the in-focus slice into a montage, focus-vs-tilt, and
+  focus-by-slice for the selected candidate — with a cancel, since it is minutes
+  per candidate. Railed picks are shown as such and never adopted.
 - **`docs/LAMINOGRAPHY_ALIGNMENT.md` — how to find the laminography rotation
   center and tilt.** A field-tested recipe, validated against a scan whose center
   was already known independently. Leads with reading the center off the raw data
