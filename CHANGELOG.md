@@ -15,6 +15,122 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **`recon::center::judge_sweep` — a focus sweep's verdict, not just its
+  argmax.** Returns `SweepVerdict::{Resolved, Railed, Ambiguous, Flat}`, and only
+  `Resolved` carries a value (`SweepVerdict::resolved()`); `best()` exists to
+  *show* the winner on a plot or montage, never to adopt it. Every caller — `align`,
+  the GUI's centre and tilt steps — now refuses rather than reports a number the
+  curve did not establish, which matters because a bad axis silently poisons the
+  tilt search that consumes it.
+  The verdict is one uniform test — does this lobe own at least 20 % of the
+  curve's height? — asked of the winner and of every other lobe. It replaces an
+  edge check, which measurement showed is blind to both ways a real sweep fails.
+  On the aligned pouch scan (known axis 396, tilt 44°), swept ±40 px: on the
+  rh/2 plane the curve carries **three** lobes and the highest is 417 — 21 px
+  wrong, interior, beating the truth by 0.34 %, so no edge check can fire
+  (`Ambiguous`, naming 396 as the strongest rival at 55 % prominence). On the
+  sample plane the curve instead rises across the whole window and turns over one
+  sample *short* of the edge at 435 — an interior maximum with no rival to
+  contradict it, and still nothing but the range running out (`Railed`). Both are
+  the same fact: the winner owns no lobe of its own. Narrowed to ±8 px around a
+  prior, the same curve resolves 395.75 at 83 %.
+- **`tomoxide align` — the alignment workflow as a subcommand**, plus the two
+  library pieces it stands on. `recon::center::find_center_rings` is the ring
+  estimator from `docs/LAMINOGRAPHY_ALIGNMENT.md` §1: the 360° mean projection is
+  a bullseye centred on the rotation axis, registered against its own mirror. It
+  reports a `prominence` — `(peak − median)/MAD` of the registration profile —
+  and flags the scan when the rings never closed, which is the acquisition-time
+  misalignment no reconstruction geometry repairs (measured: aligned scan 397.37
+  at prominence 16.2 → trustworthy; misaligned scan 281.72 at 2.22 → flagged, and
+  `align` stops there unless `--force`). `cuda::center_probe` / `center_probe_sweep`
+  then refine it: `cfunc_linerec`'s `backprojection_try` reconstructs one slice at
+  N candidate centres in **one** launch off a single filtering. A probe slice
+  equals the reconstruction exactly only when the shift is a whole number of
+  columns (measured 2e-7…9e-7 of peak) and differs by ~1.6 % at half a column, so
+  a naive sub-pixel sweep ranks integer offsets artificially sharp;
+  `center_probe_sweep` removes that by construction, issuing one probe per
+  fractional lattice, and never producing the biased slices at all. End to end on
+  the aligned pouch scan, swept ±8 px around the axis read off the rings:
+  `--center 395.87` against a known 396. Around a *prior* is the whole contract —
+  the same sweep widened to ±40 px grows three lobes and picks 417, and that is
+  what `judge_sweep` above now refuses rather than returns.
+  The two axes are searched by different machinery, and the asymmetry is physics,
+  not an optimisation left undone. A fixed slice is sound for the centre — an
+  in-plane shift does not move the in-focus layer, so one slice can rank the
+  candidates — and unsound for the tilt, whose response is broad
+  (~2 % per degree) while the in-focus layer moves in z with it (`z_peak` 800 →
+  1120 as tilt went 40° → 58°), so a fixed slice scores the wrong plane by more
+  than the tilt signal is worth. Measured: a fixed-slice tilt sweep returns 48° at
+  one slice and rails to the top of any range at another. Hence
+  `recon::center::lamino_tilt_scan` (`--tilt_width` / `--tilt_step`): one **full**
+  reconstruction per candidate — that needs every (tilt, z) pair, which is
+  exactly the work `lamino_tilt_probe` skips, so the probe buys nothing there and
+  remains for the case its saving is real, a plane that is already known — scored
+  by the max `slice_focus` **inside the sample's z band**
+  (`recon::center::SampleBand`, `--focus_z LO:HI`). The band is not an
+  optimisation, it is what makes the score mean anything on real data: mean |∇|²
+  rewards high-frequency noise over smooth particles, measured **1.7×** on the
+  aligned pouch scan (a pure-noise plane at 1.95e-5 against the eye-confirmed
+  electrode plane at 1.15e-5), so a whole-volume max pins `z_peak` to the noise
+  hump at every candidate and its curve carries no geometry signal at all — its
+  centre response is monotone past the known axis. A band *fixed* in z would fail
+  the other way (the in-focus layer moves: the sample's spike sits at z 837 / 890
+  / 956 at tilts 40° / 44° / 48°), so the band is stated once, at the tilt it was
+  read from, and carried into each candidate's volume through the detector rows —
+  which belong to the data and do not move (`v − nz/2 = cos(tilt)·(z − rh/2)`;
+  the mapping reproduces those measured spikes to ~1 px, and that measurement is
+  pinned as a unit test). End to end on the aligned pouch scan (`--focus_z
+  870:910` at 44°): the tilt curve over 36…52° is unimodal with its interior
+  peak on the known 44° and a **2.26×** span, where the whole-volume score
+  measured a 1.4 % spread with no identifiable optimum — and every candidate's
+  `z_peak` landed inside its own carried band, the three measured spikes among
+  them. The scan streams the volume, so its memory cost is one
+  rh-tile regardless of depth, and it keeps what the reconstruction already
+  computed: the winning in-band slice (§3 confirms by eye) and `focus_by_z`, the
+  focus of every slice — the profile the *next* band is read off, so it is never
+  truncated to the current one.
+- **`recon::center::pick_interior_max`** — the argmax of a sweep, plus whether the
+  sweep earned the right to call it an optimum. A maximum on the first or last
+  candidate is the range running out, and there is no way to tell from inside the
+  range whether the true peak is at the edge or beyond it. Both `align` and the
+  GUI refuse to adopt a railed pick; measured worth: it caught a real tilt scan
+  railing at 47° on the pouch scan, and a centre sweep flat to 1.8 % and railing
+  when pointed at an empty slice.
+- **`recon::center::slice_focus` and `mean_projection`** — the two measurements
+  the alignment method is written in, as library functions rather than copies in
+  each consumer. `slice_focus` is §2's score (mean |∇|² inside a 0.92-FOV disk;
+  the disk matters — reconstruction geometry decides where the sampling leaves the
+  detector, so scoring the full frame scores a boundary that moves with the
+  parameter being scored). `mean_projection` is the bullseye `find_center_rings`
+  measures, exposed because §1 makes *looking* at it step one and treats
+  eye-vs-correlation disagreement as the misalignment flag — which needs the
+  image, not only the number.
+- **`tomoxide-gui`: laminography alignment on the Center screen** (Beam:
+  Parallel | Laminography). The toggle is not a display option: under a
+  laminographic tilt the axis leans along the beam, so 0°/180° is not a mirror of
+  the object and `find_center_vo` / `_pc` / `_sift` all lose the symmetry they
+  assume (mirror registration scattered 395…607 against a known 396). It picks the
+  estimator family valid for the beam. The three steps are the doc's, and each is
+  a picture the CLI can only summarise as a number: **1 Rings** shows the mean
+  projection itself, so closed rings versus arcs that never close is a thing you
+  see rather than a prominence you trust; **2 Centre** is the probe sweep as a
+  montage plus a focus curve with click-to-pick; **3 Tilt** streams one result per
+  full reconstruction — the in-focus slice into a montage, focus-vs-tilt, and
+  focus-by-slice for the selected candidate — with a cancel, since it is minutes
+  per candidate. Railed picks are shown as such and never adopted.
+- **`docs/LAMINOGRAPHY_ALIGNMENT.md` — how to find the laminography rotation
+  center and tilt.** A field-tested recipe, validated against a scan whose center
+  was already known independently. Leads with reading the center off the raw data
+  before reconstructing anything: the mean of all projections over 360° is a
+  bullseye of rings centred on the rotation axis, so the center column is
+  readable by eye (automated flip-registration measured 397.5 vs a known 396),
+  and rings that open into arcs instead of closing diagnose a scan that was
+  mis-aligned at acquisition. Also documents the reconstruction sweep that
+  follows (full projections, focus scored as the max over the whole z range, not
+  a sub-sample over a fixed band) and records the three methods that failed
+  validation — 0°/180° mirror registration (the tilted axis breaks the mirror
+  symmetry), 1-D column-profile symmetry (truncation destroys it), and
+  sub-sampled projections with a fixed z band.
 - **Fourier laminography (`LamFourierRec`) now honours `--filter`.** The
   Fourier/USFFT lamino path applied a plain `|f|` ramp and ignored the selected
   apodisation, unlike tomocupy's `LamFourierRec` (which filters with

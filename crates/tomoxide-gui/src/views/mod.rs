@@ -4,10 +4,11 @@
 //!
 //! `PlotId` allocation convention (rsplot ids must not collide; some widgets
 //! reserve a small range): Data 0–29, Tune 30–49, Center 50–69, Run 70–89,
-//! Output 90–109, XANES 110–129, Live 130–149.
+//! Output 90–109, XANES 110–129, Live 130–149, Center/laminography 150–169.
 
 pub mod center;
 pub mod data;
+pub mod lamino;
 pub mod live;
 pub mod output;
 pub mod run;

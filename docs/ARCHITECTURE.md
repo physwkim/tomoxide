@@ -283,15 +283,30 @@ a deterministic **~1.6%** amplitude residual on the unified paths (the measured
 `cuda/cpu` scale is ≈1.016, not exactly 1); Pearson stays ≈1.0 because the shape
 difference is small and smooth. This is a shape convention, not a numerical error.
 
-**Laminography is excluded.** The CUDA lamino path (`cfunc_linerec` tilted
-back-projector) and the CPU lamino path (`recon::lamino`, a USFFT algorithm) are
-*different reconstruction algorithms* with different filter frameworks (CUDA:
-`make_fbp_filter(Wint)`; CPU: a bare `|f|/ne` ramp), so they are not
-scale-comparable and are **not** unified. The measured `cuda/cpu` lamino ratio is
-`≈ −0.89` (a sign flip plus a filter-framework gain difference); both remain
-y-flipped, consistently. Each lamino path is validated against its own reference
-(CUDA vs tomocupy, CPU vs wgpu) rather than against each other. Consumers must not
-assume CUDA and CPU laminography agree in absolute amplitude or sign.
+**Laminography is excluded from the *scale* unification** — but not from the
+orientation one. The CUDA lamino path (`cfunc_linerec` tilted back-projector) and
+the CPU lamino path (`recon::lamino`, a USFFT algorithm) are *different
+reconstruction algorithms* with different filter frameworks (CUDA:
+`make_fbp_filter(Wint)`; CPU: a bare `|f|/ne` ramp), so their **amplitudes** are
+not comparable and are **not** unified.
+
+Their handedness and sign, however, are shared with everything else:
+
+- **No y-flip on either side.** The CUDA lamino kernel lost tomocupy's `(n−1−ty)`
+  write together with the rest of `cfunc_linerec` (Phase 1), and the CPU lamino
+  reconstruction co-registers with its own matched projector's volume *un-flipped*
+  (`r = +0.96` un-flipped vs `−0.03` y-flipped over a `lamino_project → lamino`
+  round-trip).
+- **Positive attenuation for dense material on both**, since the Fourier-lamino
+  sign fix dropped tomocupy's `irfftshiftc` global `−1` from `recon::lamino`.
+
+**No `cuda/cpu` lamino ratio is quoted here.** An earlier revision of this section
+gave one; it is not reproducible, and the quantity is not meaningful to begin with
+— fed one shared sinogram the two reconstructions correlate at only `r ≈ 0.3`, so
+a least-squares scale between them summarises nothing. Each lamino path is
+validated against its own reference (CUDA vs tomocupy, CPU vs wgpu) rather than
+against each other. Consumers must not assume CUDA and CPU laminography agree in
+absolute amplitude.
 
 The cross-backend regression test `tests/cuda_cpu_convention_parity.rs` pins both
 the orientation and the `cuda/cpu ≈ 1` scale (|Δ| < 5%) for fbp/linerec/fourierrec/

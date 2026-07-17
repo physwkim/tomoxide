@@ -124,6 +124,146 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
     (((nz as f32 / c) / 2.0).ceil() as usize) * 2
 }
 
+/// Reconstruct the single output slice `sz` at every tilt in `tilts_deg`, in one
+/// pass over the filtered projection stack. Returns `[tilts_deg.len(), n, n]`,
+/// one candidate image per tilt, in the row order given.
+///
+/// `cfunc_linerec`'s `backprojection_try_lamino` indexes `phi` per output slot,
+/// so `N` tilts cost one launch over one filtered stack, where sweeping tilts
+/// through [`crate::recon::recon`] costs `N` filter passes and `N` whole
+/// `[rh, n, n]` volumes — for the 1024² pouch scans, ~1400 slices of work per
+/// tilt discarded.
+///
+/// **That saving is only real when you already know which slice you want, and a
+/// tilt search on an unknown sample does not.** The in-focus layer moves in z
+/// with the tilt (measured on the pouch scans: `z_peak` walked 800 → 1120 as the
+/// tilt went 40° → 58°), so scoring a fixed `sz` across tilts scores a different
+/// plane at every candidate. The tilt response is broad — ~2 % per degree — and
+/// the plane error swamps it: on the aligned pouch scan a fixed-`sz` focus sweep
+/// returns 48° at `sz` = rh/2 and rails monotonically to the top of any range at
+/// `sz` = nz/2. `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 is the reason: score the max
+/// over the *whole* z range, which needs every (tilt, z) pair — exactly the work
+/// this primitive skips, so it buys nothing there.
+///
+/// Use it where the plane is known and fixed: refining a tilt after a
+/// full-volume z-max has located `z_peak`, or on a sample whose layer is known.
+/// The rotation centre is an in-plane shift and does not move `z_peak`, so a
+/// fixed `sz` does rank centre candidates — but only **near the answer**. On the
+/// aligned reference scan at `sz = rh/2`, the curve resolves the known axis to
+/// 0.25 px over ±8 px, and over ±40 px grows a rival lobe 21 px away that
+/// outscores it by 0.34 %. So [`center_probe_sweep`] refines a prior; it does not
+/// find one, and `tomoxide align` uses it that way.
+///
+/// The images carry the same orientation and dθ scale as `Algorithm::Linerec`
+/// laminography, so a slice here is the slice that reconstruction produces at
+/// that tilt, and a focus metric ranks the real thing.
+///
+/// `sino` must already be prepped (flat/dark, minus-log, stripe removal), like
+/// every other analytic CUDA entry point. The rotation center comes from
+/// `geom.center`; `geom.beam` is ignored, since `tilts_deg` supplies the tilt.
+/// `sz` indexes the tilted volume's output z, offset as the analytic lamino path
+/// offsets it. Errors without the `cuda` feature.
+pub fn lamino_tilt_probe(
+    sino: &crate::data::Tomo<f32>,
+    geom: &crate::geometry::Geometry,
+    params: &crate::params::ReconParams,
+    tilts_deg: &[f32],
+    sz: i32,
+) -> Result<ndarray::Array3<f32>> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (sino, geom, params, tilts_deg, sz);
+        Err(Error::Backend("cuda feature not enabled".into()))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::lamino_tilt_probe(sino, geom, params, tilts_deg, sz)
+    }
+}
+
+/// Rotation-centre probe — the centre-axis twin of [`lamino_tilt_probe`]:
+/// reconstruct output slice `sz` once per candidate in `centers`, in **one**
+/// launch, returning `[centers.len(), n, n]`. `geom.beam` supplies the tilt
+/// (`Beam::Parallel` ⇒ untilted), so this serves parallel-beam and laminography
+/// alike, and `geom.center` is the *nominal* centre that goes into the filter.
+///
+/// **A probe slice equals the reconstruction at that centre only on the integer
+/// lattice.** The filter runs once, at the nominal centre, and each candidate is
+/// realised as a shift of the back-projection sampling coordinate — that is what
+/// buys N candidates for one filtering, and it is how tomocupy's `try_center`
+/// works. A full reconstruction instead moves its centre with a Fourier linear
+/// phase. The two coincide exactly when `nominal − candidate` is a whole number
+/// of detector columns, and not otherwise. Measured against `Algorithm::Fbp`
+/// inside the reconstruction disk (128², shepp2d, 180 angles):
+///
+/// | `nominal − candidate` | max &#124;probe − recon&#124; / peak |
+/// |---|---|
+/// | integer (any nominal, fractional included) | `2e-7 … 9e-7` — round-off |
+/// | half-integer | `1.6e-2` |
+///
+/// So a sharpness ranking over a sub-pixel grid does **not** return the sharpest
+/// centre: the fractional candidates carry ~1.6 % of extra smoothing that the
+/// integer ones do not, and the argmax is pulled onto the integer lattice. Use
+/// [`center_probe_sweep`], which keeps every candidate on its own lattice by
+/// construction; reach for this function directly only for an integer sweep.
+///
+/// Outside the reconstruction disk the two differ by ~12 % of peak at any shift,
+/// integer or not — the shift moves where the sampling leaves the detector, so
+/// the field boundary is not the same set of voxels. Score inside the disk.
+pub fn center_probe(
+    sino: &crate::data::Tomo<f32>,
+    geom: &crate::geometry::Geometry,
+    params: &crate::params::ReconParams,
+    centers: &[f32],
+    sz: i32,
+) -> Result<ndarray::Array3<f32>> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (sino, geom, params, centers, sz);
+        Err(Error::Backend("cuda feature not enabled".into()))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::center_probe(sino, geom, params, centers, sz)
+    }
+}
+
+/// Reconstruct slice `sz` at every candidate in `centers` — each one **exactly**
+/// equal to the corresponding full reconstruction, at any candidate spacing.
+/// Returns `[centers.len(), n, n]` in the order given. `geom.center` is ignored
+/// (each candidate supplies its own); `geom.beam` supplies the tilt.
+///
+/// This is [`center_probe`] with its integer-lattice restriction made structural
+/// instead of documented. A probe is exact only where `nominal − candidate` is a
+/// whole number, so rather than sweeping one nominal and letting fractional
+/// candidates come back smoothed, this groups the candidates by fractional part
+/// and issues **one probe per distinct fraction**, each anchored on a nominal of
+/// that fraction. Every candidate is then an integer shift from its own anchor,
+/// so no candidate is ever the smoothed one — there is no ranking bias to correct
+/// for afterwards, because the biased slices are never produced.
+///
+/// Cost is one filtering + one launch per distinct fractional part, independent
+/// of how many candidates share it: an integer sweep of any width costs one, a
+/// quarter-pixel grid costs four. (Candidates on no common lattice — irrational
+/// spacings — degenerate to one probe each: still exact, just not amortised.)
+pub fn center_probe_sweep(
+    sino: &crate::data::Tomo<f32>,
+    geom: &crate::geometry::Geometry,
+    params: &crate::params::ReconParams,
+    centers: &[f32],
+    sz: i32,
+) -> Result<ndarray::Array3<f32>> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (sino, geom, params, centers, sz);
+        Err(Error::Backend("cuda feature not enabled".into()))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::center_probe_sweep(sino, geom, params, centers, sz)
+    }
+}
+
 /// Per-tile sink for [`reconstruct_lamino_streaming`]: called as `(rh0, tile)`
 /// where `tile` is the `[tlen, n, n]` output volume at rows `[rh0, rh0 + tlen)`
 /// (`tlen = tile.dims().0`). Invoked on a single thread in ascending row order,
@@ -301,7 +441,7 @@ mod cuda_impl {
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
-    use crate::geometry::{Beam, Geometry};
+    use crate::geometry::{Beam, Center, Geometry};
     use crate::params::{FilterName, StripeMethod};
     use ndarray::{Array3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
@@ -2227,14 +2367,16 @@ mod cuda_impl {
     /// (c) passes the chunk's global z-start `sz` so the kernel's
     /// `z = (tz + sz) − nz/2` lands on the right detector plane. The full
     /// projection stack (`nz` rows) is filtered once and back-projected into every
-    /// output slice. Returns the chunk volume `[rh, n, n]` with the kernel's
-    /// `(n−1−ty)` y-flip and `4/nproj` scale (tomocupy convention). Unlike the
-    /// parallel-beam analytic paths, laminography is **deliberately excluded** from
-    /// the CPU/tomopy convention unification: the CUDA lamino kernel and the CPU
-    /// `recon::lamino` USFFT algorithm are different reconstructions with different
-    /// filter frameworks, so they are not scale-comparable (see `docs/ARCHITECTURE.md
-    /// §4.1`). Each lamino path is validated against its own reference (CUDA vs
-    /// tomocupy, CPU vs wgpu). Both stay y-flipped, consistently.
+    /// output slice. Returns the chunk volume `[rh, n, n]` in the CPU/tomopy
+    /// handedness — no y-flip — at the `π/nproj` dθ gain the caller passes, the same
+    /// orientation and quadrature weight as every other analytic path here
+    /// (`backprojection_ker` lost tomocupy's `(n−1−ty)` write and baked-in `4/nproj`
+    /// in the Phase 1/2 unification). What laminography *is* excluded from is the
+    /// cross-backend **scale** unification: this kernel and the CPU `recon::lamino`
+    /// USFFT algorithm are different reconstructions with different filter
+    /// frameworks, so their amplitudes are not comparable (see
+    /// `docs/ARCHITECTURE.md` §4.1). Each lamino path is validated against its own
+    /// reference (CUDA vs tomocupy, CPU vs wgpu).
     #[allow(clippy::too_many_arguments)]
     fn analytic_lamino_chunk(
         raw: &[f32],
@@ -2305,6 +2447,345 @@ mod cuda_impl {
         let mut host = vec![0.0f32; rh * n * n];
         f.to_host_f32(&mut host)?;
         Ok(host)
+    }
+
+    /// One slice `sz` back-projected at every tilt in `phi`, in a single launch.
+    ///
+    /// Same pad → cuFFT filter → crop as [`analytic_lamino_chunk`] — so the
+    /// candidate images are the reconstruction, not an approximation of it — but
+    /// the back-projection uses `cfunc_linerec`'s `backprojection_try_lamino`,
+    /// whose `phi` is indexed per output slot. The handle's `ncz` is therefore
+    /// the tilt count and the result is `[ntilt, n, n]`: one image per tilt from
+    /// one pass over the filtered stack, where sweeping tilts through
+    /// [`analytic_lamino_chunk`] reconstructs a whole `rh`-slice volume per tilt
+    /// and throws all but one slice away.
+    /// Which axis a probe sweeps, and the per-candidate parameter that sweeps it.
+    ///
+    /// The two try kernels differ only here: one indexes a back-projection shift
+    /// per output slot, the other a tilt. Everything around them — filtering,
+    /// angle chunking, accumulation — is identical, so it lives once in
+    /// [`try_probe_chunk`] rather than in two copies that can drift apart.
+    enum TrySweep<'a> {
+        /// Centre candidates as back-projection shifts; `phi` fixed for all.
+        Center { sh: &'a [f32], phi: f32 },
+        /// Tilt candidates as per-slot `phi`; the centre rides in the filter.
+        Tilt { phi: &'a [f32] },
+    }
+
+    impl TrySweep<'_> {
+        /// Number of candidates = the handle's `ncz` = the output's slot count.
+        fn len(&self) -> usize {
+            match self {
+                TrySweep::Center { sh, .. } => sh.len(),
+                TrySweep::Tilt { phi } => phi.len(),
+            }
+        }
+
+        fn host(&self) -> &[f32] {
+            match self {
+                TrySweep::Center { sh, .. } => sh,
+                TrySweep::Tilt { phi } => phi,
+            }
+        }
+    }
+
+    /// One slice `sz`, reconstructed at every candidate at once: `[ncand, n, n]`.
+    ///
+    /// Filtering goes through [`lamino_filter_to_host`] — the same owner the
+    /// streaming reconstruction uses — so the padded stack is never materialised
+    /// whole on the device. That is not a nicety: at 1800×1024×1024 with a 4096
+    /// pad it is a single 30 GB `cudaMalloc`, and the probe existed to be cheap.
+    /// The try kernels accumulate (`f[...] += ...`) and take the loop bound and
+    /// data stride (`ncproj`) separately from the quadrature scale (`π/nproj`),
+    /// so summing angle chunks into one zeroed output is exact, not approximate:
+    /// each chunk contributes its own angles at the global `dθ` weight.
+    #[allow(clippy::too_many_arguments)]
+    fn try_probe_chunk(
+        raw: &[f32],
+        w: &[f32],
+        theta: &[f32],
+        sweep: TrySweep<'_>,
+        nz: usize,
+        nproj: usize,
+        ncols: usize,
+        n: usize,
+        pad: usize,
+        pad_side: usize,
+        sz: i32,
+    ) -> Result<Vec<f32>> {
+        let fsz = std::mem::size_of::<f32>();
+        let null = std::ptr::null_mut::<c_void>();
+        let ncand = sweep.len();
+        let free = device_free_bytes();
+        let (host_gf, angle_chunks) =
+            lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
+        let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
+
+        let theta_dev = DevBuf::from_host_f32(theta)?;
+        let cand_dev = DevBuf::from_host_f32(sweep.host())?;
+        let gf_dev = DevBuf::new(nz * ncproj_max.max(1) * ncols * fsz)?;
+        // ncz = ncand: the kernel's output index selects the CANDIDATE, not a z
+        // row. Zeroed once; every angle chunk accumulates into it.
+        let f_dev = DevBuf::zeroed(ncand * n * n * fsz)?;
+
+        for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
+            gf_dev.copy_from_host_f32(&host_gf[c])?;
+            let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
+            // `nproj` global (fixes the π/nproj quadrature scale), `alen` local
+            // (the kernel's angle loop bound and its `data` stride).
+            let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, ncand) };
+            if h.is_null() {
+                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
+            }
+            match sweep {
+                TrySweep::Center { phi, .. } => unsafe {
+                    ffi::tomoxide_linerec_backproject_try(
+                        h,
+                        f_dev.ptr,
+                        gf_dev.ptr,
+                        theta_ptr,
+                        cand_dev.ptr as *const f32,
+                        phi,
+                        sz,
+                        null,
+                    );
+                },
+                TrySweep::Tilt { .. } => unsafe {
+                    ffi::tomoxide_linerec_backproject_try_lamino(
+                        h,
+                        f_dev.ptr,
+                        gf_dev.ptr,
+                        theta_ptr,
+                        cand_dev.ptr as *const f32,
+                        sz,
+                        null,
+                    );
+                },
+            }
+            unsafe { ffi::tomoxide_linerec_free(h) };
+        }
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        let mut host = vec![0.0f32; ncand * n * n];
+        f_dev.to_host_f32(&mut host)?;
+        Ok(host)
+    }
+
+    /// See [`super::center_probe`].
+    pub(super) fn center_probe(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        params: &crate::params::ReconParams,
+        centers: &[f32],
+        sz: i32,
+    ) -> Result<Array3<f32>> {
+        use crate::backend::make_fbp_filter;
+
+        if centers.is_empty() {
+            return Err(Error::InvalidParam("center_probe needs ≥1 centre".into()));
+        }
+        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
+        let (nz, nproj, ncols) = s.array.dim();
+        let n = params.num_gridx.unwrap_or(ncols);
+        if n != ncols {
+            return Err(Error::InvalidParam(format!(
+                "cuda center_probe needs a square grid = detector width {ncols}; got {n}"
+            )));
+        }
+        let theta = &geom.angles.0;
+        if theta.len() != nproj {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{nproj} angles"),
+                found: theta.len().to_string(),
+            });
+        }
+        // The candidates are realised as shifts *away from the centre the filter
+        // used*, so that nominal must be one number. `Center::PerRow` gives the
+        // filter a different phase per detector row and leaves no single nominal
+        // to sweep around — reject it rather than silently probe around row 0.
+        let nominal = match &geom.center {
+            Center::Scalar(c) => *c,
+            Center::PerRow(v) => {
+                let first = *v
+                    .first()
+                    .ok_or_else(|| Error::InvalidParam("empty PerRow centre".into()))?;
+                if v.iter().any(|c| *c != first) {
+                    return Err(Error::InvalidParam(
+                        "center_probe needs one nominal centre to sweep around; \
+                         geom.center is Center::PerRow with differing values"
+                            .into(),
+                    ));
+                }
+                first
+            }
+        };
+        let raw = s
+            .array
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let pad = filter.len();
+        let pad_side = pad / 2 - ncols / 2;
+        let w = build_filter_w(&filter, geom, nz, ncols, pad);
+        let phi = match geom.beam {
+            Beam::Laminography { phi } => phi,
+            _ => std::f32::consts::FRAC_PI_2,
+        };
+        // The filter put `nominal` at ncols/2, so the point `c` now sits at
+        // ncols/2 + (c − nominal); the kernel samples at `n/2 − sh`, so reaching
+        // it needs sh = nominal − c. (Same mapping as tomocupy's
+        // `save_centers = centeri − shift_array`, re-derived against tomoxide's
+        // own filter phase rather than inherited.)
+        let sh: Vec<f32> = centers.iter().map(|c| nominal - c).collect();
+
+        let devices = selected_devices();
+        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        let out = try_probe_chunk(
+            raw,
+            &w,
+            theta,
+            TrySweep::Center { sh: &sh, phi },
+            nz,
+            nproj,
+            ncols,
+            n,
+            pad,
+            pad_side,
+            sz,
+        )?;
+        Array3::from_shape_vec((centers.len(), n, n), out)
+            .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
+    }
+
+    /// See [`super::center_probe_sweep`].
+    pub(super) fn center_probe_sweep(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        params: &crate::params::ReconParams,
+        centers: &[f32],
+        sz: i32,
+    ) -> Result<Array3<f32>> {
+        if centers.is_empty() {
+            return Err(Error::InvalidParam(
+                "center_probe_sweep needs ≥1 centre".into(),
+            ));
+        }
+        // Group by fractional part: two candidates can share one probe exactly
+        // when they differ by a whole number of columns. The key quantises the
+        // fraction so float noise in a generated grid (`c0 + k*step`) does not
+        // split a lattice into singletons; anything coarser than this tolerance
+        // is a genuinely different lattice and gets its own probe.
+        const FRAC_TOL: f32 = 1e-4;
+        let key_of = |c: f32| -> i64 {
+            let frac = c - c.floor();
+            let k = (frac / FRAC_TOL).round() as i64;
+            // frac ≈ 1 and frac ≈ 0 are the same lattice.
+            let m = (1.0 / FRAC_TOL) as i64;
+            if k == m {
+                0
+            } else {
+                k
+            }
+        };
+
+        let mut groups: Vec<(i64, Vec<usize>)> = Vec::new();
+        for (i, &c) in centers.iter().enumerate() {
+            let k = key_of(c);
+            match groups.iter_mut().find(|(gk, _)| *gk == k) {
+                Some((_, idx)) => idx.push(i),
+                None => groups.push((k, vec![i])),
+            }
+        }
+
+        let n_out = {
+            let s = sino.as_layout(Layout::Sinogram);
+            params.num_gridx.unwrap_or(s.array.dim().2)
+        };
+        let mut out = Array3::<f32>::zeros((centers.len(), n_out, n_out));
+        for (_, idx) in &groups {
+            // Anchor on a member of the group: every other member is then an
+            // exact integer shift away from it, which is the whole point.
+            let nominal = centers[idx[0]];
+            let g = Geometry {
+                angles: geom.angles.clone(),
+                center: Center::Scalar(nominal),
+                beam: geom.beam,
+                detector: geom.detector,
+            };
+            let cands: Vec<f32> = idx.iter().map(|&i| centers[i]).collect();
+            let probe = center_probe(sino, &g, params, &cands, sz)?;
+            for (j, &i) in idx.iter().enumerate() {
+                out.index_axis_mut(Axis(0), i)
+                    .assign(&probe.index_axis(Axis(0), j));
+            }
+        }
+        Ok(out)
+    }
+
+    /// See [`super::lamino_tilt_probe`].
+    pub(super) fn lamino_tilt_probe(
+        sino: &Tomo<f32>,
+        geom: &Geometry,
+        params: &crate::params::ReconParams,
+        tilts_deg: &[f32],
+        sz: i32,
+    ) -> Result<Array3<f32>> {
+        use crate::backend::make_fbp_filter;
+
+        if tilts_deg.is_empty() {
+            return Err(Error::InvalidParam(
+                "lamino_tilt_probe needs ≥1 tilt".into(),
+            ));
+        }
+        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
+        let (nz, nproj, ncols) = s.array.dim();
+        let n = params.num_gridx.unwrap_or(ncols);
+        if n != ncols {
+            return Err(Error::InvalidParam(format!(
+                "cuda lamino_tilt_probe needs a square grid = detector width {ncols}; got {n}"
+            )));
+        }
+        let theta = &geom.angles.0;
+        if theta.len() != nproj {
+            return Err(Error::ShapeMismatch {
+                expected: format!("{nproj} angles"),
+                found: theta.len().to_string(),
+            });
+        }
+        let raw = s
+            .array
+            .as_slice()
+            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
+
+        // The rotation center rides in the filter (as every analytic CUDA path
+        // does), so it comes from `geom`; only the tilt is swept here, and
+        // `geom.beam` is ignored because these tilts replace it.
+        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let pad = filter.len();
+        let pad_side = pad / 2 - ncols / 2;
+        let w = build_filter_w(&filter, geom, nz, ncols, pad);
+        let phi: Vec<f32> = tilts_deg
+            .iter()
+            .map(|d| std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0)
+            .collect();
+
+        let devices = selected_devices();
+        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        let out = try_probe_chunk(
+            raw,
+            &w,
+            theta,
+            TrySweep::Tilt { phi: &phi },
+            nz,
+            nproj,
+            ncols,
+            n,
+            pad,
+            pad_side,
+            sz,
+        )?;
+        Array3::from_shape_vec((phi.len(), n, n), out)
+            .map_err(|e| Error::InvalidParam(format!("cuda tilt-probe shape: {e}")))
     }
 
     /// Largest projection-angle chunk (`ncproj`) for streamed laminography on the

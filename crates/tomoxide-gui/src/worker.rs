@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use rsplot::egui;
@@ -107,6 +108,43 @@ pub enum Job {
         spec: PreviewSpec,
         lambdas: Vec<f32>,
     },
+    /// Load + prep the whole projection stack (cached on the worker) and report
+    /// the ring estimate **with the mean projection it was computed from** →
+    /// [`Event::LaminoRings`]. Step 1 of `docs/LAMINOGRAPHY_ALIGNMENT.md`: the
+    /// bullseye is read by eye, and the number is the second opinion.
+    LaminoRings { step: usize },
+    /// Probe-sweep the rotation axis over `centers` on output slice `slice`
+    /// (`None` ⇒ the middle of the volume) at `tilt_deg` → the montage +
+    /// focus curve of [`Event::LaminoCenterSweep`]. One launch for the whole
+    /// sweep: the centre is an in-plane shift, so it does not move the in-focus
+    /// layer and one slice can rank it.
+    ///
+    /// Ranking is all it does. Over a wide `centers` the focus curve grows
+    /// competing lobes and its highest one is measurably not the axis (on the
+    /// aligned reference scan: 417 over a known 396, by 0.34 %), so this
+    /// **refines a prior** — the axis from step 1 — rather than searching for
+    /// one. [`tomoxide::recon::center::judge_sweep`] is what enforces that; see
+    /// its verdicts before adopting anything from here.
+    LaminoCenterSweep {
+        tilt_deg: Option<f32>,
+        slice: Option<usize>,
+        centers: Vec<f32>,
+    },
+    /// Score each tilt by a FULL reconstruction
+    /// (`recon::center::lamino_tilt_scan`) → one [`Event::LaminoTilt`] per
+    /// candidate as it lands, then [`Event::LaminoTiltDone`]. Minutes per
+    /// candidate; [`Worker::cancel`] stops it at the next boundary.
+    ///
+    /// `band` is the sample's z range, and passing it is what makes the score
+    /// mean anything on real data: the focus metric ranks noise planes above the
+    /// sample (measured 1.7×), so without a band the max-over-z answers for the
+    /// noise. It is carried into each candidate tilt's own volume through the
+    /// detector rows by the scan itself.
+    LaminoTiltScan {
+        center: f32,
+        tilts: Vec<f32>,
+        band: Option<tomoxide::recon::center::SampleBand>,
+    },
     /// Exit the worker loop.
     Shutdown,
 }
@@ -160,6 +198,49 @@ pub enum Event {
         data: Vec<f32>,
         millis: u128,
     },
+    /// The ring estimate and the mean projection `[ny, nx]` it came from.
+    /// `bytes` is what the cached prepped stack now costs in host RAM.
+    LaminoRings {
+        center: f32,
+        prominence: f32,
+        trustworthy: bool,
+        ny: usize,
+        nx: usize,
+        mean: Vec<f32>,
+        bytes: usize,
+        millis: u128,
+    },
+    /// A finished laminography centre sweep: one `[ny, nx]` probe reconstruction
+    /// per candidate (row-major in `frames`) and its `slice_focus`.
+    LaminoCenterSweep {
+        centers: Vec<f32>,
+        ny: usize,
+        nx: usize,
+        frames: Vec<f32>,
+        focus: Vec<f64>,
+        slice: usize,
+        millis: u128,
+    },
+    /// One tilt candidate finished: its score, the in-focus slice `[ny, nx]` the
+    /// reconstruction peaked on, and the focus of every slice — the profile that
+    /// says whether `z_peak` is a hump on the sample or a spike at a z-edge.
+    LaminoTilt {
+        tilt_deg: f32,
+        focus: f64,
+        z_peak: usize,
+        /// The inclusive z range that was scored at this tilt — the sample band
+        /// carried into this tilt's own volume — or `None` for every slice.
+        band: Option<(usize, usize)>,
+        depth: usize,
+        focus_by_z: Vec<f64>,
+        ny: usize,
+        nx: usize,
+        slice: Vec<f32>,
+        done: usize,
+        total: usize,
+    },
+    /// The tilt scan finished (or stopped): `cancelled` says which.
+    LaminoTiltDone { cancelled: bool, millis: u128 },
     /// A job failed; `what` names the job for the session log.
     JobFailed { what: String, error: String },
 }
@@ -168,6 +249,10 @@ pub enum Event {
 pub struct Worker {
     pub jobs: Sender<Job>,
     pub events: Receiver<Event>,
+    /// Stops the tilt scan at the next candidate boundary. A `Job` cannot do
+    /// this: the scan owns the worker for minutes and the job channel is only
+    /// drained between jobs, so the request has to reach it out of band.
+    pub cancel: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -175,13 +260,16 @@ impl Worker {
     pub fn spawn(ctx: egui::Context) -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("tomoxide-worker".into())
-            .spawn(move || worker_main(job_rx, event_tx, ctx))
+            .spawn(move || worker_main(job_rx, event_tx, ctx, worker_cancel))
             .expect("spawning the worker thread");
         Worker {
             jobs: job_tx,
             events: event_rx,
+            cancel,
             thread: Some(thread),
         }
     }
@@ -196,7 +284,12 @@ impl Drop for Worker {
     }
 }
 
-fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
+fn worker_main(
+    jobs: Receiver<Job>,
+    events: Sender<Event>,
+    ctx: egui::Context,
+    cancel: Arc<AtomicBool>,
+) {
     let send = |event: Event| {
         let _ = events.send(event);
         ctx.request_repaint();
@@ -220,12 +313,20 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     // Path of the currently opened dataset; per-job readers are opened fresh
     // (H5 handles stay on this thread; opens are cheap next to the reads).
     let mut current: Option<PathBuf> = None;
+    // The laminography jobs all need the WHOLE prepped stack — the rings average
+    // every projection, and both sweeps back-project all of them — so unlike the
+    // row-band jobs above there is nothing to read lazily. It costs
+    // nproj·nz·nx·4 bytes (7.5 GB for 1800×1024²), so it is loaded once on
+    // demand, kept, and dropped when the dataset changes.
+    let mut prepped: Option<PreppedStack> = None;
 
     while let Ok(job) = jobs.recv() {
         match job {
             Job::Shutdown => break,
             Job::OpenDataset(path) => match probe(&path) {
                 Ok(meta) => {
+                    // The cache belongs to the old file; a new one invalidates it.
+                    prepped = None;
                     current = Some(path);
                     send(Event::DatasetOpened(Arc::new(meta)));
                 }
@@ -304,6 +405,114 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                     }),
                     Err(e) => send(Event::JobFailed {
                         what: "lambda sweep".into(),
+                        error: e.to_string(),
+                    }),
+                }
+            }
+            Job::LaminoRings { step } => {
+                let Some(path) = current.clone() else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match ensure_prepped(&engine, &mut prepped, &path)
+                    .and_then(|st| st.rings(engine.backend(), step))
+                {
+                    Ok((ring, mean)) => {
+                        let (ny, nx) = mean.dim();
+                        send(Event::LaminoRings {
+                            center: ring.center,
+                            prominence: ring.prominence,
+                            trustworthy: ring.trustworthy,
+                            ny,
+                            nx,
+                            mean: mean.iter().copied().collect(),
+                            bytes: prepped.as_ref().map_or(0, PreppedStack::bytes),
+                            millis: t0.elapsed().as_millis(),
+                        })
+                    }
+                    Err(e) => send(Event::JobFailed {
+                        what: "lamino rings".into(),
+                        error: e.to_string(),
+                    }),
+                }
+            }
+            Job::LaminoCenterSweep {
+                tilt_deg,
+                slice,
+                centers,
+            } => {
+                let Some(path) = current.clone() else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match ensure_prepped(&engine, &mut prepped, &path)
+                    .and_then(|st| st.center_sweep(tilt_deg, slice, &centers))
+                {
+                    Ok((ny, nx, frames, focus, slice)) => send(Event::LaminoCenterSweep {
+                        centers,
+                        ny,
+                        nx,
+                        frames,
+                        focus,
+                        slice,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    Err(e) => send(Event::JobFailed {
+                        what: "lamino center sweep".into(),
+                        error: e.to_string(),
+                    }),
+                }
+            }
+            Job::LaminoTiltScan {
+                center,
+                tilts,
+                band,
+            } => {
+                let Some(path) = current.clone() else {
+                    continue;
+                };
+                // A cancel from a previous scan must not kill this one.
+                cancel.store(false, Ordering::Relaxed);
+                let t0 = std::time::Instant::now();
+                let total = tilts.len();
+                let mut done = 0usize;
+                let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
+                    st.tilt_scan(center, &tilts, band, &mut |r, img| {
+                        done += 1;
+                        let (ny, nx) = img.dim();
+                        send(Event::LaminoTilt {
+                            tilt_deg: r.tilt_deg,
+                            focus: r.focus,
+                            z_peak: r.z_peak,
+                            band: r.band,
+                            depth: r.depth,
+                            focus_by_z: r.focus_by_z.clone(),
+                            ny,
+                            nx,
+                            slice: img.iter().copied().collect(),
+                            done,
+                            total,
+                        });
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err(tomoxide::Error::Backend("cancelled".into()));
+                        }
+                        Ok(())
+                    })
+                });
+                let cancelled = cancel.swap(false, Ordering::Relaxed);
+                match r {
+                    Ok(_) => send(Event::LaminoTiltDone {
+                        cancelled: false,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    // A cancel unwinds through the callback as an error; that is
+                    // the scan stopping as asked, not a failure to report.
+                    Err(_) if cancelled => send(Event::LaminoTiltDone {
+                        cancelled: true,
+                        millis: t0.elapsed().as_millis(),
+                    }),
+                    Err(e) => send(Event::JobFailed {
+                        what: "lamino tilt scan".into(),
                         error: e.to_string(),
                     }),
                 }
@@ -489,6 +698,148 @@ fn tv_seminorm(vol: &ndarray::Array3<f32>) -> f64 {
     sum
 }
 
+/// A finished centre probe sweep: `[ny, nx]` per candidate concatenated
+/// row-major, each candidate's `slice_focus`, and the output slice they were
+/// scored on.
+type CenterSweepResult = (usize, usize, Vec<f32>, Vec<f64>, usize);
+
+/// The whole flat/dark-corrected, minus-log projection stack, held in host RAM.
+///
+/// Every laminography alignment step consumes all of it — the rings average the
+/// projections, and both sweeps back-project them — so there is no band to read
+/// lazily the way the preview jobs do. Loading it is the expensive part
+/// (`nproj·nz·nx·4` bytes, and a full pass of prep), and the three steps run one
+/// after another on the same data, so it is loaded once and kept.
+struct PreppedStack {
+    path: PathBuf,
+    data: tomoxide::Tomo<f32>,
+    theta: Vec<f32>,
+    nz: usize,
+    nx: usize,
+}
+
+impl PreppedStack {
+    fn load(engine: &Engine, path: &std::path::Path) -> tomoxide::Result<Self> {
+        let backend = engine.backend();
+        let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
+        let theta = reader.read_theta()?;
+        let mut ds = reader.read_all()?;
+        tomoxide::prep::normalize_dataset(&mut ds, backend)?;
+        tomoxide::prep::normalize::minus_log(&mut ds.data, backend)?;
+        let (_nproj, nz, nx) = ds
+            .data
+            .as_layout(tomoxide::data::Layout::Projection)
+            .array
+            .dim();
+        Ok(PreppedStack {
+            path: path.to_path_buf(),
+            data: ds.data,
+            theta,
+            nz,
+            nx,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.data.array.len() * std::mem::size_of::<f32>()
+    }
+
+    /// Geometry at `center`/`tilt_deg`. `tilt_deg = None` is parallel beam.
+    fn geometry(&self, center: f32, tilt_deg: Option<f32>) -> Geometry {
+        Geometry {
+            angles: Angles(self.theta.clone()),
+            center: Center::Scalar(center),
+            beam: match tilt_deg {
+                Some(d) => tomoxide::Beam::Laminography {
+                    phi: std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0,
+                },
+                None => tomoxide::Beam::Parallel,
+            },
+            detector: tomoxide::Detector {
+                width: self.nx,
+                height: self.nz,
+                pixel_size: 1.0,
+            },
+        }
+    }
+
+    /// The output slice a sweep scores by default: the middle of the volume,
+    /// which is `rh/2` under a tilt and `nz/2` without one. Those coincide only
+    /// at zero tilt — the tilt stretches the reconstruction deeper than the
+    /// detector is tall.
+    fn default_slice(&self, tilt_deg: Option<f32>) -> usize {
+        match tilt_deg {
+            Some(d) => tomoxide::cuda::lamino_recon_height(self.nz, d) / 2,
+            None => self.nz / 2,
+        }
+    }
+
+    fn rings(
+        &self,
+        backend: &dyn tomoxide::Backend,
+        step: usize,
+    ) -> tomoxide::Result<(tomoxide::recon::center::RingCenter, ndarray::Array2<f32>)> {
+        let ring = tomoxide::recon::center::find_center_rings(&self.data, backend, step)?;
+        let mean = tomoxide::recon::center::mean_projection(&self.data, step)?;
+        Ok((ring, mean))
+    }
+
+    fn center_sweep(
+        &self,
+        tilt_deg: Option<f32>,
+        slice: Option<usize>,
+        centers: &[f32],
+    ) -> tomoxide::Result<CenterSweepResult> {
+        let sz = slice.unwrap_or_else(|| self.default_slice(tilt_deg));
+        let seed = centers.first().copied().unwrap_or(self.nx as f32 / 2.0);
+        let probe = tomoxide::cuda::center_probe_sweep(
+            &self.data,
+            &self.geometry(seed, tilt_deg),
+            &ReconParams::default(),
+            centers,
+            sz as i32,
+        )?;
+        let (_n, ny, nx) = probe.dim();
+        let focus = (0..centers.len())
+            .map(|i| tomoxide::recon::center::slice_focus(&probe.index_axis(ndarray::Axis(0), i)))
+            .collect();
+        Ok((ny, nx, probe.iter().copied().collect(), focus, sz))
+    }
+
+    fn tilt_scan(
+        &self,
+        center: f32,
+        tilts: &[f32],
+        band: Option<tomoxide::recon::center::SampleBand>,
+        on_tilt: &mut dyn FnMut(
+            &tomoxide::recon::center::TiltFocus,
+            ndarray::ArrayView2<f32>,
+        ) -> tomoxide::Result<()>,
+    ) -> tomoxide::Result<Vec<tomoxide::recon::center::TiltFocus>> {
+        tomoxide::recon::center::lamino_tilt_scan(
+            &self.data,
+            &self.geometry(center, Some(0.0)), // beam ignored — `tilts` supplies it
+            Algorithm::Fourierrec,
+            &ReconParams::default(),
+            tilts,
+            band,
+            on_tilt,
+        )
+    }
+}
+
+/// Load the prepped stack unless the cache already holds this file's.
+fn ensure_prepped<'a>(
+    engine: &Engine,
+    slot: &'a mut Option<PreppedStack>,
+    path: &std::path::Path,
+) -> tomoxide::Result<&'a PreppedStack> {
+    if slot.as_ref().is_none_or(|st| st.path != path) {
+        *slot = Some(PreppedStack::load(engine, path)?);
+    }
+    Ok(slot.as_ref().expect("just loaded"))
+}
+
 /// Trial reconstructions of one sinogram row over a range of candidate
 /// centers (`recon::center::write_center`), for the sweep montage. The FOV
 /// disk mask is on (`ratio` 1.0): the corner backprojection smear it removes
@@ -633,6 +984,66 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../tomoxide/tests/fixtures/streaming_dxchange.h5"
         ))
+    }
+
+    /// The rings step is the one laminography job that needs no GPU: it loads +
+    /// preps the whole stack (which the sweeps then reuse) and hands back both
+    /// the estimate and the mean projection it came from. The image is not a
+    /// nicety — `docs/LAMINOGRAPHY_ALIGNMENT.md` §1 makes reading the bullseye by
+    /// eye step one — so what it pins is that the picture reaches the UI at the
+    /// projection's own shape, not that a 6-row fixture has rings to find.
+    #[test]
+    fn lamino_rings_returns_the_mean_projection_it_measured() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let mut slot = None;
+        let st = ensure_prepped(&engine, &mut slot, &fixture()).unwrap();
+        let (ring, mean) = st.rings(engine.backend(), 1).unwrap();
+        assert_eq!(
+            mean.dim(),
+            (st.nz, st.nx),
+            "the mean projection is not a projection-shaped image"
+        );
+        assert!(
+            mean.iter().all(|v| v.is_finite()),
+            "the mean projection has non-finite pixels"
+        );
+        assert!(
+            ring.center.is_finite() && ring.prominence >= 0.0,
+            "ring estimate is not a number: {ring:?}"
+        );
+        assert!(st.bytes() > 0);
+    }
+
+    /// The cache is keyed on the file, and every laminography step reuses it —
+    /// loading 7.5 GB three times over would make the screen unusable. A second
+    /// call must not reload, and a different file must not be served the first
+    /// file's data.
+    #[test]
+    fn prepped_stack_is_cached_per_file() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let mut slot = None;
+        let first = ensure_prepped(&engine, &mut slot, &fixture()).unwrap() as *const PreppedStack;
+        let again = ensure_prepped(&engine, &mut slot, &fixture()).unwrap() as *const PreppedStack;
+        assert_eq!(first, again, "the second call reloaded the same file");
+        assert_eq!(slot.as_ref().unwrap().path, fixture());
+    }
+
+    /// `rh/2` and `nz/2` are the same row only at zero tilt: the tilt stretches
+    /// the reconstruction deeper than the detector is tall, and the sweep's
+    /// default slice indexes the volume, not the detector.
+    #[test]
+    fn default_sweep_slice_is_the_middle_of_the_volume_not_the_detector() {
+        let engine = Engine::new(BackendKind::Cpu).unwrap();
+        let mut slot = None;
+        let st = ensure_prepped(&engine, &mut slot, &fixture()).unwrap();
+        assert_eq!(st.default_slice(None), st.nz / 2);
+        let tilted = st.default_slice(Some(44.0));
+        assert_eq!(tilted, tomoxide::cuda::lamino_recon_height(st.nz, 44.0) / 2);
+        assert!(
+            tilted > st.nz / 2,
+            "a 44° tilt must push the middle of the volume past the detector's middle row:              got {tilted} for nz {}",
+            st.nz
+        );
     }
 
     /// The whole preview path (probe → geometry → pipelined range recon →

@@ -108,6 +108,46 @@ unsafe extern "C" {
         sz: i32,
         stream: *mut c_void,
     );
+    /// Rotation-centre probe: back-project the single detector row `sz` once per
+    /// entry of `sh` (device `[nshift]`, detector columns) in one launch, writing
+    /// `f` as `[nshift, n, n]` — one candidate slice per shift. `phi` is the
+    /// scalar tilt (`π/2` = untilted), so this serves parallel-beam and
+    /// laminography alike. The handle must be built with `ncz == nshift`; `g` is
+    /// the filtered sinogram `[nz, nproj, n]`; `f` must be pre-zeroed.
+    ///
+    /// The shift is applied to the back-projection sampling coordinate
+    /// (`u -= sh[k]`) with **linear interpolation**, whereas a full
+    /// reconstruction applies its centre as a Fourier linear phase in the filter.
+    /// The two are therefore not bit-identical away from integer shifts — see
+    /// [`super::center_probe`], which owns the shift↔centre mapping and documents
+    /// the consequence.
+    pub fn tomoxide_linerec_backproject_try(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        theta: *const f32,
+        sh: *const f32,
+        phi: f32,
+        sz: i32,
+        stream: *mut c_void,
+    );
+    /// Laminography tilt probe: back-project the single detector row `sz` at
+    /// every tilt in `phi` (device `[ntilt]`, radians, `π/2` = untilted) in one
+    /// launch, writing `f` as `[ntilt, n, n]` — one candidate slice per tilt.
+    /// The handle must be built with `ncz == ntilt`; `g` is the filtered
+    /// sinogram `[nz, nproj, n]`; `f` must be pre-zeroed (the kernel `+=`s).
+    /// Carries the FBP dθ gain, so a slice matches the corresponding
+    /// `Algorithm::Linerec` laminography reconstruction, not merely its shape.
+    pub fn tomoxide_linerec_backproject_try_lamino(
+        handle: *mut c_void,
+        f: *mut c_void,
+        g: *const c_void,
+        theta: *const f32,
+        phi: *const f32,
+        sz: i32,
+        stream: *mut c_void,
+    );
+
     pub fn tomoxide_linerec_free(handle: *mut c_void);
 
     // --- forward projection (adjoint of cfunc_linerec back-projection) ---
@@ -894,6 +934,13 @@ unsafe extern "C" {
         batch: usize,
         inverse: i32,
     ) -> i32;
+
+    /// The sub-batch the `tomoxide_fft_*` entry points above would run
+    /// `(rank, n0, n1, batch, type)` in: `batch` itself when cuFFT's scratch for
+    /// the whole batch already fits the per-plan cap, and a smaller divisor when
+    /// it must be split so the scratch stays bounded (see `cuda/fft.cu`).
+    /// `type`: 0 = C2C, 1 = R2C, 2 = C2R. Creates nothing — a pure query.
+    pub fn tomoxide_fft_plan_split(rank: i32, n0: i32, n1: i32, batch: i32, r#type: i32) -> i32;
 
     // --- Fourier/USFFT laminography (LamFourierRec) gridding + modulation ---
     // Device-resident, full-complex mirror of the CPU host loops in

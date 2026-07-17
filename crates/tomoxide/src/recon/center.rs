@@ -4,6 +4,12 @@
 //! (reconstruct a slice across a range of centers) are implemented;
 //! `find_center_sift` is implemented behind the `sift-center` feature (it links
 //! OpenCV). See `docs/PORTING.md` §C.
+//!
+//! Laminography alignment lives here too, since it is the same question asked of
+//! a second axis: `find_center_rings` reads the axis off the raw projections (and
+//! says whether the scan was aligned at acquisition at all), and
+//! `lamino_tilt_scan` scores the tilt. `docs/LAMINOGRAPHY_ALIGNMENT.md` is the
+//! method both implement.
 
 use crate::backend::{Backend, Fft};
 use crate::data::{Layout, Tomo};
@@ -11,6 +17,710 @@ use crate::dtype::Complex32;
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
 use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
+
+/// What [`find_center_rings`] found, and whether to believe it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingCenter {
+    /// Estimated rotation-axis column, sub-pixel.
+    pub center: f32,
+    /// Robust prominence of the registration peak, `(peak − median) / MAD` of the
+    /// correlation profile. This is the number that says whether `center` means
+    /// anything: a bullseye registers as a sharp peak, arcs that never close do
+    /// not peak at all. See [`find_center_rings`] for the two measured
+    /// calibration points.
+    pub prominence: f32,
+    /// `prominence >= 8.0`. False ⇒ **do not use `center`**: the scan is very
+    /// likely mis-aligned at acquisition, which no reconstruction geometry
+    /// repairs.
+    pub trustworthy: bool,
+}
+
+/// Rotation-axis column from the ring pattern of a 360° scan — the cheapest
+/// estimator here (one pass, no reconstruction) and the only one validated for
+/// **laminography**, where `find_center_vo`/`find_center_pc` do not apply.
+///
+/// Over a full turn every object point at radius `r` from the axis traces
+/// `x(θ) = c + r·cos(θ + φ)`, so the mean projection smears each point into a
+/// ring centred on the axis: a bullseye whose centre column is `c`. Rings are
+/// mirror-symmetric about that column, so registering the mean projection
+/// against its own left–right flip puts the axis at `dx = 2·(c − nx/2)`. `tomo`
+/// is the flat-corrected, minus-log projection stack; every `step`-th projection
+/// is averaged (`step = 10` over 1800 projections is plenty — the rings are a
+/// bulk feature).
+///
+/// **Why this exists when three other `find_center_*` do.** The laminographic
+/// tilt gives the axis a component along the beam, so a 180° rotation is not a
+/// mirror of the object and the 0°/180° symmetry every other estimator assumes is
+/// gone: on the scan below `find_center_pc`-style mirror registration scattered
+/// 395…607 against a known 396. The 2-D ring pattern does not depend on that
+/// symmetry. (A 1-D column profile of the same mean projection does not work
+/// either — it gave 847 — because the sample is wider than the field and
+/// truncation destroys the profile's symmetry while leaving the rings intact.)
+///
+/// **The estimate carries its own alibi.** `docs/LAMINOGRAPHY_ALIGNMENT.md`
+/// prescribes reading the bullseye by eye and treating eye-vs-correlation
+/// disagreement as the misalignment flag, because on a mis-aligned scan the
+/// lopsided arcs drag the correlation peak. That disagreement is measurable
+/// without the eye: the arcs do not merely move the peak, they leave no peak.
+/// Measured on the two scans that doc is written from (2048² binned 2×, 1800
+/// projections over 360°):
+///
+/// | scan | `center` | truth | `prominence` |
+/// |---|---|---|---|
+/// | 0.55 s, closed concentric rings | 397.4 | 396 | **16.2** |
+/// | 0.6 s, arcs that never close | 281.7 | 138 | **2.2** |
+///
+/// The mis-aligned scan's profile sits at 80 % of its own peak height even at the
+/// array edges — it is flat, and its `argmax` is noise. Hence
+/// [`RingCenter::trustworthy`], thresholded at 8.0: comfortably between the two,
+/// but **calibrated on exactly those two scans**. Treat a `prominence` near the
+/// threshold as "look at the mean projection yourself", not as a verdict.
+///
+/// (The doc quotes 397.5/281.1 and prominence 21.0/2.4 for its NumPy reference,
+/// which clips at `1e-4` before the log where this goes through
+/// [`prep::normalize`](crate::prep::normalize). The centre lands within 0.13 px
+/// either way; the prominence scale differs, so the numbers above — not the
+/// doc's — are the ones this function returns.)
+pub fn find_center_rings(
+    tomo: &Tomo<f32>,
+    backend: &dyn Backend,
+    step: usize,
+) -> Result<RingCenter> {
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    if step == 0 {
+        return Err(Error::InvalidParam(
+            "find_center_rings: step must be ≥1".into(),
+        ));
+    }
+    let p = tomo.as_layout(Layout::Projection); // [nproj, ny, nx]
+    let (nproj, ny, nx) = p.array.dim();
+    if nproj == 0 || ny < 5 || nx < 4 {
+        return Err(Error::InvalidParam(format!(
+            "find_center_rings needs ≥1 projection and ≥5×4 pixels; got {nproj}×{ny}×{nx}"
+        )));
+    }
+
+    let prof = flip_registration_profile(&mean_projection(tomo, step)?, fft)?;
+    Ok(ring_center_from_profile(&prof, nx))
+}
+
+/// The bullseye itself: the mean of every `step`-th projection, `[ny, nx]`.
+///
+/// [`find_center_rings`] registers this image against its own flip to get a
+/// number, but `docs/LAMINOGRAPHY_ALIGNMENT.md` §1 makes *looking* at it step
+/// one, and treats eye-vs-correlation disagreement as the misalignment flag —
+/// which needs the image, not only the number. Same function both ways, so what
+/// a viewer shows is what the estimate was computed from.
+pub fn mean_projection(tomo: &Tomo<f32>, step: usize) -> Result<Array2<f32>> {
+    if step == 0 {
+        return Err(Error::InvalidParam(
+            "mean_projection: step must be ≥1".into(),
+        ));
+    }
+    let p = tomo.as_layout(Layout::Projection); // [nproj, ny, nx]
+    let (nproj, ny, nx) = p.array.dim();
+    if nproj == 0 {
+        return Err(Error::InvalidParam(
+            "mean_projection: the stack has no projections".into(),
+        ));
+    }
+    let mut mean = Array2::<f32>::zeros((ny, nx));
+    let mut cnt = 0usize;
+    for i in (0..nproj).step_by(step) {
+        mean += &p.array.index_axis(Axis(0), i);
+        cnt += 1;
+    }
+    mean /= cnt as f32;
+    Ok(mean)
+}
+
+/// Row-summed cross-correlation of `m` against its own left–right flip.
+/// Rings put their signature on the middle rows, so only those are summed —
+/// following `docs/LAMINOGRAPHY_ALIGNMENT.md`.
+fn flip_registration_profile(m: &Array2<f32>, fft: &dyn Fft) -> Result<Vec<f32>> {
+    let (ny, nx) = m.dim();
+    let mean = m.sum() / (ny * nx) as f32;
+
+    // a = m − mean, b = mirror(a). Correlate: irfft2(rfft2(a) · conj(rfft2(b))).
+    // Done as a full C2C 2-D transform via the backend's 1-D FFT over each axis.
+    let mut a: Vec<Complex32> = m.iter().map(|&v| Complex32::new(v - mean, 0.0)).collect();
+    let mut b: Vec<Complex32> = Vec::with_capacity(ny * nx);
+    for y in 0..ny {
+        for x in 0..nx {
+            b.push(Complex32::new(m[[y, nx - 1 - x]] - mean, 0.0));
+        }
+    }
+    fft.fft_2d(&mut a, ny, nx, 1, false)?;
+    fft.fft_2d(&mut b, ny, nx, 1, false)?;
+    for (av, bv) in a.iter_mut().zip(b.iter()) {
+        *av *= bv.conj();
+    }
+    fft.fft_2d(&mut a, ny, nx, 1, true)?;
+
+    // fftshift along x, then sum the 5 middle rows (fftshifted along y too).
+    let mut prof = vec![0.0f32; nx];
+    for dy in 0..5usize {
+        let y_shifted = ny / 2 - 2 + dy;
+        let y = (y_shifted + ny.div_ceil(2)) % ny; // undo the y fftshift
+        for (x, p) in prof.iter_mut().enumerate() {
+            let xs = (x + nx.div_ceil(2)) % nx; // undo the x fftshift
+            *p += a[y * nx + xs].re;
+        }
+    }
+    Ok(prof)
+}
+
+/// Peak of the flip-registration profile → centre column + how much to trust it.
+fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
+    let i = prof
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (k, &v)| {
+            if v > bv {
+                (k, v)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0;
+    // Parabolic sub-pixel refinement, guarded at the ends and against a flat top
+    // (a mis-aligned scan's profile has no curvature to fit).
+    let d = if i == 0 || i + 1 >= prof.len() {
+        0.0
+    } else {
+        let (y0, y1, y2) = (prof[i - 1], prof[i], prof[i + 1]);
+        let den = 2.0 * (y0 - 2.0 * y1 + y2);
+        if den.abs() < f32::EPSILON {
+            0.0
+        } else {
+            (y0 - y2) / den
+        }
+    };
+    let center = nx as f32 / 2.0 + ((i as f32 + d) - (nx / 2) as f32) / 2.0;
+
+    // Robust prominence: (peak − median) / MAD.
+    let mut sorted: Vec<f32> = prof.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let mut dev: Vec<f32> = prof.iter().map(|v| (v - median).abs()).collect();
+    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = dev[dev.len() / 2];
+    let prominence = if mad > 0.0 {
+        (prof[i] - median) / mad
+    } else {
+        0.0
+    };
+    RingCenter {
+        center,
+        prominence,
+        trustworthy: prominence >= 8.0,
+    }
+}
+
+/// Focus of one reconstructed slice: mean |∇|² inside a 0.92-FOV disk. This is
+/// the score `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 prescribes, and what
+/// [`lamino_tilt_scan`] maximises.
+///
+/// The disk is not cosmetic. Reconstruction geometry decides where the
+/// back-projection sampling leaves the detector, so the ring outside the
+/// reconstructed disk holds artifacts that move with the very parameter being
+/// scored. Scoring the full frame scores that boundary, and it is enough to flip
+/// the ranking.
+pub fn slice_focus(img: &ndarray::ArrayView2<f32>) -> f64 {
+    let (ny, nx) = img.dim();
+    if ny < 3 || nx < 3 {
+        return 0.0;
+    }
+    let (cy, cx) = (ny as f32 / 2.0, nx as f32 / 2.0);
+    let r2 = (0.46 * nx.min(ny) as f32).powi(2); // 0.92 FOV across
+    let (mut acc, mut cnt) = (0.0f64, 0usize);
+    for y in 1..ny - 1 {
+        for x in 1..nx - 1 {
+            if (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2) >= r2 {
+                continue;
+            }
+            let gx = (img[[y, x + 1]] - img[[y, x - 1]]) as f64;
+            let gy = (img[[y + 1, x]] - img[[y - 1, x]]) as f64;
+            acc += gx * gx + gy * gy;
+            cnt += 1;
+        }
+    }
+    acc / cnt.max(1) as f64
+}
+
+/// Another local maximum of a sweep that the metric did not rule out — see
+/// [`SweepVerdict::Ambiguous`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rival {
+    /// Index into the candidate/score arrays.
+    pub index: usize,
+    /// The candidate itself.
+    pub value: f32,
+    /// How far this lobe rises above the highest saddle joining it to higher
+    /// ground — its topographic prominence. This, not its height, is what makes
+    /// a lobe a competitor: a wiggle on the winner's flank has none.
+    pub prominence: f64,
+    /// How much lower it scored than the winner, as a fraction of the winner's
+    /// score.
+    pub deficit: f64,
+}
+
+/// What a sweep's focus curve actually established — see [`judge_sweep`].
+///
+/// A sum type rather than a value plus a `railed` flag, because a flag is
+/// ignorable and these sweeps fail in more than one way: **a maximum can be
+/// interior and still be no answer.** Only [`SweepVerdict::resolved`] hands back
+/// a value to adopt, so a caller cannot reach an answer without passing the
+/// verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SweepVerdict {
+    /// One lobe rises clear of every other: `value` is the sweep's answer.
+    Resolved {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself.
+        value: f32,
+    },
+    /// The curve rises to an edge and never comes back down, so the search
+    /// stopped before the metric did. **The true peak is at that edge or beyond
+    /// it and there is no way to tell which from inside the range**, so this is
+    /// not an optimum, it is the range running out. Widen it or recentre it.
+    ///
+    /// Landing exactly on the first or last candidate is the obvious shape. It is
+    /// not the only one: a curve that climbs across the whole window and turns
+    /// over one sample short of the edge has an *interior* maximum and no second
+    /// lobe to contradict it, and it is still a range that ran out. Both are the
+    /// same fact — the winner owns no lobe of its own — and both land here.
+    Railed {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself.
+        value: f32,
+    },
+    /// Two or more lobes compete and the metric does not separate them, so the
+    /// winner is not an answer.
+    ///
+    /// Measured, on the pouch-cell scan this check was written for: a ±40 px
+    /// centre sweep put its maximum at 417 while the known-correct 396 scored
+    /// only 0.34 % lower, 21 px away, and *neither* was at an edge. A rail check
+    /// cannot see that, which is why this variant exists. Narrow the range onto a
+    /// prior you trust rather than believing the winner.
+    Ambiguous {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself — the winner, which is **not** an answer.
+        value: f32,
+        /// The competitors, most prominent first. Never empty.
+        rivals: Vec<Rival>,
+    },
+    /// Every candidate scored the same, so the metric never responded to this
+    /// axis and the argmax is just the curve's first entry. Reconstruction output
+    /// that comes out uniform scores exactly flat, and uniform output has shipped
+    /// from this crate before, so this is an observed state rather than a
+    /// defensive one. Nothing about the range will help; the recon or the metric
+    /// is what is wrong.
+    Flat {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself.
+        value: f32,
+    },
+}
+
+impl SweepVerdict {
+    /// The candidate to adopt, or `None` when the sweep established none. This is
+    /// the only accessor that answers the sweep; the others only describe it.
+    pub fn resolved(&self) -> Option<f32> {
+        match *self {
+            SweepVerdict::Resolved { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The highest-scoring candidate whatever the verdict — to *show* the sweep
+    /// (mark the montage, label the plot), never to adopt. Use [`Self::resolved`]
+    /// for that.
+    pub fn best(&self) -> (usize, f32) {
+        match *self {
+            SweepVerdict::Resolved { index, value }
+            | SweepVerdict::Railed { index, value }
+            | SweepVerdict::Ambiguous { index, value, .. }
+            | SweepVerdict::Flat { index, value } => (index, value),
+        }
+    }
+}
+
+/// The share of a curve's full height that a lobe must own to be taken
+/// seriously. One bar, applied to every lobe including the winner, which is what
+/// makes the two failures below the same test rather than two special cases:
+///
+/// * the **winner** below it owns no lobe of its own — it is the top of a ramp,
+///   and a curve that only rises is a range that ran out;
+/// * any **other** lobe above it is a competitor the metric has not ruled out.
+///
+/// Calibrated on measured pouch-cell centre sweeps at tilt 44°, in units of the
+/// curve's height. The ±40 px sweep on the rh/2 plane: winner (417) **35 %**,
+/// the known-correct lobe at 396 **55 %**, a third lobe at 374 **25 %**, a
+/// shoulder at the range edge **0 %** — three competitors, no answer. The same
+/// ±40 px sweep on the sample plane: winner (435) **0.29 %**, a ramp. The ±8 px
+/// sweep around a good prior, which does resolve: winner **83 %**, no second lobe
+/// at all.
+const SIGNIFICANT_PROMINENCE: f64 = 0.2;
+
+/// Indices of the local maxima of `score`, one per lobe.
+///
+/// Plateau-aware: a run of equal values is one lobe, reported at its first index,
+/// when the curve falls off both ends of the run. Requiring a strict rise on both
+/// sides instead finds **nothing** on the real ±8 px centre sweep, whose peak is a
+/// two-sample tie at 395.75/396.00.
+fn local_maxima(score: &[f64]) -> Vec<usize> {
+    let n = score.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && score[j + 1] == score[i] {
+            j += 1;
+        }
+        let rises_before = i > 0 && score[i - 1] > score[i];
+        let rises_after = j + 1 < n && score[j + 1] > score[j];
+        if !rises_before && !rises_after {
+            out.push(i);
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// How far the lobe at `i` stands above the higher of the two troughs flanking
+/// it, where each side is walked until **either** higher ground **or** the
+/// window's edge, whichever comes first.
+///
+/// Stopping at the edge is what makes this uniform, and the uniformity is the
+/// point. Textbook topographic prominence has no higher ground to find for the
+/// global maximum and so measures it from the floor of the window — which hands
+/// the top of a *ramp* the window's entire height and makes a curve that only
+/// rises look like the most prominent lobe there is. That is backwards: a curve
+/// that never comes back down is a range that ran out. Here it scores ~0, and the
+/// same arithmetic serves the winner and its rivals alike.
+fn prominence(score: &[f64], i: usize) -> f64 {
+    let mut col = f64::NEG_INFINITY;
+    for dir in [-1i64, 1] {
+        let mut j = i as i64 + dir;
+        let mut low = score[i];
+        while j >= 0 && (j as usize) < score.len() {
+            let v = score[j as usize];
+            if v > score[i] {
+                break;
+            }
+            low = low.min(v);
+            j += dir;
+        }
+        col = col.max(low);
+    }
+    score[i] - col
+}
+
+/// Judge what a sweep's focus curve established: one answer, or one of the three
+/// ways it can fail to have one.
+///
+/// The winner alone is not the question. A railed maximum reported as an answer
+/// is how one bad axis poisons the next — a tilt railed at the top of its range
+/// moved a centre re-sweep 1.7 px off the value the un-railed sweep found — and
+/// an *interior* maximum can be just as empty: widening the pouch-cell centre
+/// sweep from ±8 px to ±40 px moves its argmax from the correct 396 to a rival at
+/// 417 that outscores it by 0.34 %, with no edge involved. So the caller gets a
+/// [`SweepVerdict`], and only [`SweepVerdict::resolved`] yields a value.
+///
+/// Returns `None` for an empty sweep or a length mismatch. A sweep of one or two
+/// candidates is all boundary, so it is never called railed: there is no interior
+/// for a peak to be in and nothing to widen toward.
+pub fn judge_sweep(cands: &[f32], score: &[f64]) -> Option<SweepVerdict> {
+    if cands.is_empty() || score.len() != cands.len() {
+        return None;
+    }
+    let index = score
+        .iter()
+        .enumerate()
+        .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv {
+                (i, x)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0;
+    let value = cands[index];
+    // Fewer than three candidates is all boundary: there is no interior for a
+    // lobe to sit in, so there is no curve to judge. One candidate is a pin the
+    // caller already chose; two is a comparison, not a sweep.
+    if cands.len() < 3 {
+        return Some(SweepVerdict::Resolved { index, value });
+    }
+    // Before the rail check, not after: the argmax of a flat curve is its first
+    // entry, which sits on the boundary, so a flat sweep would otherwise be
+    // reported as a range that ran out. Nothing ran out — nothing responded.
+    // `is_nan()` as well as `<= 0.0`: a reconstruction carrying NaN scores NaN,
+    // which is no more a curve than a flat one is, and `<= 0.0` alone is false
+    // for NaN.
+    let height = score[index] - score.iter().copied().fold(f64::INFINITY, f64::min);
+    if height.is_nan() || height <= 0.0 {
+        return Some(SweepVerdict::Flat { index, value });
+    }
+    let winner = prominence(score, index);
+    // Two ways the range can run out, and only the first is visible as an index.
+    // The second: the curve rises across the whole window and turns over just shy
+    // of the edge, so the maximum is interior and there is no second lobe to
+    // contradict it. Measured on the sample plane of the aligned reference scan —
+    // a ±40 px sweep rising to index 79 of 80, naming 435 against a known 396 and
+    // owning 0.29 % of the curve's height. That share is what tells it from a peak.
+    if index == 0 || index == cands.len() - 1 || winner < SIGNIFICANT_PROMINENCE * height {
+        return Some(SweepVerdict::Railed { index, value });
+    }
+    let mut rivals: Vec<Rival> = local_maxima(score)
+        .into_iter()
+        .filter(|&i| i != index)
+        .filter_map(|i| {
+            let p = prominence(score, i);
+            (p >= SIGNIFICANT_PROMINENCE * height).then_some(Rival {
+                index: i,
+                value: cands[i],
+                prominence: p,
+                deficit: (score[index] - score[i]) / score[index],
+            })
+        })
+        .collect();
+    if rivals.is_empty() {
+        return Some(SweepVerdict::Resolved { index, value });
+    }
+    rivals.sort_by(|a, b| {
+        b.prominence
+            .partial_cmp(&a.prominence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(SweepVerdict::Ambiguous {
+        index,
+        value,
+        rivals,
+    })
+}
+
+/// Where the sample sits, as a z-band of one reconstruction — the prior
+/// [`lamino_tilt_scan`] scores inside instead of over the whole volume.
+///
+/// The whole volume is not scorable on real data: [`slice_focus`] is mean |∇|²,
+/// and measurement on the aligned pouch scan says that ranks a pure-noise plane
+/// **1.7×** above the plane the sample is actually on (z=310 at 1.95e-5 against
+/// the eye-confirmed electrode at z=899, 1.15e-5). Max-over-z therefore scores
+/// the noise at every candidate, and the curve it produces is exactly the broken
+/// search `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 describes. Confining the score to
+/// the band the sample occupies is what the reference workflow validated (its
+/// centre curve peaks cleanly on the known axis); the band is read off one
+/// reconstruction — by eye, per §3, or from a [`TiltFocus::focus_by_z`] profile —
+/// exactly the way the centre sweep's prior is read off the rings.
+///
+/// The band is *stated* at one tilt and *carried* to the others through the
+/// detector rows, which do not move: on the rotation axis the back-projection
+/// samples row `v − nz/2 = cos(tilt)·(z − rh/2)`, so the same physical layer
+/// sits at a different z in every candidate's volume. Measured on the aligned
+/// pouch scan: the sample's focus spike lands at z 837 / 890 / 956 at tilts
+/// 40° / 44° / 48° (depths 1338 / 1424 / 1532), where carrying the 44° band
+/// through the rows predicts 836 / — / 957. A band that does **not** track the
+/// tilt misses the layer for the same reason a fixed slice cannot rank tilts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleBand {
+    /// Inclusive slice range `[z.0, z.1]` the sample occupies, in the volume the
+    /// band was read from.
+    pub z: (usize, usize),
+    /// The tilt, in degrees, of the reconstruction the band was read from.
+    pub tilt_deg: f32,
+}
+
+/// Carry `band` into the volume of another tilt: through the detector rows
+/// (`v − nz/2 = cos(tilt)·(z − rh/2)`, the kernel's own axis mapping), clamped to
+/// the target depth. `rh_from` is the depth of the volume the band was read
+/// from, `rh_to` the depth at `tilt_to_deg`.
+fn band_at(band: &SampleBand, rh_from: usize, tilt_to_deg: f32, rh_to: usize) -> (usize, usize) {
+    let map = |z: usize| -> usize {
+        let row = (z as f64 - rh_from as f64 / 2.0) * f64::from(band.tilt_deg).to_radians().cos();
+        let z = row / f64::from(tilt_to_deg).to_radians().cos() + rh_to as f64 / 2.0;
+        z.round().clamp(0.0, rh_to as f64 - 1.0) as usize
+    };
+    (map(band.z.0), map(band.z.1))
+}
+
+/// What one laminography tilt candidate scored, from [`lamino_tilt_scan`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TiltFocus {
+    /// The tilt, in degrees, that was reconstructed.
+    pub tilt_deg: f32,
+    /// The best [`slice_focus`] any scored slice of that reconstruction reached —
+    /// every slice without a [`SampleBand`], the band's slices with one.
+    pub focus: f64,
+    /// The slice that reached it — the in-focus layer. It moves with the tilt
+    /// (measured: 800 → 1120 as tilt went 40° → 58°), which is the whole reason
+    /// this is a full reconstruction and not a probe.
+    pub z_peak: usize,
+    /// The inclusive z range that was scored at this tilt: the caller's
+    /// [`SampleBand`] carried through the detector rows into this tilt's own
+    /// volume, or `None` when every slice was scored.
+    pub band: Option<(usize, usize)>,
+    /// Depth of the reconstruction `z_peak` indexes, `rh` for this tilt. It grows
+    /// with the tilt (`ceil(nz / cos(tilt) / 2) * 2`), so `z_peak` values are only
+    /// comparable across tilts as fractions of their own `depth`.
+    pub depth: usize,
+    /// [`slice_focus`] of every slice, indexed by z — `focus` is its maximum and
+    /// `z_peak` its argmax. The scan computes all of it anyway, and keeping it is
+    /// what separates the two things a bare `z_peak` cannot: a broad hump centred
+    /// on the sample, versus a spike on a z-edge slice where few projections
+    /// contribute and the streaks are the gradient. Believing an unexamined argmax
+    /// is the failure this whole method exists to avoid — `docs/
+    /// LAMINOGRAPHY_ALIGNMENT.md` §2 names its symptom, "a MONOTONE focus surface
+    /// with the argmax pinned to a grid corner".
+    pub focus_by_z: Vec<f64>,
+}
+
+/// Score each tilt in `tilts_deg` by fully reconstructing at it and taking the
+/// maximum [`slice_focus`] over the scored z range — every slice when `band` is
+/// `None`, the sample's own slices when a [`SampleBand`] carries a prior.
+///
+/// Pass the band whenever one can be read. Without it the score is the max over
+/// a volume in which, on real data, mean |∇|² ranks noise planes above the
+/// sample (measured 1.7× — see [`SampleBand`]), so the whole-volume max answers
+/// for the noise: on the aligned pouch scan it pins `z_peak` to the same noise
+/// hump at every candidate and produces a centre curve with no peak at the known
+/// axis. The band is mapped into each candidate's own volume through the
+/// detector rows, so the moving in-focus layer stays inside it.
+///
+/// It is expensive on purpose. The cheap alternative — score one fixed slice per
+/// tilt, which is what [`crate::cuda::lamino_tilt_probe`] makes a single launch —
+/// is ill-posed, and measurement says so: the in-focus layer moves in z with the
+/// tilt, so a fixed row scores a plane whose error grows with the distance from
+/// its own optimum, while the tilt's own signal is only ~2 % per degree. On the
+/// pouch scans that sweep returns 48° or rails to the range edge depending only
+/// on which row was picked. Taking the max over z needs every (tilt, z) pair,
+/// which is exactly the work the probe skips, so the probe buys nothing here.
+/// The centre is the opposite case: an in-plane shift does not move the layer, so
+/// one probe launch can rank every candidate — but only within a few px of the
+/// answer, so that probe refines a prior rather than finding one. See
+/// [`cuda::center_probe_sweep`](crate::cuda::center_probe_sweep).
+///
+/// `geom`'s beam is ignored; `tilts_deg` supplies it. `params.lamino_rh` is
+/// honoured if set, but leaving it `None` lets each tilt take its own natural
+/// depth, which is what the scan wants. The volume is never assembled: focus is
+/// scored per streamed tile, so the memory cost is one tile regardless of `rh`.
+///
+/// `sino` must already be prepped (flat/dark, minus-log, stripe removal).
+///
+/// `on_tilt(result, slice)` is called with each result as it lands — one full
+/// reconstruction apart, so a caller with a user attached should report it — and
+/// returning `Err` from it aborts the scan. `slice` is the `z_peak` slice, the
+/// in-focus layer itself: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming
+/// the winner by eye part of the method, and this is the one reconstruction that
+/// already found it. Callers that only want the numbers ignore it.
+///
+/// CUDA-only: the streaming laminography reconstruction this rides on exists only
+/// there.
+pub fn lamino_tilt_scan(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    algorithm: crate::params::Algorithm,
+    params: &crate::params::ReconParams,
+    tilts_deg: &[f32],
+    band: Option<SampleBand>,
+    on_tilt: &mut dyn FnMut(&TiltFocus, ndarray::ArrayView2<f32>) -> Result<()>,
+) -> Result<Vec<TiltFocus>> {
+    if let Some(b) = &band {
+        if b.z.0 > b.z.1 {
+            return Err(Error::Backend(format!(
+                "the sample band {}..{} is inverted",
+                b.z.0, b.z.1
+            )));
+        }
+    }
+    // The same depth rule the streaming reconstruction applies; verified against
+    // its actual depth below, because the band is mapped with this value before
+    // the first tile arrives.
+    let rh_for = |tilt_deg: f32| {
+        params
+            .lamino_rh
+            .unwrap_or_else(|| crate::cuda::lamino_recon_height(geom.detector.height, tilt_deg))
+    };
+    let mut out = Vec::with_capacity(tilts_deg.len());
+    for &tilt_deg in tilts_deg {
+        let geom = Geometry {
+            beam: Beam::Laminography {
+                phi: std::f32::consts::FRAC_PI_2 + tilt_deg * std::f32::consts::PI / 180.0,
+            },
+            ..geom.clone()
+        };
+        let rh = rh_for(tilt_deg);
+        let scored = band
+            .as_ref()
+            .map(|b| band_at(b, rh_for(b.tilt_deg), tilt_deg, rh));
+        // The volume is streamed and dropped tile by tile, so the winning slice
+        // has to be kept as it goes past — it is gone by the time the scan knows
+        // it won. Tiles arrive in ascending row order, so `focus_by_z` is built by
+        // appending; the whole profile is kept even under a band, because the
+        // profile is how the *next* band gets read.
+        let mut best: Option<(f64, usize, Array2<f32>)> = None;
+        let mut focus_by_z: Vec<f64> = Vec::new();
+        let (depth, _, _) = {
+            let mut on_tile = |z0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
+                for (k, img) in tile.array.outer_iter().enumerate() {
+                    let z = z0 + k;
+                    let f = slice_focus(&img);
+                    focus_by_z.push(f);
+                    let in_band = scored.is_none_or(|(lo, hi)| (lo..=hi).contains(&z));
+                    if in_band && best.as_ref().is_none_or(|b| f > b.0) {
+                        best = Some((f, z, img.to_owned()));
+                    }
+                }
+                Ok(())
+            };
+            crate::cuda::reconstruct_lamino_streaming(
+                sino,
+                &geom,
+                algorithm,
+                params,
+                None,
+                &mut on_tile,
+            )?
+        };
+        if depth != rh {
+            return Err(Error::Backend(format!(
+                "tilt {tilt_deg}°: the reconstruction is {depth} deep but the depth rule \
+                 said {rh} — the sample band was mapped against the wrong depth"
+            )));
+        }
+        let (focus, z_peak, img) = best.ok_or_else(|| {
+            Error::Backend(format!(
+                "the reconstruction at tilt {tilt_deg}° produced no slices to score"
+            ))
+        })?;
+        // The profile is only indexable by z if every row arrived exactly once.
+        if focus_by_z.len() != depth {
+            return Err(Error::Backend(format!(
+                "tilt {tilt_deg}°: scored {} slices but the reconstruction is {depth} deep",
+                focus_by_z.len()
+            )));
+        }
+        let r = TiltFocus {
+            tilt_deg,
+            focus,
+            z_peak,
+            band: scored,
+            depth,
+            focus_by_z,
+        };
+        on_tilt(&r, img.view())?;
+        out.push(r);
+    }
+    Ok(out)
+}
 
 /// Entropy-based center finding (tomopy `rotation.py:82`).
 ///
@@ -1421,9 +2131,205 @@ fn beta3(t: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ndimage_shift_spline3_constant;
+    use super::{band_at, judge_sweep, ndimage_shift_spline3_constant, SampleBand, SweepVerdict};
     use ndarray::{Array2, Array3};
     use ndarray_npy::read_npy;
+
+    /// The pouch-cell centre sweep at tilt 44°, scored on output slice rh/2 by
+    /// `slice_focus`, in units of 1e-6. Candidates are 356..=436 px, step 1.
+    ///
+    /// This is the curve the whole [`SweepVerdict`] type exists for. Its argmax is
+    /// 417 and its correct answer is 396 — the axis is known independently, from
+    /// the rings (docs/LAMINOGRAPHY_ALIGNMENT.md §1) — and 417 outscores 396 by
+    /// 0.34 % with neither at an edge.
+    const WIDE: [f64; 81] = [
+        1.9491, 1.9521, 1.9564, 1.9635, 1.9709, 1.9765, 1.9824, 1.9879, 1.9892, 1.9892, 1.9910,
+        1.9971, 2.0092, 2.0228, 2.0306, 2.0338, 2.0348, 2.0357, 2.0372, 2.0352, 2.0272, 2.0167,
+        2.0056, 1.9913, 1.9757, 1.9649, 1.9585, 1.9581, 1.9594, 1.9614, 1.9694, 1.9845, 2.0095,
+        2.0437, 2.0865, 2.1321, 2.1749, 2.2101, 2.2364, 2.2557, 2.2625, 2.2521, 2.2318, 2.2077,
+        2.1832, 2.1593, 2.1369, 2.1182, 2.1022, 2.0909, 2.0855, 2.0880, 2.0985, 2.1178, 2.1412,
+        2.1663, 2.1944, 2.2219, 2.2412, 2.2536, 2.2645, 2.2701, 2.2694, 2.2666, 2.2618, 2.2572,
+        2.2502, 2.2407, 2.2312, 2.2219, 2.2075, 2.1902, 2.1745, 2.1638, 2.1576, 2.1581, 2.1680,
+        2.1814, 2.1933, 2.2041, 2.2153,
+    ];
+
+    fn wide_cands() -> Vec<f32> {
+        (0..81).map(|k| 356.0 + k as f32).collect()
+    }
+
+    /// The defect this type was introduced for: a sweep whose maximum is interior
+    /// — so no rail check fires — and yet is the wrong answer, because a rival
+    /// lobe 21 px away is within 0.34 % of it. The old `Pick { railed }` reported
+    /// 417 here as an answer. Nothing may hand back a value for this curve.
+    #[test]
+    fn judge_sweep_refuses_a_curve_whose_rival_lobe_it_cannot_separate() {
+        let v = judge_sweep(&wide_cands(), &WIDE).unwrap();
+        assert_eq!(
+            v.best(),
+            (61, 417.0),
+            "the argmax is unchanged — the verdict is what changed"
+        );
+        assert_eq!(
+            v.resolved(),
+            None,
+            "an interior argmax is not automatically an answer"
+        );
+
+        let SweepVerdict::Ambiguous { rivals, .. } = &v else {
+            panic!("expected Ambiguous, got {v:?}");
+        };
+        // Most prominent first, and the most prominent rival is the correct axis.
+        assert_eq!(rivals[0].value, 396.0);
+        assert!(
+            (rivals[0].deficit - 0.0033).abs() < 0.0005,
+            "the correct lobe trails the winner by {:.4}, not the measured 0.34 %",
+            rivals[0].deficit
+        );
+        // 374 competes too (25 % of the winner's prominence); the 436 shoulder at
+        // 18 % is below the bar and must not be listed.
+        assert_eq!(
+            rivals.iter().map(|r| r.value).collect::<Vec<_>>(),
+            vec![396.0, 374.0]
+        );
+    }
+
+    /// The same metric, same slice, same scan — narrowed onto a prior from the
+    /// rings. One lobe, so it resolves, and it lands on the known 396. This is the
+    /// pair that says `Ambiguous` is about the *window*, not a metric that never
+    /// works: the sweep is a refiner of a prior, not a finder.
+    ///
+    /// Its peak is a two-sample exact tie (395.75 and 396.00 both 2.2623e-6),
+    /// which is why lobe detection has to be plateau-aware — a strict rise on both
+    /// sides finds no lobe at all here and the curve would judge `Flat`.
+    #[test]
+    fn judge_sweep_resolves_the_same_sweep_narrowed_onto_a_prior() {
+        let narrow: [f64; 17] = [
+            2.2364, 2.2419, 2.2470, 2.2517, 2.2557, 2.2590, 2.2612, 2.2623, 2.2623, 2.2610, 2.2587,
+            2.2554, 2.2514, 2.2468, 2.2419, 2.2366, 2.2310,
+        ];
+        let cands: Vec<f32> = (0..17).map(|k| 394.0 + k as f32 * 0.25).collect();
+        let v = judge_sweep(&cands, &narrow).unwrap();
+        assert_eq!(v.resolved(), Some(395.75), "got {v:?}");
+    }
+
+    /// An interior maximum with nothing else near it is an optimum; a boundary one
+    /// is the range running out. A railed pick adopted as an answer is how one bad
+    /// axis poisons the next.
+    #[test]
+    fn judge_sweep_separates_an_optimum_from_a_range_running_out() {
+        let c = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let v = judge_sweep(&c, &[1.0, 5.0, 9.0, 4.0, 2.0]).unwrap();
+        assert_eq!(v.resolved(), Some(3.0));
+
+        for (score, want) in [
+            ([9.0, 5.0, 3.0, 2.0, 1.0], 0usize),
+            ([1.0, 2.0, 3.0, 5.0, 9.0], 4usize),
+        ] {
+            let v = judge_sweep(&c, &score).unwrap();
+            assert!(
+                matches!(v, SweepVerdict::Railed { index, .. } if index == want),
+                "a peak at candidate {want} of 5 is a boundary, got {v:?}"
+            );
+            assert_eq!(v.resolved(), None);
+        }
+    }
+
+    /// The measured ±40 px centre sweep on the **sample plane** (z=899, the round
+    /// particles of the eye check) of the aligned pouch scan, tilt 44°, known axis
+    /// 396. In units of 1e-7.
+    ///
+    /// A range that ran out without landing on a candidate index: the curve climbs
+    /// across the whole window and turns over one sample short of the far edge.
+    const RAMP: [f64; 81] = [
+        4.1183, 4.1169, 4.1190, 4.1315, 4.1298, 4.1197, 4.1210, 4.1252, 4.1388, 4.1493, 4.1455,
+        4.1588, 4.1625, 4.1693, 4.1633, 4.1294, 4.1122, 4.1089, 4.0989, 4.0949, 4.1065, 4.1236,
+        4.1347, 4.1329, 4.1241, 4.1348, 4.1513, 4.1504, 4.1573, 4.1552, 4.1551, 4.1665, 4.1770,
+        4.1792, 4.1778, 4.1795, 4.1852, 4.1893, 4.1866, 4.1959, 4.2149, 4.2293, 4.2380, 4.2457,
+        4.2510, 4.2529, 4.2503, 4.2527, 4.2580, 4.2700, 4.2708, 4.2754, 4.2911, 4.3181, 4.3312,
+        4.3420, 4.3433, 4.3342, 4.3294, 4.3467, 4.3753, 4.3886, 4.4000, 4.4071, 4.4062, 4.3896,
+        4.3878, 4.3984, 4.4147, 4.4216, 4.4220, 4.4096, 4.4092, 4.4127, 4.4103, 4.4205, 4.4423,
+        4.4492, 4.4645, 4.4749, 4.4738,
+    ];
+
+    /// The edge check alone cannot see a range that ran out, and this is the curve
+    /// that proves it: the maximum is **interior** (index 79 of 80), so no index
+    /// test fires, and the curve carries no second lobe, so no rival contradicts
+    /// it. It is still nothing but a climb to the edge, and the answer it names —
+    /// 435 against a known 396 — is 39 px wrong.
+    ///
+    /// What separates it from a peak is the one bar every lobe is held to: the
+    /// winner stands 0.29 % of the curve's height above the trough that flanks it
+    /// on the right, because there is no trough on the right — only one more
+    /// sample, and then the range ends.
+    #[test]
+    fn judge_sweep_does_not_answer_from_a_curve_that_only_climbs() {
+        let cands: Vec<f32> = (0..81).map(|k| 356.0 + k as f32).collect();
+        let v = judge_sweep(&cands, &RAMP).unwrap();
+        assert!(
+            matches!(v, SweepVerdict::Railed { index: 79, .. }),
+            "an interior maximum one sample short of the edge is still the range \
+             running out, got {v:?}"
+        );
+        assert_eq!(v.resolved(), None, "435 is 39 px from the known 396");
+
+        // Not by luck of the grid: drop the one sample past the peak and the same
+        // curve rails on the index instead. Both shapes, one verdict.
+        let v = judge_sweep(&cands[..80], &RAMP[..80]).unwrap();
+        assert!(
+            matches!(v, SweepVerdict::Railed { index: 79, .. }),
+            "got {v:?}"
+        );
+    }
+
+    /// The mapping is pinned by measurement, not by its own algebra: the sample's
+    /// focus spike on the aligned pouch scan sits at z 890 at tilt 44° (depth
+    /// 1424), at 837 at 40° (depth 1338), and at 956 at 48° (depth 1532). A band
+    /// stated at 44° must land on the other two spikes; the mapping predicts 836
+    /// and 957, both within ~1 px of where the spike was measured.
+    #[test]
+    fn sample_band_lands_on_the_measured_spike_at_other_tilts() {
+        let b = SampleBand {
+            z: (890, 890),
+            tilt_deg: 44.0,
+        };
+        assert_eq!(band_at(&b, 1424, 40.0, 1338), (836, 836));
+        assert_eq!(band_at(&b, 1424, 48.0, 1532), (957, 957));
+        // At its own tilt the band is itself.
+        assert_eq!(band_at(&b, 1424, 44.0, 1424), (890, 890));
+        // A band touching the volume edges stays inside the target volume.
+        let wide = SampleBand {
+            z: (0, 1423),
+            tilt_deg: 44.0,
+        };
+        let (lo, hi) = band_at(&wide, 1424, 40.0, 1338);
+        assert!(hi < 1338, "hi {hi} escaped the 1338-deep target volume");
+        assert_eq!(lo, 0);
+    }
+
+    /// A curve that never moved says nothing, and its argmax is just its first
+    /// entry. Uniform reconstruction output — which has shipped from this crate —
+    /// scores exactly this.
+    #[test]
+    fn judge_sweep_does_not_answer_from_a_curve_that_never_responded() {
+        let v = judge_sweep(&[1.0f32, 2.0, 3.0, 4.0], &[0.0; 4]).unwrap();
+        assert!(matches!(v, SweepVerdict::Flat { .. }), "got {v:?}");
+        assert_eq!(v.resolved(), None);
+    }
+
+    /// A sweep of one or two candidates is all boundary: there is no interior for
+    /// a peak to sit in and nothing to widen toward, so calling it railed would
+    /// make every degenerate sweep an error.
+    #[test]
+    fn judge_sweep_does_not_rail_check_a_degenerate_sweep() {
+        assert_eq!(judge_sweep(&[7.0], &[1.0]).unwrap().resolved(), Some(7.0));
+        assert_eq!(
+            judge_sweep(&[7.0, 8.0], &[9.0, 1.0]).unwrap().resolved(),
+            Some(7.0)
+        );
+        assert!(judge_sweep(&[], &[]).is_none());
+        // Mismatched lengths are a caller bug, not a pick.
+        assert!(judge_sweep(&[1.0, 2.0], &[1.0]).is_none());
+    }
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
