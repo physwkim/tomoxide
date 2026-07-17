@@ -298,6 +298,116 @@ fn cuda_center_probe_sweep_argmax_matches_full_recons() {
     }
 }
 
+/// Laminography: the probe's `sz` names the same plane the reconstruction calls
+/// `z` — an equality every other test in this file is blind to by construction,
+/// because they are all `Beam::Parallel` with a phantom that stacks one 2-D slice
+/// into every row, so any constant `sz` offset would reproduce the reference
+/// exactly and pass. Under a laminographic tilt the plane matters: `align`
+/// hands the probe an output-volume index (default `rh/2`), and an off-by-one
+/// mapping would silently score a different plane than the one requested.
+///
+/// A z-slab phantom breaks the degeneracy: reconstruct in full, find the slab by
+/// per-slice focus, then probe every `sz` and require the probe's focus profile
+/// to be the reconstruction's — same peak plane, same values (measured identical
+/// to 5 significant figures when this was first established).
+#[test]
+fn cuda_lamino_probe_sz_is_the_reconstruction_z() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    const LN: usize = 64;
+    const LNPROJ: usize = 90;
+    const LNZ: usize = 32;
+    const TILT: f32 = 20.0;
+    let rh = cuda::lamino_recon_height(LNZ, TILT);
+    let (z_lo, z_hi) = (rh / 4, rh / 4 + 4);
+
+    let phantom = sim::shepp2d(LN).unwrap();
+    let mut stack = Array3::<f32>::zeros((rh, LN, LN));
+    for z in z_lo..z_hi {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let geom = Geometry {
+        angles: Angles::uniform(LNPROJ, 0.0, 2.0 * std::f32::consts::PI),
+        center: Center::Scalar(LN as f32 / 2.0),
+        beam: Beam::Laminography {
+            phi: std::f32::consts::FRAC_PI_2 + TILT.to_radians(),
+        },
+        detector: Detector {
+            width: LN,
+            height: LNZ,
+            pixel_size: 1.0,
+        },
+    };
+    let sino = sim::project(&Volume::new(stack), &geom, &cuda).unwrap();
+    let params = ReconParams::default();
+
+    let vol = recon::recon(&sino, &geom, Algorithm::Linerec, &params, &cuda).unwrap();
+    assert_eq!(vol.array.dim().0, rh);
+    let f_recon: Vec<f64> = (0..rh)
+        .map(|z| recon::center::slice_focus(&vol.array.index_axis(Axis(0), z)))
+        .collect();
+
+    let cands = [LN as f32 / 2.0];
+    let f_probe: Vec<f64> = (0..rh)
+        .map(|sz| {
+            let p = cuda::center_probe_sweep(&sino, &geom, &params, &cands, sz as i32).unwrap();
+            recon::center::slice_focus(&p.index_axis(Axis(0), 0))
+        })
+        .collect();
+
+    let argmax = |v: &[f64]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv {
+                    (i, x)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0
+    };
+    let (zr, zp) = (argmax(&f_recon), argmax(&f_probe));
+    eprintln!(
+        "rh {rh}, slab {z_lo}..{z_hi}: recon z_peak {zr} ({:.4e}), probe z_peak {zp} ({:.4e})",
+        f_recon[zr], f_probe[zp]
+    );
+    assert!(
+        (z_lo..z_hi).contains(&zr),
+        "the reconstruction should focus on the slab {z_lo}..{z_hi}, peaked at {zr}"
+    );
+    assert_eq!(
+        zp, zr,
+        "the probe's sharpest sz ({zp}) is not the reconstruction's sharpest z ({zr}) — \
+         `sz` is indexing a different plane than the reconstruction"
+    );
+    // Same values, not just the same argmax: relative to the profile's peak, so
+    // near-empty slices cannot inflate a ratio.
+    let fmax = f_recon[zr];
+    let mut worst = (0.0f64, 0usize);
+    for z in 0..rh {
+        let d = (f_recon[z] - f_probe[z]).abs() / fmax;
+        if d > worst.0 {
+            worst = (d, z);
+        }
+    }
+    eprintln!(
+        "worst focus mismatch {:.2e} of peak at z {}",
+        worst.0, worst.1
+    );
+    assert!(
+        worst.0 < 1e-3,
+        "probe focus at z {} differs from the reconstruction's by {:.2e} of peak",
+        worst.1,
+        worst.0
+    );
+}
+
 /// The probe must not depend on the whole padded stack fitting the device.
 ///
 /// It used to: the padded stack was one `cudaMalloc`, which at 1800×1024×1024
