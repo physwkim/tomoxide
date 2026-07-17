@@ -726,10 +726,6 @@ fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {
     })
 }
 
-/// Resolve the backend for a recon subcommand: an explicit top-level `--backend`
-/// wins; when it is left at the `auto` default, the `--config` file's `backend`
-/// applies (so a config can pin a device without a flag). `auto` either way
-/// leaves backend auto-detection to [`Engine`].
 /// Mean |∇|² inside a 0.92-FOV disk — the score `docs/LAMINOGRAPHY_ALIGNMENT.md`
 /// §2 prescribes.
 ///
@@ -961,6 +957,10 @@ fn run_align(
     Ok(())
 }
 
+/// Resolve the backend for a recon subcommand: an explicit top-level `--backend`
+/// wins; when it is left at the `auto` default, the `--config` file's `backend`
+/// applies (so a config can pin a device without a flag). `auto` either way
+/// leaves backend auto-detection to [`Engine`].
 fn resolve_backend(flag: &str, cfg: &Config) -> anyhow::Result<BackendKind> {
     let chosen = if flag == "auto" { &cfg.backend } else { flag };
     parse_backend(chosen)
