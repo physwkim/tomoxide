@@ -47,6 +47,47 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Find the rotation centre (and, for laminography, the tilt) without
+    /// reconstructing the volume.
+    ///
+    /// Runs the procedure `docs/LAMINOGRAPHY_ALIGNMENT.md` prescribes, in its
+    /// order: read the centre off the raw data first (the 360° mean projection is
+    /// a bullseye on the axis — one pass, and it also says whether the scan was
+    /// aligned at acquisition at all), then refine against reconstructions of a
+    /// single slice. The refinement uses the CUDA probes, so a whole sweep is one
+    /// launch per axis instead of one full volume per grid point.
+    Align {
+        /// Input DXchange HDF5 file.
+        file: PathBuf,
+        /// Output slice to refine on: a row of the reconstruction, `[0, nz)` for
+        /// parallel beam and `[0, rh)` for laminography. Default: the middle of
+        /// the volume. It must be a slice the sample actually occupies — check
+        /// the -v focus curve, a flat one means this slice is empty.
+        #[arg(long)]
+        slice: Option<usize>,
+        /// Average every Nth projection for the ring estimate.
+        #[arg(long, default_value_t = 10)]
+        ring_step: usize,
+        /// Skip the reconstruction refinement and report the ring estimate only
+        /// (no GPU needed).
+        #[arg(long)]
+        rings_only: bool,
+        /// Centre search half-width, in detector columns, around the ring estimate.
+        #[arg(long, default_value_t = 8.0)]
+        center_width: f32,
+        /// Centre search step. Sub-pixel steps are exact — `center_probe_sweep`
+        /// anchors one probe per fractional offset.
+        #[arg(long, default_value_t = 0.25)]
+        center_step: f32,
+        /// Laminography tilt in DEGREES. Builds the geometry the centre is scored
+        /// under; `align` does NOT search it — see the note the run prints. Omit
+        /// for parallel-beam.
+        #[arg(long)]
+        lamino_angle: Option<f32>,
+        /// Ignore the ring estimate's misalignment flag and refine anyway.
+        #[arg(long)]
+        force: bool,
+    },
     /// Full in-memory reconstruction.
     Recon {
         #[command(flatten)]
@@ -689,6 +730,237 @@ fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {
 /// wins; when it is left at the `auto` default, the `--config` file's `backend`
 /// applies (so a config can pin a device without a flag). `auto` either way
 /// leaves backend auto-detection to [`Engine`].
+/// Mean |∇|² inside a 0.92-FOV disk — the score `docs/LAMINOGRAPHY_ALIGNMENT.md`
+/// §2 prescribes.
+///
+/// The disk is not cosmetic. A centre probe shifts the back-projection sampling
+/// coordinate, so it moves where the sampling leaves the detector: outside the
+/// reconstructed disk a probe slice differs from the real reconstruction by ~12 %
+/// of peak at any shift, while inside it agrees to round-off. Scoring the full
+/// frame scores that boundary, and it is enough to flip the ranking.
+fn focus_disk(img: &ndarray::ArrayView2<f32>) -> f64 {
+    let (ny, nx) = img.dim();
+    let (cy, cx) = (ny as f32 / 2.0, nx as f32 / 2.0);
+    let r = 0.46 * nx.min(ny) as f32; // 0.92 FOV across
+    let (mut acc, mut cnt) = (0.0f64, 0usize);
+    for y in 1..ny - 1 {
+        for x in 1..nx - 1 {
+            let rr = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+            if rr >= r {
+                continue;
+            }
+            let gx = (img[[y, x + 1]] - img[[y, x - 1]]) as f64;
+            let gy = (img[[y + 1, x]] - img[[y - 1, x]]) as f64;
+            acc += gx * gx + gy * gy;
+            cnt += 1;
+        }
+    }
+    acc / cnt.max(1) as f64
+}
+
+fn argmax(v: &[f64]) -> usize {
+    v.iter()
+        .enumerate()
+        .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv {
+                (i, x)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0
+}
+
+/// Pick the sharpest candidate, and refuse to call a boundary an optimum.
+///
+/// A maximum on the first or last candidate means the search stopped before the
+/// metric did: the true peak is at the edge or beyond it, and there is no way to
+/// tell which from inside the range. Reporting it as the answer is how one bad
+/// axis poisons the next — a tilt railed at the top of its range moved the
+/// centre re-sweep 1.7 px away from the value the un-railed sweep had found.
+/// So this is an error the caller must handle, not a note in a footer.
+fn pick(axis: &str, cands: &[f32], focus: &[f64], widen: &str) -> anyhow::Result<f32> {
+    let i = argmax(focus);
+    if cands.len() > 2 && (i == 0 || i == cands.len() - 1) {
+        anyhow::bail!(
+            "the {axis} sweep peaked at {:.2}, the {} of its own search range \
+             [{:.2}, {:.2}].\nThat is the range running out, not an optimum: widen it with \
+             {widen}, or recentre the range on a better starting guess.",
+            cands[i],
+            if i == 0 { "bottom" } else { "top" },
+            cands[0],
+            cands[cands.len() - 1],
+        );
+    }
+    Ok(cands[i])
+}
+
+fn grid(center: f32, half_width: f32, step: f32) -> Vec<f32> {
+    if step <= 0.0 || half_width < 0.0 {
+        return vec![center];
+    }
+    let n = (half_width / step).floor() as i32;
+    (-n..=n).map(|k| center + k as f32 * step).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_align(
+    file: &std::path::Path,
+    backend_kind: BackendKind,
+    verbose: bool,
+    slice: Option<usize>,
+    ring_step: usize,
+    rings_only: bool,
+    center_width: f32,
+    center_step: f32,
+    lamino_angle: Option<f32>,
+    force: bool,
+) -> anyhow::Result<()> {
+    use tomoxide::geometry::{Angles, Beam, Center, Detector, Geometry};
+    use tomoxide::prep::normalize::{minus_log, normalize_dataset};
+    use tomoxide::recon::center::find_center_rings;
+    use tomoxide::ReconParams;
+
+    let path = file.to_string_lossy().to_string();
+    let engine = Engine::new(backend_kind)?;
+    let mut reader = tomoxide::io::open_dxchange(&path)?;
+    let theta = reader.read_theta()?;
+    let mut ds = reader.read_all()?;
+    normalize_dataset(&mut ds, engine.backend())?;
+    minus_log(&mut ds.data, engine.backend())?;
+
+    // --- step 1: the rings. One pass, and the acquisition check. ---
+    let ring = find_center_rings(&ds.data, engine.backend(), ring_step)?;
+    println!("rings (mean projection, every {ring_step}th frame):");
+    println!("  centre      = {:.2}", ring.center);
+    println!(
+        "  prominence  = {:.2}   (trustworthy ≥ 8.0)",
+        ring.prominence
+    );
+    if !ring.trustworthy {
+        println!(
+            "  VERDICT     = NOT trustworthy — the mean projection does not show a\n\
+             \x20               bullseye, so the rings never closed. That is the signature\n\
+             \x20               of a scan mis-aligned at acquisition, which no reconstruction\n\
+             \x20               geometry repairs. Look at the mean projection before\n\
+             \x20               spending a sweep on it (docs/LAMINOGRAPHY_ALIGNMENT.md §1)."
+        );
+        if !force {
+            println!("  stopping; pass --force to refine anyway.");
+            return Ok(());
+        }
+        println!("  --force given: refining anyway, treat the result with suspicion.");
+    } else {
+        println!("  VERDICT     = trustworthy (closed concentric rings)");
+    }
+    if rings_only {
+        return Ok(());
+    }
+
+    // --- step 2: refine against single-slice reconstructions, via the probes. ---
+    // The ring estimate above runs on any backend. The probes do not: a whole
+    // sweep being one kernel launch is what makes this subcommand cheap, and
+    // that kernel exists only in CUDA. Say so rather than sweeping on something
+    // the user did not ask for.
+    if engine.name() != "cuda" {
+        anyhow::bail!(
+            "the centre/tilt probes are CUDA-only, but the backend resolved to '{}'.\n\
+             The ring estimate above is backend-generic — re-run with --rings_only to\n\
+             keep it, or with --backend cuda to refine.",
+            engine.name()
+        );
+    }
+    let p = ds.data.as_layout(tomoxide::data::Layout::Projection);
+    let (_nproj, nz, nx) = p.array.dim();
+    // Only `filter_name` and `num_gridx` reach the probes; each reconstructs a
+    // single plane, so the laminography depth `rh` never enters.
+    let params = ReconParams::default();
+    let mk_geom = |center: f32, tilt_deg: Option<f32>| Geometry {
+        angles: Angles(theta.clone()),
+        center: Center::Scalar(center),
+        beam: match tilt_deg {
+            Some(d) => Beam::Laminography {
+                phi: std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0,
+            },
+            None => Beam::Parallel,
+        },
+        detector: Detector {
+            width: nx,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    // `sz` indexes the output volume: rows `[0, nz)` for parallel beam, `[0, rh)`
+    // for laminography, whose depth exceeds the detector's because the tilt
+    // stretches it. So the default is the middle of the volume, not the middle
+    // of the detector — those coincide only at zero tilt.
+    //
+    // Do not "correct" this to nz/2 by reading the kernel's
+    // `v = sin(phi)·(sz − nz/2) + nz/2` and concluding sz = nz/2 is the sample
+    // plane. That arithmetic is right and the conclusion is wrong: it assumes the
+    // sample sits on the detector's centre row. On the pouch scans it does not —
+    // at nz/2 = 512 the centre focus curve is flat to 1.8 % and rails, while at
+    // rh/2 = 712 it peaks at 395.87 against a known 396. Which plane holds the
+    // sample is a property of the scan; use --slice when the default misses it,
+    // and read the -v curve to tell a peak from a flat line.
+    let sz = slice.unwrap_or_else(|| match lamino_angle {
+        Some(deg) => tomoxide::cuda::lamino_recon_height(nz, deg) / 2,
+        None => nz / 2,
+    }) as i32;
+    let depth = match lamino_angle {
+        Some(deg) => tomoxide::cuda::lamino_recon_height(nz, deg),
+        None => nz,
+    };
+    println!(
+        "\nrefining on output slice {sz} of {depth} ({} centre candidates)",
+        grid(0.0, center_width, center_step).len()
+    );
+
+    let curve = |cands: &[f32], f: &[f64], unit: &str| {
+        if !verbose {
+            return;
+        }
+        let peak = f.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        for (c, &v) in cands.iter().zip(f) {
+            let bar = "#".repeat(((v / peak) * 40.0).round().max(0.0) as usize);
+            println!("      {c:8.2}{unit} {:.4e} {bar}", v);
+        }
+    };
+
+    let cands = grid(ring.center, center_width, center_step);
+    let probe = tomoxide::cuda::center_probe_sweep(
+        &ds.data,
+        &mk_geom(ring.center, lamino_angle),
+        &params,
+        &cands,
+        sz,
+    )?;
+    let f: Vec<f64> = (0..cands.len())
+        .map(|i| focus_disk(&probe.index_axis(ndarray::Axis(0), i)))
+        .collect();
+    curve(&cands, &f, "");
+    let center = pick("centre", &cands, &f, "--center_width")?;
+
+    println!("\nresult:");
+    println!("  --center {center:.2}");
+    if let Some(t) = lamino_angle {
+        println!("  --lamino_angle {t:.2}   (as given — align does not search it, see below)");
+    }
+    println!(
+        "\nThe centre is scored on one detector row by mean |∇|² over a 0.92-FOV disk.\n\
+         That is sound for the centre and only for the centre: the centre is an in-plane\n\
+         shift, so it does not move the in-focus layer, and its response is sharp\n\
+         (~40 % per 50 px). The tilt is the opposite on both counts — its response is\n\
+         broad (~2 % per 1°) and the in-focus layer moves in z with it (measured:\n\
+         z_peak 800 -> 1120 as tilt went 40° -> 58°), so a fixed row scores the wrong\n\
+         plane by more than the tilt signal is worth. Finding the tilt needs the max\n\
+         over the whole z range of a full reconstruction per tilt — docs/\n\
+         LAMINOGRAPHY_ALIGNMENT.md §2 and §4. Re-run with -v for the focus curve, and\n\
+         confirm on a montage before committing a full reconstruction (§3)."
+    );
+    Ok(())
+}
+
 fn resolve_backend(flag: &str, cfg: &Config) -> anyhow::Result<BackendKind> {
     let chosen = if flag == "auto" { &cfg.backend } else { flag };
     parse_backend(chosen)
@@ -721,6 +993,29 @@ fn main() -> anyhow::Result<()> {
                     Config::load(&path).with_context(|| format!("loading {}", path.display()))?;
                 println!("config: {cfg:#?}");
             }
+        }
+        Command::Align {
+            file,
+            slice,
+            ring_step,
+            rings_only,
+            center_width,
+            center_step,
+            lamino_angle,
+            force,
+        } => {
+            run_align(
+                &file,
+                backend_kind,
+                cli.verbose,
+                slice,
+                ring_step,
+                rings_only,
+                center_width,
+                center_step,
+                lamino_angle,
+                force,
+            )?;
         }
         Command::Recon {
             common,
@@ -1706,6 +2001,55 @@ fn recon_out_path(file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{grid, pick};
+
+    /// An interior maximum is an answer.
+    #[test]
+    fn pick_returns_an_interior_peak() {
+        let c = [40.0f32, 44.0, 48.0, 52.0];
+        let f = [1.0f64, 3.0, 2.0, 0.5];
+        assert_eq!(pick("tilt", &c, &f, "--tilt_width").unwrap(), 44.0);
+    }
+
+    /// A maximum on either end is the range running out, not an optimum. This is
+    /// the check that stopped `align` from reporting a 60° tilt that was simply
+    /// the top of a [28°, 60°] sweep — and from letting that value poison the
+    /// centre re-sweep that used to follow it.
+    #[test]
+    fn pick_rejects_a_peak_on_either_boundary() {
+        let c = [40.0f32, 44.0, 48.0, 52.0];
+        for f in [[9.0f64, 3.0, 2.0, 0.5], [0.5, 2.0, 3.0, 9.0]] {
+            let e = pick("tilt", &c, &f, "--tilt_width")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("search range"),
+                "boundary peak was accepted: {e}"
+            );
+        }
+    }
+
+    /// With one or two candidates every index is a boundary, so the rail test
+    /// carries no information — it must not fire and block a legitimate answer.
+    #[test]
+    fn pick_does_not_rail_check_a_degenerate_sweep() {
+        assert_eq!(pick("centre", &[396.0], &[1.0], "--w").unwrap(), 396.0);
+        assert_eq!(
+            pick("centre", &[396.0, 397.0], &[1.0, 2.0], "--w").unwrap(),
+            397.0
+        );
+    }
+
+    /// The sweep is centred on the estimate it refines, so the starting guess is
+    /// always a candidate — a grid that skipped it could only ever move away.
+    #[test]
+    fn grid_is_centred_and_symmetric() {
+        let g = grid(396.0, 1.0, 0.5);
+        assert_eq!(g, vec![395.0, 395.5, 396.0, 396.5, 397.0]);
+        assert_eq!(grid(396.0, 0.0, 0.25), vec![396.0]);
+        assert_eq!(grid(396.0, 8.0, 0.0), vec![396.0]);
+    }
+
     use super::*;
 
     #[test]

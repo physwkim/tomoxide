@@ -15,6 +15,34 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **`tomoxide align` — the alignment workflow as a subcommand**, plus the two
+  library pieces it stands on. `recon::center::find_center_rings` is the ring
+  estimator from `docs/LAMINOGRAPHY_ALIGNMENT.md` §1: the 360° mean projection is
+  a bullseye centred on the rotation axis, registered against its own mirror. It
+  reports a `prominence` — `(peak − median)/MAD` of the registration profile —
+  and flags the scan when the rings never closed, which is the acquisition-time
+  misalignment no reconstruction geometry repairs (measured: aligned scan 397.37
+  at prominence 16.2 → trustworthy; misaligned scan 281.72 at 2.22 → flagged, and
+  `align` stops there unless `--force`). `cuda::center_probe` / `center_probe_sweep`
+  then refine it: `cfunc_linerec`'s `backprojection_try` reconstructs one slice at
+  N candidate centres in **one** launch off a single filtering. A probe slice
+  equals the reconstruction exactly only when the shift is a whole number of
+  columns (measured 2e-7…9e-7 of peak) and differs by ~1.6 % at half a column, so
+  a naive sub-pixel sweep ranks integer offsets artificially sharp;
+  `center_probe_sweep` removes that by construction, issuing one probe per
+  fractional lattice, and never producing the biased slices at all. End to end on
+  the aligned pouch scan: `--center 395.87` against a known 396.
+  `align` deliberately does **not** search the tilt. A fixed slice is sound for
+  the centre — an in-plane shift does not move the in-focus layer, and the centre
+  response is sharp (~40 % per 50 px) — and unsound for the tilt, whose response
+  is broad (~2 % per degree) while the in-focus layer moves in z with it (`z_peak`
+  800 → 1120 as tilt went 40° → 58°), so a fixed slice scores the wrong plane by
+  more than the tilt signal is worth. Measured: a fixed-slice tilt sweep returns
+  48° at one slice and rails to the top of any range at another. The tilt needs
+  the max over the whole z range of a full reconstruction per tilt
+  (`docs/LAMINOGRAPHY_ALIGNMENT.md` §2/§4) — which needs every (tilt, z) pair, and
+  so is exactly the work `lamino_tilt_probe` skips. `lamino_tilt_probe` remains
+  for the case its saving is real: a plane that is already known.
 - **`docs/LAMINOGRAPHY_ALIGNMENT.md` — how to find the laminography rotation
   center and tilt.** A field-tested recipe, validated against a scan whose center
   was already known independently. Leads with reading the center off the raw data
