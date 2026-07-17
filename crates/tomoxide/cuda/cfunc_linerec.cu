@@ -50,7 +50,7 @@ void cfunc_linerec::ensure_texture() {
 }
 #endif
 
-void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float gain, int sz, size_t stream_) {
+void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float gain, int sz, int rh, size_t stream_) {
     real* g = (real *)g_;
     real* f = (real *)f_;
     float* theta = (float *)theta_;
@@ -71,13 +71,13 @@ void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float ph
     // the CPU/tomopy scale), the iterative solvers pass 1 so this kernel is the
     // pure adjoint of forwardproj.cu's unweighted scatter and the pair {A, Aᵀ}
     // converges to the physical μ.
-    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, gain, sz, ncz, n, nz, ncproj);
+    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, gain, sz, ncz, n, nz, rh, ncproj);
 #else
-    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, gain, sz, ncz, n, nz, ncproj);
+    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, gain, sz, ncz, n, nz, rh, ncproj);
 #endif
 }
 
-void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size_t sh_, float phi, int sz,  size_t stream_) {
+void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size_t sh_, float phi, int sz, int rh, size_t stream_) {
     real* g = (real *)g_;    
     real* f = (real *)f_;
     float* sh = (float *)sh_;
@@ -89,13 +89,14 @@ void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size
     dim3 GS3d0;  
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
     size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
-    backprojection_try_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, sh, ncz, n, nz, ncproj);
+    backprojection_try_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, sh, ncz, n, nz, rh, ncproj);
 }                                            
 
-void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz,  size_t stream_) {
-    real* g = (real *)g_;    
+void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz, size_t rh_, size_t stream_) {
+    real* g = (real *)g_;
     real* f = (real *)f_;
     float* phi = (float *)phi_;
+    const int* rh = (const int *)rh_;
     float* theta = (float *)theta_;
     cudaStream_t stream = (cudaStream_t)stream_;        
     // set thread block, grid sizes will be computed before cuda kernel execution
@@ -106,5 +107,5 @@ void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta
     // π/nproj — the FBP angular quadrature dθ, as `backprojection_try` uses and
     // as the analytic call sites pass to `backprojection`. tomocupy's 4/nproj
     // predates the scale unification.
-    backprojection_try_lamino_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, ncz, n, nz, ncproj);
+    backprojection_try_lamino_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, rh, ncz, n, nz, ncproj);
 }

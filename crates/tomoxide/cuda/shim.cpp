@@ -147,24 +147,27 @@ void* tomoxide_linerec_new(size_t nproj, size_t nz, size_t n, size_t ncproj, siz
   return new cfunc_linerec(nproj, nz, n, ncproj, ncz);
 }
 void tomoxide_linerec_backproject(void* h, void* f, const void* g, const float* theta, float phi,
-                                  float gain, int sz, void* stream) {
+                                  float gain, int sz, int rh, void* stream) {
   static_cast<cfunc_linerec*>(h)->backprojection(as_size(f), as_size(g), as_size(theta), phi, gain,
-                                                 sz, as_size(stream));
+                                                 sz, rh, as_size(stream));
 }
 // One slice `sz`, reconstructed at every tilt in `phi` at once: the kernel reads
 // `phi[tz]`, so the handle's `ncz` is the number of tilts and `f` comes back as
 // [ncz, n, n] — one candidate image per tilt from a single launch, rather than
 // one full volume per tilt.
 void tomoxide_linerec_backproject_try(void* h, void* f, const void* g, const float* theta,
-                                      const float* sh, float phi, int sz, void* stream) {
+                                      const float* sh, float phi, int sz, int rh, void* stream) {
   static_cast<cfunc_linerec*>(h)->backprojection_try(as_size(f), as_size(g), as_size(theta),
-                                                     as_size(sh), phi, sz, as_size(stream));
+                                                     as_size(sh), phi, sz, rh, as_size(stream));
 }
 
+// `rh` is a DEVICE array of per-slot reconstruction heights (one per tilt in
+// `phi` — the height depends on the tilt).
 void tomoxide_linerec_backproject_try_lamino(void* h, void* f, const void* g, const float* theta,
-                                             const float* phi, int sz, void* stream) {
+                                             const float* phi, int sz, const int* rh, void* stream) {
   static_cast<cfunc_linerec*>(h)->backprojection_try_lamino(as_size(f), as_size(g), as_size(theta),
-                                                            as_size(phi), sz, as_size(stream));
+                                                            as_size(phi), sz, as_size(rh),
+                                                            as_size(stream));
 }
 void tomoxide_linerec_free(void* h) { delete static_cast<cfunc_linerec*>(h); }
 

@@ -94,10 +94,16 @@ unsafe extern "C" {
         ncproj: usize,
         ncz: usize,
     ) -> *mut c_void;
-    /// `backprojection(f, g, theta, phi, gain, sz, stream)` (phi = π/2 for
+    /// `backprojection(f, g, theta, phi, gain, sz, rh, stream)` (phi = π/2 for
     /// parallel beam). `gain` is the caller's angular quadrature weight:
     /// π/nproj for the analytic FBP paths (the dθ weight), 1.0 for the
     /// iterative solvers (pure adjoint of `tomoxide_forwardproject`).
+    /// `rh` is the FULL reconstruction height in slices (`nz` for parallel
+    /// beam, [`super::lamino_recon_height`] for laminography): the volume z
+    /// `tz + sz` is centred on `rh/2` — the volume's own midpoint — while the
+    /// detector row stays centred on `nz/2`, matching the Fourier (USFFT)
+    /// laminography reconstruction. For parallel beam `rh == nz` reproduces
+    /// the old expression exactly.
     pub fn tomoxide_linerec_backproject(
         handle: *mut c_void,
         f: *mut c_void,
@@ -106,6 +112,7 @@ unsafe extern "C" {
         phi: f32,
         gain: f32,
         sz: i32,
+        rh: i32,
         stream: *mut c_void,
     );
     /// Rotation-centre probe: back-project the single detector row `sz` once per
@@ -121,6 +128,10 @@ unsafe extern "C" {
     /// The two are therefore not bit-identical away from integer shifts — see
     /// [`super::center_probe`], which owns the shift↔centre mapping and documents
     /// the consequence.
+    ///
+    /// `sz` is a volume z (centred on `rh/2`, the full reconstruction height —
+    /// `nz` for parallel beam), not a detector row; see
+    /// [`tomoxide_linerec_backproject`].
     pub fn tomoxide_linerec_backproject_try(
         handle: *mut c_void,
         f: *mut c_void,
@@ -129,6 +140,7 @@ unsafe extern "C" {
         sh: *const f32,
         phi: f32,
         sz: i32,
+        rh: i32,
         stream: *mut c_void,
     );
     /// Laminography tilt probe: back-project the single detector row `sz` at
@@ -138,6 +150,9 @@ unsafe extern "C" {
     /// sinogram `[nz, nproj, n]`; `f` must be pre-zeroed (the kernel `+=`s).
     /// Carries the FBP dθ gain, so a slice matches the corresponding
     /// `Algorithm::Linerec` laminography reconstruction, not merely its shape.
+    /// `rh` is a device array `[ntilt]` of per-slot reconstruction heights
+    /// ([`super::lamino_recon_height`] of each tilt — the height depends on the
+    /// tilt): slot k's slice `sz` is a volume z centred on `rh[k]/2`.
     pub fn tomoxide_linerec_backproject_try_lamino(
         handle: *mut c_void,
         f: *mut c_void,
@@ -145,6 +160,7 @@ unsafe extern "C" {
         theta: *const f32,
         phi: *const f32,
         sz: i32,
+        rh: *const i32,
         stream: *mut c_void,
     );
 
@@ -154,7 +170,10 @@ unsafe extern "C" {
     /// Parallel-beam forward projection (Radon), the exact discrete transpose of
     /// `tomoxide_linerec_backproject`. `g` (output sinogram `[nz, nproj, n]`)
     /// must be pre-zeroed; the kernel only `atomicAdd`s into it. `f` is the input
-    /// volume `[nz, n, n]`, `phi = π/2` for parallel beam.
+    /// volume `[nz, n, n]`, `phi = π/2` for parallel beam. `rh` = full
+    /// reconstruction height the volume z is centred on (see
+    /// [`tomoxide_linerec_backproject`]); must match the back-projection's `rh`
+    /// so the pair stays an exact adjoint.
     pub fn tomoxide_forwardproject(
         g: *mut c_void,
         f: *const c_void,
@@ -164,6 +183,7 @@ unsafe extern "C" {
         ncz: i32,
         nz: i32,
         n: i32,
+        rh: i32,
         nproj: i32,
         stream: *mut c_void,
     );
@@ -829,6 +849,7 @@ unsafe extern "C" {
         phi: f32,
         gain: f32,
         sz: i32,
+        rh: i32,
         stream: *mut c_void,
     );
     pub fn tomoxide_linerec_fp16_free(handle: *mut c_void);

@@ -29,7 +29,13 @@ void __global__ fill_tex_ker(cudaSurfaceObject_t surf, real *data, int ncz, int 
 // tex2DLayered linear fetch (col = x, z = y, projection = layer). The texture
 // returns the filtered value in float for both dtypes (a 16F array is read and
 // filtered in float), so we accumulate in float at no extra conversion cost.
-void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *theta, float phi, float c, int sz, int ncz, int n, int nz, int nproj)
+// `rh` is the FULL reconstruction height in slices (== nz for parallel beam,
+// `lamino_recon_height` for laminography). The volume z is centred on rh/2 —
+// the volume's own midpoint — while the detector row stays centred on nz/2.
+// Centring z on nz/2 instead (the pre-fix convention) shifted every lamino
+// volume by (rh-nz)/2 slices against the Fourier (USFFT) reconstruction,
+// which has always centred on rh/2.
+void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *theta, float phi, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -67,7 +73,7 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
         R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
         R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
         float u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2;
-        float v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-nz/2) + nz/2;
+        float v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-rh/2) + nz/2;
 
         int ur = (int)(u-1e-5f);
         int vr = (int)(v-1e-5f);
@@ -86,7 +92,9 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
 
 #else // !HALF: f32 direct-gather back-projection (see note above)
 
-void __global__ backprojection_ker(real *f, real *data, float *theta, float phi, float c, int sz, int ncz, int n, int nz, int nproj)
+// `rh` = full reconstruction height; volume z centres on rh/2, detector row on
+// nz/2 (see the note on `backprojection_tex_ker`).
+void __global__ backprojection_ker(real *f, real *data, float *theta, float phi, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -128,7 +136,7 @@ void __global__ backprojection_ker(real *f, real *data, float *theta, float phi,
         R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
         R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
         u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2;
-        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-nz/2) + nz/2;
+        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-rh/2) + nz/2;
 
         ur = (int)(u-1e-5f);
         vr = (int)(v-1e-5f);
@@ -149,7 +157,9 @@ void __global__ backprojection_ker(real *f, real *data, float *theta, float phi,
 
 #endif // HALF
 
-void __global__ backprojection_try_ker(real *f, real *data, float *theta, float phi, float c, int sz, float* sh, int ncz, int n, int nz, int nproj)
+// `rh` = full reconstruction height; the probed slice `sz` is a volume z and
+// centres on rh/2 (see the note on `backprojection_tex_ker`).
+void __global__ backprojection_try_ker(real *f, real *data, float *theta, float phi, float c, int sz, float* sh, int ncz, int n, int nz, int rh, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -188,7 +198,7 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
         R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
         R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
         u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2-sh[tz];
-        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(sz-nz/2) + nz/2;
+        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(sz-rh/2) + nz/2;
         
         ur = (int)(u-1e-5f);
         vr = (int)(v-1e-5f);            
@@ -207,7 +217,10 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
     }
     f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
 }
-void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta, float* phi, float c, int sz, int ncz, int n, int nz, int nproj)
+// `phi` and `rh` are per-tz: each tz slot probes one tilt candidate, and the
+// full reconstruction height depends on the tilt (`lamino_recon_height`), so
+// each candidate's slice `sz` centres on its own rh[tz]/2.
+void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta, float* phi, float c, int sz, const int* rh, int ncz, int n, int nz, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -247,7 +260,7 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
         R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
         R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
         u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2;
-        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(sz-nz/2) + nz/2;
+        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(sz-rh[tz]/2) + nz/2;
         
         ur = (int)(u-1e-5f);
         vr = (int)(v-1e-5f);                                    

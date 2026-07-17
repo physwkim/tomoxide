@@ -25,15 +25,18 @@ All notable changes to this project are documented here. The format is based on
   The verdict is one uniform test — does this lobe own at least 20 % of the
   curve's height? — asked of the winner and of every other lobe. It replaces an
   edge check, which measurement showed is blind to both ways a real sweep fails.
-  On the aligned pouch scan (known axis 396, tilt 44°), swept ±40 px: on the
-  rh/2 plane the curve carries **three** lobes and the highest is 417 — 21 px
+  On the aligned pouch scan (known axis 396, tilt 44°), swept ±40 px: on one
+  probed slice the curve carries **three** lobes and the highest is 417 — 21 px
   wrong, interior, beating the truth by 0.34 %, so no edge check can fire
-  (`Ambiguous`, naming 396 as the strongest rival at 55 % prominence). On the
-  sample plane the curve instead rises across the whole window and turns over one
+  (`Ambiguous`, naming 396 as the strongest rival at 55 % prominence). On
+  another the curve instead rises across the whole window and turns over one
   sample *short* of the edge at 435 — an interior maximum with no rival to
   contradict it, and still nothing but the range running out (`Railed`). Both are
   the same fact: the winner owns no lobe of its own. Narrowed to ±8 px around a
-  prior, the same curve resolves 395.75 at 83 %.
+  prior, the same curve resolves 395.75 at 83 %. (These sweeps predate the
+  z-centring fix below, which found the probe's slice index offset by
+  `(rh − nz)/2` from the volume z it claimed — the curve shapes and their
+  verdicts, not the planes' names, are what these measurements establish.)
 - **`tomoxide align` — the alignment workflow as a subcommand**, plus the two
   library pieces it stands on. `recon::center::find_center_rings` is the ring
   estimator from `docs/LAMINOGRAPHY_ALIGNMENT.md` §1: the 360° mean projection is
@@ -253,6 +256,28 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Laminography volume z-centring unified: a slice index — and the probes'
+  `sz` — now names the same volume z in every algorithm.** The linerec-family
+  CUDA kernels (back-projection, both try-probes, and the forward projector)
+  centred the volume z on `nz/2`, the detector-row midpoint, while the
+  Fourier/USFFT path centres it on `rh/2`, the volume's own midpoint — so for a
+  tilted axis (`rh > nz`) every Linerec/Fbp/SIRT laminography volume, and every
+  probe slice, sat `(rh − nz)/2` slices off the Fourierrec volume of the same
+  data: 200 slices on the reference pouch scan (rh 1424, nz 1024). This is the
+  defect behind the centre sweep's slice dependence — a probe pointed at the
+  "middle of the volume" was in fact scoring 200 slices above it. Every kernel
+  now takes the full reconstruction height and centres z on `rh/2`; the parallel
+  beam passes `rh == nz`, so that path is bit-identical, and the tilt probe
+  carries a per-tilt height (the in-focus height depends on the tilt). A new
+  test (`cuda_lamino_z_convention`) pins the convention by placing a slab at a
+  known off-centre z and requiring Linerec and Fourierrec to put its peak at
+  the same volume z — it fails under the old centring. `tomoxide align` now
+  defaults the centre-sweep slice to the `--focus_z` band's midpoint — the
+  plane the sample occupies — falling back to `rh/2` (`--focus_z` no longer
+  requires `--tilt_width`). Validated on the reference scan: probed at the band
+  midpoint (slice 890) the sweep resolves **395.00** against the known 396;
+  probed at the empty volume midpoint the focus response is ~100× weaker and
+  `judge_sweep` refuses the railed curve instead of reporting a number.
 - **`align` and the GUI Center screen applied minus-log twice.** Both preceded
   their reconstructions with `normalize_dataset` — which already ends in the
   minus-log — and then called `minus_log` again. `−log` of a line integral

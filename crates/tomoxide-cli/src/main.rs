@@ -60,9 +60,11 @@ enum Command {
         /// Input DXchange HDF5 file.
         file: PathBuf,
         /// Output slice to refine on: a row of the reconstruction, `[0, nz)` for
-        /// parallel beam and `[0, rh)` for laminography. Default: the middle of
-        /// the volume. It must be a slice the sample actually occupies — check
-        /// the -v focus curve, a flat one means this slice is empty.
+        /// parallel beam and `[0, rh)` for laminography — the same volume z a
+        /// reconstruction's slice index means, in any algorithm. Default: the
+        /// midpoint of `--focus_z` if given, else the middle of the volume. It
+        /// must be a slice the sample actually occupies — check the -v focus
+        /// curve, a flat one means this slice is empty.
         #[arg(long)]
         slice: Option<usize>,
         /// Average every Nth projection for the ring estimate.
@@ -95,13 +97,13 @@ enum Command {
         /// worth the reconstruction each step costs.
         #[arg(long, default_value_t = 1.0)]
         tilt_step: f32,
-        /// Score the tilt scan only inside this sample z-band, `LO:HI` inclusive,
-        /// read off a reconstruction at `--lamino_angle`. Give it whenever you
-        /// can: without it the score is the max over the whole volume, and on
-        /// real data the focus metric ranks noise planes above the sample
-        /// (measured 1.7×), which drowns the tilt signal. The band follows the
-        /// tilt into each candidate's volume by itself — the sample's detector
-        /// rows do not move, so no candidate escapes it.
+        /// The sample's z-band, `LO:HI` inclusive, read off a reconstruction at
+        /// `--lamino_angle`. Its midpoint becomes the centre sweep's slice
+        /// (unless `--slice` overrides), and a tilt scan (`--tilt_width`) scores
+        /// only inside it — the band follows the tilt into each candidate's
+        /// volume by itself, since the sample's detector rows do not move.
+        /// Useful wherever structured noise competes with the sample for the
+        /// focus score.
         #[arg(long, value_parser = parse_zband)]
         focus_z: Option<(usize, usize)>,
         /// Ignore the ring estimate's misalignment flag and refine anyway.
@@ -839,14 +841,8 @@ fn run_align(
              no tilt to search."
         );
     }
-    // The band scores the tilt scan; accepting it without one would silently do
-    // nothing, which reads as \"the band was applied\".
-    if focus_z.is_some() && tilt_width.is_none() {
-        anyhow::bail!(
-            "--focus_z restricts the tilt scan's scoring, and no tilt scan was requested.\n\
-             Add --tilt_width to scan the tilt, or drop --focus_z."
-        );
-    }
+    // The band also anchors the centre sweep (its midpoint is the default
+    // `--slice`), so unlike before it is meaningful without a tilt scan.
 
     let path = file.to_string_lossy().to_string();
     let engine = Engine::new(backend_kind)?;
@@ -921,20 +917,20 @@ fn run_align(
     };
     // `sz` indexes the output volume: rows `[0, nz)` for parallel beam, `[0, rh)`
     // for laminography, whose depth exceeds the detector's because the tilt
-    // stretches it. So the default is the middle of the volume, not the middle
-    // of the detector — those coincide only at zero tilt.
+    // stretches it. Since the z-centring unification it is the same volume z in
+    // every algorithm — a Fourierrec slice index names the same plane here.
     //
-    // Do not "correct" this to nz/2 by reading the kernel's
-    // `v = sin(phi)·(sz − nz/2) + nz/2` and concluding sz = nz/2 is the sample
-    // plane. That arithmetic is right and the conclusion is wrong: it assumes the
-    // sample sits on the detector's centre row. On the pouch scans it does not —
-    // at nz/2 = 512 the centre focus curve is flat to 1.8 % and rails, while at
-    // rh/2 = 712 it peaks at 395.87 against a known 396. Which plane holds the
-    // sample is a property of the scan; use --slice when the default misses it,
-    // and read the -v curve to tell a peak from a flat line.
-    let sz = slice.unwrap_or_else(|| match lamino_angle {
-        Some(deg) => tomoxide::cuda::lamino_recon_height(nz, deg) / 2,
-        None => nz / 2,
+    // The centre response lives where the sample is, and which plane holds the
+    // sample is a property of the scan, not of the geometry — so when the user
+    // states the sample band (`--focus_z`, read off a reconstruction at
+    // `--lamino_angle`), its midpoint is the default slice. Without a band the
+    // only neutral default is the middle of the volume; read the -v curve to
+    // tell a peak from a flat line (flat = the slice is empty; give --focus_z
+    // or --slice).
+    let sz = slice.unwrap_or_else(|| match (focus_z, lamino_angle) {
+        (Some((lo, hi)), _) => (lo + hi) / 2,
+        (None, Some(deg)) => tomoxide::cuda::lamino_recon_height(nz, deg) / 2,
+        (None, None) => nz / 2,
     }) as i32;
     let depth = match lamino_angle {
         Some(deg) => tomoxide::cuda::lamino_recon_height(nz, deg),
