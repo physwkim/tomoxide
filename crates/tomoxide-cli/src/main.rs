@@ -825,7 +825,7 @@ fn run_align(
     force: bool,
 ) -> anyhow::Result<()> {
     use tomoxide::geometry::{Angles, Beam, Center, Detector, Geometry};
-    use tomoxide::prep::normalize::{minus_log, normalize_dataset};
+    use tomoxide::prep::normalize::normalize_dataset;
     use tomoxide::recon::center::{find_center_rings, lamino_tilt_scan, slice_focus, SampleBand};
     use tomoxide::ReconParams;
 
@@ -854,7 +854,6 @@ fn run_align(
     let theta = reader.read_theta()?;
     let mut ds = reader.read_all()?;
     normalize_dataset(&mut ds, engine.backend())?;
-    minus_log(&mut ds.data, engine.backend())?;
 
     // --- step 1: the rings. One pass, and the acquisition check. ---
     let ring = find_center_rings(&ds.data, engine.backend(), ring_step)?;
@@ -998,10 +997,10 @@ fn run_align(
                 None => println!(
                     "  Each candidate is a FULL reconstruction ({nproj} projections, \
                      {nx}×{nx}×~{depth}) scored\n  by the max focus over every one of its \
-                     slices. Minutes per tilt, not seconds.\n  NOTE: whole-volume focus is \
-                     noise-prone — on real data the metric ranks noise planes\n  above the \
-                     sample. Read the sample's z range off the focus-by-slice curve (or a\n  \
-                     reconstruction) and pass it as --focus_z LO:HI."
+                     slices. Minutes per tilt, not seconds.\n  Optional: --focus_z LO:HI \
+                     confines the score to the sample's own slices (read\n  the range off \
+                     the focus-by-slice curve below) — useful where structured noise\n  \
+                     competes with the sample."
                 ),
             }
             let t_start = Instant::now();
@@ -1070,8 +1069,8 @@ fn run_align(
          axis rather than searching for one. The tilt is the opposite on both\n\
          counts — ~2 % per 1°, and it drags the in-focus layer through z (measured: z_peak\n\
          800 -> 1120 as tilt went 40° -> 58°) — so a fixed slice scores a plane whose error\n\
-         swamps the signal; a full reconstruction ranks it, scored inside the sample's\n\
-         z band (--focus_z), because the focus metric ranks noise planes above the sample.\n\
+         swamps the signal; a full reconstruction ranks it, by the max focus over its\n\
+         slices or inside the sample's z band (--focus_z) where noise competes.\n\
          docs/LAMINOGRAPHY_ALIGNMENT.md §2 and §4. If the tilt moved far, the centre was\n\
          scored under the old one: re-run with the new --lamino_angle. Use -v for the focus\n\
          curves, and confirm on a montage before committing a full reconstruction (§3)."
