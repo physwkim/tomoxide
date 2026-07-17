@@ -284,10 +284,16 @@ pub enum SweepVerdict {
         /// The candidate itself.
         value: f32,
     },
-    /// The maximum landed on the first or last candidate, so the search stopped
-    /// before the metric did. **The true peak is at the edge or beyond it and
-    /// there is no way to tell which from inside the range**, so this is not an
-    /// optimum, it is the range running out. Widen it or recentre it.
+    /// The curve rises to an edge and never comes back down, so the search
+    /// stopped before the metric did. **The true peak is at that edge or beyond
+    /// it and there is no way to tell which from inside the range**, so this is
+    /// not an optimum, it is the range running out. Widen it or recentre it.
+    ///
+    /// Landing exactly on the first or last candidate is the obvious shape. It is
+    /// not the only one: a curve that climbs across the whole window and turns
+    /// over one sample short of the edge has an *interior* maximum and no second
+    /// lobe to contradict it, and it is still a range that ran out. Both are the
+    /// same fact — the winner owns no lobe of its own — and both land here.
     Railed {
         /// Index into the candidate/score arrays.
         index: usize,
@@ -347,16 +353,22 @@ impl SweepVerdict {
     }
 }
 
-/// A lobe whose prominence reaches this fraction of the winner's own is a
-/// competitor the metric has not ruled out.
+/// The share of a curve's full height that a lobe must own to be taken
+/// seriously. One bar, applied to every lobe including the winner, which is what
+/// makes the two failures below the same test rather than two special cases:
 ///
-/// Calibrated on the pouch-cell centre sweep at tilt 44°, where the winner (417)
-/// is contradicted by the known-correct lobe at 396 standing at **55 %** of its
-/// prominence, a further lobe at 374 at **25 %**, and a shoulder at the range
-/// edge at 18 %. The ±8 px sweep around a good prior, which does resolve, has no
-/// second lobe at all — so this threshold only ever arbitrates curves that
-/// already have competing lobes, and its job there is to ignore noise wiggles.
-const RIVAL_PROMINENCE: f64 = 0.2;
+/// * the **winner** below it owns no lobe of its own — it is the top of a ramp,
+///   and a curve that only rises is a range that ran out;
+/// * any **other** lobe above it is a competitor the metric has not ruled out.
+///
+/// Calibrated on measured pouch-cell centre sweeps at tilt 44°, in units of the
+/// curve's height. The ±40 px sweep on the rh/2 plane: winner (417) **35 %**,
+/// the known-correct lobe at 396 **55 %**, a third lobe at 374 **25 %**, a
+/// shoulder at the range edge **0 %** — three competitors, no answer. The same
+/// ±40 px sweep on the sample plane: winner (435) **0.29 %**, a ramp. The ±8 px
+/// sweep around a good prior, which does resolve: winner **83 %**, no second lobe
+/// at all.
+const SIGNIFICANT_PROMINENCE: f64 = 0.2;
 
 /// Indices of the local maxima of `score`, one per lobe.
 ///
@@ -383,29 +395,33 @@ fn local_maxima(score: &[f64]) -> Vec<usize> {
     out
 }
 
-/// Topographic prominence of the lobe at `i`: how far it stands above the highest
-/// saddle that connects it to higher ground. A lobe with no higher ground either
-/// way is the global maximum, and its prominence is measured from the floor of
-/// the window.
+/// How far the lobe at `i` stands above the higher of the two troughs flanking
+/// it, where each side is walked until **either** higher ground **or** the
+/// window's edge, whichever comes first.
+///
+/// Stopping at the edge is what makes this uniform, and the uniformity is the
+/// point. Textbook topographic prominence has no higher ground to find for the
+/// global maximum and so measures it from the floor of the window — which hands
+/// the top of a *ramp* the window's entire height and makes a curve that only
+/// rises look like the most prominent lobe there is. That is backwards: a curve
+/// that never comes back down is a range that ran out. Here it scores ~0, and the
+/// same arithmetic serves the winner and its rivals alike.
 fn prominence(score: &[f64], i: usize) -> f64 {
-    let mut col: Option<f64> = None;
+    let mut col = f64::NEG_INFINITY;
     for dir in [-1i64, 1] {
         let mut j = i as i64 + dir;
         let mut low = score[i];
         while j >= 0 && (j as usize) < score.len() {
             let v = score[j as usize];
             if v > score[i] {
-                col = Some(col.map_or(low, |c: f64| c.max(low)));
                 break;
             }
             low = low.min(v);
             j += dir;
         }
+        col = col.max(low);
     }
-    match col {
-        Some(c) => score[i] - c,
-        None => score[i] - score.iter().copied().fold(f64::INFINITY, f64::min),
-    }
+    score[i] - col
 }
 
 /// Judge what a sweep's focus curve established: one answer, or one of the three
@@ -438,22 +454,30 @@ pub fn judge_sweep(cands: &[f32], score: &[f64]) -> Option<SweepVerdict> {
         })
         .0;
     let value = cands[index];
-    // One candidate is a pin, not a sweep: no curve to be flat, railed or
-    // ambiguous, and the caller already chose it.
-    if cands.len() < 2 {
+    // Fewer than three candidates is all boundary: there is no interior for a
+    // lobe to sit in, so there is no curve to judge. One candidate is a pin the
+    // caller already chose; two is a comparison, not a sweep.
+    if cands.len() < 3 {
         return Some(SweepVerdict::Resolved { index, value });
     }
     // Before the rail check, not after: the argmax of a flat curve is its first
     // entry, which sits on the boundary, so a flat sweep would otherwise be
     // reported as a range that ran out. Nothing ran out — nothing responded.
     // `is_nan()` as well as `<= 0.0`: a reconstruction carrying NaN scores NaN,
-    // which is no more a lobe than a flat curve is, and `<= 0.0` alone is false
+    // which is no more a curve than a flat one is, and `<= 0.0` alone is false
     // for NaN.
-    let winner = prominence(score, index);
-    if winner.is_nan() || winner <= 0.0 {
+    let height = score[index] - score.iter().copied().fold(f64::INFINITY, f64::min);
+    if height.is_nan() || height <= 0.0 {
         return Some(SweepVerdict::Flat { index, value });
     }
-    if cands.len() > 2 && (index == 0 || index == cands.len() - 1) {
+    let winner = prominence(score, index);
+    // Two ways the range can run out, and only the first is visible as an index.
+    // The second: the curve rises across the whole window and turns over just shy
+    // of the edge, so the maximum is interior and there is no second lobe to
+    // contradict it. Measured on the sample plane of the aligned reference scan —
+    // a ±40 px sweep rising to index 79 of 80, naming 435 against a known 396 and
+    // owning 0.29 % of the curve's height. That share is what tells it from a peak.
+    if index == 0 || index == cands.len() - 1 || winner < SIGNIFICANT_PROMINENCE * height {
         return Some(SweepVerdict::Railed { index, value });
     }
     let mut rivals: Vec<Rival> = local_maxima(score)
@@ -461,7 +485,7 @@ pub fn judge_sweep(cands: &[f32], score: &[f64]) -> Option<SweepVerdict> {
         .filter(|&i| i != index)
         .filter_map(|i| {
             let p = prominence(score, i);
-            (p >= RIVAL_PROMINENCE * winner).then_some(Rival {
+            (p >= SIGNIFICANT_PROMINENCE * height).then_some(Rival {
                 index: i,
                 value: cands[i],
                 prominence: p,
@@ -2118,6 +2142,53 @@ mod tests {
             );
             assert_eq!(v.resolved(), None);
         }
+    }
+
+    /// The measured ±40 px centre sweep on the **sample plane** (z=899, the round
+    /// particles of the eye check) of the aligned pouch scan, tilt 44°, known axis
+    /// 396. In units of 1e-7.
+    ///
+    /// A range that ran out without landing on a candidate index: the curve climbs
+    /// across the whole window and turns over one sample short of the far edge.
+    const RAMP: [f64; 81] = [
+        4.1183, 4.1169, 4.1190, 4.1315, 4.1298, 4.1197, 4.1210, 4.1252, 4.1388, 4.1493, 4.1455,
+        4.1588, 4.1625, 4.1693, 4.1633, 4.1294, 4.1122, 4.1089, 4.0989, 4.0949, 4.1065, 4.1236,
+        4.1347, 4.1329, 4.1241, 4.1348, 4.1513, 4.1504, 4.1573, 4.1552, 4.1551, 4.1665, 4.1770,
+        4.1792, 4.1778, 4.1795, 4.1852, 4.1893, 4.1866, 4.1959, 4.2149, 4.2293, 4.2380, 4.2457,
+        4.2510, 4.2529, 4.2503, 4.2527, 4.2580, 4.2700, 4.2708, 4.2754, 4.2911, 4.3181, 4.3312,
+        4.3420, 4.3433, 4.3342, 4.3294, 4.3467, 4.3753, 4.3886, 4.4000, 4.4071, 4.4062, 4.3896,
+        4.3878, 4.3984, 4.4147, 4.4216, 4.4220, 4.4096, 4.4092, 4.4127, 4.4103, 4.4205, 4.4423,
+        4.4492, 4.4645, 4.4749, 4.4738,
+    ];
+
+    /// The edge check alone cannot see a range that ran out, and this is the curve
+    /// that proves it: the maximum is **interior** (index 79 of 80), so no index
+    /// test fires, and the curve carries no second lobe, so no rival contradicts
+    /// it. It is still nothing but a climb to the edge, and the answer it names —
+    /// 435 against a known 396 — is 39 px wrong.
+    ///
+    /// What separates it from a peak is the one bar every lobe is held to: the
+    /// winner stands 0.29 % of the curve's height above the trough that flanks it
+    /// on the right, because there is no trough on the right — only one more
+    /// sample, and then the range ends.
+    #[test]
+    fn judge_sweep_does_not_answer_from_a_curve_that_only_climbs() {
+        let cands: Vec<f32> = (0..81).map(|k| 356.0 + k as f32).collect();
+        let v = judge_sweep(&cands, &RAMP).unwrap();
+        assert!(
+            matches!(v, SweepVerdict::Railed { index: 79, .. }),
+            "an interior maximum one sample short of the edge is still the range \
+             running out, got {v:?}"
+        );
+        assert_eq!(v.resolved(), None, "435 is 39 px from the known 396");
+
+        // Not by luck of the grid: drop the one sample past the peak and the same
+        // curve rails on the index instead. Both shapes, one verdict.
+        let v = judge_sweep(&cands[..80], &RAMP[..80]).unwrap();
+        assert!(
+            matches!(v, SweepVerdict::Railed { index: 79, .. }),
+            "got {v:?}"
+        );
     }
 
     /// A curve that never moved says nothing, and its argmax is just its first

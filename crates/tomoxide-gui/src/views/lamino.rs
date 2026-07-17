@@ -64,8 +64,8 @@ fn verdict_line(
         SweepVerdict::Railed { value, .. } => (
             egui::Color32::LIGHT_RED,
             format!(
-                "The sweep peaked at {value:.2}{unit}, the edge of its own range \
-                 [{lo:.2}, {hi:.2}] — that is the range running out, not an optimum. \
+                "The sweep peaked at {value:.2}{unit} without ever coming back down inside its \
+                 own range [{lo:.2}, {hi:.2}] — that is the range running out, not an optimum. \
                  Widen ± or recentre it."
             ),
         ),

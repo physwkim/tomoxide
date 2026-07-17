@@ -15,6 +15,25 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **`recon::center::judge_sweep` — a focus sweep's verdict, not just its
+  argmax.** Returns `SweepVerdict::{Resolved, Railed, Ambiguous, Flat}`, and only
+  `Resolved` carries a value (`SweepVerdict::resolved()`); `best()` exists to
+  *show* the winner on a plot or montage, never to adopt it. Every caller — `align`,
+  the GUI's centre and tilt steps — now refuses rather than reports a number the
+  curve did not establish, which matters because a bad axis silently poisons the
+  tilt search that consumes it.
+  The verdict is one uniform test — does this lobe own at least 20 % of the
+  curve's height? — asked of the winner and of every other lobe. It replaces an
+  edge check, which measurement showed is blind to both ways a real sweep fails.
+  On the aligned pouch scan (known axis 396, tilt 44°), swept ±40 px: on the
+  rh/2 plane the curve carries **three** lobes and the highest is 417 — 21 px
+  wrong, interior, beating the truth by 0.34 %, so no edge check can fire
+  (`Ambiguous`, naming 396 as the strongest rival at 55 % prominence). On the
+  sample plane the curve instead rises across the whole window and turns over one
+  sample *short* of the edge at 435 — an interior maximum with no rival to
+  contradict it, and still nothing but the range running out (`Railed`). Both are
+  the same fact: the winner owns no lobe of its own. Narrowed to ±8 px around a
+  prior, the same curve resolves 395.75 at 83 %.
 - **`tomoxide align` — the alignment workflow as a subcommand**, plus the two
   library pieces it stands on. `recon::center::find_center_rings` is the ring
   estimator from `docs/LAMINOGRAPHY_ALIGNMENT.md` §1: the 360° mean projection is
