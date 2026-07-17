@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **`tomoxide-gui`'s live-test dev-dependency `epics-pva-rs` is now `0.24`**
+  (was `0.21`). The in-process test server and rsdm's internal pvAccess client
+  (`^0.21` at the pinned rsdm) are coupled only by a TCP address, so the two
+  copies coexist and talk wire protocol — verified by the live source tests.
 - **`tomoxide-gui` now depends on `rsplot` / `rsdm` `=0.5.2`** (was `=0.5.0`).
   0.5.1 adds the `VolumeRaycaster` widget the XANES 3-D chemical-map view uses
   and 0.5.2 hardens it; the GUI builds against crates.io again, with the
