@@ -1018,8 +1018,9 @@ fn run_align(
         "\nThe centre is scored on one output slice, the tilt on the best slice of a whole\n\
          reconstruction, and the asymmetry is the physics rather than an optimisation that\n\
          was skipped. The centre is an in-plane shift: it leaves the in-focus layer where\n\
-         it is, and its response is sharp (~40 % per 50 px), so one slice ranks it and a\n\
-         probe sweeps every candidate in a single launch. The tilt is the opposite on both\n\
+         it is, so one slice ranks it and a probe sweeps every candidate in a single\n\
+         launch — but only near the answer, which is why --center_width refines the rings'\n\
+         axis rather than searching for one. The tilt is the opposite on both\n\
          counts — ~2 % per 1°, and it drags the in-focus layer through z (measured: z_peak\n\
          800 -> 1120 as tilt went 40° -> 58°) — so a fixed slice scores a plane whose error\n\
          swamps the signal, and only the max over the whole z range ranks it.\n\

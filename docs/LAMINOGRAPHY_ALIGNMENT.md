@@ -130,10 +130,23 @@ which is the point of running both.
 
 ## 4. Fine 2D refine
 
-Only now refine `(center, tilt)` together on a small grid. Expect the tilt
-response to be broad: on the example data, tilt 44/45/46 spanned 5.84/5.92/5.76
-(×1e-7) — a ±1° error costs ~2%, while a 50 px center error costs ~40%. Center
-first, tilt second.
+Only now refine `(center, tilt)` together on a **small** grid. Small is the whole
+point: both responses are broad, so a wide grid does not find an answer faster, it
+finds a wrong one.
+
+- Tilt: on the example data, 44/45/46 spanned 5.84/5.92/5.76 (×1e-7) — a ±1° error
+  costs ~2%.
+- Center: no sharper. Do not read the ~40%-per-50px figure that used to sit here —
+  it was never measured. What was: on the aligned pouch scan (known axis 396,
+  tilt 44°), a **21 px** error cost **0.34%**, and widening the sweep to ±40 px grew
+  the curve **three** lobes whose highest stood at 417 — the wrong one, by a margin
+  no rail check can see. Narrowed to ±8 px around the axis from §1, the same code
+  returns 395.75.
+
+So a `(center, tilt)` sweep **refines a prior; it does not find one**. Get the
+center from §1's rings first, tilt second, and keep both grids tight enough that
+there is only one lobe in them. `recon::center::judge_sweep` enforces this — it
+returns no value from a curve with a rival lobe, and none from one that only rises.
 
 ---
 

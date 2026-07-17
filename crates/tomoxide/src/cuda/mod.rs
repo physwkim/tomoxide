@@ -147,9 +147,12 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 ///
 /// Use it where the plane is known and fixed: refining a tilt after a
 /// full-volume z-max has located `z_peak`, or on a sample whose layer is known.
-/// For the rotation centre — an in-plane shift, which does not move `z_peak`,
-/// and whose response is ~40 % per 50 px — a fixed `sz` is sound; see
-/// [`center_probe_sweep`], which `tomoxide align` uses for exactly that.
+/// The rotation centre is an in-plane shift and does not move `z_peak`, so a
+/// fixed `sz` does rank centre candidates — but only **near the answer**. On the
+/// aligned reference scan at `sz = rh/2`, the curve resolves the known axis to
+/// 0.25 px over ±8 px, and over ±40 px grows a rival lobe 21 px away that
+/// outscores it by 0.34 %. So [`center_probe_sweep`] refines a prior; it does not
+/// find one, and `tomoxide align` uses it that way.
 ///
 /// The images carry the same orientation and dθ scale as `Algorithm::Linerec`
 /// laminography, so a slice here is the slice that reconstruction produces at

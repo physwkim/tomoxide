@@ -116,7 +116,15 @@ pub enum Job {
     /// Probe-sweep the rotation axis over `centers` on output slice `slice`
     /// (`None` ⇒ the middle of the volume) at `tilt_deg` → the montage +
     /// focus curve of [`Event::LaminoCenterSweep`]. One launch for the whole
-    /// sweep: the centre is an in-plane shift, so one slice ranks it.
+    /// sweep: the centre is an in-plane shift, so it does not move the in-focus
+    /// layer and one slice can rank it.
+    ///
+    /// Ranking is all it does. Over a wide `centers` the focus curve grows
+    /// competing lobes and its highest one is measurably not the axis (on the
+    /// aligned reference scan: 417 over a known 396, by 0.34 %), so this
+    /// **refines a prior** — the axis from step 1 — rather than searching for
+    /// one. [`tomoxide::recon::center::judge_sweep`] is what enforces that; see
+    /// its verdicts before adopting anything from here.
     LaminoCenterSweep {
         tilt_deg: Option<f32>,
         slice: Option<usize>,

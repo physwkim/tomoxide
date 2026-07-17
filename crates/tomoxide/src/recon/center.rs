@@ -546,8 +546,10 @@ pub struct TiltFocus {
 /// pouch scans that sweep returns 48° or rails to the range edge depending only
 /// on which row was picked. Taking the max over z needs every (tilt, z) pair,
 /// which is exactly the work the probe skips, so the probe buys nothing here.
-/// The centre is the opposite case — an in-plane shift does not move the layer,
-/// and its response is ~40 % per 50 px — and that is what the probe is for.
+/// The centre is the opposite case: an in-plane shift does not move the layer, so
+/// one probe launch can rank every candidate — but only within a few px of the
+/// answer, so that probe refines a prior rather than finding one. See
+/// [`cuda::center_probe_sweep`](crate::cuda::center_probe_sweep).
 ///
 /// `geom`'s beam is ignored; `tilts_deg` supplies it. `params.lamino_rh` is
 /// honoured if set, but leaving it `None` lets each tilt take its own natural

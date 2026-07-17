@@ -50,11 +50,14 @@ All notable changes to this project are documented here. The format is based on
   a naive sub-pixel sweep ranks integer offsets artificially sharp;
   `center_probe_sweep` removes that by construction, issuing one probe per
   fractional lattice, and never producing the biased slices at all. End to end on
-  the aligned pouch scan: `--center 395.87` against a known 396.
+  the aligned pouch scan, swept ±8 px around the axis read off the rings:
+  `--center 395.87` against a known 396. Around a *prior* is the whole contract —
+  the same sweep widened to ±40 px grows three lobes and picks 417, and that is
+  what `judge_sweep` above now refuses rather than returns.
   The two axes are searched by different machinery, and the asymmetry is physics,
   not an optimisation left undone. A fixed slice is sound for the centre — an
-  in-plane shift does not move the in-focus layer, and the centre response is
-  sharp (~40 % per 50 px) — and unsound for the tilt, whose response is broad
+  in-plane shift does not move the in-focus layer, so one slice can rank the
+  candidates — and unsound for the tilt, whose response is broad
   (~2 % per degree) while the in-focus layer moves in z with it (`z_peak` 800 →
   1120 as tilt went 40° → 58°), so a fixed slice scores the wrong plane by more
   than the tilt signal is worth. Measured: a fixed-slice tilt sweep returns 48° at

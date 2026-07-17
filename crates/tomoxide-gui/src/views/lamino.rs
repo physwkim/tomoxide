@@ -18,8 +18,12 @@
 //!    arcs that never close mean it was not, and no reconstruction geometry
 //!    repairs that. The number cannot show you an arc.
 //! 2. **Centre** — one probe launch sweeps every candidate, because an in-plane
-//!    shift leaves the in-focus layer where it is and its response is sharp
-//!    (~40 % per 50 px).
+//!    shift leaves the in-focus layer where it is. This step **refines step 1's
+//!    prior; it does not find the axis.** Measured on the reference scan: at
+//!    ±40 px the curve carries three lobes and its winner (417) outscores the
+//!    known-correct 396 by 0.34 %, with neither at an edge — so the picture, not
+//!    a rail check, is what shows you the sweep is lost. At ±8 px around the
+//!    rings' answer it is one lobe, 0.25 px from the truth.
 //! 3. **Tilt** — a FULL reconstruction per candidate, scored by the max focus
 //!    over every slice (§2). The tilt drags the in-focus layer through z, so a
 //!    fixed slice cannot rank it. Minutes per candidate, hence the cancel.
@@ -151,6 +155,10 @@ pub struct LaminoView {
     z_curve: Option<ItemHandle>,
     /// Set by "Use in Tune"; the app shell takes it and applies it.
     accepted: Option<f32>,
+    /// The user overrode an untrustworthy ring prominence by looking at the
+    /// image. §1 makes the eye the authority, so the heuristic must not be able to
+    /// lock out someone who can see closed rings — see [`LaminoView::have_prior`].
+    rings_closed_by_eye: bool,
 }
 
 impl LaminoView {
@@ -200,7 +208,12 @@ impl LaminoView {
             z_plot,
             z_curve: None,
             accepted: None,
+            rings_closed_by_eye: false,
         }
+    }
+
+    fn have_prior(&self) -> bool {
+        have_prior(self.rings.as_ref(), self.rings_closed_by_eye)
     }
 
     pub fn on_dataset(&mut self, meta: &DatasetMeta) {
@@ -515,6 +528,13 @@ impl LaminoView {
                      signature of a scan mis-aligned at acquisition, which no reconstruction \
                      geometry repairs. Look at the image before spending a sweep on it.",
                 );
+                // §1 makes the eye the authority and the prominence a hint, so the
+                // hint must not be able to lock out someone who can see closed
+                // rings. It only unlocks step 2 — it does not make the number green.
+                ui.checkbox(
+                    &mut self.rings_closed_by_eye,
+                    "The rings are closed — I have looked at the image",
+                );
             }
             ui.allocate_ui(egui::vec2(ui.available_width(), 320.0), |ui| {
                 super::show_image_view_with_value(ui, &mut self.mean_view);
@@ -523,10 +543,14 @@ impl LaminoView {
     }
 
     fn step_center(&mut self, ui: &mut egui::Ui, jobs: &Sender<Job>) {
-        ui.heading("2 · Centre — one launch for the whole sweep");
+        ui.heading("2 · Centre — refine the prior from step 1");
         ui.label(
-            "The centre is an in-plane shift: it leaves the in-focus layer where it is, and \
-             its response is sharp, so a single slice ranks every candidate.",
+            "This sweep refines an axis you already have to within a few px; it does not find \
+             one. Measured on the reference scan: over ±40 px the focus curve grows a second \
+             lobe that outscores the correct axis by 0.34 %, and no rail check can see it, \
+             because neither lobe is at an edge. Over ±8 px around the rings' answer the same \
+             curve has one lobe and lands 0.25 px from the known axis. Keep ± small, and get the \
+             prior from the rings.",
         );
         ui.horizontal(|ui| {
             ui.label("tilt");
@@ -562,13 +586,18 @@ impl LaminoView {
             } else {
                 ui.label("auto (middle of the volume)");
             }
-            let idle = !self.center_pending && self.rings.is_some();
+            let idle = !self.center_pending && self.have_prior();
             if ui
                 .add_enabled(idle, egui::Button::new("Sweep the centre"))
-                .on_hover_text(if self.rings.is_some() {
+                .on_hover_text(if idle {
                     "One probe launch for every candidate."
+                } else if self.rings.is_none() {
+                    "Read the rings first — they are the prior this sweep refines, and they \
+                     load the stack it runs on."
                 } else {
-                    "Read the rings first — they load the stack this sweep runs on."
+                    "The rings did not close, so there is no prior to refine and this sweep \
+                     cannot find one on its own. If they look closed to you, say so above — \
+                     §1 makes the eye the authority, not the prominence number."
                 })
                 .clicked()
             {
@@ -647,7 +676,7 @@ impl LaminoView {
             ui.label(format!("= {} reconstructions", cands.len()));
         });
         ui.horizontal(|ui| {
-            let idle = self.tilt_progress.is_none() && self.rings.is_some();
+            let idle = self.tilt_progress.is_none() && self.have_prior();
             if ui
                 .add_enabled(idle, egui::Button::new("Scan the tilt"))
                 .on_hover_text(
@@ -735,6 +764,18 @@ impl LaminoView {
 /// Candidates covering `center ± half` in `step` increments, `center` included.
 /// Shared shape with the CLI's `align`, so a sweep here and a sweep there ask the
 /// same question.
+/// Whether step 1 established an axis for step 2 to refine.
+///
+/// Step 2 is a refiner: over a wide window its metric grows rival lobes it cannot
+/// rank (measured: 417 beats the known-correct 396 by 0.34 % at ±40 px), so
+/// without a prior it has nothing to be narrow *around* and will answer
+/// confidently and wrongly. The rings are that prior. Either the prominence says
+/// they closed, or the user says so having looked — §1 makes the eye the
+/// authority and the number the hint, so the number may not lock the user out.
+fn have_prior(rings: Option<&Rings>, closed_by_eye: bool) -> bool {
+    rings.is_some_and(|r| r.trustworthy || closed_by_eye)
+}
+
 fn grid(center: f32, half: f32, step: f32) -> Vec<f32> {
     if step <= 0.0 || half < 0.0 {
         return vec![center];
@@ -770,6 +811,39 @@ mod tests {
         assert_eq!(nearest_index(&cands, 45.4), Some(1));
         assert_eq!(nearest_index(&cands, 0.0), Some(0));
         assert_eq!(nearest_index(&[], 1.0), None);
+    }
+
+    fn rings(trustworthy: bool) -> Rings {
+        Rings {
+            center: 396.0,
+            prominence: if trustworthy { 12.0 } else { 2.0 },
+            trustworthy,
+            bytes: 0,
+        }
+    }
+
+    /// Step 2 refines a prior and cannot find one, so it stays shut until step 1
+    /// produced an axis — and the eye can produce one the prominence missed,
+    /// because §1 makes the eye the authority.
+    #[test]
+    fn the_centre_sweep_stays_shut_until_the_rings_gave_it_an_axis() {
+        assert!(!have_prior(None, false), "no rings read at all");
+        assert!(
+            !have_prior(None, true),
+            "the eye cannot vouch for an unread image"
+        );
+        assert!(
+            have_prior(Some(&rings(true)), false),
+            "closed rings are a prior"
+        );
+        assert!(
+            !have_prior(Some(&rings(false)), false),
+            "arcs that never closed are the mis-aligned-at-acquisition signature, not a prior"
+        );
+        assert!(
+            have_prior(Some(&rings(false)), true),
+            "a low prominence must not lock out someone who can see the rings closed"
+        );
     }
 
     /// The verdict a sweep cannot answer must read as a refusal that names its
