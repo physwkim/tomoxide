@@ -86,6 +86,12 @@ pub struct App {
     data: crate::views::data::DataView,
     tune: crate::views::tune::TuneView,
     center: crate::views::center::CenterView,
+    lamino: crate::views::lamino::LaminoView,
+    /// Which estimator family the Center screen offers. Not a display option:
+    /// under a laminographic tilt the axis leans along the beam, so 0°/180° is
+    /// not a mirror of the object and every parallel-beam center finder loses
+    /// the symmetry it assumes. The toggle picks the family valid for the beam.
+    lamino_beam: bool,
     run: crate::views::run::RunView,
     output: crate::views::output::OutputView,
     xanes: crate::views::xanes::XanesView,
@@ -121,6 +127,8 @@ impl App {
             data: crate::views::data::DataView::new(render_state),
             tune: crate::views::tune::TuneView::new(render_state),
             center: crate::views::center::CenterView::new(render_state),
+            lamino: crate::views::lamino::LaminoView::new(render_state),
+            lamino_beam: false,
             run: crate::views::run::RunView::new(render_state),
             output: crate::views::output::OutputView::new(render_state),
             xanes: crate::views::xanes::XanesView::new(render_state),
@@ -150,6 +158,7 @@ impl App {
                     ));
                     self.tune.on_dataset(&meta);
                     self.center.on_dataset(&meta);
+                    self.lamino.on_dataset(&meta);
                     self.run.on_dataset(&meta);
                     self.meta = Some(meta.clone());
                     self.data.on_dataset(meta);
@@ -209,6 +218,69 @@ impl App {
                     self.tune
                         .on_lambda_sweep(lambdas, ny, nx, &frames, residual, roughness);
                 }
+                Event::LaminoRings {
+                    center,
+                    prominence,
+                    trustworthy,
+                    ny,
+                    nx,
+                    mean,
+                    bytes,
+                    millis,
+                } => {
+                    self.log.push(format!(
+                        "rings: centre {center:.2}, prominence {prominence:.2} — {} — {millis} ms",
+                        if trustworthy {
+                            "closed concentric rings"
+                        } else {
+                            "NOT trustworthy: no bullseye, likely mis-aligned at acquisition"
+                        }
+                    ));
+                    self.lamino
+                        .on_rings(center, prominence, trustworthy, ny, nx, &mean, bytes);
+                }
+                Event::LaminoCenterSweep {
+                    centers,
+                    ny,
+                    nx,
+                    frames,
+                    focus,
+                    slice,
+                    millis,
+                } => {
+                    self.log.push(format!(
+                        "lamino centre sweep: {} candidates on slice {slice} — {millis} ms",
+                        centers.len()
+                    ));
+                    self.lamino
+                        .on_center_sweep(centers, ny, nx, &frames, focus, slice);
+                }
+                Event::LaminoTilt {
+                    tilt_deg,
+                    focus,
+                    z_peak,
+                    depth,
+                    focus_by_z,
+                    ny,
+                    nx,
+                    slice,
+                    done,
+                    total,
+                } => {
+                    self.log.push(format!(
+                        "tilt {tilt_deg:.2}°: focus {focus:.4e}, peak slice {z_peak} of {depth}                          ({done}/{total})"
+                    ));
+                    self.lamino.on_tilt(
+                        tilt_deg, focus, z_peak, depth, focus_by_z, ny, nx, &slice, done, total,
+                    );
+                }
+                Event::LaminoTiltDone { cancelled, millis } => {
+                    self.log.push(format!(
+                        "tilt scan {} — {millis} ms",
+                        if cancelled { "cancelled" } else { "finished" }
+                    ));
+                    self.lamino.on_tilt_done(cancelled);
+                }
                 Event::JobFailed { what, error } => {
                     self.log.push(format!("FAILED {what}: {error}"));
                     if what.starts_with("preview") {
@@ -219,6 +291,9 @@ impl App {
                     }
                     if what.starts_with("center") {
                         self.center.on_failed();
+                    }
+                    if what.starts_with("lamino") {
+                        self.lamino.on_failed();
                     }
                 }
             }
@@ -365,11 +440,35 @@ impl App {
                 }
             }
             Mode::Center => {
-                self.center.ui(ui, &self.worker.jobs, self.meta.as_ref());
-                if let Some(c) = self.center.take_accepted() {
-                    self.tune.center = c;
-                    self.tune.center_auto = false;
-                    self.log.push(format!("center {c:.3} → Tune"));
+                ui.horizontal(|ui| {
+                    ui.label("Beam:");
+                    ui.selectable_value(&mut self.lamino_beam, false, "Parallel")
+                        .on_hover_text("Vo / entropy / phase-correlation + the sweep montage.");
+                    ui.selectable_value(&mut self.lamino_beam, true, "Laminography")
+                        .on_hover_text(
+                            "Rings → centre → tilt. The estimators on the left assume 0°/180°                              is a mirror of the object; a laminographic tilt breaks that, so                              they do not apply here.",
+                        );
+                });
+                ui.separator();
+                if self.lamino_beam {
+                    self.lamino.ui(
+                        ui,
+                        &self.worker.jobs,
+                        &self.worker.cancel,
+                        self.meta.as_ref(),
+                    );
+                    if let Some(c) = self.lamino.take_accepted() {
+                        self.tune.center = c;
+                        self.tune.center_auto = false;
+                        self.log.push(format!("center {c:.3} → Tune"));
+                    }
+                } else {
+                    self.center.ui(ui, &self.worker.jobs, self.meta.as_ref());
+                    if let Some(c) = self.center.take_accepted() {
+                        self.tune.center = c;
+                        self.tune.center_auto = false;
+                        self.log.push(format!("center {c:.3} → Tune"));
+                    }
                 }
             }
             Mode::Run => {
