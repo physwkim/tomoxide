@@ -737,24 +737,45 @@ fn parse_backend(s: &str) -> anyhow::Result<BackendKind> {
     })
 }
 
-/// `recon::center::pick_interior_max`, with a railed sweep made the caller's
-/// problem: a boundary maximum is the range running out, not an answer, and
-/// reporting it in a footer is how one bad axis poisons the next.
+/// `recon::center::judge_sweep`, with every way a sweep can fail to have an
+/// answer made the caller's problem rather than a footer. A footer is how one bad
+/// axis poisons the next.
 fn pick(axis: &str, cands: &[f32], focus: &[f64], widen: &str) -> anyhow::Result<f32> {
-    let p = tomoxide::recon::center::pick_interior_max(cands, focus)
+    use tomoxide::recon::center::SweepVerdict;
+    // `judge_sweep` returning `Some` is what says `cands` is non-empty.
+    let verdict = tomoxide::recon::center::judge_sweep(cands, focus)
         .ok_or_else(|| anyhow!("the {axis} sweep has no candidates to pick from"))?;
-    if p.railed {
-        anyhow::bail!(
-            "the {axis} sweep peaked at {:.2}, the {} of its own search range \
-             [{:.2}, {:.2}].\nThat is the range running out, not an optimum: widen it with \
+    let (lo, hi) = (cands[0], cands[cands.len() - 1]);
+    match verdict {
+        SweepVerdict::Resolved { value, .. } => Ok(value),
+        SweepVerdict::Railed { index, value } => anyhow::bail!(
+            "the {axis} sweep peaked at {value:.2}, the {} of its own search range \
+             [{lo:.2}, {hi:.2}].\nThat is the range running out, not an optimum: widen it with \
              {widen}, or recentre the range on a better starting guess.",
-            p.value,
-            if p.index == 0 { "bottom" } else { "top" },
-            cands[0],
-            cands[cands.len() - 1],
-        );
+            if index == 0 { "bottom" } else { "top" },
+        ),
+        SweepVerdict::Ambiguous { value, rivals, .. } => anyhow::bail!(
+            "the {axis} sweep does not resolve an answer over [{lo:.2}, {hi:.2}]: it peaked at \
+             {value:.2}, but {} competes at {:.2}, only {:.2} % behind.\nThe metric does not \
+             separate them, and neither is at an edge, so the winner is not the answer — this \
+             sweep refines a prior, it does not find one. Narrow {widen} around an axis you \
+             established independently (read it off the rings first: \
+             docs/LAMINOGRAPHY_ALIGNMENT.md §1), and confirm by eye (§3).",
+            if rivals.len() == 1 {
+                "another lobe".to_string()
+            } else {
+                format!("{} other lobes, the strongest", rivals.len())
+            },
+            rivals[0].value,
+            rivals[0].deficit * 100.0,
+        ),
+        SweepVerdict::Flat { .. } => anyhow::bail!(
+            "the {axis} sweep scored every one of its {} candidates identically over \
+             [{lo:.2}, {hi:.2}].\nThe metric did not respond at all, so no range will help: the \
+             reconstruction is uniform, or the focus is being measured on empty field.",
+            cands.len(),
+        ),
     }
-    Ok(p.value)
 }
 
 fn grid(center: f32, half_width: f32, step: f32) -> Vec<f32> {
@@ -2059,12 +2080,48 @@ fn recon_out_path(file: &Path) -> String {
 mod tests {
     use super::{grid, pick};
 
-    /// An interior maximum is an answer.
+    /// An interior maximum with no rival is an answer.
     #[test]
     fn pick_returns_an_interior_peak() {
         let c = [40.0f32, 44.0, 48.0, 52.0];
         let f = [1.0f64, 3.0, 2.0, 0.5];
         assert_eq!(pick("tilt", &c, &f, "--tilt_width").unwrap(), 44.0);
+    }
+
+    /// An interior maximum with a rival the metric cannot separate is **not** an
+    /// answer, and `align` must not print one. This is the real failure: a ±40 px
+    /// centre sweep on the pouch-cell scan peaks at 417 while the known-correct
+    /// 396 trails by 0.34 %, with neither at an edge, so no rail check fires.
+    #[test]
+    fn pick_rejects_a_peak_it_cannot_separate_from_its_rival() {
+        // Two lobes of nearly equal height, well apart, both interior.
+        let c: Vec<f32> = (0..21).map(|k| 380.0 + k as f32 * 2.0).collect();
+        let f: Vec<f64> = c
+            .iter()
+            .map(|&x| {
+                let a = (-((x - 396.0) / 6.0).powi(2)).exp() as f64;
+                let b = (-((x - 417.0) / 6.0).powi(2)).exp() as f64 * 1.003;
+                1.0 + a.max(b)
+            })
+            .collect();
+        let e = pick("centre", &c, &f, "--center_width")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("does not resolve") && e.contains("396"),
+            "an unseparated rival was accepted, or its message names no rival: {e}"
+        );
+    }
+
+    /// A metric that never moved has no argmax worth the name — and its argmax is
+    /// its first candidate, which `align` would otherwise print as the answer.
+    #[test]
+    fn pick_rejects_a_sweep_the_metric_never_responded_to() {
+        let c = [40.0f32, 44.0, 48.0, 52.0];
+        let e = pick("tilt", &c, &[0.0; 4], "--tilt_width")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("identically"), "a flat sweep was accepted: {e}");
     }
 
     /// A maximum on either end is the range running out, not an optimum. This is

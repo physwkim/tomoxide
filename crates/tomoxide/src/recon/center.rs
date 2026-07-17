@@ -251,32 +251,178 @@ pub fn slice_focus(img: &ndarray::ArrayView2<f32>) -> f64 {
     acc / cnt.max(1) as f64
 }
 
-/// The best candidate of a sweep, and whether the sweep earned the right to call
-/// it one — see [`pick_interior_max`].
+/// Another local maximum of a sweep that the metric did not rule out — see
+/// [`SweepVerdict::Ambiguous`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Pick {
+pub struct Rival {
     /// Index into the candidate/score arrays.
     pub index: usize,
     /// The candidate itself.
     pub value: f32,
+    /// How far this lobe rises above the highest saddle joining it to higher
+    /// ground — its topographic prominence. This, not its height, is what makes
+    /// a lobe a competitor: a wiggle on the winner's flank has none.
+    pub prominence: f64,
+    /// How much lower it scored than the winner, as a fraction of the winner's
+    /// score.
+    pub deficit: f64,
+}
+
+/// What a sweep's focus curve actually established — see [`judge_sweep`].
+///
+/// A sum type rather than a value plus a `railed` flag, because a flag is
+/// ignorable and these sweeps fail in more than one way: **a maximum can be
+/// interior and still be no answer.** Only [`SweepVerdict::resolved`] hands back
+/// a value to adopt, so a caller cannot reach an answer without passing the
+/// verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SweepVerdict {
+    /// One lobe rises clear of every other: `value` is the sweep's answer.
+    Resolved {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself.
+        value: f32,
+    },
     /// The maximum landed on the first or last candidate, so the search stopped
     /// before the metric did. **The true peak is at the edge or beyond it and
     /// there is no way to tell which from inside the range**, so this is not an
-    /// optimum, it is the range running out.
-    pub railed: bool,
+    /// optimum, it is the range running out. Widen it or recentre it.
+    Railed {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself.
+        value: f32,
+    },
+    /// Two or more lobes compete and the metric does not separate them, so the
+    /// winner is not an answer.
+    ///
+    /// Measured, on the pouch-cell scan this check was written for: a ±40 px
+    /// centre sweep put its maximum at 417 while the known-correct 396 scored
+    /// only 0.34 % lower, 21 px away, and *neither* was at an edge. A rail check
+    /// cannot see that, which is why this variant exists. Narrow the range onto a
+    /// prior you trust rather than believing the winner.
+    Ambiguous {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself — the winner, which is **not** an answer.
+        value: f32,
+        /// The competitors, most prominent first. Never empty.
+        rivals: Vec<Rival>,
+    },
+    /// Every candidate scored the same, so the metric never responded to this
+    /// axis and the argmax is just the curve's first entry. Reconstruction output
+    /// that comes out uniform scores exactly flat, and uniform output has shipped
+    /// from this crate before, so this is an observed state rather than a
+    /// defensive one. Nothing about the range will help; the recon or the metric
+    /// is what is wrong.
+    Flat {
+        /// Index into the candidate/score arrays.
+        index: usize,
+        /// The candidate itself.
+        value: f32,
+    },
 }
 
-/// Pick the highest-scoring candidate, and say whether it is interior.
+impl SweepVerdict {
+    /// The candidate to adopt, or `None` when the sweep established none. This is
+    /// the only accessor that answers the sweep; the others only describe it.
+    pub fn resolved(&self) -> Option<f32> {
+        match *self {
+            SweepVerdict::Resolved { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The highest-scoring candidate whatever the verdict — to *show* the sweep
+    /// (mark the montage, label the plot), never to adopt. Use [`Self::resolved`]
+    /// for that.
+    pub fn best(&self) -> (usize, f32) {
+        match *self {
+            SweepVerdict::Resolved { index, value }
+            | SweepVerdict::Railed { index, value }
+            | SweepVerdict::Ambiguous { index, value, .. }
+            | SweepVerdict::Flat { index, value } => (index, value),
+        }
+    }
+}
+
+/// A lobe whose prominence reaches this fraction of the winner's own is a
+/// competitor the metric has not ruled out.
 ///
-/// A railed maximum reported as an answer is how one bad axis poisons the next:
-/// a tilt railed at the top of its range moved a centre re-sweep 1.7 px off the
-/// value the un-railed sweep found. Callers must handle `railed` — widen the
-/// range or recentre it — rather than print it in a footer.
+/// Calibrated on the pouch-cell centre sweep at tilt 44°, where the winner (417)
+/// is contradicted by the known-correct lobe at 396 standing at **55 %** of its
+/// prominence, a further lobe at 374 at **25 %**, and a shoulder at the range
+/// edge at 18 %. The ±8 px sweep around a good prior, which does resolve, has no
+/// second lobe at all — so this threshold only ever arbitrates curves that
+/// already have competing lobes, and its job there is to ignore noise wiggles.
+const RIVAL_PROMINENCE: f64 = 0.2;
+
+/// Indices of the local maxima of `score`, one per lobe.
 ///
-/// Returns `None` for an empty sweep. A sweep of one or two candidates is all
-/// boundary, so `railed` is left false: there is no interior for a peak to be in
-/// and nothing to widen toward.
-pub fn pick_interior_max(cands: &[f32], score: &[f64]) -> Option<Pick> {
+/// Plateau-aware: a run of equal values is one lobe, reported at its first index,
+/// when the curve falls off both ends of the run. Requiring a strict rise on both
+/// sides instead finds **nothing** on the real ±8 px centre sweep, whose peak is a
+/// two-sample tie at 395.75/396.00.
+fn local_maxima(score: &[f64]) -> Vec<usize> {
+    let n = score.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && score[j + 1] == score[i] {
+            j += 1;
+        }
+        let rises_before = i > 0 && score[i - 1] > score[i];
+        let rises_after = j + 1 < n && score[j + 1] > score[j];
+        if !rises_before && !rises_after {
+            out.push(i);
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Topographic prominence of the lobe at `i`: how far it stands above the highest
+/// saddle that connects it to higher ground. A lobe with no higher ground either
+/// way is the global maximum, and its prominence is measured from the floor of
+/// the window.
+fn prominence(score: &[f64], i: usize) -> f64 {
+    let mut col: Option<f64> = None;
+    for dir in [-1i64, 1] {
+        let mut j = i as i64 + dir;
+        let mut low = score[i];
+        while j >= 0 && (j as usize) < score.len() {
+            let v = score[j as usize];
+            if v > score[i] {
+                col = Some(col.map_or(low, |c: f64| c.max(low)));
+                break;
+            }
+            low = low.min(v);
+            j += dir;
+        }
+    }
+    match col {
+        Some(c) => score[i] - c,
+        None => score[i] - score.iter().copied().fold(f64::INFINITY, f64::min),
+    }
+}
+
+/// Judge what a sweep's focus curve established: one answer, or one of the three
+/// ways it can fail to have one.
+///
+/// The winner alone is not the question. A railed maximum reported as an answer
+/// is how one bad axis poisons the next — a tilt railed at the top of its range
+/// moved a centre re-sweep 1.7 px off the value the un-railed sweep found — and
+/// an *interior* maximum can be just as empty: widening the pouch-cell centre
+/// sweep from ±8 px to ±40 px moves its argmax from the correct 396 to a rival at
+/// 417 that outscores it by 0.34 %, with no edge involved. So the caller gets a
+/// [`SweepVerdict`], and only [`SweepVerdict::resolved`] yields a value.
+///
+/// Returns `None` for an empty sweep or a length mismatch. A sweep of one or two
+/// candidates is all boundary, so it is never called railed: there is no interior
+/// for a peak to be in and nothing to widen toward.
+pub fn judge_sweep(cands: &[f32], score: &[f64]) -> Option<SweepVerdict> {
     if cands.is_empty() || score.len() != cands.len() {
         return None;
     }
@@ -291,10 +437,50 @@ pub fn pick_interior_max(cands: &[f32], score: &[f64]) -> Option<Pick> {
             }
         })
         .0;
-    Some(Pick {
+    let value = cands[index];
+    // One candidate is a pin, not a sweep: no curve to be flat, railed or
+    // ambiguous, and the caller already chose it.
+    if cands.len() < 2 {
+        return Some(SweepVerdict::Resolved { index, value });
+    }
+    // Before the rail check, not after: the argmax of a flat curve is its first
+    // entry, which sits on the boundary, so a flat sweep would otherwise be
+    // reported as a range that ran out. Nothing ran out — nothing responded.
+    // `is_nan()` as well as `<= 0.0`: a reconstruction carrying NaN scores NaN,
+    // which is no more a lobe than a flat curve is, and `<= 0.0` alone is false
+    // for NaN.
+    let winner = prominence(score, index);
+    if winner.is_nan() || winner <= 0.0 {
+        return Some(SweepVerdict::Flat { index, value });
+    }
+    if cands.len() > 2 && (index == 0 || index == cands.len() - 1) {
+        return Some(SweepVerdict::Railed { index, value });
+    }
+    let mut rivals: Vec<Rival> = local_maxima(score)
+        .into_iter()
+        .filter(|&i| i != index)
+        .filter_map(|i| {
+            let p = prominence(score, i);
+            (p >= RIVAL_PROMINENCE * winner).then_some(Rival {
+                index: i,
+                value: cands[i],
+                prominence: p,
+                deficit: (score[index] - score[i]) / score[index],
+            })
+        })
+        .collect();
+    if rivals.is_empty() {
+        return Some(SweepVerdict::Resolved { index, value });
+    }
+    rivals.sort_by(|a, b| {
+        b.prominence
+            .partial_cmp(&a.prominence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(SweepVerdict::Ambiguous {
         index,
-        value: cands[index],
-        railed: cands.len() > 2 && (index == 0 || index == cands.len() - 1),
+        value,
+        rivals,
     })
 }
 
@@ -1831,39 +2017,132 @@ fn beta3(t: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ndimage_shift_spline3_constant, pick_interior_max};
+    use super::{judge_sweep, ndimage_shift_spline3_constant, SweepVerdict};
     use ndarray::{Array2, Array3};
     use ndarray_npy::read_npy;
 
-    /// An interior maximum is an optimum; a boundary one is the range running
-    /// out. The distinction is the whole point — a railed pick adopted as an
-    /// answer is how one bad axis poisons the next.
+    /// The pouch-cell centre sweep at tilt 44°, scored on output slice rh/2 by
+    /// `slice_focus`, in units of 1e-6. Candidates are 356..=436 px, step 1.
+    ///
+    /// This is the curve the whole [`SweepVerdict`] type exists for. Its argmax is
+    /// 417 and its correct answer is 396 — the axis is known independently, from
+    /// the rings (docs/LAMINOGRAPHY_ALIGNMENT.md §1) — and 417 outscores 396 by
+    /// 0.34 % with neither at an edge.
+    const WIDE: [f64; 81] = [
+        1.9491, 1.9521, 1.9564, 1.9635, 1.9709, 1.9765, 1.9824, 1.9879, 1.9892, 1.9892, 1.9910,
+        1.9971, 2.0092, 2.0228, 2.0306, 2.0338, 2.0348, 2.0357, 2.0372, 2.0352, 2.0272, 2.0167,
+        2.0056, 1.9913, 1.9757, 1.9649, 1.9585, 1.9581, 1.9594, 1.9614, 1.9694, 1.9845, 2.0095,
+        2.0437, 2.0865, 2.1321, 2.1749, 2.2101, 2.2364, 2.2557, 2.2625, 2.2521, 2.2318, 2.2077,
+        2.1832, 2.1593, 2.1369, 2.1182, 2.1022, 2.0909, 2.0855, 2.0880, 2.0985, 2.1178, 2.1412,
+        2.1663, 2.1944, 2.2219, 2.2412, 2.2536, 2.2645, 2.2701, 2.2694, 2.2666, 2.2618, 2.2572,
+        2.2502, 2.2407, 2.2312, 2.2219, 2.2075, 2.1902, 2.1745, 2.1638, 2.1576, 2.1581, 2.1680,
+        2.1814, 2.1933, 2.2041, 2.2153,
+    ];
+
+    fn wide_cands() -> Vec<f32> {
+        (0..81).map(|k| 356.0 + k as f32).collect()
+    }
+
+    /// The defect this type was introduced for: a sweep whose maximum is interior
+    /// — so no rail check fires — and yet is the wrong answer, because a rival
+    /// lobe 21 px away is within 0.34 % of it. The old `Pick { railed }` reported
+    /// 417 here as an answer. Nothing may hand back a value for this curve.
     #[test]
-    fn pick_interior_max_separates_an_optimum_from_a_range_running_out() {
+    fn judge_sweep_refuses_a_curve_whose_rival_lobe_it_cannot_separate() {
+        let v = judge_sweep(&wide_cands(), &WIDE).unwrap();
+        assert_eq!(
+            v.best(),
+            (61, 417.0),
+            "the argmax is unchanged — the verdict is what changed"
+        );
+        assert_eq!(
+            v.resolved(),
+            None,
+            "an interior argmax is not automatically an answer"
+        );
+
+        let SweepVerdict::Ambiguous { rivals, .. } = &v else {
+            panic!("expected Ambiguous, got {v:?}");
+        };
+        // Most prominent first, and the most prominent rival is the correct axis.
+        assert_eq!(rivals[0].value, 396.0);
+        assert!(
+            (rivals[0].deficit - 0.0033).abs() < 0.0005,
+            "the correct lobe trails the winner by {:.4}, not the measured 0.34 %",
+            rivals[0].deficit
+        );
+        // 374 competes too (25 % of the winner's prominence); the 436 shoulder at
+        // 18 % is below the bar and must not be listed.
+        assert_eq!(
+            rivals.iter().map(|r| r.value).collect::<Vec<_>>(),
+            vec![396.0, 374.0]
+        );
+    }
+
+    /// The same metric, same slice, same scan — narrowed onto a prior from the
+    /// rings. One lobe, so it resolves, and it lands on the known 396. This is the
+    /// pair that says `Ambiguous` is about the *window*, not a metric that never
+    /// works: the sweep is a refiner of a prior, not a finder.
+    ///
+    /// Its peak is a two-sample exact tie (395.75 and 396.00 both 2.2623e-6),
+    /// which is why lobe detection has to be plateau-aware — a strict rise on both
+    /// sides finds no lobe at all here and the curve would judge `Flat`.
+    #[test]
+    fn judge_sweep_resolves_the_same_sweep_narrowed_onto_a_prior() {
+        let narrow: [f64; 17] = [
+            2.2364, 2.2419, 2.2470, 2.2517, 2.2557, 2.2590, 2.2612, 2.2623, 2.2623, 2.2610, 2.2587,
+            2.2554, 2.2514, 2.2468, 2.2419, 2.2366, 2.2310,
+        ];
+        let cands: Vec<f32> = (0..17).map(|k| 394.0 + k as f32 * 0.25).collect();
+        let v = judge_sweep(&cands, &narrow).unwrap();
+        assert_eq!(v.resolved(), Some(395.75), "got {v:?}");
+    }
+
+    /// An interior maximum with nothing else near it is an optimum; a boundary one
+    /// is the range running out. A railed pick adopted as an answer is how one bad
+    /// axis poisons the next.
+    #[test]
+    fn judge_sweep_separates_an_optimum_from_a_range_running_out() {
         let c = [1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let p = pick_interior_max(&c, &[1.0, 5.0, 9.0, 4.0, 2.0]).unwrap();
-        assert_eq!((p.index, p.value, p.railed), (2, 3.0, false));
+        let v = judge_sweep(&c, &[1.0, 5.0, 9.0, 4.0, 2.0]).unwrap();
+        assert_eq!(v.resolved(), Some(3.0));
 
         for (score, want) in [
             ([9.0, 5.0, 3.0, 2.0, 1.0], 0usize),
             ([1.0, 2.0, 3.0, 5.0, 9.0], 4usize),
         ] {
-            let p = pick_interior_max(&c, &score).unwrap();
-            assert_eq!(p.index, want);
-            assert!(p.railed, "a peak at candidate {want} of 5 is a boundary");
+            let v = judge_sweep(&c, &score).unwrap();
+            assert!(
+                matches!(v, SweepVerdict::Railed { index, .. } if index == want),
+                "a peak at candidate {want} of 5 is a boundary, got {v:?}"
+            );
+            assert_eq!(v.resolved(), None);
         }
+    }
+
+    /// A curve that never moved says nothing, and its argmax is just its first
+    /// entry. Uniform reconstruction output — which has shipped from this crate —
+    /// scores exactly this.
+    #[test]
+    fn judge_sweep_does_not_answer_from_a_curve_that_never_responded() {
+        let v = judge_sweep(&[1.0f32, 2.0, 3.0, 4.0], &[0.0; 4]).unwrap();
+        assert!(matches!(v, SweepVerdict::Flat { .. }), "got {v:?}");
+        assert_eq!(v.resolved(), None);
     }
 
     /// A sweep of one or two candidates is all boundary: there is no interior for
     /// a peak to sit in and nothing to widen toward, so calling it railed would
     /// make every degenerate sweep an error.
     #[test]
-    fn pick_interior_max_does_not_rail_check_a_degenerate_sweep() {
-        assert!(!pick_interior_max(&[7.0], &[1.0]).unwrap().railed);
-        assert!(!pick_interior_max(&[7.0, 8.0], &[9.0, 1.0]).unwrap().railed);
-        assert!(pick_interior_max(&[], &[]).is_none());
+    fn judge_sweep_does_not_rail_check_a_degenerate_sweep() {
+        assert_eq!(judge_sweep(&[7.0], &[1.0]).unwrap().resolved(), Some(7.0));
+        assert_eq!(
+            judge_sweep(&[7.0, 8.0], &[9.0, 1.0]).unwrap().resolved(),
+            Some(7.0)
+        );
+        assert!(judge_sweep(&[], &[]).is_none());
         // Mismatched lengths are a caller bug, not a pick.
-        assert!(pick_interior_max(&[1.0, 2.0], &[1.0]).is_none());
+        assert!(judge_sweep(&[1.0, 2.0], &[1.0]).is_none());
     }
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");

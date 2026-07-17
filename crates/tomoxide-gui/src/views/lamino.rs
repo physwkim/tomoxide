@@ -29,7 +29,7 @@ use std::sync::mpsc::Sender;
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
 
-use tomoxide::recon::center::pick_interior_max;
+use tomoxide::recon::center::{SweepVerdict, judge_sweep};
 
 use crate::worker::{DatasetMeta, Job};
 
@@ -40,10 +40,55 @@ struct Sweep {
 }
 
 impl Sweep {
-    /// The sharpest candidate, and whether the sweep ran out of range before the
-    /// metric did.
-    fn pick(&self) -> Option<tomoxide::recon::center::Pick> {
-        pick_interior_max(&self.cands, &self.focus)
+    /// What the curve established — an answer, or one of the ways it has none.
+    fn judge(&self) -> Option<SweepVerdict> {
+        judge_sweep(&self.cands, &self.focus)
+    }
+}
+
+/// The verdict as a line to show: colour and text. `None` when the sweep resolved
+/// nothing *and* has nothing to say, which cannot happen — every variant speaks.
+fn verdict_line(
+    v: &SweepVerdict,
+    axis: &str,
+    unit: &str,
+    cands: &[f32],
+    scored_on: &str,
+) -> (egui::Color32, String) {
+    let (lo, hi) = (cands[0], cands[cands.len() - 1]);
+    match v {
+        SweepVerdict::Resolved { value, .. } => (
+            egui::Color32::LIGHT_GREEN,
+            format!("Sharpest at {axis} {value:.2}{unit}{scored_on}."),
+        ),
+        SweepVerdict::Railed { value, .. } => (
+            egui::Color32::LIGHT_RED,
+            format!(
+                "The sweep peaked at {value:.2}{unit}, the edge of its own range \
+                 [{lo:.2}, {hi:.2}] — that is the range running out, not an optimum. \
+                 Widen ± or recentre it."
+            ),
+        ),
+        SweepVerdict::Ambiguous { value, rivals, .. } => (
+            egui::Color32::LIGHT_RED,
+            format!(
+                "No answer over [{lo:.2}, {hi:.2}]: {value:.2}{unit} won but {:.2}{unit} is only \
+                 {:.2} % behind, and neither is at an edge — the metric does not separate them. \
+                 This sweep refines a prior, it does not find one: narrow ± around an axis you \
+                 trust (step 1), and confirm by eye.",
+                rivals[0].value,
+                rivals[0].deficit * 100.0,
+            ),
+        ),
+        SweepVerdict::Flat { .. } => (
+            egui::Color32::LIGHT_RED,
+            format!(
+                "Every one of the {} candidates scored the same. The metric never responded, so \
+                 no range will help — the reconstruction is uniform, or the focus is being \
+                 measured on empty field.",
+                cands.len()
+            ),
+        ),
     }
 }
 
@@ -249,12 +294,12 @@ impl LaminoView {
             cands: centers,
             focus,
         };
-        if let Some(p) = sweep.pick() {
-            self.center_stack.set_current(p.index);
-            // A railed sweep is the range running out, not an answer — do not
-            // adopt it as the working centre.
-            if !p.railed {
-                self.center = p.value;
+        if let Some(v) = sweep.judge() {
+            self.center_stack.set_current(v.best().0);
+            // Only a resolved sweep hands back a value; a railed, ambiguous or
+            // flat one is shown, never adopted.
+            if let Some(value) = v.resolved() {
+                self.center = value;
             }
         }
         self.center_sweep = Some(sweep);
@@ -311,10 +356,12 @@ impl LaminoView {
 
     pub fn on_tilt_done(&mut self, _cancelled: bool) {
         self.tilt_progress = None;
-        if let Some(p) = self.tilt_sweep().and_then(|s| s.pick())
-            && !p.railed
+        if let Some(value) = self
+            .tilt_sweep()
+            .and_then(|s| s.judge())
+            .and_then(|v| v.resolved())
         {
-            self.tilt = p.value;
+            self.tilt = value;
         }
     }
 
@@ -545,28 +592,10 @@ impl LaminoView {
         let Some(sweep) = &self.center_sweep else {
             return;
         };
-        let picked = sweep.pick();
-        if let Some(p) = picked {
-            if p.railed {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!(
-                        "The sweep peaked at {:.2}, the edge of its own range [{:.2}, {:.2}] — \
-                         that is the range running out, not an optimum. Widen ± or recentre it.",
-                        p.value,
-                        sweep.cands[0],
-                        sweep.cands[sweep.cands.len() - 1]
-                    ),
-                );
-            } else {
-                ui.colored_label(
-                    egui::Color32::LIGHT_GREEN,
-                    format!(
-                        "Sharpest at centre {:.2} (scored on slice {}).",
-                        p.value, self.center_slice
-                    ),
-                );
-            }
+        if let Some(v) = sweep.judge() {
+            let scored_on = format!(" (scored on slice {})", self.center_slice);
+            let (colour, text) = verdict_line(&v, "centre", "", &sweep.cands, &scored_on);
+            ui.colored_label(colour, text);
         }
         ui.horizontal(|ui| {
             ui.allocate_ui(egui::vec2(ui.available_width() * 0.5, 300.0), |ui| {
@@ -652,37 +681,26 @@ impl LaminoView {
         if self.tilts.is_empty() {
             return;
         }
-        if let Some(p) = self.tilt_sweep().and_then(|s| s.pick()) {
+        if let Some(v) = self.tilt_sweep().and_then(|s| s.judge()) {
             let cands: Vec<f32> = self.tilts.iter().map(|t| t.tilt_deg).collect();
-            if p.railed {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!(
-                        "The scan peaked at {:.2}°, the edge of its own range [{:.2}, {:.2}] — \
-                         the range ran out before the metric did. Widen ± or recentre it.",
-                        p.value,
-                        cands[0],
-                        cands[cands.len() - 1]
-                    ),
-                );
-            } else {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        egui::Color32::LIGHT_GREEN,
-                        format!("Sharpest at tilt {:.2}°.", p.value),
-                    );
-                    if ui
+            let (colour, text) = verdict_line(&v, "tilt", "°", &cands, "");
+            ui.horizontal(|ui| {
+                ui.colored_label(colour, text);
+                // The centre is the screen's output, and it is worth carrying over
+                // whatever the tilt scan concluded — but only if the centre step
+                // itself resolved one.
+                if v.resolved().is_some()
+                    && ui
                         .button("Use centre in Tune")
                         .on_hover_text(
                             "Confirm on the montage first: at a wrong centre the particles \
                              smear into dashes, at the right one they are round.",
                         )
                         .clicked()
-                    {
-                        self.accepted = Some(self.center);
-                    }
-                });
-            }
+                {
+                    self.accepted = Some(self.center);
+                }
+            });
         }
         ui.horizontal(|ui| {
             ui.allocate_ui(egui::vec2(ui.available_width() * 0.5, 300.0), |ui| {
@@ -752,5 +770,42 @@ mod tests {
         assert_eq!(nearest_index(&cands, 45.4), Some(1));
         assert_eq!(nearest_index(&cands, 0.0), Some(0));
         assert_eq!(nearest_index(&[], 1.0), None);
+    }
+
+    /// The verdict a sweep cannot answer must read as a refusal that names its
+    /// rival — not as a quieter version of the sharpest-at line. This is the
+    /// screen's half of the defect: the old UI printed the ±40 px winner (417) in
+    /// green because it was not at an edge.
+    #[test]
+    fn an_unresolved_sweep_never_reads_as_an_answer() {
+        let cands: Vec<f32> = (0..81).map(|k| 356.0 + k as f32).collect();
+        let ambiguous = SweepVerdict::Ambiguous {
+            index: 61,
+            value: 417.0,
+            rivals: vec![tomoxide::recon::center::Rival {
+                index: 40,
+                value: 396.0,
+                prominence: 1.77e-7,
+                deficit: 0.00335,
+            }],
+        };
+        let (colour, text) = verdict_line(&ambiguous, "centre", "", &cands, "");
+        assert_eq!(colour, egui::Color32::LIGHT_RED);
+        assert!(text.contains("No answer"), "{text}");
+        assert!(text.contains("396"), "the rival is not named: {text}");
+        assert!(!text.contains("Sharpest"), "{text}");
+
+        let (colour, text) = verdict_line(
+            &SweepVerdict::Resolved {
+                index: 40,
+                value: 396.0,
+            },
+            "centre",
+            "",
+            &cands,
+            "",
+        );
+        assert_eq!(colour, egui::Color32::LIGHT_GREEN);
+        assert!(text.contains("Sharpest at centre 396.00"), "{text}");
     }
 }
