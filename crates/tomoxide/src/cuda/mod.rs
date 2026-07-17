@@ -128,12 +128,28 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 /// pass over the filtered projection stack. Returns `[tilts_deg.len(), n, n]`,
 /// one candidate image per tilt, in the row order given.
 ///
-/// This is the primitive a laminography tilt search should sit on.
 /// `cfunc_linerec`'s `backprojection_try_lamino` indexes `phi` per output slot,
-/// so `N` tilts cost one launch over one filtered stack. Sweeping tilts by
-/// reconstructing with [`crate::recon::recon`] instead costs `N` filter passes
-/// and `N` whole `[rh, n, n]` volumes, of which the search keeps one slice each
-/// — for the 1024² pouch scans that is ~1400 slices of work per tilt discarded.
+/// so `N` tilts cost one launch over one filtered stack, where sweeping tilts
+/// through [`crate::recon::recon`] costs `N` filter passes and `N` whole
+/// `[rh, n, n]` volumes — for the 1024² pouch scans, ~1400 slices of work per
+/// tilt discarded.
+///
+/// **That saving is only real when you already know which slice you want, and a
+/// tilt search on an unknown sample does not.** The in-focus layer moves in z
+/// with the tilt (measured on the pouch scans: `z_peak` walked 800 → 1120 as the
+/// tilt went 40° → 58°), so scoring a fixed `sz` across tilts scores a different
+/// plane at every candidate. The tilt response is broad — ~2 % per degree — and
+/// the plane error swamps it: on the aligned pouch scan a fixed-`sz` focus sweep
+/// returns 48° at `sz` = rh/2 and rails monotonically to the top of any range at
+/// `sz` = nz/2. `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 is the reason: score the max
+/// over the *whole* z range, which needs every (tilt, z) pair — exactly the work
+/// this primitive skips, so it buys nothing there.
+///
+/// Use it where the plane is known and fixed: refining a tilt after a
+/// full-volume z-max has located `z_peak`, or on a sample whose layer is known.
+/// For the rotation centre — an in-plane shift, which does not move `z_peak`,
+/// and whose response is ~40 % per 50 px — a fixed `sz` is sound; see
+/// [`center_probe_sweep`], which `tomoxide align` uses for exactly that.
 ///
 /// The images carry the same orientation and dθ scale as `Algorithm::Linerec`
 /// laminography, so a slice here is the slice that reconstruction produces at

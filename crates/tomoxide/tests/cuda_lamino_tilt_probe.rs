@@ -147,8 +147,18 @@ fn cuda_lamino_tilt_probe_rows_are_distinct_tilts() {
     assert!(d > 0.0, "both probe rows identical — phi is not per-tilt");
 }
 
-/// The tilt sweep it exists for: probing N tilts costs one pass, and the focus
-/// peak it finds is the peak the full reconstructions agree on.
+/// Probing N tilts costs one pass, and the focus peak it finds is the peak the
+/// full reconstructions agree on **at the same slice**.
+///
+/// Read that scope literally. Both sides score the same fixed `z`, and
+/// `lamino_sino` stacks one 2-D phantom into every z, so the object has no z
+/// structure to move. Passing therefore says the probe reproduces the
+/// reconstruction — it does NOT say a fixed-`z` sweep finds the right tilt. On
+/// real data it does not: the in-focus layer moves in z with the tilt (`z_peak`
+/// 800 → 1120 for 40° → 58° on the pouch scans), and a fixed row returns 48° or
+/// rails to the range edge depending only on which row you picked. Believing
+/// this test covered that is how `tomoxide align` got a tilt sweep it had to
+/// lose; `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 had said so all along.
 #[test]
 fn cuda_lamino_tilt_probe_finds_the_same_peak_as_full_recons() {
     let cuda = match CudaBackend::new() {
