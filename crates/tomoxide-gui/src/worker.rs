@@ -725,7 +725,6 @@ impl PreppedStack {
         let theta = reader.read_theta()?;
         let mut ds = reader.read_all()?;
         tomoxide::prep::normalize_dataset(&mut ds, backend)?;
-        tomoxide::prep::normalize::minus_log(&mut ds.data, backend)?;
         let (_nproj, nz, nx) = ds
             .data
             .as_layout(tomoxide::data::Layout::Projection)

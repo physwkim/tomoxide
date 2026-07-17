@@ -25,10 +25,11 @@
 //!    a rail check, is what shows you the sweep is lost. At ±8 px around the
 //!    rings' answer it is one lobe, 0.25 px from the truth.
 //! 3. **Tilt** — a FULL reconstruction per candidate, scored by the max focus
-//!    inside the sample's z band (§2). The tilt drags the in-focus layer through
-//!    z, so a fixed slice cannot rank it — and the whole volume cannot score it
-//!    either, because the focus metric ranks noise planes above the sample
-//!    (measured 1.7×); the band follows the tilt through the detector rows.
+//!    over its slices. The tilt drags the in-focus layer through z, so a fixed
+//!    slice cannot rank it. The optional sample z band (§2) confines the score
+//!    to the layer the sample is known to occupy — the reference workflow's
+//!    practice, and a guard where structured noise competes with the sample —
+//!    and follows the tilt through the detector rows by itself.
 //!    Minutes per candidate, hence the cancel.
 
 use std::sync::mpsc::Sender;
@@ -150,8 +151,7 @@ pub struct LaminoView {
     tilt_half: f32,
     tilt_step: f32,
     /// Sample z-band the tilt scan scores inside, read off a reconstruction at
-    /// the working tilt. Off ⇒ the whole volume, which on real data lets the
-    /// focus metric answer for noise planes instead of the sample.
+    /// the working tilt. Off ⇒ the max over the whole volume.
     sample_z: (usize, usize),
     sample_z_on: bool,
     /// `Some((done, total))` while a scan is running.
@@ -445,7 +445,7 @@ impl LaminoView {
         let x: Vec<f64> = (0..t.focus_by_z.len()).map(|z| z as f64).collect();
         self.z_plot.set_graph_title(match t.band {
             Some((lo, hi)) => format!("focus by slice — scored {lo}..{hi}"),
-            None => "focus by slice — scored everywhere (noise-prone)".into(),
+            None => "focus by slice — scored everywhere".into(),
         });
         let curve = CurveData::new(x, t.focus_by_z.clone(), egui::Color32::LIGHT_RED);
         match self.z_curve {
@@ -678,9 +678,8 @@ impl LaminoView {
             "The tilt drags the in-focus layer through z (measured: slice 800 → 1120 as the \
              tilt went 40° → 58°) while its own response is only ~2 % per degree, so a fixed \
              slice scores a plane whose error swamps the signal. Ranking tilts takes the \
-             whole reconstruction — scored inside the sample's own z range, because the \
-             focus metric ranks noise planes above the sample (measured 1.7×) and a \
-             whole-volume max answers for the noise.",
+             whole reconstruction, scored by the max focus over its slices; the optional \
+             band confines that score to the layer the sample is known to occupy.",
         );
         let cands = grid(self.tilt, self.tilt_half, self.tilt_step);
         ui.horizontal(|ui| {
@@ -713,10 +712,7 @@ impl LaminoView {
                     ui.colored_label(egui::Color32::LIGHT_RED, "empty band");
                 }
             } else {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "off — scoring every slice, noise included",
-                );
+                ui.label("off — scoring every slice");
             }
         });
         ui.horizontal(|ui| {

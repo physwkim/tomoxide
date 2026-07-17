@@ -25,23 +25,26 @@ All notable changes to this project are documented here. The format is based on
   The verdict is one uniform test — does this lobe own at least 20 % of the
   curve's height? — asked of the winner and of every other lobe. It replaces an
   edge check, which measurement showed is blind to both ways a real sweep fails.
-  On the aligned pouch scan (known axis 396, tilt 44°), swept ±40 px: on the
-  rh/2 plane the curve carries **three** lobes and the highest is 417 — 21 px
+  On the aligned pouch scan (known axis 396, tilt 44°), swept ±40 px: on one
+  probed slice the curve carries **three** lobes and the highest is 417 — 21 px
   wrong, interior, beating the truth by 0.34 %, so no edge check can fire
-  (`Ambiguous`, naming 396 as the strongest rival at 55 % prominence). On the
-  sample plane the curve instead rises across the whole window and turns over one
+  (`Ambiguous`, naming 396 as the strongest rival at 55 % prominence). On
+  another the curve instead rises across the whole window and turns over one
   sample *short* of the edge at 435 — an interior maximum with no rival to
   contradict it, and still nothing but the range running out (`Railed`). Both are
   the same fact: the winner owns no lobe of its own. Narrowed to ±8 px around a
-  prior, the same curve resolves 395.75 at 83 %.
+  prior, the same curve resolves 395.75 at 83 %. (These sweeps predate the
+  z-centring fix below, which found the probe's slice index offset by
+  `(rh − nz)/2` from the volume z it claimed — the curve shapes and their
+  verdicts, not the planes' names, are what these measurements establish.)
 - **`tomoxide align` — the alignment workflow as a subcommand**, plus the two
   library pieces it stands on. `recon::center::find_center_rings` is the ring
   estimator from `docs/LAMINOGRAPHY_ALIGNMENT.md` §1: the 360° mean projection is
   a bullseye centred on the rotation axis, registered against its own mirror. It
   reports a `prominence` — `(peak − median)/MAD` of the registration profile —
   and flags the scan when the rings never closed, which is the acquisition-time
-  misalignment no reconstruction geometry repairs (measured: aligned scan 397.37
-  at prominence 16.2 → trustworthy; misaligned scan 281.72 at 2.22 → flagged, and
+  misalignment no reconstruction geometry repairs (measured: aligned scan 397.50
+  at prominence 21.0 → trustworthy; misaligned scan 281.72 at 2.22 → flagged, and
   `align` stops there unless `--force`). `cuda::center_probe` / `center_probe_sweep`
   then refine it: `cfunc_linerec`'s `backprojection_try` reconstructs one slice at
   N candidate centres in **one** launch off a single filtering. A probe slice
@@ -51,7 +54,7 @@ All notable changes to this project are documented here. The format is based on
   `center_probe_sweep` removes that by construction, issuing one probe per
   fractional lattice, and never producing the biased slices at all. End to end on
   the aligned pouch scan, swept ±8 px around the axis read off the rings:
-  `--center 395.87` against a known 396. Around a *prior* is the whole contract —
+  `--center 395.00` against a known 396. Around a *prior* is the whole contract —
   the same sweep widened to ±40 px grows three lobes and picks 417, and that is
   what `judge_sweep` above now refuses rather than returns.
   The two axes are searched by different machinery, and the asymmetry is physics,
@@ -66,24 +69,18 @@ All notable changes to this project are documented here. The format is based on
   reconstruction per candidate — that needs every (tilt, z) pair, which is
   exactly the work `lamino_tilt_probe` skips, so the probe buys nothing there and
   remains for the case its saving is real, a plane that is already known — scored
-  by the max `slice_focus` **inside the sample's z band**
-  (`recon::center::SampleBand`, `--focus_z LO:HI`). The band is not an
-  optimisation, it is what makes the score mean anything on real data: mean |∇|²
-  rewards high-frequency noise over smooth particles, measured **1.7×** on the
-  aligned pouch scan (a pure-noise plane at 1.95e-5 against the eye-confirmed
-  electrode plane at 1.15e-5), so a whole-volume max pins `z_peak` to the noise
-  hump at every candidate and its curve carries no geometry signal at all — its
-  centre response is monotone past the known axis. A band *fixed* in z would fail
-  the other way (the in-focus layer moves: the sample's spike sits at z 837 / 890
-  / 956 at tilts 40° / 44° / 48°), so the band is stated once, at the tilt it was
-  read from, and carried into each candidate's volume through the detector rows —
-  which belong to the data and do not move (`v − nz/2 = cos(tilt)·(z − rh/2)`;
-  the mapping reproduces those measured spikes to ~1 px, and that measurement is
-  pinned as a unit test). End to end on the aligned pouch scan (`--focus_z
-  870:910` at 44°): the tilt curve over 36…52° is unimodal with its interior
-  peak on the known 44° and a **2.26×** span, where the whole-volume score
-  measured a 1.4 % spread with no identifiable optimum — and every candidate's
-  `z_peak` landed inside its own carried band, the three measured spikes among
+  by the max `slice_focus` over its slices, optionally **inside the sample's z
+  band** (`recon::center::SampleBand`, `--focus_z LO:HI`) — the reference
+  workflow's practice, and the guard wherever structured noise competes with
+  the sample. A band *fixed* in z would miss the layer (it moves: the sample's
+  spike sits at z 837 / 890 / 956 at tilts 40° / 44° / 48°), so the band is
+  stated once, at the tilt it was read from, and carried into each candidate's
+  volume through the detector rows — which belong to the data and do not move
+  (`v − nz/2 = cos(tilt)·(z − rh/2)`; the mapping reproduces those measured
+  spikes to ~1 px, and that measurement is pinned as a unit test). End to end
+  on the aligned pouch scan at 44°: the unbanded tilt curve over 36…52° is
+  unimodal with its interior peak on the known 44° and a **3.0×** span, every
+  candidate's `z_peak` on the sample layer, the three measured spikes among
   them. The scan streams the volume, so its memory cost is one
   rh-tile regardless of depth, and it keeps what the reconstruction already
   computed: the winning in-band slice (§3 confirms by eye) and `focus_by_z`, the
@@ -126,8 +123,8 @@ All notable changes to this project are documented here. The format is based on
   readable by eye (automated flip-registration measured 397.5 vs a known 396),
   and rings that open into arcs instead of closing diagnose a scan that was
   mis-aligned at acquisition. Also documents the reconstruction sweep that
-  follows (full projections, focus scored as the max over the whole z range, not
-  a sub-sample over a fixed band) and records the three methods that failed
+  follows (full projections; focus scored as the max over z, optionally confined
+  to a sample band carried per tilt) and records the three methods that failed
   validation — 0°/180° mirror registration (the tilted axis breaks the mirror
   symmetry), 1-D column-profile symmetry (truncation destroys it), and
   sub-sampled projections with a fixed z band.
@@ -259,6 +256,42 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Laminography volume z-centring unified: a slice index — and the probes'
+  `sz` — now names the same volume z in every algorithm.** The linerec-family
+  CUDA kernels (back-projection, both try-probes, and the forward projector)
+  centred the volume z on `nz/2`, the detector-row midpoint, while the
+  Fourier/USFFT path centres it on `rh/2`, the volume's own midpoint — so for a
+  tilted axis (`rh > nz`) every Linerec/Fbp/SIRT laminography volume, and every
+  probe slice, sat `(rh − nz)/2` slices off the Fourierrec volume of the same
+  data: 200 slices on the reference pouch scan (rh 1424, nz 1024). This is the
+  defect behind the centre sweep's slice dependence — a probe pointed at the
+  "middle of the volume" was in fact scoring 200 slices above it. Every kernel
+  now takes the full reconstruction height and centres z on `rh/2`; the parallel
+  beam passes `rh == nz`, so that path is bit-identical, and the tilt probe
+  carries a per-tilt height (the in-focus height depends on the tilt). A new
+  test (`cuda_lamino_z_convention`) pins the convention by placing a slab at a
+  known off-centre z and requiring Linerec and Fourierrec to put its peak at
+  the same volume z — it fails under the old centring. `tomoxide align` now
+  defaults the centre-sweep slice to the `--focus_z` band's midpoint — the
+  plane the sample occupies — falling back to `rh/2` (`--focus_z` no longer
+  requires `--tilt_width`). Validated on the reference scan: probed at the band
+  midpoint (slice 890) the sweep resolves **395.00** against the known 396;
+  probed at the empty volume midpoint the focus response is ~100× weaker and
+  `judge_sweep` refuses the railed curve instead of reporting a number.
+- **`align` and the GUI Center screen applied minus-log twice.** Both preceded
+  their reconstructions with `normalize_dataset` — which already ends in the
+  minus-log — and then called `minus_log` again. `−log` of a line integral
+  amplifies the noise floor everywhere the integral is near zero (air) while
+  leaving the sample recognisable, so every recon these paths scored was
+  quietly noise-inflated: on the aligned pouch scan the double-prepped volume
+  put a pure-noise plane 1.7× **above** the eye-confirmed electrode plane
+  (1.95e-5 vs 1.15e-5), which made whole-volume focus scoring unusable and
+  was misdiagnosed as a defect of the focus metric itself. With the prep
+  applied once, the same metric on the same scan puts the sample ≈6× above
+  the noise floor, the **unbanded** tilt scan resolves the known 44° with a
+  3.0× span (previously a 1.4 % spread with no identifiable optimum), and the
+  rings' flip-registration reads 397.50 at prominence 21.0.
+  `normalize_dataset`'s doc now states the minus-log is included.
 - **Fourier laminography reconstruction sign corrected.** The Fourier/USFFT
   lamino path (`recon::lamino::lamino` and its CUDA analytic mirror) reconstructed
   dense material as **negative** attenuation — inverted versus the physical

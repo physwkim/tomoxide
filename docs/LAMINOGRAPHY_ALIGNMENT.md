@@ -94,20 +94,22 @@ scoring are load-bearing; both were learned by getting them wrong first.
 
 - **Reconstruct from the FULL projection set.** On a 1/3 subsample the streak
   noise dominates and the focus metric tracks streaks instead of the sample.
+- **Prep exactly once.** `normalize_dataset` already ends in the minus-log; a
+  second `minus_log` on its output amplifies the noise floor everywhere the
+  line integral is near zero while leaving the sample recognisable. On the
+  aligned pouch scan the double-prepped volume ranked a pure-noise plane 1.7×
+  above the eye-confirmed electrode, which made the whole-volume max
+  unusable and was misread as a defect of the focus metric itself; with the
+  prep fixed, the same metric puts the sample ≈6× **above** the noise floor
+  and the unbanded tilt scan resolves 44° on its own (3.0× span over
+  36..52°).
 - **Score inside the sample's z band, carried to each tilt through the detector
-  rows.** Two failure modes meet here; both were measured on the aligned pouch
-  scan, and each one alone used to be an argument for the other mistake.
-  1. *The whole volume is not scorable.* Mean `|∇|²` rewards high-frequency
-     noise over smooth round particles: it ranks a pure-noise plane **1.7×
-     above** the eye-confirmed sample plane (z=310 at 1.95e-5 against the
-     electrode at z=899, 1.15e-5, tilt 44°). A whole-volume max therefore pins
-     `z_peak` to the noise at every candidate — its centre curve on this scan is
-     monotone with no peak at the known 396, which is exactly the broken-search
-     symptom below.
-  2. *A band fixed in z misses the layer.* The in-focus layer moves in z with
-     the sample height *and* with the tilt: the sample's focus spike sits at
-     z 837 / 890 / 956 at tilts 40° / 44° / 48° (volume depths 1338 / 1424 /
-     1532).
+  rows** (`tomoxide align --focus_z LO:HI`). Optional but load-bearing twice
+  over: it is what the reference workflow does, and it keeps the score on the
+  sample wherever structured noise still competes. A band cannot be *fixed* in
+  z, though — the in-focus layer moves with the sample height *and* with the
+  tilt: the sample's focus spike sits at z 837 / 890 / 956 at tilts 40° / 44° /
+  48° (volume depths 1338 / 1424 / 1532).
 
   The resolution is that the sample's *detector rows* do not move — they are a
   property of the data, not of the reconstruction. On the axis the

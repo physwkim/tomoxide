@@ -139,20 +139,21 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 /// with the tilt (measured on the pouch scans: `z_peak` walked 800 → 1120 as the
 /// tilt went 40° → 58°), so scoring a fixed `sz` across tilts scores a different
 /// plane at every candidate. The tilt response is broad — ~2 % per degree — and
-/// the plane error swamps it: on the aligned pouch scan a fixed-`sz` focus sweep
-/// returns 48° at `sz` = rh/2 and rails monotonically to the top of any range at
-/// `sz` = nz/2. `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 is the reason: score the max
-/// over the *whole* z range, which needs every (tilt, z) pair — exactly the work
-/// this primitive skips, so it buys nothing there.
+/// the plane error swamps it: on the aligned pouch scan a fixed-slice focus
+/// sweep returned an interior wrong answer or railed depending only on which
+/// slice it was pointed at. `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 is the reason:
+/// score the max over the *whole* z range, which needs every (tilt, z) pair —
+/// exactly the work this primitive skips, so it buys nothing there.
 ///
 /// Use it where the plane is known and fixed: refining a tilt after a
 /// full-volume z-max has located `z_peak`, or on a sample whose layer is known.
 /// The rotation centre is an in-plane shift and does not move `z_peak`, so a
-/// fixed `sz` does rank centre candidates — but only **near the answer**. On the
-/// aligned reference scan at `sz = rh/2`, the curve resolves the known axis to
-/// 0.25 px over ±8 px, and over ±40 px grows a rival lobe 21 px away that
-/// outscores it by 0.34 %. So [`center_probe_sweep`] refines a prior; it does not
-/// find one, and `tomoxide align` uses it that way.
+/// fixed `sz` does rank centre candidates — but only **on the sample's own
+/// slice, near the answer**. On the aligned reference scan probed at the sample
+/// plane (the `--focus_z` band midpoint), the curve resolves the known axis to
+/// 1.0 px over ±8 px; probed at an empty plane the response is ~100× weaker and
+/// the sweep rails. So [`center_probe_sweep`] refines a prior on a slice the
+/// sample occupies; it does not find one, and `tomoxide align` uses it that way.
 ///
 /// The images carry the same orientation and dθ scale as `Algorithm::Linerec`
 /// laminography, so a slice here is the slice that reconstruction produces at
@@ -161,8 +162,10 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 /// `sino` must already be prepped (flat/dark, minus-log, stripe removal), like
 /// every other analytic CUDA entry point. The rotation center comes from
 /// `geom.center`; `geom.beam` is ignored, since `tilts_deg` supplies the tilt.
-/// `sz` indexes the tilted volume's output z, offset as the analytic lamino path
-/// offsets it. Errors without the `cuda` feature.
+/// `sz` is a volume z: the same slice index a full reconstruction at that tilt
+/// produces, in any algorithm — every path centres z on the recon height's
+/// midpoint (`tests/cuda_lamino_z_convention.rs` pins this). Errors without the
+/// `cuda` feature.
 pub fn lamino_tilt_probe(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
@@ -886,8 +889,9 @@ mod cuda_impl {
                         g.ptr,
                         theta_d.ptr as *const f32,
                         phi,
-                        1.0, // pure adjoint Wᵀ
-                        0,   // sz
+                        1.0,       // pure adjoint Wᵀ
+                        0,         // sz
+                        rh as i32, // volume z centred on the full recon height
                         std::ptr::null_mut(),
                     );
                 }
@@ -950,6 +954,7 @@ mod cuda_impl {
                     phi,
                     1.0, // pure adjoint Wᵀ — no angular-quadrature gain
                     0,
+                    nz_run as i32, // parallel beam: rh == nz
                     std::ptr::null_mut(),
                 );
             }
@@ -1038,6 +1043,7 @@ mod cuda_impl {
                         rh as i32,
                         nz as i32,
                         n as i32,
+                        rh as i32, // volume z centred on the full recon height
                         nproj as i32,
                         std::ptr::null_mut(),
                     );
@@ -1092,6 +1098,7 @@ mod cuda_impl {
                     nz_run as i32,
                     nz_run as i32,
                     n as i32,
+                    nz_run as i32, // parallel beam: rh == nz
                     nproj as i32,
                     std::ptr::null_mut(),
                 );
@@ -1169,6 +1176,7 @@ mod cuda_impl {
             nz as i32, // ncz: recon height == detector rows (rh == nz here)
             nz as i32,
             n as i32,
+            nz as i32, // rh == nz by the device-path design (see above)
             nproj as i32,
             null,
         );
@@ -1178,7 +1186,8 @@ mod cuda_impl {
     /// `cfunc_linerec` handle: zero `f` (the kernel accumulates) then launch.
     /// Gain 1 — the pure adjoint of [`dev_forward`], no angular-quadrature
     /// weight (that π/nproj belongs to the analytic FBP paths only). `vbytes` =
-    /// byte size of `f`.
+    /// byte size of `f`; `nz` = the volume height (== detector rows in the
+    /// device path — rh == nz by design, mirroring [`dev_forward`]'s centring).
     ///
     /// # Safety
     /// `handle` from [`ffi::tomoxide_linerec_new`]; `f`/`g`/`theta` valid device
@@ -1190,13 +1199,15 @@ mod cuda_impl {
         g: *const c_void,
         theta: *const f32,
         phi: f32,
+        nz: usize,
         vbytes: usize,
     ) {
         let null = std::ptr::null_mut::<c_void>();
         ffi::tomoxide_cuda_memset_async(f, 0, vbytes, null);
         ffi::tomoxide_linerec_backproject(
             handle, f, g, theta, phi, // π/2 parallel beam, tilted for laminography
-            1.0, 0, null,
+            1.0, 0, nz as i32, // rh == nz by the device-path design
+            null,
         );
     }
 
@@ -1265,12 +1276,12 @@ mod cuda_impl {
         unsafe {
             dev_forward(ax_d.ptr, ones_v.ptr, tp, phi, nz, n, nproj); // A(1)
             ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null); // R
-            dev_backproject(handle, corr_d.ptr, ones_s.ptr, tp, phi, vbytes); // Aᵀ(1)
+            dev_backproject(handle, corr_d.ptr, ones_s.ptr, tp, phi, nz, vbytes); // Aᵀ(1)
             ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null); // C
             for _ in 0..num_iter.max(1) {
                 dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj); // ax = A x
                 ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null); // (b−Ax)∘R
-                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, phi, vbytes); // corr = Aᵀ(…)
+                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, phi, nz, vbytes); // corr = Aᵀ(…)
                 ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null);
                 // x += C∘corr
             }
@@ -1447,7 +1458,9 @@ mod cuda_impl {
                         {
                             let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsub])?;
                             unsafe {
-                                dev_backproject(handle, corr_d.ptr, ones_s.ptr, tp, phi, vbytes);
+                                dev_backproject(
+                                    handle, corr_d.ptr, ones_s.ptr, tp, phi, nz, vbytes,
+                                );
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
                                 }
@@ -1473,7 +1486,7 @@ mod cuda_impl {
                                 ffi::tomoxide_iter_residual(
                                     ax_d.ptr, b_d.ptr, rw_d.ptr, nsub, null,
                                 ); // (b−Ax)∘R
-                                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, phi, vbytes); // Aᵀₘ(…)
+                                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, phi, nz, vbytes); // Aᵀₘ(…)
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
                                 }
@@ -1585,6 +1598,7 @@ mod cuda_impl {
                     ones_s.ptr,
                     theta_d.ptr as *const f32,
                     phi,
+                    nz,
                     vbytes,
                 )
             };
@@ -1633,7 +1647,7 @@ mod cuda_impl {
                     let nsub = nz * sub.len * ncols;
                     dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, phi, nz, n, sub.len); // Aₛ x
                     ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null); // bₛ ⊘ Aₛ x
-                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, phi, vbytes); // Aₛᵀ(…)
+                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, phi, nz, vbytes); // Aₛᵀ(…)
                     ffi::tomoxide_iter_em_update(vol_d.ptr, corr_d.ptr, sub.sens_d.ptr, nvol, null);
                     // x ∘ corr ⊘ sens
                 }
@@ -1692,7 +1706,7 @@ mod cuda_impl {
                     let nsub = nz * sub.len * ncols;
                     dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, phi, nz, n, sub.len); // Aₛ x
                     ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null); // bₛ ⊘ Aₛ x
-                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, phi, vbytes); // Aₛᵀ(…)
+                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, phi, nz, vbytes); // Aₛᵀ(…)
                     ffi::tomoxide_cuda_memcpy_d2d_async(old_d.ptr, vol_d.ptr, vbytes, null); // snapshot
                     ffi::tomoxide_iter_pml_update(
                         vol_d.ptr,
@@ -1788,7 +1802,7 @@ mod cuda_impl {
             for it in 0..num_iter.max(1) {
                 dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj); // ax = R x
                 ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null); // r·R x − b
-                dev_backproject(handle, bpv_d.ptr, ax_d.ptr, tp, phi, vbytes); // Rᵀ(…)
+                dev_backproject(handle, bpv_d.ptr, ax_d.ptr, tp, phi, nz, vbytes); // Rᵀ(…)
                 ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·Rᵀ
                 if let Some(pd) = &prior_d {
                     ffi::tomoxide_iter_grad_tikh(
@@ -1903,7 +1917,7 @@ mod cuda_impl {
             // Init: r = b − A x0 ; z = Aᵀ r ; p = z ; gamma = ⟨z,z⟩ per slice.
             dev_forward(r_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj); // r = A x0
             ffi::tomoxide_iter_residual(r_d.ptr, b_d.ptr, ones_s.ptr, nsino, null); // r = b − A x0
-            dev_backproject(handle, z_d.ptr, r_d.ptr, tp, phi, vbytes); // z = Aᵀ r
+            dev_backproject(handle, z_d.ptr, r_d.ptr, tp, phi, nz, vbytes); // z = Aᵀ r
             ffi::tomoxide_cuda_memcpy_d2d_async(p_d.ptr, z_d.ptr, vbytes, null); // p = z
             ffi::tomoxide_iter_slice_dot(gamma_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null);
 
@@ -1935,7 +1949,7 @@ mod cuda_impl {
                     nsino,
                     null,
                 );
-                dev_backproject(handle, z_d.ptr, r_d.ptr, tp, phi, vbytes); // z = Aᵀ r
+                dev_backproject(handle, z_d.ptr, r_d.ptr, tp, phi, nz, vbytes); // z = Aᵀ r
                 ffi::tomoxide_iter_slice_dot(gnew_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null);
                 ffi::tomoxide_iter_cgls_beta(beta_d.ptr, gamma_d.ptr, gnew_d.ptr, nz, null);
                 ffi::tomoxide_iter_xpby_slice(p_d.ptr, z_d.ptr, beta_d.ptr, vslice, nvol, null);
@@ -2011,7 +2025,7 @@ mod cuda_impl {
             for _ in 0..num_iter.max(1) {
                 dev_forward(ax_d.ptr, xbar_d.ptr, tp, phi, nz, n, nproj); // R x̄
                 ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null);
-                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, phi, vbytes); // Rᵀ(pd)
+                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, phi, nz, vbytes); // Rᵀ(pd)
                 ffi::tomoxide_iter_tv_dual(
                     p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
                 );
@@ -2347,6 +2361,7 @@ mod cuda_impl {
                 std::f32::consts::FRAC_PI_2,
                 std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                 0,
+                nz as i32, // parallel beam: rh == nz
                 null,
             );
         }
@@ -2364,10 +2379,15 @@ mod cuda_impl {
     /// (b) reconstructs `rh` output slices (not the `nz` detector rows — every
     /// output voxel samples a detector row that depends on `(x,y,z)` once the axis
     /// is tilted, so a parallel-beam per-slice mapping no longer holds), and
-    /// (c) passes the chunk's global z-start `sz` so the kernel's
-    /// `z = (tz + sz) − nz/2` lands on the right detector plane. The full
-    /// projection stack (`nz` rows) is filtered once and back-projected into every
-    /// output slice. Returns the chunk volume `[rh, n, n]` in the CPU/tomopy
+    /// (c) passes the chunk's global z-start `sz` so the kernel's volume z
+    /// `tz + sz` — centred on `rh/2`, the full recon height's midpoint, matching
+    /// the Fourier (USFFT) laminography convention — lands on the right detector
+    /// plane (row centre `nz/2`). `rh` is therefore the FULL reconstruction
+    /// height: this function reconstructs all of it in one launch (`sz` = 0 from
+    /// its only caller); partial-height streaming goes through
+    /// [`lamino_backproject_shard`], which takes the shard extent and the full
+    /// height separately. The full projection stack (`nz` rows) is filtered once
+    /// and back-projected into every output slice. Returns the chunk volume `[rh, n, n]` in the CPU/tomopy
     /// handedness — no y-flip — at the `π/nproj` dθ gain the caller passes, the same
     /// orientation and quadrature weight as every other analytic path here
     /// (`backprojection_ker` lost tomocupy's `(n−1−ty)` write and baked-in `4/nproj`
@@ -2439,6 +2459,7 @@ mod cuda_impl {
                 phi,
                 std::f32::consts::PI / nproj as f32, // analytic angular quadrature dθ
                 sz,
+                rh as i32, // volume z centred on the full recon height
                 null,
             );
         }
@@ -2465,11 +2486,16 @@ mod cuda_impl {
     /// per output slot, the other a tilt. Everything around them — filtering,
     /// angle chunking, accumulation — is identical, so it lives once in
     /// [`try_probe_chunk`] rather than in two copies that can drift apart.
+    /// Each variant also carries the reconstruction height(s) `rh` the probed
+    /// slice `sz` is centred on (`sz` is a volume z, `tz + sz` centred on `rh/2`
+    /// like every reconstruction — see `kernels_linerec.cuh`): one scalar for the
+    /// centre sweep (the geometry, and thus the height, is fixed), one per slot
+    /// for the tilt sweep (the height depends on the tilt).
     enum TrySweep<'a> {
         /// Centre candidates as back-projection shifts; `phi` fixed for all.
-        Center { sh: &'a [f32], phi: f32 },
+        Center { sh: &'a [f32], phi: f32, rh: i32 },
         /// Tilt candidates as per-slot `phi`; the centre rides in the filter.
-        Tilt { phi: &'a [f32] },
+        Tilt { phi: &'a [f32], rh: &'a [i32] },
     }
 
     impl TrySweep<'_> {
@@ -2477,14 +2503,14 @@ mod cuda_impl {
         fn len(&self) -> usize {
             match self {
                 TrySweep::Center { sh, .. } => sh.len(),
-                TrySweep::Tilt { phi } => phi.len(),
+                TrySweep::Tilt { phi, .. } => phi.len(),
             }
         }
 
         fn host(&self) -> &[f32] {
             match self {
                 TrySweep::Center { sh, .. } => sh,
-                TrySweep::Tilt { phi } => phi,
+                TrySweep::Tilt { phi, .. } => phi,
             }
         }
     }
@@ -2523,6 +2549,12 @@ mod cuda_impl {
 
         let theta_dev = DevBuf::from_host_f32(theta)?;
         let cand_dev = DevBuf::from_host_f32(sweep.host())?;
+        // Per-slot recon heights for the tilt sweep (the kernel reads rh[tz]);
+        // the centre sweep's single height travels as a plain scalar argument.
+        let rh_dev = match &sweep {
+            TrySweep::Tilt { rh, .. } => Some(DevBuf::from_host_i32(rh)?),
+            TrySweep::Center { .. } => None,
+        };
         let gf_dev = DevBuf::new(nz * ncproj_max.max(1) * ncols * fsz)?;
         // ncz = ncand: the kernel's output index selects the CANDIDATE, not a z
         // row. Zeroed once; every angle chunk accumulates into it.
@@ -2538,7 +2570,7 @@ mod cuda_impl {
                 return Err(Error::Backend("cfunc_linerec allocation failed".into()));
             }
             match sweep {
-                TrySweep::Center { phi, .. } => unsafe {
+                TrySweep::Center { phi, rh, .. } => unsafe {
                     ffi::tomoxide_linerec_backproject_try(
                         h,
                         f_dev.ptr,
@@ -2547,6 +2579,7 @@ mod cuda_impl {
                         cand_dev.ptr as *const f32,
                         phi,
                         sz,
+                        rh,
                         null,
                     );
                 },
@@ -2558,6 +2591,10 @@ mod cuda_impl {
                         theta_ptr,
                         cand_dev.ptr as *const f32,
                         sz,
+                        rh_dev
+                            .as_ref()
+                            .expect("Tilt sweep uploads its per-slot rh")
+                            .ptr as *const i32,
                         null,
                     );
                 },
@@ -2631,6 +2668,18 @@ mod cuda_impl {
             Beam::Laminography { phi } => phi,
             _ => std::f32::consts::FRAC_PI_2,
         };
+        // Recon height the probed slice `sz` is centred on — the same height the
+        // full reconstruction at this geometry would use, so `sz` means the same
+        // volume z the reconstruction's slice index means.
+        let rh = match geom.beam {
+            Beam::Laminography { phi } => {
+                let deg = (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+                params
+                    .lamino_rh
+                    .unwrap_or_else(|| super::lamino_recon_height(nz, deg))
+            }
+            _ => nz,
+        } as i32;
         // The filter put `nominal` at ncols/2, so the point `c` now sits at
         // ncols/2 + (c − nominal); the kernel samples at `n/2 − sh`, so reaching
         // it needs sh = nominal − c. (Same mapping as tomocupy's
@@ -2644,7 +2693,7 @@ mod cuda_impl {
             raw,
             &w,
             theta,
-            TrySweep::Center { sh: &sh, phi },
+            TrySweep::Center { sh: &sh, phi, rh },
             nz,
             nproj,
             ncols,
@@ -2768,6 +2817,17 @@ mod cuda_impl {
             .iter()
             .map(|d| std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0)
             .collect();
+        // Per-tilt recon height: each candidate's slice `sz` is centred on the
+        // height the full reconstruction at THAT tilt would use, so one volume z
+        // means the same thing across the sweep and against the reconstruction.
+        let rh: Vec<i32> = tilts_deg
+            .iter()
+            .map(|d| {
+                params
+                    .lamino_rh
+                    .unwrap_or_else(|| super::lamino_recon_height(nz, *d)) as i32
+            })
+            .collect();
 
         let devices = selected_devices();
         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
@@ -2775,7 +2835,7 @@ mod cuda_impl {
             raw,
             &w,
             theta,
-            TrySweep::Tilt { phi: &phi },
+            TrySweep::Tilt { phi: &phi, rh: &rh },
             nz,
             nproj,
             ncols,
@@ -2900,6 +2960,7 @@ mod cuda_impl {
             phi,
             0,
             rh,
+            rh,
             free,
         )
     }
@@ -3004,6 +3065,8 @@ mod cuda_impl {
     /// row offset `sz = rh0 + tile_local_start` so the shard lands on the correct
     /// output rows. This is the shardable unit: a multi-GPU driver runs one shard
     /// per device over disjoint rh ranges reading the shared `host_gf`.
+    /// `rh_total` is the FULL reconstruction height the global rows are centred
+    /// on (every shard passes the same value; a shard's own extent is `rh_len`).
     #[allow(clippy::too_many_arguments)]
     fn lamino_backproject_shard(
         host_gf: &[Vec<f32>],
@@ -3016,6 +3079,7 @@ mod cuda_impl {
         phi: f32,
         rh0: usize,
         rh_len: usize,
+        rh_total: usize,
         free: usize,
     ) -> Result<Vec<f32>> {
         let fsz = std::mem::size_of::<f32>();
@@ -3048,7 +3112,15 @@ mod cuda_impl {
                 }
                 unsafe {
                     ffi::tomoxide_linerec_backproject(
-                        h, f_dev.ptr, gf_dev.ptr, theta_ptr, phi, gain, sz, null,
+                        h,
+                        f_dev.ptr,
+                        gf_dev.ptr,
+                        theta_ptr,
+                        phi,
+                        gain,
+                        sz,
+                        rh_total as i32, // global rows centred on the full height
+                        null,
                     );
                 }
                 unsafe { ffi::tomoxide_linerec_free(h) };
@@ -3131,6 +3203,7 @@ mod cuda_impl {
                 std::f32::consts::FRAC_PI_2,
                 std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                 0,
+                nz as i32, // parallel beam: rh == nz
                 null,
             );
         }
@@ -4463,6 +4536,7 @@ mod cuda_impl {
                             std::f32::consts::FRAC_PI_2,
                             std::f32::consts::PI / nproj as f32, // FBP dθ weight
                             0,
+                            self.max_nz as i32, // parallel: rh == the handle's nz
                             null,
                         );
                     }
@@ -4617,6 +4691,7 @@ mod cuda_impl {
                         std::f32::consts::FRAC_PI_2,
                         std::f32::consts::PI / nproj as f32, // FBP dθ weight
                         0,
+                        self.max_nz as i32, // parallel: rh == the handle's nz
                         null,
                     );
                 }
@@ -4795,6 +4870,7 @@ mod cuda_impl {
                     std::f32::consts::FRAC_PI_2,
                     std::f32::consts::PI / nproj as f32, // FBP dθ weight
                     0,
+                    len as i32, // parallel: rh == the chunk's nz
                     st,
                 );
             }
@@ -5053,6 +5129,7 @@ mod cuda_impl {
                     std::f32::consts::FRAC_PI_2,
                     std::f32::consts::PI / nproj as f32, // FBP dθ weight
                     0,
+                    len as i32, // parallel: rh == the chunk's nz
                     st,
                 );
             }
@@ -6753,6 +6830,7 @@ mod cuda_impl {
                                 phi,
                                 tz0,
                                 tlen,
+                                rh,
                                 device_free_bytes(),
                             )
                         })
@@ -6939,6 +7017,7 @@ mod cuda_impl {
                                     phi,
                                     rh0,
                                     rh_len,
+                                    rh,
                                     device_free_bytes(),
                                 )
                             })

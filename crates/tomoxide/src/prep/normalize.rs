@@ -61,6 +61,10 @@ pub fn minus_log(data: &mut Tomo<f32>, backend: &dyn Backend) -> Result<()> {
 /// Full flat-field correction then minus-log on a [`Dataset`], in place.
 ///
 /// No-ops the dark/flat step when either is absent (already-normalized input).
+/// The minus-log is **included** — following this with [`minus_log`] applies
+/// `−log` twice, which amplifies the noise floor everywhere the line integral
+/// is near zero (air) while leaving the sample recognisable, i.e. it corrupts
+/// quietly. Call [`minus_log`] only on data that never went through here.
 pub fn normalize_dataset(ds: &mut Dataset<f32>, backend: &dyn Backend) -> Result<()> {
     if let (Some(flat), Some(dark)) = (&ds.flat, &ds.dark) {
         normalize(&mut ds.data, flat, dark, backend)?;
