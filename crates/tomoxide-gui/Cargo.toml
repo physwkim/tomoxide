@@ -6,7 +6,7 @@
 # [workspace] + own Cargo.lock; build from this directory. See docs/GUI.md §3.1.
 [package]
 name = "tomoxide-gui"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.92"
 license = "BSD-3-Clause"
@@ -31,7 +31,7 @@ sift-center = ["tomoxide/sift-center"]
 [dependencies]
 # `version` (alongside `path`) is required to publish to crates.io: the
 # published crate depends on tomoxide 0.6.0 from crates.io; local builds use path.
-tomoxide = { path = "../tomoxide", version = "0.6.0", features = ["config", "xanes"] }
+tomoxide = { path = "../tomoxide", version = "0.7.0", features = ["config", "xanes"] }
 # Same major as tomoxide's workspace pin — its public API leaks ndarray types
 # (Tomo.array, find_center_pc's Array2), so both must resolve to one ndarray.
 ndarray = "0.16"

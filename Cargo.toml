@@ -22,7 +22,7 @@ members = [
 exclude = ["crates/tomoxide-gui"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.82"
 license = "BSD-3-Clause"
@@ -32,7 +32,7 @@ description = "GPU/CPU tomographic reconstruction toolkit (tomopy + tomocupy, in
 
 [workspace.dependencies]
 # --- the single library crate (used by the CLI binary) ---
-tomoxide = { path = "crates/tomoxide", version = "0.6.0" }
+tomoxide = { path = "crates/tomoxide", version = "0.7.0" }
 
 # --- x-ray physics (beam hardening; optional, pulled only by the
 # `beam-hardening` feature). From crates.io so the workspace is self-contained
