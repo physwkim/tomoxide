@@ -71,11 +71,12 @@ tiff = "0.11"
 fs4 = "0.13"
 
 # Live mode integration test: stand up an in-process PvaServer publishing
-# synthetic frames/angles and subscribe through rsdm. Must be the SAME
-# epics-pva-rs 0.21.x rsdm builds against, or the NT value types would not unify
-# (the local epics-rs checkout is 0.22 — do NOT path-patch to it).
+# synthetic frames/angles and subscribe through rsdm. The coupling is a TCP
+# address (`PvaPlugin::with_server(server.tcp_addr())`), not shared types, so
+# this may lead rsdm's internal epics-pva-rs (^0.22 as of rsdm 0.5.4) — the two
+# copies talk pvAccess wire protocol, verified by the live tests.
 [dev-dependencies]
-epics-pva-rs = "0.21"
+epics-pva-rs = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # Local development against a sibling checkout (uncomment; do not commit):
