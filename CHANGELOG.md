@@ -62,18 +62,33 @@ All notable changes to this project are documented here. The format is based on
   1120 as tilt went 40° → 58°), so a fixed slice scores the wrong plane by more
   than the tilt signal is worth. Measured: a fixed-slice tilt sweep returns 48° at
   one slice and rails to the top of any range at another. Hence
-  `recon::center::lamino_tilt_scan` (`--tilt_width` / `--tilt_step`), which does
-  what `docs/LAMINOGRAPHY_ALIGNMENT.md` §2/§4 validates: one **full**
-  reconstruction per candidate, scored by the max `slice_focus` over the whole z
-  range. That needs every (tilt, z) pair, which is exactly the work
-  `lamino_tilt_probe` skips — so the probe buys nothing there and remains for the
-  case its saving is real, a plane that is already known. The scan streams the
-  volume, so its memory cost is one rh-tile regardless of depth, and it keeps what
-  the reconstruction already computed: the winning slice (§3 confirms by eye) and
-  `focus_by_z`, the focus of every slice. The profile is what separates a real
-  optimum from the failure §2 names — "a MONOTONE focus surface with the argmax
-  pinned to a grid corner" — and on the aligned pouch scan at 44° it shows a broad
-  hump rising to 1.96e-5 at slice 292 of 1424, not an edge spike.
+  `recon::center::lamino_tilt_scan` (`--tilt_width` / `--tilt_step`): one **full**
+  reconstruction per candidate — that needs every (tilt, z) pair, which is
+  exactly the work `lamino_tilt_probe` skips, so the probe buys nothing there and
+  remains for the case its saving is real, a plane that is already known — scored
+  by the max `slice_focus` **inside the sample's z band**
+  (`recon::center::SampleBand`, `--focus_z LO:HI`). The band is not an
+  optimisation, it is what makes the score mean anything on real data: mean |∇|²
+  rewards high-frequency noise over smooth particles, measured **1.7×** on the
+  aligned pouch scan (a pure-noise plane at 1.95e-5 against the eye-confirmed
+  electrode plane at 1.15e-5), so a whole-volume max pins `z_peak` to the noise
+  hump at every candidate and its curve carries no geometry signal at all — its
+  centre response is monotone past the known axis. A band *fixed* in z would fail
+  the other way (the in-focus layer moves: the sample's spike sits at z 837 / 890
+  / 956 at tilts 40° / 44° / 48°), so the band is stated once, at the tilt it was
+  read from, and carried into each candidate's volume through the detector rows —
+  which belong to the data and do not move (`v − nz/2 = cos(tilt)·(z − rh/2)`;
+  the mapping reproduces those measured spikes to ~1 px, and that measurement is
+  pinned as a unit test). End to end on the aligned pouch scan (`--focus_z
+  870:910` at 44°): the tilt curve over 36…52° is unimodal with its interior
+  peak on the known 44° and a **2.26×** span, where the whole-volume score
+  measured a 1.4 % spread with no identifiable optimum — and every candidate's
+  `z_peak` landed inside its own carried band, the three measured spikes among
+  them. The scan streams the volume, so its memory cost is one
+  rh-tile regardless of depth, and it keeps what the reconstruction already
+  computed: the winning in-band slice (§3 confirms by eye) and `focus_by_z`, the
+  focus of every slice — the profile the *next* band is read off, so it is never
+  truncated to the current one.
 - **`recon::center::pick_interior_max`** — the argmax of a sweep, plus whether the
   sweep earned the right to call it an optimum. A maximum on the first or last
   candidate is the range running out, and there is no way to tell from inside the

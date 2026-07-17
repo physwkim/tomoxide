@@ -259,6 +259,7 @@ impl App {
                     tilt_deg,
                     focus,
                     z_peak,
+                    band,
                     depth,
                     focus_by_z,
                     ny,
@@ -267,11 +268,16 @@ impl App {
                     done,
                     total,
                 } => {
+                    let scored = match band {
+                        Some((lo, hi)) => format!(", band {lo}..{hi}"),
+                        None => String::new(),
+                    };
                     self.log.push(format!(
-                        "tilt {tilt_deg:.2}°: focus {focus:.4e}, peak slice {z_peak} of {depth}                          ({done}/{total})"
+                        "tilt {tilt_deg:.2}°: focus {focus:.4e}, peak slice {z_peak} of {depth}{scored} ({done}/{total})"
                     ));
                     self.lamino.on_tilt(
-                        tilt_deg, focus, z_peak, depth, focus_by_z, ny, nx, &slice, done, total,
+                        tilt_deg, focus, z_peak, band, depth, focus_by_z, ny, nx, &slice, done,
+                        total,
                     );
                 }
                 Event::LaminoTiltDone { cancelled, millis } => {

@@ -95,6 +95,15 @@ enum Command {
         /// worth the reconstruction each step costs.
         #[arg(long, default_value_t = 1.0)]
         tilt_step: f32,
+        /// Score the tilt scan only inside this sample z-band, `LO:HI` inclusive,
+        /// read off a reconstruction at `--lamino_angle`. Give it whenever you
+        /// can: without it the score is the max over the whole volume, and on
+        /// real data the focus metric ranks noise planes above the sample
+        /// (measured 1.7×), which drowns the tilt signal. The band follows the
+        /// tilt into each candidate's volume by itself — the sample's detector
+        /// rows do not move, so no candidate escapes it.
+        #[arg(long, value_parser = parse_zband)]
+        focus_z: Option<(usize, usize)>,
         /// Ignore the ring estimate's misalignment flag and refine anyway.
         #[arg(long)]
         force: bool,
@@ -786,6 +795,19 @@ fn grid(center: f32, half_width: f32, step: f32) -> Vec<f32> {
     (-n..=n).map(|k| center + k as f32 * step).collect()
 }
 
+/// `LO:HI` → an inclusive slice band, for `--focus_z`.
+fn parse_zband(s: &str) -> Result<(usize, usize), String> {
+    let (a, b) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected LO:HI (e.g. 820:940), got `{s}`"))?;
+    let lo: usize = a.trim().parse().map_err(|e| format!("LO `{a}`: {e}"))?;
+    let hi: usize = b.trim().parse().map_err(|e| format!("HI `{b}`: {e}"))?;
+    if lo > hi {
+        return Err(format!("LO {lo} is above HI {hi}"));
+    }
+    Ok((lo, hi))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_align(
     file: &std::path::Path,
@@ -799,11 +821,12 @@ fn run_align(
     lamino_angle: Option<f32>,
     tilt_width: Option<f32>,
     tilt_step: f32,
+    focus_z: Option<(usize, usize)>,
     force: bool,
 ) -> anyhow::Result<()> {
     use tomoxide::geometry::{Angles, Beam, Center, Detector, Geometry};
     use tomoxide::prep::normalize::{minus_log, normalize_dataset};
-    use tomoxide::recon::center::{find_center_rings, lamino_tilt_scan, slice_focus};
+    use tomoxide::recon::center::{find_center_rings, lamino_tilt_scan, slice_focus, SampleBand};
     use tomoxide::ReconParams;
 
     // The tilt scan reconstructs at `--lamino_angle ± --tilt_width`, so without a
@@ -814,6 +837,14 @@ fn run_align(
             "--tilt_width searches around --lamino_angle, which was not given.\n\
              Pass the tilt you believe the scan was taken at; parallel-beam scans have\n\
              no tilt to search."
+        );
+    }
+    // The band scores the tilt scan; accepting it without one would silently do
+    // nothing, which reads as \"the band was applied\".
+    if focus_z.is_some() && tilt_width.is_none() {
+        anyhow::bail!(
+            "--focus_z restricts the tilt scan's scoring, and no tilt scan was requested.\n\
+             Add --tilt_width to scan the tilt, or drop --focus_z."
         );
     }
 
@@ -957,11 +988,22 @@ fn run_align(
                 "\nscanning {} tilts around {t0:.2}° at centre {center:.2}",
                 tilts.len()
             );
-            println!(
-                "  Each candidate is a FULL reconstruction ({nproj} projections, \
-                 {nx}×{nx}×~{depth}) scored\n  by the max focus over every one of its \
-                 slices. Minutes per tilt, not seconds."
-            );
+            match focus_z {
+                Some((lo, hi)) => println!(
+                    "  Each candidate is a FULL reconstruction ({nproj} projections, \
+                     {nx}×{nx}×~{depth}) scored\n  by the max focus inside the sample band \
+                     {lo}..{hi} (read at {t0:.2}°, carried to each\n  tilt through the \
+                     detector rows). Minutes per tilt, not seconds."
+                ),
+                None => println!(
+                    "  Each candidate is a FULL reconstruction ({nproj} projections, \
+                     {nx}×{nx}×~{depth}) scored\n  by the max focus over every one of its \
+                     slices. Minutes per tilt, not seconds.\n  NOTE: whole-volume focus is \
+                     noise-prone — on real data the metric ranks noise planes\n  above the \
+                     sample. Read the sample's z range off the focus-by-slice curve (or a\n  \
+                     reconstruction) and pass it as --focus_z LO:HI."
+                ),
+            }
             let t_start = Instant::now();
             let scores = lamino_tilt_scan(
                 &ds.data,
@@ -969,11 +1011,16 @@ fn run_align(
                 Algorithm::Fourierrec,
                 &params,
                 &tilts,
+                focus_z.map(|z| SampleBand { z, tilt_deg: t0 }),
                 // The winning slice is `align`'s to ignore: it prints, and
                 // docs/LAMINOGRAPHY_ALIGNMENT.md §3 says confirm on a montage.
                 &mut |r, _slice| {
+                    let band = match r.band {
+                        Some((lo, hi)) => format!("  band {lo}..{hi}"),
+                        None => String::new(),
+                    };
                     println!(
-                        "    {:6.2}°  focus {:.4e}  z_peak {} of {}   [{:.0} s elapsed]",
+                        "    {:6.2}°  focus {:.4e}  z_peak {} of {}{band}   [{:.0} s elapsed]",
                         r.tilt_deg,
                         r.focus,
                         r.z_peak,
@@ -1023,7 +1070,8 @@ fn run_align(
          axis rather than searching for one. The tilt is the opposite on both\n\
          counts — ~2 % per 1°, and it drags the in-focus layer through z (measured: z_peak\n\
          800 -> 1120 as tilt went 40° -> 58°) — so a fixed slice scores a plane whose error\n\
-         swamps the signal, and only the max over the whole z range ranks it.\n\
+         swamps the signal; a full reconstruction ranks it, scored inside the sample's\n\
+         z band (--focus_z), because the focus metric ranks noise planes above the sample.\n\
          docs/LAMINOGRAPHY_ALIGNMENT.md §2 and §4. If the tilt moved far, the centre was\n\
          scored under the old one: re-run with the new --lamino_angle. Use -v for the focus\n\
          curves, and confirm on a montage before committing a full reconstruction (§3)."
@@ -1078,6 +1126,7 @@ fn main() -> anyhow::Result<()> {
             lamino_angle,
             tilt_width,
             tilt_step,
+            focus_z,
             force,
         } => {
             run_align(
@@ -1092,6 +1141,7 @@ fn main() -> anyhow::Result<()> {
                 lamino_angle,
                 tilt_width,
                 tilt_step,
+                focus_z,
                 force,
             )?;
         }

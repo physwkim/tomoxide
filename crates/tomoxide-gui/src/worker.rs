@@ -130,11 +130,21 @@ pub enum Job {
         slice: Option<usize>,
         centers: Vec<f32>,
     },
-    /// Score each tilt by a FULL reconstruction, max focus over every slice
+    /// Score each tilt by a FULL reconstruction
     /// (`recon::center::lamino_tilt_scan`) → one [`Event::LaminoTilt`] per
     /// candidate as it lands, then [`Event::LaminoTiltDone`]. Minutes per
     /// candidate; [`Worker::cancel`] stops it at the next boundary.
-    LaminoTiltScan { center: f32, tilts: Vec<f32> },
+    ///
+    /// `band` is the sample's z range, and passing it is what makes the score
+    /// mean anything on real data: the focus metric ranks noise planes above the
+    /// sample (measured 1.7×), so without a band the max-over-z answers for the
+    /// noise. It is carried into each candidate tilt's own volume through the
+    /// detector rows by the scan itself.
+    LaminoTiltScan {
+        center: f32,
+        tilts: Vec<f32>,
+        band: Option<tomoxide::recon::center::SampleBand>,
+    },
     /// Exit the worker loop.
     Shutdown,
 }
@@ -218,6 +228,9 @@ pub enum Event {
         tilt_deg: f32,
         focus: f64,
         z_peak: usize,
+        /// The inclusive z range that was scored at this tilt — the sample band
+        /// carried into this tilt's own volume — or `None` for every slice.
+        band: Option<(usize, usize)>,
         depth: usize,
         focus_by_z: Vec<f64>,
         ny: usize,
@@ -450,7 +463,11 @@ fn worker_main(
                     }),
                 }
             }
-            Job::LaminoTiltScan { center, tilts } => {
+            Job::LaminoTiltScan {
+                center,
+                tilts,
+                band,
+            } => {
                 let Some(path) = current.clone() else {
                     continue;
                 };
@@ -460,13 +477,14 @@ fn worker_main(
                 let total = tilts.len();
                 let mut done = 0usize;
                 let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
-                    st.tilt_scan(center, &tilts, &mut |r, img| {
+                    st.tilt_scan(center, &tilts, band, &mut |r, img| {
                         done += 1;
                         let (ny, nx) = img.dim();
                         send(Event::LaminoTilt {
                             tilt_deg: r.tilt_deg,
                             focus: r.focus,
                             z_peak: r.z_peak,
+                            band: r.band,
                             depth: r.depth,
                             focus_by_z: r.focus_by_z.clone(),
                             ny,
@@ -792,6 +810,7 @@ impl PreppedStack {
         &self,
         center: f32,
         tilts: &[f32],
+        band: Option<tomoxide::recon::center::SampleBand>,
         on_tilt: &mut dyn FnMut(
             &tomoxide::recon::center::TiltFocus,
             ndarray::ArrayView2<f32>,
@@ -803,6 +822,7 @@ impl PreppedStack {
             Algorithm::Fourierrec,
             &ReconParams::default(),
             tilts,
+            band,
             on_tilt,
         )
     }

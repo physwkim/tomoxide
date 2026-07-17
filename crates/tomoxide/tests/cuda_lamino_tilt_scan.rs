@@ -11,7 +11,7 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::{Array2, Axis};
-use tomoxide::recon::center::{lamino_tilt_scan, slice_focus, TiltFocus};
+use tomoxide::recon::center::{lamino_tilt_scan, slice_focus, SampleBand, TiltFocus};
 use tomoxide::{
     cuda, sim, Algorithm, Angles, Beam, Center, CudaBackend, Detector, Geometry, ReconParams,
     Volume,
@@ -51,6 +51,13 @@ fn slab_volume(n: usize, rh: usize, z_lo: usize, z_hi: usize) -> Volume<f32> {
 /// Returns the scores, the in-focus slice `on_tilt` handed over for each, and
 /// the slab bounds.
 fn scan(tilts: &[f32]) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
+    scan_banded(tilts, None)
+}
+
+fn scan_banded(
+    tilts: &[f32],
+    band: Option<SampleBand>,
+) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
     let cuda = CudaBackend::new().expect("checked by the caller");
     let (n, nproj, nz) = (64usize, 90usize, 32usize);
     let rh = cuda::lamino_recon_height(nz, TRUE_TILT);
@@ -69,6 +76,7 @@ fn scan(tilts: &[f32]) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
         Algorithm::Fourierrec,
         &params,
         tilts,
+        band,
         &mut |r, slice| {
             assert_eq!(
                 slice.dim(),
@@ -213,4 +221,67 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
             r.focus
         );
     }
+}
+
+/// The band is what gets scored, and nothing else answers. A band enclosing the
+/// slab reproduces the whole-volume winner; a band on the empty far side of the
+/// volume forces the winner inside itself, away from the slab a whole-volume max
+/// would pick — which is the point: on real data the plane a whole-volume max
+/// picks is noise, and the band is how the caller keeps the score on the sample.
+#[test]
+fn cuda_lamino_tilt_scan_scores_only_the_sample_band() {
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping CUDA test: {e}");
+        return;
+    }
+    let (unbanded, _, z_lo, z_hi) = scan(&[TRUE_TILT]);
+
+    let on_slab = SampleBand {
+        z: (z_lo, z_hi - 1),
+        tilt_deg: TRUE_TILT,
+    };
+    let (scores, _, _, _) = scan_banded(&[TRUE_TILT], Some(on_slab));
+    let r = &scores[0];
+    // At its own tilt the band maps to itself, and the slab holds the winner.
+    assert_eq!(
+        r.band,
+        Some((z_lo, z_hi - 1)),
+        "band not carried to TiltFocus"
+    );
+    assert_eq!(
+        r.z_peak, unbanded[0].z_peak,
+        "a band enclosing the slab changed the winner"
+    );
+    // Two independent scans, so the FFT batching can differ — round-off, not
+    // bit-equality, same as the whole-vs-streamed comparison above.
+    assert!(
+        (r.focus - unbanded[0].focus).abs() <= unbanded[0].focus * 1e-6,
+        "banded {} vs unbanded {}",
+        r.focus,
+        unbanded[0].focus
+    );
+
+    let far = (3 * r.depth / 4, 3 * r.depth / 4 + 4);
+    let off_slab = SampleBand {
+        z: far,
+        tilt_deg: TRUE_TILT,
+    };
+    let (scores, _, _, _) = scan_banded(&[TRUE_TILT], Some(off_slab));
+    let r = &scores[0];
+    assert!(
+        (far.0..=far.1).contains(&r.z_peak),
+        "the winner {} escaped the scored band {}..{}",
+        r.z_peak,
+        far.0,
+        far.1
+    );
+    assert!(
+        r.focus < unbanded[0].focus,
+        "an empty band scored {} — at least as high as the slab's {} — so the band \
+         did not restrict anything",
+        r.focus,
+        unbanded[0].focus
+    );
+    // The profile is never truncated to the band: the next band is read off it.
+    assert_eq!(r.focus_by_z.len(), r.depth);
 }

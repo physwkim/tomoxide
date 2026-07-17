@@ -25,8 +25,11 @@
 //!    a rail check, is what shows you the sweep is lost. At ±8 px around the
 //!    rings' answer it is one lobe, 0.25 px from the truth.
 //! 3. **Tilt** — a FULL reconstruction per candidate, scored by the max focus
-//!    over every slice (§2). The tilt drags the in-focus layer through z, so a
-//!    fixed slice cannot rank it. Minutes per candidate, hence the cancel.
+//!    inside the sample's z band (§2). The tilt drags the in-focus layer through
+//!    z, so a fixed slice cannot rank it — and the whole volume cannot score it
+//!    either, because the focus metric ranks noise planes above the sample
+//!    (measured 1.7×); the band follows the tilt through the detector rows.
+//!    Minutes per candidate, hence the cancel.
 
 use std::sync::mpsc::Sender;
 
@@ -111,6 +114,9 @@ struct Tilt {
     tilt_deg: f32,
     focus: f64,
     z_peak: usize,
+    /// The inclusive z range the scan scored at this tilt (the sample band
+    /// carried into this tilt's own volume), `None` = every slice.
+    band: Option<(usize, usize)>,
     depth: usize,
     focus_by_z: Vec<f64>,
     ny: usize,
@@ -143,6 +149,11 @@ pub struct LaminoView {
 
     tilt_half: f32,
     tilt_step: f32,
+    /// Sample z-band the tilt scan scores inside, read off a reconstruction at
+    /// the working tilt. Off ⇒ the whole volume, which on real data lets the
+    /// focus metric answer for noise planes instead of the sample.
+    sample_z: (usize, usize),
+    sample_z_on: bool,
     /// `Some((done, total))` while a scan is running.
     tilt_progress: Option<(usize, usize)>,
     tilts: Vec<Tilt>,
@@ -200,6 +211,8 @@ impl LaminoView {
             center_curve: None,
             tilt_half: 3.0,
             tilt_step: 1.0,
+            sample_z: (0, 0),
+            sample_z_on: false,
             tilt_progress: None,
             tilts: Vec::new(),
             tilt_stack,
@@ -326,6 +339,7 @@ impl LaminoView {
         tilt_deg: f32,
         focus: f64,
         z_peak: usize,
+        band: Option<(usize, usize)>,
         depth: usize,
         focus_by_z: Vec<f64>,
         ny: usize,
@@ -339,6 +353,7 @@ impl LaminoView {
             tilt_deg,
             focus,
             z_peak,
+            band,
             depth,
             focus_by_z,
             ny,
@@ -411,7 +426,7 @@ impl LaminoView {
             None => {
                 self.tilt_curve = Some(
                     self.tilt_plot
-                        .add_curve_data_with_legend(&curve, "max focus over all slices"),
+                        .add_curve_data_with_legend(&curve, "max focus per tilt"),
                 );
             }
         }
@@ -428,6 +443,10 @@ impl LaminoView {
             return;
         };
         let x: Vec<f64> = (0..t.focus_by_z.len()).map(|z| z as f64).collect();
+        self.z_plot.set_graph_title(match t.band {
+            Some((lo, hi)) => format!("focus by slice — scored {lo}..{hi}"),
+            None => "focus by slice — scored everywhere (noise-prone)".into(),
+        });
         let curve = CurveData::new(x, t.focus_by_z.clone(), egui::Color32::LIGHT_RED);
         match self.z_curve {
             Some(h) => {
@@ -658,8 +677,10 @@ impl LaminoView {
         ui.label(
             "The tilt drags the in-focus layer through z (measured: slice 800 → 1120 as the \
              tilt went 40° → 58°) while its own response is only ~2 % per degree, so a fixed \
-             slice scores a plane whose error swamps the signal. Only the max over the whole \
-             z range ranks it — and that needs the whole reconstruction.",
+             slice scores a plane whose error swamps the signal. Ranking tilts takes the \
+             whole reconstruction — scored inside the sample's own z range, because the \
+             focus metric ranks noise planes above the sample (measured 1.7×) and a \
+             whole-volume max answers for the noise.",
         );
         let cands = grid(self.tilt, self.tilt_half, self.tilt_step);
         ui.horizontal(|ui| {
@@ -676,7 +697,31 @@ impl LaminoView {
             ui.label(format!("= {} reconstructions", cands.len()));
         });
         ui.horizontal(|ui| {
-            let idle = self.tilt_progress.is_none() && self.have_prior();
+            ui.checkbox(&mut self.sample_z_on, "sample z band")
+                .on_hover_text(
+                    "The slice range the sample occupies, read off a reconstruction at the \
+                     working tilt — the focus-by-slice curve below shows it after one scan, \
+                     and §3's eye check (round particles) confirms it. The band follows each \
+                     candidate tilt into its own volume by itself; the sample's detector \
+                     rows do not move.",
+                );
+            if self.sample_z_on {
+                ui.add(egui::DragValue::new(&mut self.sample_z.0).speed(1));
+                ui.label("..");
+                ui.add(egui::DragValue::new(&mut self.sample_z.1).speed(1));
+                if self.sample_z.0 > self.sample_z.1 {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "empty band");
+                }
+            } else {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "off — scoring every slice, noise included",
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            let band_ok = !self.sample_z_on || self.sample_z.0 <= self.sample_z.1;
+            let idle = self.tilt_progress.is_none() && self.have_prior() && band_ok;
             if ui
                 .add_enabled(idle, egui::Button::new("Scan the tilt"))
                 .on_hover_text(
@@ -691,6 +736,12 @@ impl LaminoView {
                     .send(Job::LaminoTiltScan {
                         center: self.center,
                         tilts: cands,
+                        band: self
+                            .sample_z_on
+                            .then_some(tomoxide::recon::center::SampleBand {
+                                z: self.sample_z,
+                                tilt_deg: self.tilt,
+                            }),
                     })
                     .is_ok()
                 {

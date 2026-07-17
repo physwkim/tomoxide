@@ -94,13 +94,34 @@ scoring are load-bearing; both were learned by getting them wrong first.
 
 - **Reconstruct from the FULL projection set.** On a 1/3 subsample the streak
   noise dominates and the focus metric tracks streaks instead of the sample.
-- **Score the MAX over the WHOLE z range, not a fixed band.** The in-focus layer
-  moves in z with the sample height *and* with the tilt (measured: `z_peak` walked
-  800 → 1120 as tilt went 40° → 58°). A fixed band silently misses it.
+- **Score inside the sample's z band, carried to each tilt through the detector
+  rows.** Two failure modes meet here; both were measured on the aligned pouch
+  scan, and each one alone used to be an argument for the other mistake.
+  1. *The whole volume is not scorable.* Mean `|∇|²` rewards high-frequency
+     noise over smooth round particles: it ranks a pure-noise plane **1.7×
+     above** the eye-confirmed sample plane (z=310 at 1.95e-5 against the
+     electrode at z=899, 1.15e-5, tilt 44°). A whole-volume max therefore pins
+     `z_peak` to the noise at every candidate — its centre curve on this scan is
+     monotone with no peak at the known 396, which is exactly the broken-search
+     symptom below.
+  2. *A band fixed in z misses the layer.* The in-focus layer moves in z with
+     the sample height *and* with the tilt: the sample's focus spike sits at
+     z 837 / 890 / 956 at tilts 40° / 44° / 48° (volume depths 1338 / 1424 /
+     1532).
 
-Focus score per slice: mean `|∇|²` inside a 0.92-FOV disk; take the max over z.
-Correct geometry concentrates a thin layer into one sharp slice, so the peak is
-high; wrong geometry spreads it.
+  The resolution is that the sample's *detector rows* do not move — they are a
+  property of the data, not of the reconstruction. On the axis the
+  back-projection samples row `v − nz/2 = cos(tilt)·(z − rh/2)`, so state the
+  band once, at the tilt of the reconstruction you read it from, and map it into
+  each candidate's own volume (`tomoxide align --focus_z LO:HI`;
+  `recon::center::SampleBand` in the library). The mapping lands on the measured
+  spikes to ~1 px: carrying the 44° band predicts 836 / — / 957.
+
+Focus score per slice: mean `|∇|²` inside a 0.92-FOV disk; take the max inside
+the band. Correct geometry concentrates a thin layer into one sharp slice, so
+the peak is high; wrong geometry spreads it. Read the band off one
+reconstruction at your prior geometry — §3's eye check says which slices carry
+round particles — or off the focus-by-slice profile the tilt scan reports.
 
 **The symptom of a broken search is a monotone surface with the argmax pinned to a
 grid corner.** That means the metric has no focus signal to lock onto — widen the
