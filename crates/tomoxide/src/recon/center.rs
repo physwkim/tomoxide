@@ -4,6 +4,11 @@
 //! (reconstruct a slice across a range of centers) are implemented;
 //! `find_center_sift` is implemented behind the `sift-center` feature (it links
 //! OpenCV). See `docs/PORTING.md` §C.
+//!
+//! Laminography alignment lives here too, since it is the same question asked of
+//! a second axis: `find_center_rings` reads the axis off the raw projections and
+//! says whether the scan was aligned at acquisition at all.
+//! `docs/LAMINOGRAPHY_ALIGNMENT.md` is the method it implements.
 
 use crate::backend::{Backend, Fft};
 use crate::data::{Layout, Tomo};
@@ -97,7 +102,30 @@ pub fn find_center_rings(
         )));
     }
 
-    // Mean projection over every `step`-th frame.
+    let prof = flip_registration_profile(&mean_projection(tomo, step)?, fft)?;
+    Ok(ring_center_from_profile(&prof, nx))
+}
+
+/// The bullseye itself: the mean of every `step`-th projection, `[ny, nx]`.
+///
+/// [`find_center_rings`] registers this image against its own flip to get a
+/// number, but `docs/LAMINOGRAPHY_ALIGNMENT.md` §1 makes *looking* at it step
+/// one, and treats eye-vs-correlation disagreement as the misalignment flag —
+/// which needs the image, not only the number. Same function both ways, so what
+/// a viewer shows is what the estimate was computed from.
+pub fn mean_projection(tomo: &Tomo<f32>, step: usize) -> Result<Array2<f32>> {
+    if step == 0 {
+        return Err(Error::InvalidParam(
+            "mean_projection: step must be ≥1".into(),
+        ));
+    }
+    let p = tomo.as_layout(Layout::Projection); // [nproj, ny, nx]
+    let (nproj, ny, nx) = p.array.dim();
+    if nproj == 0 {
+        return Err(Error::InvalidParam(
+            "mean_projection: the stack has no projections".into(),
+        ));
+    }
     let mut mean = Array2::<f32>::zeros((ny, nx));
     let mut cnt = 0usize;
     for i in (0..nproj).step_by(step) {
@@ -105,9 +133,7 @@ pub fn find_center_rings(
         cnt += 1;
     }
     mean /= cnt as f32;
-
-    let prof = flip_registration_profile(&mean, fft)?;
-    Ok(ring_center_from_profile(&prof, nx))
+    Ok(mean)
 }
 
 /// Row-summed cross-correlation of `m` against its own left–right flip.
@@ -191,6 +217,83 @@ fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
         prominence,
         trustworthy: prominence >= 8.0,
     }
+}
+
+/// Focus of one reconstructed slice: mean |∇|² inside a 0.92-FOV disk — the
+/// score `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 prescribes.
+///
+/// The disk is not cosmetic. Reconstruction geometry decides where the
+/// back-projection sampling leaves the detector, so the ring outside the
+/// reconstructed disk holds artifacts that move with the very parameter being
+/// scored. Scoring the full frame scores that boundary, and it is enough to flip
+/// the ranking.
+pub fn slice_focus(img: &ndarray::ArrayView2<f32>) -> f64 {
+    let (ny, nx) = img.dim();
+    if ny < 3 || nx < 3 {
+        return 0.0;
+    }
+    let (cy, cx) = (ny as f32 / 2.0, nx as f32 / 2.0);
+    let r2 = (0.46 * nx.min(ny) as f32).powi(2); // 0.92 FOV across
+    let (mut acc, mut cnt) = (0.0f64, 0usize);
+    for y in 1..ny - 1 {
+        for x in 1..nx - 1 {
+            if (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2) >= r2 {
+                continue;
+            }
+            let gx = (img[[y, x + 1]] - img[[y, x - 1]]) as f64;
+            let gy = (img[[y + 1, x]] - img[[y - 1, x]]) as f64;
+            acc += gx * gx + gy * gy;
+            cnt += 1;
+        }
+    }
+    acc / cnt.max(1) as f64
+}
+
+/// The best candidate of a sweep, and whether the sweep earned the right to call
+/// it one — see [`pick_interior_max`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pick {
+    /// Index into the candidate/score arrays.
+    pub index: usize,
+    /// The candidate itself.
+    pub value: f32,
+    /// The maximum landed on the first or last candidate, so the search stopped
+    /// before the metric did. **The true peak is at the edge or beyond it and
+    /// there is no way to tell which from inside the range**, so this is not an
+    /// optimum, it is the range running out.
+    pub railed: bool,
+}
+
+/// Pick the highest-scoring candidate, and say whether it is interior.
+///
+/// A railed maximum reported as an answer is how one bad axis poisons the next:
+/// a tilt railed at the top of its range moved a centre re-sweep 1.7 px off the
+/// value the un-railed sweep found. Callers must handle `railed` — widen the
+/// range or recentre it — rather than print it in a footer.
+///
+/// Returns `None` for an empty sweep. A sweep of one or two candidates is all
+/// boundary, so `railed` is left false: there is no interior for a peak to be in
+/// and nothing to widen toward.
+pub fn pick_interior_max(cands: &[f32], score: &[f64]) -> Option<Pick> {
+    if cands.is_empty() || score.len() != cands.len() {
+        return None;
+    }
+    let index = score
+        .iter()
+        .enumerate()
+        .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv {
+                (i, x)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0;
+    Some(Pick {
+        index,
+        value: cands[index],
+        railed: cands.len() > 2 && (index == 0 || index == cands.len() - 1),
+    })
 }
 
 /// Entropy-based center finding (tomopy `rotation.py:82`).
@@ -1602,9 +1705,40 @@ fn beta3(t: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ndimage_shift_spline3_constant;
+    use super::{ndimage_shift_spline3_constant, pick_interior_max};
     use ndarray::{Array2, Array3};
     use ndarray_npy::read_npy;
+
+    /// An interior maximum is an optimum; a boundary one is the range running
+    /// out. The distinction is the whole point — a railed pick adopted as an
+    /// answer is how one bad axis poisons the next.
+    #[test]
+    fn pick_interior_max_separates_an_optimum_from_a_range_running_out() {
+        let c = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let p = pick_interior_max(&c, &[1.0, 5.0, 9.0, 4.0, 2.0]).unwrap();
+        assert_eq!((p.index, p.value, p.railed), (2, 3.0, false));
+
+        for (score, want) in [
+            ([9.0, 5.0, 3.0, 2.0, 1.0], 0usize),
+            ([1.0, 2.0, 3.0, 5.0, 9.0], 4usize),
+        ] {
+            let p = pick_interior_max(&c, &score).unwrap();
+            assert_eq!(p.index, want);
+            assert!(p.railed, "a peak at candidate {want} of 5 is a boundary");
+        }
+    }
+
+    /// A sweep of one or two candidates is all boundary: there is no interior for
+    /// a peak to sit in and nothing to widen toward, so calling it railed would
+    /// make every degenerate sweep an error.
+    #[test]
+    fn pick_interior_max_does_not_rail_check_a_degenerate_sweep() {
+        assert!(!pick_interior_max(&[7.0], &[1.0]).unwrap().railed);
+        assert!(!pick_interior_max(&[7.0, 8.0], &[9.0, 1.0]).unwrap().railed);
+        assert!(pick_interior_max(&[], &[]).is_none());
+        // Mismatched lengths are a caller bug, not a pick.
+        assert!(pick_interior_max(&[1.0, 2.0], &[1.0]).is_none());
+    }
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
