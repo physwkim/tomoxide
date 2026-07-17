@@ -6,9 +6,10 @@
 //! OpenCV). See `docs/PORTING.md` §C.
 //!
 //! Laminography alignment lives here too, since it is the same question asked of
-//! a second axis: `find_center_rings` reads the axis off the raw projections and
-//! says whether the scan was aligned at acquisition at all.
-//! `docs/LAMINOGRAPHY_ALIGNMENT.md` is the method it implements.
+//! a second axis: `find_center_rings` reads the axis off the raw projections (and
+//! says whether the scan was aligned at acquisition at all), and
+//! `lamino_tilt_scan` scores the tilt. `docs/LAMINOGRAPHY_ALIGNMENT.md` is the
+//! method both implement.
 
 use crate::backend::{Backend, Fft};
 use crate::data::{Layout, Tomo};
@@ -219,8 +220,9 @@ fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
     }
 }
 
-/// Focus of one reconstructed slice: mean |∇|² inside a 0.92-FOV disk — the
-/// score `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 prescribes.
+/// Focus of one reconstructed slice: mean |∇|² inside a 0.92-FOV disk. This is
+/// the score `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 prescribes, and what
+/// [`lamino_tilt_scan`] maximises.
 ///
 /// The disk is not cosmetic. Reconstruction geometry decides where the
 /// back-projection sampling leaves the detector, so the ring outside the
@@ -294,6 +296,130 @@ pub fn pick_interior_max(cands: &[f32], score: &[f64]) -> Option<Pick> {
         value: cands[index],
         railed: cands.len() > 2 && (index == 0 || index == cands.len() - 1),
     })
+}
+
+/// What one laminography tilt candidate scored, from [`lamino_tilt_scan`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TiltFocus {
+    /// The tilt, in degrees, that was reconstructed.
+    pub tilt_deg: f32,
+    /// The best [`slice_focus`] any slice of that reconstruction reached.
+    pub focus: f64,
+    /// The slice that reached it — the in-focus layer. It moves with the tilt
+    /// (measured: 800 → 1120 as tilt went 40° → 58°), which is the whole reason
+    /// this is a full reconstruction and not a probe.
+    pub z_peak: usize,
+    /// Depth of the reconstruction `z_peak` indexes, `rh` for this tilt. It grows
+    /// with the tilt (`ceil(nz / cos(tilt) / 2) * 2`), so `z_peak` values are only
+    /// comparable across tilts as fractions of their own `depth`.
+    pub depth: usize,
+    /// [`slice_focus`] of every slice, indexed by z — `focus` is its maximum and
+    /// `z_peak` its argmax. The scan computes all of it anyway, and keeping it is
+    /// what separates the two things a bare `z_peak` cannot: a broad hump centred
+    /// on the sample, versus a spike on a z-edge slice where few projections
+    /// contribute and the streaks are the gradient. Believing an unexamined argmax
+    /// is the failure this whole method exists to avoid — `docs/
+    /// LAMINOGRAPHY_ALIGNMENT.md` §2 names its symptom, "a MONOTONE focus surface
+    /// with the argmax pinned to a grid corner".
+    pub focus_by_z: Vec<f64>,
+}
+
+/// Score each tilt in `tilts_deg` by fully reconstructing at it and taking the
+/// **maximum [`slice_focus`] over the whole z range** — the only method
+/// `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 validates for the tilt.
+///
+/// It is expensive on purpose. The cheap alternative — score one fixed slice per
+/// tilt, which is what [`crate::cuda::lamino_tilt_probe`] makes a single launch —
+/// is ill-posed, and measurement says so: the in-focus layer moves in z with the
+/// tilt, so a fixed row scores a plane whose error grows with the distance from
+/// its own optimum, while the tilt's own signal is only ~2 % per degree. On the
+/// pouch scans that sweep returns 48° or rails to the range edge depending only
+/// on which row was picked. Taking the max over z needs every (tilt, z) pair,
+/// which is exactly the work the probe skips, so the probe buys nothing here.
+/// The centre is the opposite case — an in-plane shift does not move the layer,
+/// and its response is ~40 % per 50 px — and that is what the probe is for.
+///
+/// `geom`'s beam is ignored; `tilts_deg` supplies it. `params.lamino_rh` is
+/// honoured if set, but leaving it `None` lets each tilt take its own natural
+/// depth, which is what the scan wants. The volume is never assembled: focus is
+/// scored per streamed tile, so the memory cost is one tile regardless of `rh`.
+///
+/// `sino` must already be prepped (flat/dark, minus-log, stripe removal).
+///
+/// `on_tilt(result, slice)` is called with each result as it lands — one full
+/// reconstruction apart, so a caller with a user attached should report it — and
+/// returning `Err` from it aborts the scan. `slice` is the `z_peak` slice, the
+/// in-focus layer itself: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming
+/// the winner by eye part of the method, and this is the one reconstruction that
+/// already found it. Callers that only want the numbers ignore it.
+///
+/// CUDA-only: the streaming laminography reconstruction this rides on exists only
+/// there.
+pub fn lamino_tilt_scan(
+    sino: &Tomo<f32>,
+    geom: &Geometry,
+    algorithm: crate::params::Algorithm,
+    params: &crate::params::ReconParams,
+    tilts_deg: &[f32],
+    on_tilt: &mut dyn FnMut(&TiltFocus, ndarray::ArrayView2<f32>) -> Result<()>,
+) -> Result<Vec<TiltFocus>> {
+    let mut out = Vec::with_capacity(tilts_deg.len());
+    for &tilt_deg in tilts_deg {
+        let geom = Geometry {
+            beam: Beam::Laminography {
+                phi: std::f32::consts::FRAC_PI_2 + tilt_deg * std::f32::consts::PI / 180.0,
+            },
+            ..geom.clone()
+        };
+        // The volume is streamed and dropped tile by tile, so the winning slice
+        // has to be kept as it goes past — it is gone by the time the scan knows
+        // it won. Tiles arrive in ascending row order, so `focus_by_z` is built by
+        // appending.
+        let mut best: Option<(f64, usize, Array2<f32>)> = None;
+        let mut focus_by_z: Vec<f64> = Vec::new();
+        let (depth, _, _) = {
+            let mut on_tile = |rh0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
+                for (k, img) in tile.array.outer_iter().enumerate() {
+                    let f = slice_focus(&img);
+                    focus_by_z.push(f);
+                    if best.as_ref().is_none_or(|b| f > b.0) {
+                        best = Some((f, rh0 + k, img.to_owned()));
+                    }
+                }
+                Ok(())
+            };
+            crate::cuda::reconstruct_lamino_streaming(
+                sino,
+                &geom,
+                algorithm,
+                params,
+                None,
+                &mut on_tile,
+            )?
+        };
+        let (focus, z_peak, img) = best.ok_or_else(|| {
+            Error::Backend(format!(
+                "the reconstruction at tilt {tilt_deg}° produced no slices to score"
+            ))
+        })?;
+        // The profile is only indexable by z if every row arrived exactly once.
+        if focus_by_z.len() != depth {
+            return Err(Error::Backend(format!(
+                "tilt {tilt_deg}°: scored {} slices but the reconstruction is {depth} deep",
+                focus_by_z.len()
+            )));
+        }
+        let r = TiltFocus {
+            tilt_deg,
+            focus,
+            z_peak,
+            depth,
+            focus_by_z,
+        };
+        on_tilt(&r, img.view())?;
+        out.push(r);
+    }
+    Ok(out)
 }
 
 /// Entropy-based center finding (tomopy `rotation.py:82`).
