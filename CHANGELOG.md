@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **`tomoxide-gui` now depends on `rsplot` / `rsdm` `=0.5.5`** (was `=0.5.2`).
+  rsdm 0.5.5 builds against epics-rs 0.24 — the same version as the GUI's
+  live-test `epics-pva-rs` dev-dependency — so the dependency tree unifies on
+  one epics-pva-rs copy again (0.7.0 carried a 0.21 + 0.24 pair). rsplot moves
+  in lockstep because rsdm 0.5.5 requires `rsplot ^0.5.5`; the jump also picks
+  up rsplot 0.5.3's `VolumeRaycaster` rendering fixes (thickness cue,
+  faint-voxel hue) for the XANES 3-D view.
+
 ## [0.7.0] - 2026-07-18
 
 ### Changed

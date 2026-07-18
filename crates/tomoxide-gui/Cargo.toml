@@ -39,15 +39,19 @@ ndarray = "0.16"
 # From crates.io (the crate and its GitHub repo were renamed siplot → rsplot,
 # and adl2sidm's engine crate sidm → rsdm); a `=` pin keeps the GUI tracking one
 # rsplot API rather than picking up 0.5.x additions silently. 0.5.1 adds the
-# `VolumeRaycaster` widget the XANES 3-D view uses; 0.5.2 hardens it
-# (premultiplied-alpha compositing, opacity correction, per-callback uniforms).
-rsplot = "=0.5.2"
+# `VolumeRaycaster` widget the XANES 3-D view uses; 0.5.3 fixes its 0.5.2
+# rendering regressions (thickness cue, faint-voxel hue); 0.5.5 moves in
+# lockstep with rsdm below (rsdm 0.5.5 requires rsplot ^0.5.5, and `=0.5.2`
+# cannot co-resolve with that).
+rsplot = "=0.5.5"
 # Live mode: rsdm is rsplot's sibling EPICS data engine. `pva` alone pulls the
 # headless pvAccess data engine (epics-pva-rs) and its codec decoders — no CA,
 # no calc, and the display widgets sit unused (they are not feature-gated but
 # need no egui context). Reaches egui through rsplot's re-export, so no second
-# egui/wgpu. `=` pin tracks one rsdm API like the rsplot pin above.
-rsdm = { version = "=0.5.2", default-features = false, features = ["pva"] }
+# egui/wgpu. `=` pin tracks one rsdm API like the rsplot pin above. 0.5.5
+# builds against epics-pva-rs 0.24 — the same version as the test server
+# dev-dependency below, so the tree carries ONE epics-pva-rs again.
+rsdm = { version = "=0.5.5", default-features = false, features = ["pva"] }
 # eframe must run the wgpu renderer (rsplot widgets need cc.wgpu_render_state).
 eframe = { version = "0.34", default-features = false, features = [
     "wgpu",
@@ -73,8 +77,9 @@ fs4 = "0.13"
 # Live mode integration test: stand up an in-process PvaServer publishing
 # synthetic frames/angles and subscribe through rsdm. The coupling is a TCP
 # address (`PvaPlugin::with_server(server.tcp_addr())`), not shared types, so
-# this may lead rsdm's internal epics-pva-rs (^0.22 as of rsdm 0.5.4) — the two
-# copies talk pvAccess wire protocol, verified by the live tests.
+# a version skew against rsdm's internal epics-pva-rs would still work over the
+# wire — but rsdm 0.5.5 builds against ^0.24, the same as this pin, so the
+# resolver unifies the tree on one copy.
 [dev-dependencies]
 epics-pva-rs = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread"] }
