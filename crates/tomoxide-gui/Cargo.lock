@@ -1225,28 +1225,6 @@ checksum = "f8970033a4282a7bcf899b38b5ed3a58b732fe093d03785d58648515d8d309da"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4846787402dafd405b6b6d6919ce84cb9d6880aaf230bfb0bc23b69f99af3a73"
-dependencies = [
- "bytes",
- "chrono",
- "clap",
- "epics-macros-rs 0.21.0",
- "hostname",
- "if-addrs",
- "libc",
- "parking_lot",
- "rustyline",
- "serde_json",
- "socket2 0.5.10",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "epics-base-rs"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c16a89ec4df7d0bcb7e15e66503d00b54875b3cee2dc19db2c364860eec44478"
@@ -1255,7 +1233,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "epics-macros-rs 0.24.0",
+ "epics-macros-rs",
  "hostname",
  "if-addrs",
  "libc",
@@ -1266,18 +1244,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "epics-macros-rs"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d9330891025158f77fa7af42a6a92a444d138368e0e0c85f48d6365f11ecc2"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -1294,45 +1260,6 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38b8921e46a4f0d9fba74e078715b1faecb7776d538ab61c66b6aa7cbb0fce15"
-dependencies = [
- "bytes",
- "chrono",
- "clap",
- "dashmap",
- "der",
- "epics-base-rs 0.21.0",
- "epics-macros-rs 0.21.0",
- "futures-util",
- "hmac 0.13.0",
- "hostname",
- "if-addrs",
- "libc",
- "p12",
- "parking_lot",
- "pkcs5",
- "rustls",
- "rustls-pemfile",
- "serde_json",
- "sha1 0.10.6",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "socket2 0.5.10",
- "spki",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.59.0",
- "x509-parser",
-]
-
-[[package]]
-name = "epics-pva-rs"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f2e0c9eda8d9f1df01bdae4f5079a7e15adce94459d1e31ae85c2e24a15593e"
@@ -1342,8 +1269,8 @@ dependencies = [
  "clap",
  "dashmap",
  "der",
- "epics-base-rs 0.24.0",
- "epics-macros-rs 0.24.0",
+ "epics-base-rs",
+ "epics-macros-rs",
  "futures-util",
  "hmac 0.13.0",
  "hostname",
@@ -3701,12 +3628,12 @@ dependencies = [
 
 [[package]]
 name = "rsdm"
-version = "0.5.2"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9508ce1c61c4e016ace222ab536cbf1ba8b4a5fb573b85b298708f51074527ea"
+checksum = "3b21d70568c4ec49ec90d9c91a7a9918840734bb7aecfa06e41946e5828234e6"
 dependencies = [
  "arboard",
- "epics-pva-rs 0.21.0",
+ "epics-pva-rs",
  "flate2",
  "image",
  "log",
@@ -3720,15 +3647,16 @@ dependencies = [
 
 [[package]]
 name = "rsplot"
-version = "0.5.2"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba13936594768dd98eaf8052effe372263c511585409aa572e3175400f7fc0f3"
+checksum = "80e3698da56d63f9822413151e26304991303092a4974849d4865d55da034164"
 dependencies = [
  "arboard",
  "bytemuck",
  "colorous",
  "egui",
  "egui-wgpu",
+ "half",
  "lowe-sift",
  "medians",
  "png",
@@ -4616,7 +4544,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "env_logger",
- "epics-pva-rs 0.24.0",
+ "epics-pva-rs",
  "fs4",
  "log",
  "ndarray",
