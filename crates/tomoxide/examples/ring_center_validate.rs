@@ -8,8 +8,8 @@
 //!
 //! Expected — the doc's reference implementation, reproduced in Python on the
 //! same two files:
-//!   aligned    0.55 s: centre 397.50 (truth 396), prominence ≈ 21.0 → trustworthy
-//!   misaligned 0.6 s : centre 281.09 (truth 138), prominence ≈  2.4 → NOT trustworthy
+//!   aligned    0.55 s: centre 397.00 (truth 396), prominence ≈ 21.0 → trustworthy
+//!   misaligned 0.6 s : centre 280.59 (truth 138), prominence ≈  2.4 → NOT trustworthy
 
 use tomoxide::prep::normalize::{minus_log, normalize_dataset};
 use tomoxide::recon::center::find_center_rings;

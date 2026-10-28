@@ -16,6 +16,16 @@ All notable changes to this project are documented here. The format is based on
   up rsplot 0.5.3's `VolumeRaycaster` rendering fixes (thickness cue,
   faint-voxel hue) for the XANES 3-D view.
 
+### Fixed
+
+- **`find_center_rings` and `find_center_sift` read half a pixel right.** Both
+  register an image against its left–right flip, which mirrors about column
+  `(n − 1)/2`, but converted the shift about `n/2`. They now use `(n − 1)/2`,
+  the axis `find_center_pc` and `find_center_vo` already use. A synthetic
+  bullseye now reads its own column (was +0.50); the aligned pouch scan reads
+  396.87 against a known 396 (was 397.37). tomocupy's SIFT formula `n//2 −
+  shift/2` carries the same half pixel on even widths and is not copied.
+
 ## [0.7.0] - 2026-07-18
 
 ### Changed

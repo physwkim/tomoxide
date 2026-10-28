@@ -259,7 +259,7 @@ impl LaminoView {
             self.mean_view
                 .set_image(nx as u32, ny as u32, mean, super::autoscale_viridis(mean));
         // Seed the centre, but only from an estimate worth seeding with: on a
-        // mis-aligned scan the lopsided arcs drag the correlation peak (281.7
+        // mis-aligned scan the lopsided arcs drag the correlation peak (281.2
         // against a known 138), so adopting it silently would hand step 2 a
         // starting guess that is 143 px out.
         if trustworthy {

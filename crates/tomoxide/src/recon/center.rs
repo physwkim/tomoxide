@@ -43,7 +43,8 @@ pub struct RingCenter {
 /// `x(θ) = c + r·cos(θ + φ)`, so the mean projection smears each point into a
 /// ring centred on the axis: a bullseye whose centre column is `c`. Rings are
 /// mirror-symmetric about that column, so registering the mean projection
-/// against its own left–right flip puts the axis at `dx = 2·(c − nx/2)`. `tomo`
+/// against its own left–right flip, a mirror about column `(nx − 1)/2`, puts the
+/// axis at `dx = 2c − (nx − 1)`. `tomo`
 /// is the flat-corrected, minus-log projection stack; every `step`-th projection
 /// is averaged (`step = 10` over 1800 projections is plenty — the rings are a
 /// bulk feature).
@@ -67,8 +68,8 @@ pub struct RingCenter {
 ///
 /// | scan | `center` | truth | `prominence` |
 /// |---|---|---|---|
-/// | 0.55 s, closed concentric rings | 397.4 | 396 | **16.2** |
-/// | 0.6 s, arcs that never close | 281.7 | 138 | **2.2** |
+/// | 0.55 s, closed concentric rings | 396.9 | 396 | **16.2** |
+/// | 0.6 s, arcs that never close | 281.2 | 138 | **2.2** |
 ///
 /// The mis-aligned scan's profile sits at 80 % of its own peak height even at the
 /// array edges — it is flat, and its `argmax` is noise. Hence
@@ -76,7 +77,7 @@ pub struct RingCenter {
 /// but **calibrated on exactly those two scans**. Treat a `prominence` near the
 /// threshold as "look at the mean projection yourself", not as a verdict.
 ///
-/// (The doc quotes 397.5/281.1 and prominence 21.0/2.4 for its NumPy reference,
+/// (The doc quotes 397.0/280.6 and prominence 21.0/2.4 for its NumPy reference,
 /// which clips at `1e-4` before the log where this goes through
 /// [`prep::normalize`](fn@crate::prep::normalize). The centre lands within 0.13 px
 /// either way; the prominence scale differs, so the numbers above — not the
@@ -204,7 +205,10 @@ fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
             (y0 - y2) / den
         }
     };
-    let center = nx as f32 / 2.0 + ((i as f32 + d) - (nx / 2) as f32) / 2.0;
+    // The flip mirrors about column (nx − 1)/2, so rings centred on `c` peak at
+    // lag 2c − (nx − 1).
+    let lag = i as f32 + d - (nx / 2) as f32;
+    let center = (nx as f32 - 1.0 + lag) / 2.0;
 
     // Robust prominence: (peak − median) / MAD.
     let mut sorted: Vec<f32> = prof.to_vec();
@@ -979,7 +983,8 @@ pub fn find_center_sift(
 pub use sift::{find_center_sift, register_shift_sift};
 
 /// SIFT-feature rotation-center finding (tomocupy `find_center.py`
-/// `_register_shift_sift` + the `n//2 - shift_x/2` center formula). Requires the
+/// `_register_shift_sift` + the `(n − 1)/2 − shift_x/2` center formula; tomocupy
+/// has `n//2`, see [`find_center_sift`]). Requires the
 /// `sift-center` feature.
 #[cfg(feature = "sift-center")]
 pub mod sift {
@@ -1120,8 +1125,12 @@ pub mod sift {
     /// Rotation center from a 0°/180° projection pair via SIFT feature matching
     /// (tomocupy `find_center_sift`). The 180° projection is flipped left-right
     /// (`data[..., ::-1]`), matched against the 0° projection, and the center is
-    /// `ncol/2 - mean_horizontal_shift/2`. `threshold` is the Lowe ratio (0.5
-    /// upstream).
+    /// `(ncol − 1)/2 − mean_horizontal_shift/2`. `threshold` is the Lowe ratio
+    /// (0.5 upstream).
+    ///
+    /// tomocupy writes `n//2 − shift/2`, which is half a pixel right on even
+    /// widths: the flip mirrors about `(n − 1)/2`, the axis `find_center_pc` and
+    /// `find_center_vo` use too.
     pub fn find_center_sift(
         proj0: &Array2<f32>,
         proj180: &Array2<f32>,
@@ -1137,7 +1146,7 @@ pub mod sift {
         let datap1 = [proj0.clone()];
         let datap2 = [fliplr(proj180)];
         let (shifts, _) = register_shift_sift(&datap1, &datap2, threshold)?;
-        Ok(ncol as f32 / 2.0 - shifts[[0, 1]] / 2.0)
+        Ok((ncol as f32 - 1.0) / 2.0 - shifts[[0, 1]] / 2.0)
     }
 }
 
