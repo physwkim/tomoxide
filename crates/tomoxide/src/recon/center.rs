@@ -16,7 +16,7 @@ use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
-use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
+use ndarray::{Array2, Array3, ArrayView2, ArrayViewMut2, Axis, Slice};
 
 /// What [`find_center_rings`] found, and whether to believe it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,24 +86,29 @@ pub fn find_center_rings(
     backend: &dyn Backend,
     step: usize,
 ) -> Result<RingCenter> {
+    find_center_rings_from_mean(mean_projection(tomo, step)?.view(), backend)
+}
+
+/// [`find_center_rings`] on a [`mean_projection`] already in hand, or on a band
+/// of its rows. Concentric rings register at the same column in every row band,
+/// so estimating per band (`ring_center.py` takes quarters) and finding the
+/// bands disagree is a second misalignment flag next to
+/// [`RingCenter::prominence`].
+pub fn find_center_rings_from_mean(
+    mean: ArrayView2<f32>,
+    backend: &dyn Backend,
+) -> Result<RingCenter> {
     let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
         backend: backend.name(),
         capability: "Fft",
     })?;
-    if step == 0 {
-        return Err(Error::InvalidParam(
-            "find_center_rings: step must be ≥1".into(),
-        ));
-    }
-    let p = tomo.as_layout(Layout::Projection); // [nproj, ny, nx]
-    let (nproj, ny, nx) = p.array.dim();
-    if nproj == 0 || ny < 5 || nx < 4 {
+    let (ny, nx) = mean.dim();
+    if ny < 5 || nx < 4 {
         return Err(Error::InvalidParam(format!(
-            "find_center_rings needs ≥1 projection and ≥5×4 pixels; got {nproj}×{ny}×{nx}"
+            "find_center_rings needs ≥5×4 pixels; got {ny}×{nx}"
         )));
     }
-
-    let prof = flip_registration_profile(&mean_projection(tomo, step)?, fft)?;
+    let prof = flip_registration_profile(&mean, fft)?;
     Ok(ring_center_from_profile(&prof, nx))
 }
 
@@ -140,7 +145,7 @@ pub fn mean_projection(tomo: &Tomo<f32>, step: usize) -> Result<Array2<f32>> {
 /// Row-summed cross-correlation of `m` against its own left–right flip.
 /// Rings put their signature on the middle rows, so only those are summed —
 /// following `docs/LAMINOGRAPHY_ALIGNMENT.md`.
-fn flip_registration_profile(m: &Array2<f32>, fft: &dyn Fft) -> Result<Vec<f32>> {
+fn flip_registration_profile(m: &ArrayView2<f32>, fft: &dyn Fft) -> Result<Vec<f32>> {
     let (ny, nx) = m.dim();
     let mean = m.sum() / (ny * nx) as f32;
 

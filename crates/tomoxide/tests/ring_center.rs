@@ -8,9 +8,9 @@
 //! pattern which is *not* a bullseye is reported as untrustworthy instead of
 //! returning a confident wrong number.
 
-use ndarray::{Array3, Axis};
+use ndarray::{s, Array3, Axis};
 use tomoxide::data::{Layout, Tomo};
-use tomoxide::recon::center::find_center_rings;
+use tomoxide::recon::center::{find_center_rings, find_center_rings_from_mean, mean_projection};
 use tomoxide::CpuBackend;
 
 const NY: usize = 96;
@@ -162,4 +162,31 @@ fn ring_center_step_does_not_shift_the_estimate() {
         full.center,
         strided.center
     );
+}
+
+/// Every quarter row band of a bullseye registers at the bullseye's column —
+/// the per-band consistency `ring_center.py` checks — and the whole frame
+/// through `find_center_rings_from_mean` is `find_center_rings` itself.
+#[test]
+fn ring_center_row_bands_agree_on_a_bullseye() {
+    let cpu = CpuBackend::new();
+    let tomo = Tomo::new(bullseye(52.0, NY as f32 / 2.0), Layout::Projection);
+    let mean = mean_projection(&tomo, 1).unwrap();
+    let whole = find_center_rings_from_mean(mean.view(), &cpu).unwrap();
+    assert_eq!(whole, find_center_rings(&tomo, &cpu, 1).unwrap());
+    for q in 0..4 {
+        let band = mean.slice(s![q * NY / 4..(q + 1) * NY / 4, ..]);
+        let r = find_center_rings_from_mean(band, &cpu).unwrap();
+        eprintln!(
+            "rows {}..{} -> {:.2}",
+            q * NY / 4,
+            (q + 1) * NY / 4,
+            r.center
+        );
+        assert!(
+            (r.center - 52.0).abs() < 1.0,
+            "quarter {q} registered at {:.2}, the bullseye is at 52",
+            r.center
+        );
+    }
 }
