@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
 use crate::params::{Algorithm, ReconParams};
 use crate::recon::center::{RingCenter, SampleBand, TiltFocus};
+use crate::recon::tilt_flow::TiltFlow;
 
 /// The whole flat/dark-corrected, minus-log projection stack, held in host RAM.
 ///
@@ -122,6 +123,13 @@ impl PreppedStack {
     /// The axis read off the mean of every `step`th projection.
     pub fn rings(&self, backend: &dyn Backend, step: usize) -> Result<RingCenter> {
         crate::recon::center::find_center_rings(&self.data, backend, step)
+    }
+
+    /// The tilt read off the vertical flow between neighbouring projections,
+    /// before any reconstruction; see
+    /// [`estimate_tilt_flow`](crate::recon::tilt_flow::estimate_tilt_flow).
+    pub fn tilt_flow(&self, backend: &dyn Backend) -> Result<TiltFlow> {
+        crate::recon::tilt_flow::estimate_tilt_flow(&self.data, &self.theta, backend)
     }
 
     /// Reconstruct output slice `slice` at every candidate centre in one probe
