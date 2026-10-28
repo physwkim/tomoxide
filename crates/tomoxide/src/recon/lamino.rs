@@ -552,13 +552,15 @@ pub fn usfft2d_adj(
     // Centered inverse 2-D FFT over the (x,y) window, per ky slice.
     centered_fft2d(&mut fdee, n0, n1, m0, m1, nky, true, fft)?;
 
-    // divker2d (adj): deapodize → f[n1, nky, n0] (note the n1−ty−1 y-flip).
+    // divker2d (adj): deapodize → f[n1, nky, n0]. tomocupy writes row
+    // n1−ty−1 to match its own y-flipped linerec; tomoxide's linerec is not
+    // flipped, so neither is this.
     // Parallel over ty (f is contiguous per ty; fdee read-only).
     let mut f = vec![Complex32::new(0.0, 0.0); n1 * nky * n0];
     f.par_chunks_mut(nky * n0)
         .enumerate()
         .for_each(|(ty, fchunk)| {
-            let yg = (n1 - ty - 1) + n1 / 2 + m1;
+            let yg = ty + n1 / 2 + m1;
             for ky in 0..nky {
                 for tx in 0..n0 {
                     let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
@@ -596,10 +598,10 @@ pub fn usfft2d_fwd(
     let (xs, ys) = usfft2d_xy(theta, phi, ntheta, nky, detw);
     let mut fdee = vec![Complex32::new(0.0, 0.0); nky * gy * gx];
 
-    // divker2d (fwd): f → oversampled grid interior (n1−ty−1 y-flip).
+    // divker2d (fwd): f → oversampled grid interior, unflipped as the adjoint.
     for ky in 0..nky {
         for ty in 0..n1 {
-            let yg = (n1 - ty - 1) + n1 / 2 + m1;
+            let yg = ty + n1 / 2 + m1;
             for tx in 0..n0 {
                 let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
                     - mu1 * (ty as f32 - n1 as f32 / 2.0).powi(2))

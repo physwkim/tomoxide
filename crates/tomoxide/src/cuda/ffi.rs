@@ -1082,7 +1082,7 @@ unsafe extern "C" {
         m1: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// usfft2d divker (adj): deapodize -> `f [n1,nky,n0]` complex (n1-ty-1 y-flip).
+    /// usfft2d divker (adj): deapodize -> `f [n1,nky,n0]` complex.
     #[allow(clippy::too_many_arguments)]
     pub fn tomoxide_lam_divker2d_adj(
         fdee: *const c_void,

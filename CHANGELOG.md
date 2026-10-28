@@ -25,6 +25,12 @@ All notable changes to this project are documented here. The format is based on
   bullseye now reads its own column (was +0.50); the aligned pouch scan reads
   396.87 against a known 396 (was 397.37). tomocupy's SIFT formula `n//2 −
   shift/2` carries the same half pixel on even widths and is not copied.
+- **Fourier laminography (`recon::lamino`, CUDA `Fourierrec`) came out flipped
+  in y** against Linerec, FBP and the volume it was projected from. The USFFT
+  divker kept tomocupy's `n1−ty−1` row, which matches tomocupy's own y-flipped
+  linerec; tomoxide's linerec is not flipped. The row is now `ty`, so
+  `lamino_project` at zero tilt equals the parallel projection and Fourierrec
+  volumes are the y-flip of earlier ones and of tomocupy's.
 
 ## [0.7.0] - 2026-07-18
 

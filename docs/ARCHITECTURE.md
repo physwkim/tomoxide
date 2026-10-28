@@ -293,10 +293,13 @@ not comparable and are **not** unified.
 Their handedness and sign, however, are shared with everything else:
 
 - **No y-flip on either side.** The CUDA lamino kernel lost tomocupy's `(n−1−ty)`
-  write together with the rest of `cfunc_linerec` (Phase 1), and the CPU lamino
-  reconstruction co-registers with its own matched projector's volume *un-flipped*
-  (`r = +0.96` un-flipped vs `−0.03` y-flipped over a `lamino_project → lamino`
-  round-trip).
+  write together with the rest of `cfunc_linerec` (Phase 1). The USFFT pair
+  (`recon::lamino`, `lam_divker2d_adj_ker`) kept tomocupy's `n1−ty−1` divker row,
+  which tomocupy added to match its own y-flipped linerec, until it too was
+  dropped. A `lamino_project → lamino` round trip cannot see a flip both sides
+  share, so `tests/lamino_orientation.rs` pins the CPU pair to the parallel
+  projector at zero tilt, and `cuda_lamino_fourierrec.rs` pins Fourierrec and
+  Linerec to the volume of a 20° scan.
 - **Positive attenuation for dense material on both**, since the Fourier-lamino
   sign fix dropped tomocupy's `irfftshiftc` global `−1` from `recon::lamino`.
 

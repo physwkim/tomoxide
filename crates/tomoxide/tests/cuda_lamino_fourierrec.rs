@@ -4,7 +4,7 @@
 //! ramp filter, the same Gaussian USFFT gridding. The only differences are the
 //! `atomicAdd` accumulation order (gather/wrap adjoints) and `expf` vs the host
 //! `f32::exp`, so the two agree to ~f32 rounding, not bit-exactly (the CPU golden
-//! is itself validated against tomocupy at Pearson 0.99995).
+//! matches tomocupy at Pearson 0.99995 once tomocupy's y-flip is undone).
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
 
@@ -277,4 +277,61 @@ fn cuda_fourierrec_lamino_fused_normalize_matches_separate() {
         mid > 0.9999,
         "fused normalize mid-slice disagrees: r = {mid:.6}"
     );
+}
+
+/// Fourierrec and Linerec reconstruct a tilted scan in the same in-plane
+/// orientation as the volume it was projected from. The data come from the
+/// linerec-family projector, so the USFFT pair's own round trip plays no part.
+#[test]
+fn cuda_fourierrec_lamino_has_the_volume_orientation() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let (n, nproj, nz, rh, z0) = (64usize, 180usize, 32usize, 48usize, 22usize);
+    // Shepp–Logan is nearly symmetric in y; the disk in its top half is not.
+    let mut phantom = sim::shepp2d(n).unwrap();
+    for ((y, x), v) in phantom.indexed_iter_mut() {
+        if (y as f32 - 14.0).powi(2) + (x as f32 - 40.0).powi(2) < 25.0 {
+            *v += 1.0;
+        }
+    }
+    let mut flipped = phantom.clone();
+    flipped.invert_axis(Axis(0));
+    let flipped = flipped.as_standard_layout().to_owned();
+    let mut stack = Array3::<f32>::zeros((rh, n, n));
+    for z in z0..z0 + 4 {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let tilt_deg = 20.0f32;
+    let geom = Geometry {
+        angles: Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI),
+        center: Center::Scalar(n as f32 / 2.0),
+        beam: Beam::Laminography {
+            phi: std::f32::consts::FRAC_PI_2 + tilt_deg.to_radians(),
+        },
+        detector: Detector {
+            width: n,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    let params = ReconParams {
+        lamino_rh: Some(rh),
+        ..Default::default()
+    };
+    let sino = sim::project(&Volume::new(stack), &geom, &cuda).unwrap();
+    for algorithm in [Algorithm::Linerec, Algorithm::Fourierrec] {
+        let v = recon::recon(&sino, &geom, algorithm, &params, &cuda).unwrap();
+        let mid = v.array.index_axis(Axis(0), z0 + 2).to_owned();
+        let (r, r_flip) = (pearson(&mid, &phantom), pearson(&mid, &flipped));
+        eprintln!("{algorithm:?}: vs volume r = {r:.3}, vs its y-flip r = {r_flip:.3}");
+        assert!(
+            r > r_flip + 0.2,
+            "{algorithm:?} reconstructs the volume at r = {r:.3}, its y-flip at {r_flip:.3}"
+        );
+    }
 }
