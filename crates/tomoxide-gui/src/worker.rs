@@ -749,9 +749,7 @@ impl PreppedStack {
             angles: Angles(self.theta.clone()),
             center: Center::Scalar(center),
             beam: match tilt_deg {
-                Some(d) => tomoxide::Beam::Laminography {
-                    phi: std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0,
-                },
+                Some(d) => tomoxide::Beam::laminography(d),
                 None => tomoxide::Beam::Parallel,
             },
             detector: tomoxide::Detector {

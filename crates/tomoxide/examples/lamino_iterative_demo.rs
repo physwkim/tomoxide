@@ -21,7 +21,6 @@
 //!
 //! `reg_par` is the TV strength λ (ignored by SIRT/MLEM; pass 0).
 
-use std::f32::consts::PI;
 use std::time::Instant;
 
 use tomoxide::{
@@ -63,9 +62,7 @@ fn main() -> tomoxide::Result<()> {
     let theta = reader.read_theta()?;
     let mut geom = Geometry::parallel(Angles(theta), nx, nz, 1.0);
     geom.center = Center::Scalar(center);
-    geom.beam = Beam::Laminography {
-        phi: PI / 2.0 + tilt_deg * PI / 180.0,
-    };
+    geom.beam = Beam::laminography(tilt_deg);
     println!(
         "input={input} nproj={nproj} nz={nz} nx={nx} center={center} tilt={tilt_deg}° \
          algo={algorithm:?} num_iter={num_iter} reg_par={reg_par}"

@@ -652,9 +652,7 @@ pub fn lamino_tilt_scan(
     let mut out = Vec::with_capacity(tilts_deg.len());
     for &tilt_deg in tilts_deg {
         let geom = Geometry {
-            beam: Beam::Laminography {
-                phi: std::f32::consts::FRAC_PI_2 + tilt_deg * std::f32::consts::PI / 180.0,
-            },
+            beam: Beam::laminography(tilt_deg),
             ..geom.clone()
         };
         let rh = rh_for(tilt_deg);

@@ -54,6 +54,7 @@
 use crate::backend::Fft;
 use crate::dtype::Complex32;
 use crate::error::Result;
+use crate::geometry::lamino_phi;
 use crate::params::FilterName;
 use rayon::prelude::*;
 use std::f32::consts::PI;
@@ -727,12 +728,6 @@ fn ramp_filter_detw(
         }
     }
     Ok(())
-}
-
-/// `phi = π/2 + lamino_angle·π/180` (tomocupy's tilt convention).
-#[inline]
-fn lamino_phi(lamino_angle_deg: f32) -> f32 {
-    std::f32::consts::FRAC_PI_2 + lamino_angle_deg / 180.0 * PI
 }
 
 /// Reconstruct a 3-D laminographic volume from tilted parallel-beam projections

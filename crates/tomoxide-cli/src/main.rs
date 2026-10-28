@@ -904,9 +904,7 @@ fn run_align(
         angles: Angles(theta.clone()),
         center: Center::Scalar(center),
         beam: match tilt_deg {
-            Some(d) => Beam::Laminography {
-                phi: std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0,
-            },
+            Some(d) => Beam::laminography(d),
             None => Beam::Parallel,
         },
         detector: Detector {
@@ -1183,10 +1181,7 @@ fn main() -> anyhow::Result<()> {
                 let (z0, z1, banded) =
                     row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
                 if let Some(deg) = lamino_angle {
-                    use std::f32::consts::PI;
-                    geom.beam = tomoxide::Beam::Laminography {
-                        phi: PI / 2.0 + deg * PI / 180.0,
-                    };
+                    geom.beam = tomoxide::Beam::laminography(deg);
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
                 let nz_total = geom.detector.height;
@@ -1294,10 +1289,7 @@ fn main() -> anyhow::Result<()> {
                     plan.ext_pad,
                 );
                 if let Some(deg) = lamino_angle {
-                    use std::f32::consts::PI;
-                    geom.beam = tomoxide::Beam::Laminography {
-                        phi: PI / 2.0 + deg * PI / 180.0,
-                    };
+                    geom.beam = tomoxide::Beam::laminography(deg);
                     params.lamino_rh = lamino_rh;
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }

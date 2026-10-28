@@ -444,7 +444,7 @@ mod cuda_impl {
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
-    use crate::geometry::{Beam, Center, Geometry};
+    use crate::geometry::{lamino_phi, lamino_tilt_deg, Beam, Center, Geometry};
     use crate::params::{FilterName, StripeMethod};
     use ndarray::{Array3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
@@ -2673,7 +2673,7 @@ mod cuda_impl {
         // volume z the reconstruction's slice index means.
         let rh = match geom.beam {
             Beam::Laminography { phi } => {
-                let deg = (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+                let deg = lamino_tilt_deg(phi);
                 params
                     .lamino_rh
                     .unwrap_or_else(|| super::lamino_recon_height(nz, deg))
@@ -2813,10 +2813,7 @@ mod cuda_impl {
         let pad = filter.len();
         let pad_side = pad / 2 - ncols / 2;
         let w = build_filter_w(&filter, geom, nz, ncols, pad);
-        let phi: Vec<f32> = tilts_deg
-            .iter()
-            .map(|d| std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0)
-            .collect();
+        let phi: Vec<f32> = tilts_deg.iter().map(|&d| lamino_phi(d)).collect();
         // Per-tilt recon height: each candidate's slice `sz` is centred on the
         // height the full reconstruction at THAT tilt would use, so one volume z
         // means the same thing across the sweep and against the reconstruction.
@@ -6734,8 +6731,7 @@ mod cuda_impl {
         // disk-streaming caller still works. (Output-tile streaming for this
         // algorithm is the same follow-up as its input chunking.)
         if matches!(algorithm, Algorithm::Fourierrec) {
-            let lamino_angle_deg =
-                (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+            let lamino_angle_deg = lamino_tilt_deg(phi);
             let rh = params
                 .lamino_rh
                 .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
@@ -6783,7 +6779,7 @@ mod cuda_impl {
         let pad = filter.len();
         let pad_side = pad / 2 - ncols / 2;
         let w = build_filter_w(&filter, geom, nz, ncols, pad);
-        let lamino_angle_deg = (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+        let lamino_angle_deg = lamino_tilt_deg(phi);
         let rh = params
             .lamino_rh
             .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
@@ -6925,8 +6921,7 @@ mod cuda_impl {
                 // (unfiltered; it ramp-filters internally) projections in projection
                 // layout `[nproj, nz, n]`.
                 if matches!(algorithm, Algorithm::Fourierrec) {
-                    let lamino_angle_deg =
-                        (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+                    let lamino_angle_deg = lamino_tilt_deg(phi);
                     let rh = params
                         .lamino_rh
                         .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
@@ -6960,8 +6955,7 @@ mod cuda_impl {
                         "cuda laminography supports Fbp/Linerec/Fourierrec only; got {algorithm:?}"
                     )));
                 }
-                let lamino_angle_deg =
-                    (phi - std::f32::consts::FRAC_PI_2) * 180.0 / std::f32::consts::PI;
+                let lamino_angle_deg = lamino_tilt_deg(phi);
                 let rh = params
                     .lamino_rh
                     .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
