@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{CompareImages, CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
-use tomoxide::{Algorithm, StripeMethod};
+use tomoxide::Algorithm;
 
 use crate::worker::{DatasetMeta, Job, PreviewSpec};
 
@@ -308,32 +308,16 @@ impl TuneView {
         s
     }
 
+    /// The panel's stripe/phase fields as a config, the one parser of both.
+    fn prep_config(&self) -> tomoxide::config::Config {
+        let mut cfg = tomoxide::config::Config::default();
+        self.write_prep(&mut cfg);
+        cfg
+    }
+
     /// The panel's phase fields as a typed [`tomoxide::PhaseMethod`].
     fn build_phase(&self) -> Result<tomoxide::PhaseMethod, String> {
-        use tomoxide::PhaseMethod;
-        Ok(match self.phase.as_str() {
-            "none" => PhaseMethod::None,
-            "paganin" => PhaseMethod::Paganin {
-                pixel_size: self.pixel_size,
-                dist: self.propagation_distance,
-                energy: self.energy,
-                alpha: self.alpha,
-            },
-            "Gpaganin" => PhaseMethod::GPaganin {
-                pixel_size: self.pixel_size,
-                dist: self.propagation_distance,
-                energy: self.energy,
-                db: self.db,
-                w: self.w,
-            },
-            "farago" => PhaseMethod::Farago {
-                pixel_size: self.pixel_size,
-                dist: self.propagation_distance,
-                energy: self.energy,
-                db: self.db,
-            },
-            other => return Err(format!("unknown phase method '{other}'")),
-        })
+        self.prep_config().phase_method().map_err(|e| e.to_string())
     }
 
     fn is_iterative(&self) -> bool {
@@ -529,6 +513,12 @@ impl TuneView {
         cfg.num_iter = self.num_iter;
         cfg.ext_pad = self.ext_pad;
         cfg.reg_par = parse_reg_par(&self.reg_par)?;
+        self.write_prep(cfg);
+        Ok(())
+    }
+
+    /// The stripe/phase part of [`Self::write_config`].
+    fn write_prep(&self, cfg: &mut tomoxide::config::Config) {
         cfg.remove_stripe_method = self.stripe.clone();
         cfg.fw_sigma = self.fw_sigma;
         cfg.fw_level = self.fw_level;
@@ -560,7 +550,6 @@ impl TuneView {
         cfg.alpha = self.alpha as f64;
         cfg.db = self.db as f64;
         cfg.w = self.w as f64;
-        Ok(())
     }
 
     /// Adopt a loaded recipe's parameters (recipe load). Marks the panel
@@ -619,48 +608,7 @@ impl TuneView {
         let algorithm: Algorithm = self.algorithm.parse().map_err(|e| format!("{e}"))?;
         let filter = self.filter.parse().map_err(|e| format!("{e}"))?;
         let reg_par = parse_reg_par(&self.reg_par)?;
-        let stripe = match self.stripe.as_str() {
-            "none" => StripeMethod::None,
-            "fw" => StripeMethod::Fw {
-                sigma: self.fw_sigma,
-                level: (self.fw_level != 0).then_some(self.fw_level),
-            },
-            "ti" => StripeMethod::Ti {
-                nblock: self.ti_nblock,
-                beta: self.ti_beta,
-            },
-            "sf" => StripeMethod::Sf { size: self.sf_size },
-            "vo-all" => StripeMethod::VoAll {
-                snr: self.vo_snr,
-                la_size: self.vo_la_size,
-                sm_size: self.vo_sm_size,
-            },
-            "vo-sort" => StripeMethod::VoSort {
-                size: (self.vo_sort_size != 0).then_some(self.vo_sort_size),
-                dim: self.vo_sort_dim,
-            },
-            "vo-filter" => StripeMethod::VoFilter {
-                sigma: self.vo_filter_sigma,
-                size: (self.vo_filter_size != 0).then_some(self.vo_filter_size),
-                dim: self.vo_filter_dim,
-            },
-            "vo-large" => StripeMethod::VoLarge {
-                snr: self.vo_large_snr,
-                size: self.vo_large_size,
-                drop_ratio: self.vo_large_drop_ratio,
-                norm: self.vo_large_norm,
-            },
-            "vo-dead" => StripeMethod::VoDead {
-                snr: self.vo_dead_snr,
-                size: self.vo_dead_size,
-                norm: self.vo_dead_norm,
-            },
-            "vo-fit" => StripeMethod::VoFit {
-                order: self.vo_fit_order,
-                sigma: (self.vo_fit_sigma_x, self.vo_fit_sigma_y),
-            },
-            other => return Err(format!("unknown stripe method '{other}'")),
-        };
+        let prep = self.prep_config();
         Ok(PreviewSpec {
             slice: self.slice,
             algorithm,
@@ -669,8 +617,8 @@ impl TuneView {
             num_iter: self.num_iter,
             reg_par,
             ext_pad: self.ext_pad,
-            stripe,
-            phase: self.build_phase()?,
+            stripe: prep.stripe_method().map_err(|e| e.to_string())?,
+            phase: prep.phase_method().map_err(|e| e.to_string())?,
         })
     }
 

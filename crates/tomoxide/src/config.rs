@@ -16,6 +16,7 @@
 //! CLI.
 
 use crate::error::{Error, Result};
+use crate::params::{PhaseMethod, StripeMethod};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -205,5 +206,204 @@ impl Config {
             .map_err(|e| Error::Io(format!("reading config {}: {e}", path.display())))?;
         toml::from_str(&text)
             .map_err(|e| Error::InvalidParam(format!("config parse {}: {e}", path.display())))
+    }
+
+    /// The [`StripeMethod`] named by `remove_stripe_method` (case-insensitive,
+    /// `-`/`_` spellings), filled from this config's parameters for that
+    /// method. A `0` level/median size means auto (`None`).
+    pub fn stripe_method(&self) -> Result<StripeMethod> {
+        let auto = |n: usize| (n != 0).then_some(n);
+        Ok(
+            match self.remove_stripe_method.to_ascii_lowercase().as_str() {
+                "none" => StripeMethod::None,
+                "fw" => StripeMethod::Fw {
+                    sigma: self.fw_sigma,
+                    level: auto(self.fw_level),
+                },
+                "ti" => StripeMethod::Ti {
+                    nblock: self.ti_nblock,
+                    beta: self.ti_beta,
+                },
+                "sf" => StripeMethod::Sf { size: self.sf_size },
+                "vo-all" | "vo_all" | "voall" => StripeMethod::VoAll {
+                    snr: self.vo_snr,
+                    la_size: self.vo_la_size,
+                    sm_size: self.vo_sm_size,
+                },
+                "vo-sort" | "vo_sort" => StripeMethod::VoSort {
+                    size: auto(self.vo_sort_size),
+                    dim: self.vo_sort_dim,
+                },
+                "vo-filter" | "vo_filter" => StripeMethod::VoFilter {
+                    sigma: self.vo_filter_sigma,
+                    size: auto(self.vo_filter_size),
+                    dim: self.vo_filter_dim,
+                },
+                "vo-large" | "vo_large" => StripeMethod::VoLarge {
+                    snr: self.vo_large_snr,
+                    size: self.vo_large_size,
+                    drop_ratio: self.vo_large_drop_ratio,
+                    norm: self.vo_large_norm,
+                },
+                "vo-dead" | "vo_dead" => StripeMethod::VoDead {
+                    snr: self.vo_dead_snr,
+                    size: self.vo_dead_size,
+                    norm: self.vo_dead_norm,
+                },
+                "vo-fit" | "vo_fit" => StripeMethod::VoFit {
+                    order: self.vo_fit_order,
+                    sigma: (self.vo_fit_sigma_x, self.vo_fit_sigma_y),
+                },
+                other => {
+                    return Err(Error::InvalidParam(format!(
+                        "unknown stripe method '{other}' \
+                         (none|fw|ti|sf|vo-all|vo-sort|vo-filter|vo-large|vo-dead|vo-fit)"
+                    )))
+                }
+            },
+        )
+    }
+
+    /// The [`PhaseMethod`] named by `retrieve_phase_method` (case-insensitive),
+    /// filled from this config's physics cast to `f32`.
+    pub fn phase_method(&self) -> Result<PhaseMethod> {
+        let (pixel_size, dist, energy) = (
+            self.pixel_size as f32,
+            self.propagation_distance as f32,
+            self.energy as f32,
+        );
+        Ok(
+            match self.retrieve_phase_method.to_ascii_lowercase().as_str() {
+                "none" => PhaseMethod::None,
+                "paganin" => PhaseMethod::Paganin {
+                    pixel_size,
+                    dist,
+                    energy,
+                    alpha: self.alpha as f32,
+                },
+                "gpaganin" => PhaseMethod::GPaganin {
+                    pixel_size,
+                    dist,
+                    energy,
+                    db: self.db as f32,
+                    w: self.w as f32,
+                },
+                "farago" => PhaseMethod::Farago {
+                    pixel_size,
+                    dist,
+                    energy,
+                    db: self.db as f32,
+                },
+                other => {
+                    return Err(Error::InvalidParam(format!(
+                        "unknown phase method '{other}' (none|paganin|Gpaganin|farago)"
+                    )))
+                }
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `remove_stripe_method` spelling maps to its variant with this
+    /// config's parameters (the Vo 2018 single-method variants included), and
+    /// unknown names list the full set.
+    #[test]
+    fn stripe_method_parses_every_spelling() {
+        let mut c = Config {
+            vo_filter_size: 7,
+            vo_filter_dim: 2,
+            vo_dead_snr: 4.0,
+            vo_dead_size: 41,
+            vo_dead_norm: false,
+            ..Config::default()
+        };
+        let mut m = |name: &str| {
+            c.remove_stripe_method = name.into();
+            c.stripe_method()
+        };
+        assert_eq!(m("none").unwrap(), StripeMethod::None);
+        assert_eq!(
+            m("FW").unwrap(),
+            StripeMethod::Fw {
+                sigma: 2.0,
+                level: None
+            }
+        );
+        assert_eq!(
+            m("vo_all").unwrap(),
+            StripeMethod::VoAll {
+                snr: 3.0,
+                la_size: 61,
+                sm_size: 21
+            }
+        );
+        assert_eq!(
+            m("vo-sort").unwrap(),
+            StripeMethod::VoSort { size: None, dim: 1 }
+        );
+        assert_eq!(
+            m("vo_filter").unwrap(),
+            StripeMethod::VoFilter {
+                sigma: 3.0,
+                size: Some(7),
+                dim: 2
+            }
+        );
+        assert_eq!(
+            m("vo-large").unwrap(),
+            StripeMethod::VoLarge {
+                snr: 3.0,
+                size: 51,
+                drop_ratio: 0.1,
+                norm: true
+            }
+        );
+        assert_eq!(
+            m("vo-dead").unwrap(),
+            StripeMethod::VoDead {
+                snr: 4.0,
+                size: 41,
+                norm: false
+            }
+        );
+        assert_eq!(
+            m("vo-fit").unwrap(),
+            StripeMethod::VoFit {
+                order: 3,
+                sigma: (5.0, 20.0)
+            }
+        );
+        let err = m("nope").unwrap_err().to_string();
+        assert!(err.contains("vo-fit"), "{err}");
+    }
+
+    /// Phase names are case-insensitive and the f64 physics reach the method
+    /// as the f32 the CLI flags carry.
+    #[test]
+    fn phase_method_parses_and_casts() {
+        let c = Config {
+            retrieve_phase_method: "Gpaganin".into(),
+            pixel_size: 0.65e-4,
+            ..Config::default()
+        };
+        assert_eq!(
+            c.phase_method().unwrap(),
+            PhaseMethod::GPaganin {
+                pixel_size: 0.65e-4,
+                dist: 50.0,
+                energy: 30.0,
+                db: 1000.0,
+                w: 2e-4
+            }
+        );
+        let c = Config {
+            retrieve_phase_method: "nope".into(),
+            ..Config::default()
+        };
+        assert!(c.phase_method().unwrap_err().to_string().contains("farago"));
     }
 }
