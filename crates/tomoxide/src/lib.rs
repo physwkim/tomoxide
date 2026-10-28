@@ -64,7 +64,7 @@ pub use cuda::CudaBackend;
 pub use data::{Dataset, Frames, Layout, Slice2D, Tomo, Volume};
 pub use dtype::{Complex32, Dtype, Element};
 pub use error::{Error, Result};
-pub use geometry::{Angles, Beam, Center, Detector, Geometry};
+pub use geometry::{Angles, Beam, Center, Detector, Geometry, ValidFov};
 pub use params::{Algorithm, BackendKind, FilterName, PhaseMethod, ReconParams, StripeMethod};
 
 #[cfg(test)]
