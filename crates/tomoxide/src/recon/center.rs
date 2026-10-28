@@ -16,7 +16,7 @@ use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
-use ndarray::{Array2, Array3, ArrayView2, ArrayViewMut2, Axis, Slice};
+use ndarray::{Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis, Slice};
 
 /// What [`find_center_rings`] found, and whether to believe it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -254,6 +254,18 @@ pub fn slice_focus(img: &ndarray::ArrayView2<f32>) -> f64 {
         }
     }
     acc / cnt.max(1) as f64
+}
+
+/// [`slice_focus`] of every slice along axis 0, in order: a volume's
+/// focus-by-z profile, or a centre sweep's score per candidate. The one place
+/// slices are scored in bulk, so the tilt scan, the sweep and a volume
+/// inspection rank by the same number.
+pub fn focus_by_z(vol: ArrayView3<f32>) -> Vec<f64> {
+    use rayon::prelude::*;
+    (0..vol.len_of(Axis(0)))
+        .into_par_iter()
+        .map(|z| slice_focus(&vol.index_axis(Axis(0), z)))
+        .collect()
 }
 
 /// Another local maximum of a sweep that the metric did not rule out — see
@@ -666,20 +678,19 @@ pub fn lamino_tilt_scan(
             .map(|b| band_at(b, rh_for(b.tilt_deg), tilt_deg, rh));
         // The volume is streamed and dropped tile by tile, so the winning slice
         // has to be kept as it goes past — it is gone by the time the scan knows
-        // it won. Tiles arrive in ascending row order, so `focus_by_z` is built by
+        // it won. Tiles arrive in ascending row order, so the profile is built by
         // appending; the whole profile is kept even under a band, because the
         // profile is how the *next* band gets read.
         let mut best: Option<(f64, usize, Array2<f32>)> = None;
-        let mut focus_by_z: Vec<f64> = Vec::new();
+        let mut profile: Vec<f64> = Vec::new();
         let (depth, _, _) = {
             let mut on_tile = |z0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
-                for (k, img) in tile.array.outer_iter().enumerate() {
+                for (k, f) in focus_by_z(tile.array.view()).into_iter().enumerate() {
                     let z = z0 + k;
-                    let f = slice_focus(&img);
-                    focus_by_z.push(f);
+                    profile.push(f);
                     let in_band = scored.is_none_or(|(lo, hi)| (lo..=hi).contains(&z));
                     if in_band && best.as_ref().is_none_or(|b| f > b.0) {
-                        best = Some((f, z, img.to_owned()));
+                        best = Some((f, z, tile.array.index_axis(Axis(0), k).to_owned()));
                     }
                 }
                 Ok(())
@@ -705,10 +716,10 @@ pub fn lamino_tilt_scan(
             ))
         })?;
         // The profile is only indexable by z if every row arrived exactly once.
-        if focus_by_z.len() != depth {
+        if profile.len() != depth {
             return Err(Error::Backend(format!(
                 "tilt {tilt_deg}°: scored {} slices but the reconstruction is {depth} deep",
-                focus_by_z.len()
+                profile.len()
             )));
         }
         let r = TiltFocus {
@@ -717,7 +728,7 @@ pub fn lamino_tilt_scan(
             z_peak,
             band: scored,
             depth,
-            focus_by_z,
+            focus_by_z: profile,
         };
         on_tilt(&r, img.view())?;
         out.push(r);

@@ -141,10 +141,7 @@ impl PreppedStack {
             centers,
             slice as i32,
         )?;
-        let focus = frames
-            .outer_iter()
-            .map(|f| crate::recon::center::slice_focus(&f))
-            .collect();
+        let focus = crate::recon::center::focus_by_z(frames.view());
         Ok(CenterSweep {
             slice,
             frames,
