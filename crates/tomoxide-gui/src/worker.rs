@@ -13,7 +13,6 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use rsplot::egui;
 use tomoxide::align::PreppedStack;
-use tomoxide::io::{DatasetReader, RowBandReader};
 use tomoxide::{
     Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PhaseMethod, ReconParams,
     StripeMethod,
@@ -51,9 +50,8 @@ pub struct PreviewSpec {
     /// `ReconParams::ext_pad`).
     pub ext_pad: bool,
     pub stripe: StripeMethod,
-    /// Phase retrieval. A non-`None` method makes the preview read a
-    /// [`RowBandReader`] band around the slice (the retrieval couples
-    /// detector rows) — see [`run_preview`].
+    /// Phase retrieval. A non-`None` method widens the preview's read around
+    /// the slice (the retrieval couples detector rows) — see [`run_preview`].
     pub phase: PhaseMethod,
 }
 
@@ -546,17 +544,10 @@ fn worker_main(
     }
 }
 
-/// Single-slice preview: banded read → the same prep order as
-/// `tomoxide::reconstruct` (normalize+minus-log → phase → sinogram layout →
-/// stripe) → reconstruction of the requested row only.
-///
-/// Phase retrieval couples detector rows, so the read is a [`RowBandReader`]
-/// band `[z − m, z + m]` with `m` = the Fresnel kernel's pixel support
-/// (`prep::phase::margin_rows`; 0 without phase, i.e. exactly one row read).
-/// Prep runs on the whole band; the sinogram is then cropped to the center
-/// row *before* stripe removal and reconstruction (every stripe method is
-/// per-sinogram independent, so crop-then-stripe equals stripe-then-crop) —
-/// the preview stays one-slice cheap however wide the phase kernel is.
+/// Single-slice preview: the requested row prepped by [`tomoxide::prep_band`]
+/// (which widens its read by the phase kernel's support) → reconstruction of
+/// that row only, so the preview stays one-slice cheap however wide the phase
+/// kernel is.
 fn run_preview(
     engine: &Engine,
     path: &std::path::Path,
@@ -571,39 +562,22 @@ fn run_preview(
 }
 
 /// Prep the requested slice down to the one-row sinogram and its geometry —
-/// the shared front half of [`run_preview`] and [`run_lambda_sweep`]. Banded
-/// read → normalize+minus-log → phase → sinogram layout → crop to the slice
-/// row → stripe (see the module comment on crop-then-stripe).
+/// the shared front half of [`run_preview`] and [`run_lambda_sweep`].
 fn prep_slice(
     engine: &Engine,
     path: &std::path::Path,
     spec: &PreviewSpec,
 ) -> tomoxide::Result<(tomoxide::Tomo, Geometry)> {
-    let backend = engine.backend();
-    let mut probe = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
-    let (_nproj, nz, nx, _nflat, _ndark) = probe.read_sizes()?;
-    drop(probe);
-
+    let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
+    let (_nproj, nz, nx, _nflat, _ndark) = reader.read_sizes()?;
     let slice = spec.slice.min(nz.saturating_sub(1));
-    let m = tomoxide::prep::phase::margin_rows(&spec.phase);
-    let z0 = slice.saturating_sub(m);
-    let z1 = (slice + m + 1).min(nz);
+    let prep = tomoxide::PrepOptions {
+        stripe: spec.stripe,
+        phase: spec.phase,
+    };
+    let one = tomoxide::prep_band(reader.as_mut(), slice, slice + 1, &prep, engine.backend())?;
 
-    let inner = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
-    let mut ds = RowBandReader::new(inner, z0, z1)?.read_all()?;
-    tomoxide::prep::normalize_dataset(&mut ds, backend)?;
-    tomoxide::prep::retrieve_phase(&mut ds.data, spec.phase, backend)?;
-    let sino = ds.data.to_layout(tomoxide::Layout::Sinogram);
-    let row = slice - z0;
-    let mut one = tomoxide::Tomo::new(
-        sino.array
-            .slice(ndarray::s![row..row + 1, .., ..])
-            .to_owned(),
-        tomoxide::Layout::Sinogram,
-    );
-    tomoxide::prep::remove_stripe(&mut one, spec.stripe)?;
-
-    let mut geom = Geometry::parallel(Angles(ds.theta), nx, 1, 1.0);
+    let mut geom = Geometry::parallel(Angles(reader.read_theta()?), nx, 1, 1.0);
     if let Some(c) = spec.center {
         geom.center = Center::Scalar(c);
     }
@@ -937,7 +911,7 @@ mod tests {
         assert!(data.iter().any(|&v| v != 0.0), "all-zero reconstruction");
     }
 
-    /// Phase retrieval previews through a row band (`RowBandReader`; the
+    /// Phase retrieval previews through a row band (`prep_band`; the
     /// margin at these physics is 65 rows, far wider than the 6-row fixture,
     /// so the band clamps to the whole file) and still returns one finite,
     /// non-zero slice.

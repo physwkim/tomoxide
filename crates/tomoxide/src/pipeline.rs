@@ -62,6 +62,42 @@ pub fn reconstruct(
     crate::recon::recon(&sino, geom, algorithm, params, backend)
 }
 
+/// Detector rows `[z0, z1)` of `reader`, prepped as [`reconstruct`] preps the
+/// whole stack (flat/dark + minus-log → phase → stripe) and returned as
+/// `[z1 − z0, nproj, nx]` sinograms. Phase retrieval couples rows, so the read
+/// takes [`margin_rows`](crate::prep::phase::margin_rows) more on each side and
+/// drops them before stripe removal; without them the band's edge rows see a
+/// truncated phase kernel.
+pub fn prep_band(
+    reader: &mut dyn crate::io::DatasetReader,
+    z0: usize,
+    z1: usize,
+    prep: &PrepOptions,
+    backend: &dyn crate::backend::Backend,
+) -> Result<Tomo<f32>> {
+    let (_nproj, nz, _nx, _nflat, _ndark) = reader.read_sizes()?;
+    let m = crate::prep::phase::margin_rows(&prep.phase);
+    let (r0, r1) = (z0.saturating_sub(m), (z1 + m).min(nz));
+    // `read_all` for the whole stack keeps readers without `read_chunk` working.
+    let mut ds = if (r0, r1) == (0, nz) {
+        reader.read_all()?
+    } else {
+        reader.read_chunk(r0, r1)?
+    };
+    crate::prep::normalize_dataset(&mut ds, backend)?;
+    crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+    let rows = match ds.data.layout {
+        Layout::Projection => ndarray::Axis(1),
+        Layout::Sinogram => ndarray::Axis(0),
+    };
+    ds.data
+        .array
+        .slice_axis_inplace(rows, ndarray::Slice::from(z0 - r0..z1 - r0));
+    let mut sino = ds.data.to_layout(Layout::Sinogram);
+    crate::prep::remove_stripe(&mut sino, prep.stripe)?;
+    Ok(sino)
+}
+
 /// Laminography reconstruction that streams the output rh-tiles to `on_tile`
 /// instead of returning the whole `[rh, n, n]` volume — for outputs too large to
 /// assemble in host RAM. Runs the same projection-domain prep as [`reconstruct`]

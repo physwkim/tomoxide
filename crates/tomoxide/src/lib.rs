@@ -51,7 +51,7 @@ pub mod pipeline;
 
 pub use engine::Engine;
 pub use pipeline::{
-    reconstruct, reconstruct_lamino_streaming, CancelToken, PrepOptions, ReconSteps,
+    prep_band, reconstruct, reconstruct_lamino_streaming, CancelToken, PrepOptions, ReconSteps,
 };
 
 // Flat re-exports of the common building blocks (was tomoxide-core's root).

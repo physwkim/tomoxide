@@ -986,13 +986,10 @@ fn main() -> anyhow::Result<()> {
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
                 let nz_total = geom.detector.height;
-                let ds = if banded {
-                    geom.detector.height = z1 - z0;
-                    reader.read_chunk(z0, z1)?
-                } else {
-                    reader.read_all()?
-                };
-                let vol = reconstruct_chain(ds, &geom, &plan, lamino_rh, &engine)?;
+                geom.detector.height = z1 - z0;
+                let sino =
+                    tomoxide::prep_band(reader.as_mut(), z0, z1, &plan.prep, engine.backend())?;
+                let vol = reconstruct_chain(&sino, &geom, &plan, lamino_rh, &engine)?;
                 let mut writer = maybe_progress(
                     tomoxide::io::create_writer(&out, save_format)?,
                     common.progress_json,
@@ -1098,12 +1095,7 @@ fn main() -> anyhow::Result<()> {
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
                 let nz_total = geom.detector.height;
-                let ds = if banded {
-                    geom.detector.height = z1 - z0;
-                    reader.read_chunk(z0, z1)?
-                } else {
-                    reader.read_all()?
-                };
+                geom.detector.height = z1 - z0;
                 if let Some(deg) = lamino_angle.filter(|_| engine.name() == "cuda") {
                     // Laminography on CUDA: disk-stream the OUTPUT. Reconstruct the
                     // rh volume tile-by-tile and write each tile as it lands, so
@@ -1120,7 +1112,7 @@ fn main() -> anyhow::Result<()> {
                     );
                     writer.reserve(rh)?;
                     tomoxide::reconstruct_lamino_streaming(
-                        ds,
+                        reader.read_all()?,
                         &geom,
                         plan.algo,
                         &params,
@@ -1130,8 +1122,10 @@ fn main() -> anyhow::Result<()> {
                     )?;
                     writer.finalize()?;
                 } else {
+                    let sino =
+                        tomoxide::prep_band(reader.as_mut(), z0, z1, &plan.prep, engine.backend())?;
                     let vol =
-                        tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
+                        tomoxide::recon::recon(&sino, &geom, plan.algo, &params, engine.backend())?;
                     let mut writer = maybe_progress(
                         tomoxide::io::create_writer(&out, save_format)?,
                         common.progress_json,
@@ -1902,27 +1896,22 @@ fn recon_params(
 /// Reconstruct through an algorithm chain (`--algorithm a,b,c`), warm-starting each
 /// stage from the previous stage's volume via [`ReconParams::init`].
 ///
-/// Preprocessing (flat/dark + minus-log → phase retrieval → sinogram → stripe
-/// removal) runs **once** — mirroring [`tomoxide::reconstruct`] — then each stage
-/// reconstructs the same prepared sinogram, seeding its initial estimate with the
-/// prior stage's output. The classic use is `fbp,sirt`: the analytic FBP gives a
+/// Every stage reconstructs the same sinograms, prepped once by
+/// [`tomoxide::prep_band`], seeding its initial estimate with the prior stage's
+/// output. The classic use is `fbp,sirt`: the analytic FBP gives a
 /// fast seed the iterative SIRT then refines (fewer iterations for the same
 /// quality). Each stage uses its own `num_iter` (from a `name:iters` suffix, else
 /// the global `--num_iter`); `reg_par`/`filter` still apply to every stage
 /// (analytic stages ignore iterations). Whole-volume only (the warm-start needs
 /// the full prior volume). Returns the final stage's volume.
 fn reconstruct_chain(
-    mut ds: tomoxide::Dataset<f32>,
+    sino: &tomoxide::Tomo<f32>,
     geom: &Geometry,
     plan: &ReconPlan,
     lamino_rh: Option<usize>,
     engine: &Engine,
 ) -> anyhow::Result<tomoxide::Volume<f32>> {
     let backend = engine.backend();
-    tomoxide::prep::normalize_dataset(&mut ds, backend)?;
-    tomoxide::prep::retrieve_phase(&mut ds.data, plan.prep.phase, backend)?;
-    let mut sino = ds.data.to_layout(tomoxide::Layout::Sinogram);
-    tomoxide::prep::remove_stripe(&mut sino, plan.prep.stripe)?;
 
     let n = plan.chain.len();
     let mut init: Option<tomoxide::Volume<f32>> = None;
@@ -1938,7 +1927,7 @@ fn reconstruct_chain(
         params.lamino_rh = lamino_rh;
         params.init = init.take();
         let warm = params.init.is_some();
-        let vol = tomoxide::recon::recon(&sino, geom, stage.algo, &params, backend)?;
+        let vol = tomoxide::recon::recon(sino, geom, stage.algo, &params, backend)?;
         let iters_note = if stage.algo.is_analytic() {
             String::new()
         } else {
