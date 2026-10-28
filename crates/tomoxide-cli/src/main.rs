@@ -648,14 +648,6 @@ fn pick(axis: &str, cands: &[f32], focus: &[f64], widen: &str) -> anyhow::Result
     }
 }
 
-fn grid(center: f32, half_width: f32, step: f32) -> Vec<f32> {
-    if step <= 0.0 || half_width < 0.0 {
-        return vec![center];
-    }
-    let n = (half_width / step).floor() as i32;
-    (-n..=n).map(|k| center + k as f32 * step).collect()
-}
-
 /// `LO:HI` → an inclusive slice band, for `--focus_z`.
 fn parse_zband(s: &str) -> Result<(usize, usize), String> {
     let (a, b) = s
@@ -685,10 +677,8 @@ fn run_align(
     focus_z: Option<(usize, usize)>,
     force: bool,
 ) -> anyhow::Result<()> {
-    use tomoxide::geometry::{Angles, Beam, Center, Detector, Geometry};
-    use tomoxide::prep::normalize::normalize_dataset;
-    use tomoxide::recon::center::{find_center_rings, lamino_tilt_scan, slice_focus, SampleBand};
-    use tomoxide::ReconParams;
+    use tomoxide::align::{grid, PreppedStack};
+    use tomoxide::recon::center::SampleBand;
 
     // The tilt scan reconstructs at `--lamino_angle ± --tilt_width`, so without a
     // tilt there is nothing to search around — and a parallel-beam scan has no
@@ -703,15 +693,11 @@ fn run_align(
     // The band also anchors the centre sweep (its midpoint is the default
     // `--slice`), so unlike before it is meaningful without a tilt scan.
 
-    let path = file.to_string_lossy().to_string();
     let engine = Engine::new(backend_kind)?;
-    let mut reader = tomoxide::io::open_dxchange(&path)?;
-    let theta = reader.read_theta()?;
-    let mut ds = reader.read_all()?;
-    normalize_dataset(&mut ds, engine.backend())?;
+    let st = PreppedStack::load(engine.backend(), file)?;
 
     // --- step 1: the rings. One pass, and the acquisition check. ---
-    let ring = find_center_rings(&ds.data, engine.backend(), ring_step)?;
+    let ring = st.rings(engine.backend(), ring_step)?;
     println!("rings (mean projection, every {ring_step}th frame):");
     println!("  centre      = {:.2}", ring.center);
     println!(
@@ -751,48 +737,15 @@ fn run_align(
             engine.name()
         );
     }
-    let p = ds.data.as_layout(tomoxide::data::Layout::Projection);
-    let (nproj, nz, nx) = p.array.dim();
-    // Defaults are the tuned analytic path (parzen filter), which is what the
-    // laminography goldens reconstruct with. The centre probes read only
-    // `filter_name` and `num_gridx` — each does a single plane, so `lamino_rh`
-    // never enters. Leaving it `None` also lets the tilt scan give every tilt its
-    // own natural depth, which is the point of scoring the max over all of it.
-    let params = ReconParams::default();
-    let mk_geom = |center: f32, tilt_deg: Option<f32>| Geometry {
-        angles: Angles(theta.clone()),
-        center: Center::Scalar(center),
-        beam: match tilt_deg {
-            Some(d) => Beam::laminography(d),
-            None => Beam::Parallel,
-        },
-        detector: Detector {
-            width: nx,
-            height: nz,
-            pixel_size: 1.0,
-        },
-    };
-    // `sz` indexes the output volume: rows `[0, nz)` for parallel beam, `[0, rh)`
-    // for laminography, whose depth exceeds the detector's because the tilt
-    // stretches it. Since the z-centring unification it is the same volume z in
+    let (nproj, _nz, nx) = st.shape();
+    // `sz` indexes the output volume, whose depth under a tilt exceeds the
+    // detector's. Since the z-centring unification it is the same volume z in
     // every algorithm — a Fourierrec slice index names the same plane here.
-    //
-    // The centre response lives where the sample is, and which plane holds the
-    // sample is a property of the scan, not of the geometry — so when the user
-    // states the sample band (`--focus_z`, read off a reconstruction at
-    // `--lamino_angle`), its midpoint is the default slice. Without a band the
-    // only neutral default is the middle of the volume; read the -v curve to
-    // tell a peak from a flat line (flat = the slice is empty; give --focus_z
-    // or --slice).
-    let sz = slice.unwrap_or_else(|| match (focus_z, lamino_angle) {
-        (Some((lo, hi)), _) => (lo + hi) / 2,
-        (None, Some(deg)) => tomoxide::cuda::lamino_recon_height(nz, deg) / 2,
-        (None, None) => nz / 2,
-    }) as i32;
-    let depth = match lamino_angle {
-        Some(deg) => tomoxide::cuda::lamino_recon_height(nz, deg),
-        None => nz,
-    };
+    // Without --focus_z the default is the middle of the volume; read the -v
+    // curve to tell a peak from a flat line (flat = the slice is empty; give
+    // --focus_z or --slice).
+    let sz = slice.unwrap_or_else(|| st.default_slice(lamino_angle, focus_z));
+    let depth = st.depth(lamino_angle);
     println!(
         "\nrefining on output slice {sz} of {depth} ({} centre candidates)",
         grid(0.0, center_width, center_step).len()
@@ -810,16 +763,7 @@ fn run_align(
     };
 
     let cands = grid(ring.center, center_width, center_step);
-    let probe = tomoxide::cuda::center_probe_sweep(
-        &ds.data,
-        &mk_geom(ring.center, lamino_angle),
-        &params,
-        &cands,
-        sz,
-    )?;
-    let f: Vec<f64> = (0..cands.len())
-        .map(|i| slice_focus(&probe.index_axis(ndarray::Axis(0), i)))
-        .collect();
+    let f = st.center_sweep(lamino_angle, sz, &cands)?.focus;
     curve(&cands, &f, "");
     let center = pick("centre", &cands, &f, "--center_width")?;
     println!(
@@ -857,11 +801,8 @@ fn run_align(
                 ),
             }
             let t_start = Instant::now();
-            let scores = lamino_tilt_scan(
-                &ds.data,
-                &mk_geom(center, Some(t0)), // beam ignored — `tilts` supplies it
-                Algorithm::Fourierrec,
-                &params,
+            let scores = st.tilt_scan(
+                center,
                 &tilts,
                 focus_z.map(|z| SampleBand { z, tilt_deg: t0 }),
                 // The winning slice is `align`'s to ignore: it prints, and
@@ -2009,7 +1950,7 @@ fn recon_out_path(file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{grid, pick};
+    use super::pick;
 
     /// An interior maximum with no rival is an answer.
     #[test]
@@ -2088,16 +2029,6 @@ mod tests {
             pick("centre", &[396.0, 397.0], &[1.0, 2.0], "--w").unwrap(),
             397.0
         );
-    }
-
-    /// The sweep is centred on the estimate it refines, so the starting guess is
-    /// always a candidate — a grid that skipped it could only ever move away.
-    #[test]
-    fn grid_is_centred_and_symmetric() {
-        let g = grid(396.0, 1.0, 0.5);
-        assert_eq!(g, vec![395.0, 395.5, 396.0, 396.5, 397.0]);
-        assert_eq!(grid(396.0, 0.0, 0.25), vec![396.0]);
-        assert_eq!(grid(396.0, 8.0, 0.0), vec![396.0]);
     }
 
     use super::*;

@@ -8,7 +8,7 @@
 //! backend traits ([`backend`], [`data`], [`dtype`], [`error`], [`geometry`],
 //! [`params`]), the backends ([`cpu`], [`cuda`], [`wgpu`]), reconstruction
 //! ([`recon`]), preprocessing ([`prep`]), I/O ([`io`]), simulation ([`sim`]),
-//! and the high-level [`engine`] + [`pipeline`].
+//! and the high-level [`engine`] + [`pipeline`] + [`align`].
 //!
 //! ```no_run
 //! use tomoxide::{Engine, BackendKind};
@@ -45,6 +45,7 @@ pub mod sim;
 pub mod xanes;
 
 // High-level orchestration.
+pub mod align;
 pub mod engine;
 pub mod pipeline;
 

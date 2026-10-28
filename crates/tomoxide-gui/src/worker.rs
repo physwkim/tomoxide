@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use rsplot::egui;
+use tomoxide::align::PreppedStack;
 use tomoxide::io::{DatasetReader, RowBandReader};
 use tomoxide::{
     Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PhaseMethod, ReconParams,
@@ -415,7 +416,7 @@ fn worker_main(
                 };
                 let t0 = std::time::Instant::now();
                 match ensure_prepped(&engine, &mut prepped, &path)
-                    .and_then(|st| st.rings(engine.backend(), step))
+                    .and_then(|st| lamino_rings(st, engine.backend(), step))
                 {
                     Ok((ring, mean)) => {
                         let (ny, nx) = mean.dim();
@@ -445,18 +446,22 @@ fn worker_main(
                     continue;
                 };
                 let t0 = std::time::Instant::now();
-                match ensure_prepped(&engine, &mut prepped, &path)
-                    .and_then(|st| st.center_sweep(tilt_deg, slice, &centers))
-                {
-                    Ok((ny, nx, frames, focus, slice)) => send(Event::LaminoCenterSweep {
-                        centers,
-                        ny,
-                        nx,
-                        frames,
-                        focus,
-                        slice,
-                        millis: t0.elapsed().as_millis(),
-                    }),
+                match ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
+                    let slice = slice.unwrap_or_else(|| st.default_slice(tilt_deg, None));
+                    st.center_sweep(tilt_deg, slice, &centers)
+                }) {
+                    Ok(sweep) => {
+                        let (_n, ny, nx) = sweep.frames.dim();
+                        send(Event::LaminoCenterSweep {
+                            centers,
+                            ny,
+                            nx,
+                            frames: sweep.frames.iter().copied().collect(),
+                            focus: sweep.focus,
+                            slice: sweep.slice,
+                            millis: t0.elapsed().as_millis(),
+                        })
+                    }
                     Err(e) => send(Event::JobFailed {
                         what: "lamino center sweep".into(),
                         error: e.to_string(),
@@ -698,131 +703,16 @@ fn tv_seminorm(vol: &ndarray::Array3<f32>) -> f64 {
     sum
 }
 
-/// A finished centre probe sweep: `[ny, nx]` per candidate concatenated
-/// row-major, each candidate's `slice_focus`, and the output slice they were
-/// scored on.
-type CenterSweepResult = (usize, usize, Vec<f32>, Vec<f64>, usize);
-
-/// The whole flat/dark-corrected, minus-log projection stack, held in host RAM.
-///
-/// Every laminography alignment step consumes all of it — the rings average the
-/// projections, and both sweeps back-project them — so there is no band to read
-/// lazily the way the preview jobs do. Loading it is the expensive part
-/// (`nproj·nz·nx·4` bytes, and a full pass of prep), and the three steps run one
-/// after another on the same data, so it is loaded once and kept.
-struct PreppedStack {
-    path: PathBuf,
-    data: tomoxide::Tomo<f32>,
-    theta: Vec<f32>,
-    nz: usize,
-    nx: usize,
-}
-
-impl PreppedStack {
-    fn load(engine: &Engine, path: &std::path::Path) -> tomoxide::Result<Self> {
-        let backend = engine.backend();
-        let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
-        let theta = reader.read_theta()?;
-        let mut ds = reader.read_all()?;
-        tomoxide::prep::normalize_dataset(&mut ds, backend)?;
-        let (_nproj, nz, nx) = ds
-            .data
-            .as_layout(tomoxide::data::Layout::Projection)
-            .array
-            .dim();
-        Ok(PreppedStack {
-            path: path.to_path_buf(),
-            data: ds.data,
-            theta,
-            nz,
-            nx,
-        })
-    }
-
-    fn bytes(&self) -> usize {
-        self.data.array.len() * std::mem::size_of::<f32>()
-    }
-
-    /// Geometry at `center`/`tilt_deg`. `tilt_deg = None` is parallel beam.
-    fn geometry(&self, center: f32, tilt_deg: Option<f32>) -> Geometry {
-        Geometry {
-            angles: Angles(self.theta.clone()),
-            center: Center::Scalar(center),
-            beam: match tilt_deg {
-                Some(d) => tomoxide::Beam::laminography(d),
-                None => tomoxide::Beam::Parallel,
-            },
-            detector: tomoxide::Detector {
-                width: self.nx,
-                height: self.nz,
-                pixel_size: 1.0,
-            },
-        }
-    }
-
-    /// The output slice a sweep scores by default: the middle of the volume,
-    /// which is `rh/2` under a tilt and `nz/2` without one. Those coincide only
-    /// at zero tilt — the tilt stretches the reconstruction deeper than the
-    /// detector is tall.
-    fn default_slice(&self, tilt_deg: Option<f32>) -> usize {
-        match tilt_deg {
-            Some(d) => tomoxide::cuda::lamino_recon_height(self.nz, d) / 2,
-            None => self.nz / 2,
-        }
-    }
-
-    fn rings(
-        &self,
-        backend: &dyn tomoxide::Backend,
-        step: usize,
-    ) -> tomoxide::Result<(tomoxide::recon::center::RingCenter, ndarray::Array2<f32>)> {
-        let ring = tomoxide::recon::center::find_center_rings(&self.data, backend, step)?;
-        let mean = tomoxide::recon::center::mean_projection(&self.data, step)?;
-        Ok((ring, mean))
-    }
-
-    fn center_sweep(
-        &self,
-        tilt_deg: Option<f32>,
-        slice: Option<usize>,
-        centers: &[f32],
-    ) -> tomoxide::Result<CenterSweepResult> {
-        let sz = slice.unwrap_or_else(|| self.default_slice(tilt_deg));
-        let seed = centers.first().copied().unwrap_or(self.nx as f32 / 2.0);
-        let probe = tomoxide::cuda::center_probe_sweep(
-            &self.data,
-            &self.geometry(seed, tilt_deg),
-            &ReconParams::default(),
-            centers,
-            sz as i32,
-        )?;
-        let (_n, ny, nx) = probe.dim();
-        let focus = (0..centers.len())
-            .map(|i| tomoxide::recon::center::slice_focus(&probe.index_axis(ndarray::Axis(0), i)))
-            .collect();
-        Ok((ny, nx, probe.iter().copied().collect(), focus, sz))
-    }
-
-    fn tilt_scan(
-        &self,
-        center: f32,
-        tilts: &[f32],
-        band: Option<tomoxide::recon::center::SampleBand>,
-        on_tilt: &mut dyn FnMut(
-            &tomoxide::recon::center::TiltFocus,
-            ndarray::ArrayView2<f32>,
-        ) -> tomoxide::Result<()>,
-    ) -> tomoxide::Result<Vec<tomoxide::recon::center::TiltFocus>> {
-        tomoxide::recon::center::lamino_tilt_scan(
-            &self.data,
-            &self.geometry(center, Some(0.0)), // beam ignored — `tilts` supplies it
-            Algorithm::Fourierrec,
-            &ReconParams::default(),
-            tilts,
-            band,
-            on_tilt,
-        )
-    }
+/// The rings estimate and the mean projection it was read off — the bullseye
+/// `docs/LAMINOGRAPHY_ALIGNMENT.md` §1 has the user look at first.
+fn lamino_rings(
+    st: &PreppedStack,
+    backend: &dyn tomoxide::Backend,
+    step: usize,
+) -> tomoxide::Result<(tomoxide::recon::center::RingCenter, ndarray::Array2<f32>)> {
+    let ring = st.rings(backend, step)?;
+    let mean = tomoxide::recon::center::mean_projection(st.data(), step)?;
+    Ok((ring, mean))
 }
 
 /// Load the prepped stack unless the cache already holds this file's.
@@ -831,8 +721,8 @@ fn ensure_prepped<'a>(
     slot: &'a mut Option<PreppedStack>,
     path: &std::path::Path,
 ) -> tomoxide::Result<&'a PreppedStack> {
-    if slot.as_ref().is_none_or(|st| st.path != path) {
-        *slot = Some(PreppedStack::load(engine, path)?);
+    if slot.as_ref().is_none_or(|st| st.path() != path) {
+        *slot = Some(PreppedStack::load(engine.backend(), path)?);
     }
     Ok(slot.as_ref().expect("just loaded"))
 }
@@ -994,10 +884,11 @@ mod tests {
         let engine = Engine::new(BackendKind::Cpu).unwrap();
         let mut slot = None;
         let st = ensure_prepped(&engine, &mut slot, &fixture()).unwrap();
-        let (ring, mean) = st.rings(engine.backend(), 1).unwrap();
+        let (ring, mean) = lamino_rings(st, engine.backend(), 1).unwrap();
+        let (_nproj, nz, nx) = st.shape();
         assert_eq!(
             mean.dim(),
-            (st.nz, st.nx),
+            (nz, nx),
             "the mean projection is not a projection-shaped image"
         );
         assert!(
@@ -1022,25 +913,7 @@ mod tests {
         let first = ensure_prepped(&engine, &mut slot, &fixture()).unwrap() as *const PreppedStack;
         let again = ensure_prepped(&engine, &mut slot, &fixture()).unwrap() as *const PreppedStack;
         assert_eq!(first, again, "the second call reloaded the same file");
-        assert_eq!(slot.as_ref().unwrap().path, fixture());
-    }
-
-    /// `rh/2` and `nz/2` are the same row only at zero tilt: the tilt stretches
-    /// the reconstruction deeper than the detector is tall, and the sweep's
-    /// default slice indexes the volume, not the detector.
-    #[test]
-    fn default_sweep_slice_is_the_middle_of_the_volume_not_the_detector() {
-        let engine = Engine::new(BackendKind::Cpu).unwrap();
-        let mut slot = None;
-        let st = ensure_prepped(&engine, &mut slot, &fixture()).unwrap();
-        assert_eq!(st.default_slice(None), st.nz / 2);
-        let tilted = st.default_slice(Some(44.0));
-        assert_eq!(tilted, tomoxide::cuda::lamino_recon_height(st.nz, 44.0) / 2);
-        assert!(
-            tilted > st.nz / 2,
-            "a 44° tilt must push the middle of the volume past the detector's middle row:              got {tilted} for nz {}",
-            st.nz
-        );
+        assert_eq!(slot.as_ref().unwrap().path(), fixture());
     }
 
     /// The whole preview path (probe → geometry → pipelined range recon →
