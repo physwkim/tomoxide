@@ -908,6 +908,41 @@ pub fn find_center_pc(
     Ok((center + imgshift) as f32)
 }
 
+/// The `(row, col)` shift that registers `moving` onto `reference`: `moving`
+/// moved by it lines up with `reference`. Phase cross-correlation, the same
+/// registration [`find_center_pc`] runs (skimage `phase_cross_correlation`,
+/// `normalization="phase"`), resolved to `1/upsample` px; `upsample = 1` gives
+/// whole pixels. The refinement costs `~1.5·upsample·nrow·ncol` complex
+/// exponentials.
+///
+/// Outside the centre finder this is the drift check: the 0° and 360°
+/// projections of a full turn see the same object, so a shift between them is
+/// the stage's, not the sample's.
+pub fn register_shift(
+    reference: &Array2<f32>,
+    moving: &Array2<f32>,
+    backend: &dyn Backend,
+    upsample: f64,
+) -> Result<(f64, f64)> {
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    if reference.dim() != moving.dim() {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{}x{}", reference.dim().0, reference.dim().1),
+            found: format!("{}x{}", moving.dim().0, moving.dim().1),
+        });
+    }
+    if reference.is_empty() || !(upsample >= 1.0 && upsample.is_finite()) {
+        return Err(Error::InvalidParam(format!(
+            "register_shift needs a non-empty image and upsample ≥ 1; got {:?}, {upsample}",
+            reference.dim()
+        )));
+    }
+    phase_cross_correlation(reference, moving, upsample, fft)
+}
+
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
 ///
 /// Available only with the **`sift-center`** feature (pure-Rust `lowe-sift`).
