@@ -78,7 +78,7 @@ pub struct RingCenter {
 ///
 /// (The doc quotes 397.5/281.1 and prominence 21.0/2.4 for its NumPy reference,
 /// which clips at `1e-4` before the log where this goes through
-/// [`prep::normalize`](crate::prep::normalize). The centre lands within 0.13 px
+/// [`prep::normalize`](fn@crate::prep::normalize). The centre lands within 0.13 px
 /// either way; the prominence scale differs, so the numbers above — not the
 /// doc's — are the ones this function returns.)
 pub fn find_center_rings(
@@ -911,7 +911,7 @@ pub fn find_center_pc(
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
 ///
 /// Available only with the **`sift-center`** feature (pure-Rust `lowe-sift`).
-/// See [`sift`] for the implementation.
+/// See `sift` for the implementation.
 #[cfg(not(feature = "sift-center"))]
 pub fn find_center_sift(
     _proj0: &Array2<f32>,

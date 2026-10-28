@@ -206,7 +206,7 @@ struct CommonRecon {
     save_format: Option<String>,
     /// Output base path — each writer adds its own suffix (tiff:
     /// `<base>_NNNNN.tiff` per slice; h5: `<base>.h5`; zarr: `<base>.zarr`)
-    /// [default: <input-without-extension>_rec].
+    /// [default: the input path without its extension, plus _rec].
     #[arg(long)]
     output: Option<PathBuf>,
     /// Apodization filter (none|ramp|shepp|cosine|cosine2|hamming|hann|parzen).
@@ -1297,7 +1297,8 @@ fn maybe_progress(
 /// Run the overlapped read‖compute‖write streaming pipeline for one file.
 ///
 /// Probes geometry (metadata only) on the calling thread, then hands
-/// reader/writer **factories** to [`ReconSteps::run_streaming_pipelined`] — the
+/// reader/writer **factories** to
+/// [`ReconSteps::run_streaming_pipelined_range`](tomoxide::ReconSteps::run_streaming_pipelined_range) — the
 /// `rust-hdf5` handles are `!Send`, so each I/O object is built on the thread
 /// that owns it. Shared by `recon` (auto-pipelined GPU path) and `recon_steps`.
 #[allow(clippy::too_many_arguments)]

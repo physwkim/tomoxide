@@ -38,7 +38,7 @@ impl CudaBackend {
     /// Initialise the CUDA backend.
     ///
     /// Without the `cuda` feature this always returns
-    /// [`Error::BackendUnavailable`]. With the feature it probes for a device
+    /// [`crate::Error::BackendUnavailable`]. With the feature it probes for a device
     /// via the shim and fails if none is present.
     pub fn new() -> Result<Self> {
         #[cfg(not(feature = "cuda"))]
@@ -70,7 +70,7 @@ impl CudaBackend {
 /// correction to each projection chunk it already uploads for stage 1.
 ///
 /// `darkflat` carries `(mean(dark), denom)` — each `[deth·detw]`, the exact
-/// operands [`crate::prep::normalize::darkflat_frames`] produces — or `None`
+/// operands `crate::prep::normalize::darkflat_frames` produces — or `None`
 /// when the dataset had no flat/dark (already-normalized input); minus-log is
 /// always applied, matching `normalize_dataset`.
 pub struct LamNorm {
@@ -1122,7 +1122,7 @@ mod cuda_impl {
         /// Row-action (ART/BART) rows. The row-action solvers are sequential
         /// Kaczmarz updates (no GPU kernel in this design) and the rows are
         /// geometry-only, so CUDA reuses the shared host geometry
-        /// [`parallel_ray_rows`] — byte-identical to the CPU backend's rows.
+        /// `parallel_ray_rows` — byte-identical to the CPU backend's rows.
         fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>> {
             parallel_ray_rows(geom, n)
         }
@@ -2051,9 +2051,9 @@ mod cuda_impl {
     impl IterativeReconstruct for CudaBackend {
         /// Device-resident iterative reconstruction — the volume/sinogram stay on
         /// the GPU across all iterations (no per-iteration host↔device transfer).
-        /// Implemented for SIRT ([`sirt_device`]), MLEM/OSEM ([`em_device`]),
-        /// OSPML/PML ([`ospml_device`]), GRAD/TIKH ([`grad_device`]), and TV
-        /// ([`tv_device`]); every other algorithm returns `Ok(None)` → generic
+        /// Implemented for SIRT (`sirt_device`), MLEM/OSEM (`em_device`),
+        /// OSPML/PML (`ospml_device`), GRAD/TIKH (`grad_device`), and TV
+        /// (`tv_device`); every other algorithm returns `Ok(None)` → generic
         /// host fallback (ART/BART are dispatched earlier, by ray projector).
         /// Serves parallel beam and laminography (`beam_phi` threads the tilt
         /// into the projector pair; recon-height = detector rows); falls back for
@@ -7184,10 +7184,11 @@ mod cuda_impl {
         }
 
         /// Reuse one set of device handles + uploaded grids across all streaming
-        /// chunks (see [`CudaFbpStream`]). Handle-reusing for FBP/Linerec
+        /// chunks (see `CudaFbpStream`). Handle-reusing for FBP/Linerec
         /// (`cfunc_filter`/`cfunc_linerec`), Fourierrec (`cfunc_fourierrec`), and
-        /// lprec (the [`LpRecDev`] grids — built once here, not per chunk). Gridrec
-        /// returns `None` and the caller falls back to per-chunk [`reconstruct`].
+        /// lprec (the `LpRecDev` grids — built once here, not per chunk). Gridrec
+        /// returns `None` and the caller falls back to per-chunk
+        /// [`reconstruct`](crate::backend::AnalyticReconstruct::reconstruct).
         /// Binds the first selected device, as the f16 one-shot path does, since
         /// the handles are device-resident.
         fn streaming(
@@ -7643,7 +7644,7 @@ mod cuda_impl {
     impl crate::backend::Fft for CudaBackend {
         /// Fan the per-slice loop across the selected GPUs (and host cores).
         /// Slices are partitioned into one contiguous chunk per device; each
-        /// chunk runs on that device's [`slice_pool`] — a pinned pool sized to the
+        /// chunk runs on that device's `slice_pool` — a pinned pool sized to the
         /// device's in-flight cap — all devices concurrently.
         ///
         /// Bit-identical regardless of device count: each slice's cuFFT uses a
@@ -7651,7 +7652,7 @@ mod cuda_impl {
         /// host gather/deapodize is deterministic f32 — so gridrec/lprec/phase
         /// give max|Δ|=0 single-GPU vs multi-GPU. (This is *not* true of the
         /// fused filter path, whose batch scales with the chunk; see
-        /// [`analytic_fbp_chunk`]'s caller.) Note gridrec is host-gather bound:
+        /// `analytic_fbp_chunk`'s caller.) Note gridrec is host-gather bound:
         /// one GPU already saturates the host cores, so extra GPUs help the
         /// GPU-heavier lprec/phase far more than gridrec.
         fn for_each_slice(
@@ -8235,7 +8236,7 @@ mod cuda_impl {
 
     impl LpRecReconstruct for CudaBackend {
         /// Device-resident log-polar reconstruction — the GPU port of
-        /// [`crate::recon::lprec`]'s per-slice runtime. The geometry grids are
+        /// `crate::recon::lprec`'s per-slice runtime. The geometry grids are
         /// precomputed on the host by `build_grids` (the same precompute the CPU
         /// path uses) and uploaded once; the cubic-B-spline prefilter, the
         /// polar↔log-polar gather/scatter, and the per-span FFT convolution all

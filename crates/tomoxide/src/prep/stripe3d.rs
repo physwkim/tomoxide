@@ -4,7 +4,7 @@
 //! works with full and partial stripes of constant or varying intensity. See
 //! `docs/PORTING.md` §D.
 //!
-//! Unlike the [`stripe`](crate::stripe) removal methods, these do not modify the
+//! Unlike the [`stripe`](crate::prep::stripe) removal methods, these do not modify the
 //! data. [`stripes_detect3d`] returns a `[0, 1]` weights volume in which stripe
 //! *edges* are highlighted with smaller (e.g. `< 0.5`) values, and
 //! [`stripes_mask3d`] turns those weights into a binary `bool` mask of the

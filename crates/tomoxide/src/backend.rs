@@ -386,7 +386,7 @@ pub enum RampShape {
     /// tomopy's classic straight-line ramp `r = 2·fk/pad`. The CPU and wgpu
     /// backends port tomopy, so they build this shape.
     Linear,
-    /// tomocupy's degree-12 `_wint` quadrature ramp ([`wint_ramp`]). The CUDA
+    /// tomocupy's degree-12 `_wint` quadrature ramp (`wint_ramp`). The CUDA
     /// backend ports tomocupy, so it builds this shape; combined with the
     /// `0.5/pad` gain in `build_filter_w` it reproduces tomocupy's net FBP
     /// filter bit-for-bit.
@@ -421,7 +421,7 @@ pub enum RampShape {
 /// The base ramp is the physical inversion filter `|ω|` in cycles/pixel, so it
 /// runs `0` at DC to `0.5` at Nyquist and `name` apodizes it.
 /// [`RampShape::Linear`] is the plain `k/pad` line (tomopy's ramp shape);
-/// [`RampShape::Wint`] is `pad·wint(t)` ([`wint_ramp`], tomocupy's degree-12
+/// [`RampShape::Wint`] is `pad·wint(t)` (`wint_ramp`, tomocupy's degree-12
 /// quadrature ramp). Both tomopy and tomocupy carry an extra factor `2` here
 /// (their ramp peaks at `1` at Nyquist), which puts every analytic
 /// reconstruction at `2×` the physical attenuation μ; tomoxide drops it so the
@@ -560,13 +560,13 @@ pub trait AnalyticReconstruct {
     /// Build a [`StreamingAnalytic`] bound to fixed `(algorithm, params, ncols,
     /// max_nz)` so a multi-chunk streaming job creates the FBP-filter / back-
     /// projection handles (cuFFT plans, f16 textures) **once** and reuses them
-    /// across z-chunks, instead of the per-chunk new/free [`reconstruct`] does.
+    /// across z-chunks, instead of the per-chunk new/free [`reconstruct`](Self::reconstruct) does.
     ///
     /// `geom` supplies the (chunk-invariant) projection angles; per-chunk centre
     /// shifts are taken from the geometry handed to
     /// [`StreamingAnalytic::reconstruct_chunk`]. Returns `Ok(None)` when this
     /// backend cannot reuse handles for `algorithm` (e.g. the CPU backend, or
-    /// gridrec/lprec) — the caller falls back to per-chunk [`reconstruct`].
+    /// gridrec/lprec) — the caller falls back to per-chunk [`reconstruct`](Self::reconstruct).
     fn streaming(
         &self,
         _algorithm: crate::params::Algorithm,
@@ -606,7 +606,7 @@ pub trait StreamingAnalytic {
     /// requested `stripe` method on the device. `StripeMethod::None` is always
     /// handled (no-op). This keeps the device/host gating decision inside the
     /// backend: the caller simply falls back to host normalize + transpose +
-    /// host `remove_stripe` + [`reconstruct_chunk`] whenever this returns `None`.
+    /// host `remove_stripe` + [`reconstruct_chunk`](Self::reconstruct_chunk) whenever this returns `None`.
     ///
     /// `data` is the contiguous, C-order raw projection chunk in
     /// [`Layout::Projection`](crate::data::Layout) — `[nproj, nz, ncols]` with

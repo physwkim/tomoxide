@@ -14,7 +14,7 @@
 //!
 //! ## Cross-section source
 //! `beamhardening` uses `xraydb`, which has no Rust port, so this uses
-//! [`xraylib`] instead. For pure elements the two are bit-identical; for
+//! `xraylib` instead. For pure elements the two are bit-identical; for
 //! compounds they differ by ~4e-5 (atomic-weight tables). The algorithm — the
 //! Simpson integration, the thickness grid, the `np.interp` passes, and the
 //! flat-field angle finding — is reproduced exactly, so against an xraylib-based
@@ -30,7 +30,7 @@ mod disabled {
     use crate::error::{Error, Result};
 
     /// Beam-hardening correction is a compile-time opt-in. Build with the
-    /// `beam-hardening` feature to enable [`BeamCorrector`].
+    /// `beam-hardening` feature to enable `BeamCorrector`.
     pub fn beam_correct(_data: &mut Tomo<f32>, _start_row: usize, _end_row: usize) -> Result<()> {
         Err(Error::todo(
             "hardening::beam_correct (build with the `beam-hardening` feature)",
@@ -381,7 +381,7 @@ mod enabled {
             (&self.angular_angles, &self.angular_corr)
         }
 
-        /// Per-detector-row vertical fan angles (µrad) from [`find_angles`];
+        /// Per-detector-row vertical fan angles (µrad) from [`find_angles`](BeamCorrector::find_angles);
         /// empty until it is called.
         pub fn row_angles(&self) -> &[f64] {
             &self.row_angles
@@ -390,7 +390,7 @@ mod enabled {
         /// Set the per-detector-row vertical fan angles from a flat field
         /// (`find_angles`): find the brightest row (Gaussian-smoothed vertical
         /// profile), then `angle[row] = |row − center| · pixel_size / d_source`
-        /// (µrad, since µm/m = µrad). Must be called before [`correct`].
+        /// (µrad, since µm/m = µrad). Must be called before [`correct`](Self::correct).
         pub fn find_angles(&mut self, flat: &Array2<f32>) {
             let (nrows, _ncols) = flat.dim();
             // vertical_slice = sum over columns, in f64.
@@ -409,7 +409,7 @@ mod enabled {
         /// Apply both correction passes to a projection-layout chunk
         /// (tomocupy `proc_functions.beamhardening`, applied after minus-log).
         /// `data` is `[nproj, nrows, ncols]`; `[start_row, end_row)` selects the
-        /// absolute detector rows this chunk spans (indexing the [`find_angles`]
+        /// absolute detector rows this chunk spans (indexing the [`find_angles`](Self::find_angles)
         /// table for the angular pass).
         pub fn correct(
             &self,

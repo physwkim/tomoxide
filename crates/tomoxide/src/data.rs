@@ -83,7 +83,7 @@ impl<T: Clone> Tomo<T> {
     /// actually needed. When `self` is already in `target` this returns a
     /// borrow (no copy); otherwise it transposes into an owned copy.
     ///
-    /// Prefer this over [`to_layout`] on read-only paths: `to_layout` always
+    /// Prefer this over [`to_layout`](Self::to_layout) on read-only paths: `to_layout` always
     /// allocates — it `clone()`s the full array even when the layout already
     /// matches — which on a reconstruction-sized sinogram is hundreds of MB
     /// copied per call for nothing.

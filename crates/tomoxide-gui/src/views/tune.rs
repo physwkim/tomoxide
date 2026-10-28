@@ -133,7 +133,7 @@ pub struct TuneView {
     compare: CompareImages,
 
     // --- λ sweep (L-curve regularization tuner) ---
-    /// Log-spaced sweep endpoints and count (λ = reg_par[0]).
+    /// Log-spaced sweep endpoints and count (λ = `reg_par[0]`).
     lam_min: f32,
     lam_max: f32,
     lam_count: usize,

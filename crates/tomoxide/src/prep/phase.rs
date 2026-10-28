@@ -118,7 +118,7 @@ fn wavelength(energy: f64) -> f64 {
 /// Detector rows of context a row-restricted (banded) run needs around the
 /// rows it will keep, so their retrieval matches a full-frame run: the Fresnel
 /// kernel's pixel support `⌈π·λ·dist / pixel_size²⌉` — the same `pad_pix` that
-/// sizes [`calc_pad_width`]'s padding (tomopy `_calc_pad_width`). `0` for
+/// sizes `calc_pad_width`'s padding (tomopy `_calc_pad_width`). `0` for
 /// [`PhaseMethod::None`]. [`prep_band`](crate::prep_band) reads this many extra
 /// rows on each side of its band.
 pub fn margin_rows(method: &PhaseMethod) -> usize {
