@@ -974,7 +974,8 @@ fn main() -> anyhow::Result<()> {
             // previous stage's volume, which needs the whole prior volume — so it
             // takes the whole-volume path and never the per-slice pipeline/shard.
             // Laminography is likewise whole-stack only (the tilt couples all
-            // detector rows into every output voxel).
+            // detector rows into every output voxel), and so is a prep that is
+            // not `row_separable` (phase retrieval couples each projection's rows).
             if plan.chain.len() > 1 {
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
@@ -1005,7 +1006,10 @@ fn main() -> anyhow::Result<()> {
                     writer.write_chunk(&vol, 0, nz)?;
                 }
                 writer.finalize()?;
-            } else if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
+            } else if pipelines_well(&engine, plan.algo)
+                && lamino_angle.is_none()
+                && plan.prep.row_separable()
+            {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
                 // else the safe default.
@@ -1074,8 +1078,8 @@ fn main() -> anyhow::Result<()> {
                     )?;
                 }
             } else {
-                // Whole-volume path (CPU/wgpu, chunking-hostile GPU methods, or
-                // laminography).
+                // Whole-volume path (CPU/wgpu, chunking-hostile GPU methods,
+                // laminography, or phase retrieval).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
                 let (z0, z1, banded) =
@@ -1159,6 +1163,14 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow!(
                     "lamino_angle (from config) needs the whole-volume path; it is \
                      supported only by `recon`, not the streaming `recon_steps`"
+                ));
+            }
+            if !plan.prep.row_separable() {
+                return Err(anyhow!(
+                    "phase retrieval ({}) couples detector rows, so it needs the \
+                     whole-volume path; it is supported only by `recon`, not the \
+                     streaming `recon_steps`",
+                    plan.phase_str
                 ));
             }
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;

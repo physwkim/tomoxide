@@ -23,6 +23,16 @@ pub struct PrepOptions {
     pub phase: PhaseMethod,
 }
 
+impl PrepOptions {
+    /// Whether this prep gives the same rows on a detector-row band as on the
+    /// whole stack, so a reconstruction can read and process it chunk by chunk.
+    /// Normalize is per pixel and stripe removal per sinogram, but phase
+    /// retrieval filters each projection in 2D and so couples its rows.
+    pub fn row_separable(&self) -> bool {
+        self.phase == PhaseMethod::None
+    }
+}
+
 /// Full in-memory reconstruction: normalize → minus-log → (stripe/phase) →
 /// reconstruct. Ports tomocupy `rec.py::GPURec` at a high level.
 ///
@@ -271,7 +281,7 @@ impl ReconSteps {
         prep: &PrepOptions,
         engine: &Engine,
     ) -> Result<()> {
-        if prep.phase != PhaseMethod::None {
+        if !prep.row_separable() {
             return Err(crate::error::Error::InvalidParam(
                 "ReconSteps::run_streaming does not support phase retrieval (row-coupled); \
                  use run() for a phase pipeline"
@@ -399,7 +409,7 @@ impl ReconSteps {
         RF: FnOnce() -> Result<Box<dyn crate::io::DatasetReader>> + Send,
         WF: FnOnce() -> Result<Box<dyn crate::io::VolumeWriter>> + Send,
     {
-        if prep.phase != PhaseMethod::None {
+        if !prep.row_separable() {
             return Err(crate::error::Error::InvalidParam(
                 "ReconSteps::run_streaming_pipelined does not support phase retrieval \
                  (row-coupled); use run() for a phase pipeline"

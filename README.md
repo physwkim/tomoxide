@@ -186,6 +186,9 @@ Each method reads only its own parameters (all overridable; defaults shown):
 | `Gpaganin` | pixel_size, distance, energy, db, w |
 | `farago` | pixel_size, distance, energy, db |
 
+Phase retrieval couples detector rows, so it uses the whole-volume path: it is
+supported by `recon` only (not the streaming `recon_steps`).
+
 **`recon`-only**
 
 | Option | Meaning |
