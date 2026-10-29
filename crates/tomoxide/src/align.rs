@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use ndarray::{Array3, ArrayView2, Axis};
+use ndarray::{Array3, Axis};
 
 use crate::backend::Backend;
 use crate::cuda::LaminoTileFn;
@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
 use crate::params::{Algorithm, ReconParams};
 use crate::pipeline::PrepOptions;
-use crate::recon::center::{RingCenter, SampleBand, TiltFocus};
+use crate::recon::center::{RingCenter, SampleBand, TiltFocus, TiltViews};
 use crate::recon::tilt_flow::TiltFlow;
 
 /// The whole flat/dark-corrected, minus-log projection stack, held in host RAM.
@@ -213,7 +213,7 @@ impl PreppedStack {
         center: f32,
         tilts_deg: &[f32],
         band: Option<SampleBand>,
-        on_tilt: &mut dyn FnMut(&TiltFocus, ArrayView2<f32>) -> Result<()>,
+        on_tilt: &mut dyn FnMut(&TiltFocus, TiltViews<'_>) -> Result<()>,
     ) -> Result<Vec<TiltFocus>> {
         // Default parameters are the tuned analytic path (parzen filter) the
         // laminography goldens reconstruct with. `lamino_rh` left `None` gives

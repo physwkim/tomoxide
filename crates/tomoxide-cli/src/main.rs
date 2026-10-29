@@ -795,9 +795,9 @@ fn run_align(
                 center,
                 &tilts,
                 focus_z.map(|z| SampleBand { z, tilt_deg: t0 }),
-                // The winning slice is `align`'s to ignore: it prints, and
+                // The views are `align`'s to ignore: it prints, and
                 // docs/LAMINOGRAPHY_ALIGNMENT.md §3 says confirm on a montage.
-                &mut |r, _slice| {
+                &mut |r, _views| {
                     let band = match r.band {
                         Some((lo, hi)) => format!("  band {lo}..{hi}"),
                         None => String::new(),

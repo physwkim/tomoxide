@@ -602,6 +602,15 @@ pub struct TiltFocus {
     pub focus_by_z: Vec<f64>,
 }
 
+/// What [`lamino_tilt_scan`] shows the eye of one tilt's reconstruction.
+pub struct TiltViews<'a> {
+    /// The `z_peak` slice, `[y, x]`: the in-focus layer.
+    pub slice: ArrayView2<'a, f32>,
+    /// The xz plane through the middle row `y = ny / 2`, `[z, x]` over the whole
+    /// depth: how the layers stack, which a wrong tilt doubles or smears.
+    pub xz: ArrayView2<'a, f32>,
+}
+
 /// Score each tilt in `tilts_deg` by fully reconstructing at it and taking the
 /// maximum [`slice_focus`] over the scored z range — every slice when `band` is
 /// `None`, the sample's own slices when a [`SampleBand`] carries a prior.
@@ -630,16 +639,17 @@ pub struct TiltFocus {
 /// `geom`'s beam is ignored; `tilts_deg` supplies it. `params.lamino_rh` is
 /// honoured if set, but leaving it `None` lets each tilt take its own natural
 /// depth, which is what the scan wants. The volume is never assembled: focus is
-/// scored per streamed tile, so the memory cost is one tile regardless of `rh`.
+/// scored per streamed tile, so the memory cost is one tile and one xz plane
+/// regardless of `rh`.
 ///
 /// `sino` must already be prepped (flat/dark, minus-log, stripe removal).
 ///
-/// `on_tilt(result, slice)` is called with each result as it lands — one full
+/// `on_tilt(result, views)` is called with each result as it lands — one full
 /// reconstruction apart, so a caller with a user attached should report it — and
-/// returning `Err` from it aborts the scan. `slice` is the `z_peak` slice, the
-/// in-focus layer itself: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming
+/// returning `Err` from it aborts the scan. `views` are the [`TiltViews`] of
+/// that reconstruction: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming
 /// the winner by eye part of the method, and this is the one reconstruction that
-/// already found it. Callers that only want the numbers ignore it.
+/// already found it. Callers that only want the numbers ignore them.
 ///
 /// CUDA-only: the streaming laminography reconstruction this rides on exists only
 /// there.
@@ -650,7 +660,7 @@ pub fn lamino_tilt_scan(
     params: &crate::params::ReconParams,
     tilts_deg: &[f32],
     band: Option<SampleBand>,
-    on_tilt: &mut dyn FnMut(&TiltFocus, ndarray::ArrayView2<f32>) -> Result<()>,
+    on_tilt: &mut dyn FnMut(&TiltFocus, TiltViews<'_>) -> Result<()>,
 ) -> Result<Vec<TiltFocus>> {
     if let Some(b) = &band {
         if b.z.0 > b.z.1 {
@@ -685,8 +695,11 @@ pub fn lamino_tilt_scan(
         // profile is how the *next* band gets read.
         let mut best: Option<(f64, usize, Array2<f32>)> = None;
         let mut profile: Vec<f64> = Vec::new();
-        let (depth, _, _) = {
+        let mut xz: Vec<f32> = Vec::new();
+        let (depth, _, nx) = {
             let mut on_tile = |z0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
+                let ny = tile.array.dim().1;
+                xz.extend(tile.array.index_axis(Axis(1), ny / 2).iter());
                 for (k, f) in focus_by_z(tile.array.view()).into_iter().enumerate() {
                     let z = z0 + k;
                     profile.push(f);
@@ -724,6 +737,8 @@ pub fn lamino_tilt_scan(
                 profile.len()
             )));
         }
+        let xz = Array2::from_shape_vec((depth, nx), xz)
+            .map_err(|e| Error::Backend(format!("tilt {tilt_deg}°: the xz plane: {e}")))?;
         let r = TiltFocus {
             tilt_deg,
             focus,
@@ -732,7 +747,13 @@ pub fn lamino_tilt_scan(
             depth,
             focus_by_z: profile,
         };
-        on_tilt(&r, img.view())?;
+        on_tilt(
+            &r,
+            TiltViews {
+                slice: img.view(),
+                xz: xz.view(),
+            },
+        )?;
         out.push(r);
     }
     Ok(out)

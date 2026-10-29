@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `lamino_tilt_scan` and `PreppedStack::tilt_scan` hand `on_tilt` a
+  `TiltViews`** (the `z_peak` slice and the xz plane through `y = ny / 2` over
+  the whole depth) instead of the slice alone. The xz plane is how the layers
+  stack, which the eye compares across tilts and which the streamed volume was
+  dropped before a caller could read.
+
 ## [0.8.0] - 2026-10-29
 
 ### Changed

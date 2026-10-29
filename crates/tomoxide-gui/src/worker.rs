@@ -480,8 +480,9 @@ fn worker_main(
                 let total = tilts.len();
                 let mut done = 0usize;
                 let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
-                    st.tilt_scan(center, &tilts, band, &mut |r, img| {
+                    st.tilt_scan(center, &tilts, band, &mut |r, views| {
                         done += 1;
+                        let img = views.slice;
                         let (ny, nx) = img.dim();
                         send(Event::LaminoTilt {
                             tilt_deg: r.tilt_deg,

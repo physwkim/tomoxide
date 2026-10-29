@@ -47,17 +47,20 @@ fn slab_volume(n: usize, rh: usize, z_lo: usize, z_hi: usize) -> Volume<f32> {
     Volume::new(stack)
 }
 
+/// The in-focus slice and the xz plane `on_tilt` handed over for one tilt.
+type Views = (Array2<f32>, Array2<f32>);
+
 /// The scan, the phantom, and the tilts the data was actually projected at.
-/// Returns the scores, the in-focus slice `on_tilt` handed over for each, and
-/// the slab bounds.
-fn scan(tilts: &[f32]) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
+/// Returns the scores, the views `on_tilt` handed over for each, and the slab
+/// bounds.
+fn scan(tilts: &[f32]) -> (Vec<TiltFocus>, Vec<Views>, usize, usize) {
     scan_banded(tilts, None)
 }
 
 fn scan_banded(
     tilts: &[f32],
     band: Option<SampleBand>,
-) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
+) -> (Vec<TiltFocus>, Vec<Views>, usize, usize) {
     let cuda = CudaBackend::new().expect("checked by the caller");
     let (n, nproj, nz) = (64usize, 90usize, 32usize);
     let rh = cuda::lamino_recon_height(nz, TRUE_TILT);
@@ -77,17 +80,22 @@ fn scan_banded(
         &params,
         tilts,
         band,
-        &mut |r, slice| {
+        &mut |r, views| {
             assert_eq!(
-                slice.dim(),
+                views.slice.dim(),
                 (n, n),
                 "the slice handed to on_tilt is not an [n, n] reconstruction plane"
+            );
+            assert_eq!(
+                views.xz.dim(),
+                (r.depth, n),
+                "the xz plane handed to on_tilt is not [depth, n]"
             );
             eprintln!(
                 "  {:5.1}°  focus {:.4e}  z_peak {} of {}",
                 r.tilt_deg, r.focus, r.z_peak, r.depth
             );
-            slices.push(slice.to_owned());
+            slices.push((views.slice.to_owned(), views.xz.to_owned()));
             Ok(())
         },
     )
@@ -198,6 +206,7 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
     // peak, not by round-off.
     let peak = named.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let d = slices[0]
+        .0
         .iter()
         .zip(named.iter())
         .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
@@ -210,6 +219,25 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
         d / peak < 1e-5,
         "the slice on_tilt handed over differs from the z_peak slice it named by \
          {:.2e} of peak",
+        d / peak
+    );
+    // The xz plane is row n/2 of every tile, in z order: a tile offset off by
+    // one would shift the slab's rows, a whole tile's worth of difference.
+    let row = vol.array.index_axis(Axis(1), n / 2);
+    let d = slices[0]
+        .1
+        .iter()
+        .zip(row.iter())
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+    eprintln!(
+        "handed-over xz vs recon row {}: {:.2e} of peak",
+        n / 2,
+        d / peak
+    );
+    assert!(
+        d / peak < 1e-5,
+        "the xz plane on_tilt handed over differs from the volume's row {} by {:.2e} of peak",
+        n / 2,
         d / peak
     );
     // ...and it really is the best one, i.e. the running max kept the right tile.
