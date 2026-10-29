@@ -37,6 +37,7 @@ use std::sync::mpsc::Sender;
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
 
+use tomoxide::align::grid;
 use tomoxide::recon::center::{SweepVerdict, judge_sweep};
 
 use crate::worker::{DatasetMeta, Job};
@@ -258,7 +259,7 @@ impl LaminoView {
             self.mean_view
                 .set_image(nx as u32, ny as u32, mean, super::autoscale_viridis(mean));
         // Seed the centre, but only from an estimate worth seeding with: on a
-        // mis-aligned scan the lopsided arcs drag the correlation peak (281.7
+        // mis-aligned scan the lopsided arcs drag the correlation peak (280.6
         // against a known 138), so adopting it silently would hand step 2 a
         // starting guess that is 143 px out.
         if trustworthy {
@@ -823,14 +824,6 @@ fn have_prior(rings: Option<&Rings>, closed_by_eye: bool) -> bool {
     rings.is_some_and(|r| r.trustworthy || closed_by_eye)
 }
 
-fn grid(center: f32, half: f32, step: f32) -> Vec<f32> {
-    if step <= 0.0 || half < 0.0 {
-        return vec![center];
-    }
-    let n = (half / step).floor() as i32;
-    (-n..=n).map(|k| center + k as f32 * step).collect()
-}
-
 /// Index of the candidate closest to `x` (`None` on an empty list).
 fn nearest_index(cands: &[f32], x: f32) -> Option<usize> {
     cands
@@ -843,14 +836,6 @@ fn nearest_index(cands: &[f32], x: f32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn grid_is_centred_and_symmetric() {
-        assert_eq!(grid(10.0, 1.0, 0.5), vec![9.0, 9.5, 10.0, 10.5, 11.0]);
-        // A step wider than the half-width leaves only the centre itself.
-        assert_eq!(grid(10.0, 0.2, 0.5), vec![10.0]);
-        assert_eq!(grid(10.0, 1.0, 0.0), vec![10.0]);
-    }
 
     #[test]
     fn nearest_index_snaps_to_closest_candidate() {

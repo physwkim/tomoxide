@@ -6,9 +6,9 @@ carry: the **rotation center** and the **laminographic tilt**
 BL7C data, in the order it should be run.
 
 > **Scope of the claims.** Every step below was validated on a scan whose answer
-> was already known independently (`center = 396`, recovered earlier and confirmed
-> against tomocupy at Pearson 0.99995 — see [`PORTING.md`](PORTING.md)
-> `recon::lamino`). Steps that failed that validation are listed in
+> was already known independently (`center = 396`, found earlier with tomocupy's
+> `try` sweeps and a full-volume center × tilt grid). Steps that failed that
+> validation are listed in
 > [§6](#6-methods-that-failed-validation--do-not-retry) rather than quietly
 > dropped. The numbers are from one instrument and one sample class; the
 > *procedure* is the transferable part, not the values.
@@ -61,7 +61,8 @@ reconstruction sweep produces.
 ### Automating it (and why the eye still goes first)
 
 Concentric rings are mirror-symmetric about the axis column, so registering the
-mean projection against its own left–right flip gives `dx = 2·(c − nx/2)`:
+mean projection against its own left–right flip, a mirror about column
+`(nx − 1)/2`, gives `dx = 2c − (nx − 1)`:
 
 ```python
 def ring_center_col(M):
@@ -74,10 +75,10 @@ def ring_center_col(M):
     i = int(np.argmax(prof))
     y0, y1, y2 = prof[i - 1], prof[i], prof[i + 1]     # parabolic sub-pixel
     d = (y0 - y2) / (2 * (y0 - 2 * y1 + y2))
-    return nx / 2 + ((i + d) - nx // 2) / 2
+    return (nx - 1 + (i + d) - nx // 2) / 2
 ```
 
-Measured: **397.5 vs a known 396 (+1.5 px)** on the aligned scan. On the
+Measured: **397.0 vs a known 396 (+1.0 px)** on the aligned scan. On the
 mis-aligned scan it returned **281 vs a true 138** — the incomplete arcs on one
 side dominate the global correlation and drag the peak, while a human still
 reads the bullseye at 138 without difficulty.

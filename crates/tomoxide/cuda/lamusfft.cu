@@ -1,11 +1,11 @@
 // Device-resident gridding + modulation kernels for Fourier/USFFT laminography
 // (tomocupy `LamFourierRec`). These are a faithful, full-complex GPU port of the
-// host loops in `crates/tomoxide/src/recon/lamino.rs` — the CPU golden that is
-// itself validated against tomocupy (Pearson 0.99995). The FFTs themselves are
-// NOT here: the Rust orchestrator drives the existing device-resident cuFFT
-// (`tomoxide_fft_1d`/`tomoxide_fft_2d`, bound to `cudaStreamPerThread`) between
-// these gridding stages, so the whole pipeline stays on the GPU with no host
-// round-trips.
+// host loops in `crates/tomoxide/src/recon/lamino.rs` — the CPU golden; its
+// tomocupy parity is in docs/PORTING.md `recon::lamino`. The FFTs
+// themselves are NOT here: the Rust orchestrator drives the existing
+// device-resident cuFFT (`tomoxide_fft_1d`/`tomoxide_fft_2d`, bound to
+// `cudaStreamPerThread`) between these gridding stages, so the whole pipeline
+// stays on the GPU with no host round-trips.
 //
 // Like the CPU port, this carries the FULL complex spectra (tomocupy's R2C
 // half-spectrum optimization is dropped) so each operator is a clean transpose.
@@ -45,8 +45,9 @@ static inline unsigned int lam_grid(long long total, int block) {
 extern "C" {
 
 // ===========================================================================
-// ramp_filter_detw  (lamino.rs:668) — plain |f| ramp on detector-width lines.
-//   proj [ntheta, deth, detw] real, ne = 2*detw, pad = (ne-detw)/2, nlines = ntheta*deth.
+// ramp_filter_detw (lamino.rs) — FBP filter on detector-width lines.
+//   proj [ntheta, deth, detw] real, nlines = ntheta*deth; ne and pad come from
+//   recon::lamino::projection_filter.
 // ===========================================================================
 
 // Edge-replicate real proj into complex padded lines [nlines, ne].
@@ -65,7 +66,7 @@ __global__ void lam_ramp_pad_ker(const float* proj, float2* buf, long long nline
 }
 
 // Multiply each frequency by the per-bin filter weight filt[k] (the ramp folded
-// with the chosen FBP apodisation window; see backend::lam_ramp_weights), then
+// with the chosen FBP apodisation window; see recon::lamino::projection_filter), then
 // by the rotation-center linear phase exp(-2*pi*i * t * shift) with
 // t = fftfreq(ne) and shift = detw/2 - center (tomocupy `fbp_filter_center`).
 // shift == 0 (center == detw/2) leaves the filter unchanged. filt has length ne.
@@ -306,7 +307,8 @@ __global__ void lam_win2d_scatter_ker(float2* fdee, const float2* win, int nky,
   fdee[fidx] = lam_cscale(win[i], s);
 }
 
-// divker2d adj: deapodize -> f[n1,nky,n0] complex (note n1-ty-1 y-flip).
+// divker2d adj: deapodize -> f[n1,nky,n0] complex. Row ty, not tomocupy's
+// n1-ty-1: that flip matches tomocupy's y-flipped linerec, which tomoxide's is not.
 // The grid `fdee` is chunk-local `[nky,gy,gx]`; the output `f` may be a strided
 // view of a larger `[n1, fdeth, n0]` buffer, written at absolute depth-freq
 // `ky0+ky` (device-resident path); the host path passes `fdeth==nky, ky0==0`.
@@ -323,7 +325,7 @@ __global__ void lam_divker2d_adj_ker(const float2* fdee, float2* f, int n1, int 
   int tx = (int)(r - (long long)ky * n0);
   int gx = 2 * n0 + 2 * m0;
   int gy = 2 * n1 + 2 * m1;
-  long long yg = (long long)(n1 - ty - 1) + n1 / 2 + m1;
+  long long yg = (long long)ty + n1 / 2 + m1;
   long long xg = (long long)tx + n0 / 2 + m0;
   float ker = expf(-mu0 * ((float)tx - (float)n0 / 2.0f) * ((float)tx - (float)n0 / 2.0f)
                    - mu1 * ((float)ty - (float)n1 / 2.0f) * ((float)ty - (float)n1 / 2.0f));

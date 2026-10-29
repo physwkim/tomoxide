@@ -112,14 +112,12 @@ The core interaction (the Octopus tune-loop concept mapped onto tomoxide):
   with λ, and on real data there is no ground truth — so the pick stays the
   user's (the accuracy rationale is [`BENCHMARKS.md` §10](BENCHMARKS.md#10-fbp-vs-iterative-accuracy-against-a-known-truth-phantom)).
 
-Execution path: the worker runs
-`ReconSteps::run_streaming_pipelined_range(z, z + 1, …)` into the new
-`InMemoryWriter` (§6 #2) for analytic algorithms without phase retrieval.
-Phase retrieval is row-coupled and iterative methods want more context, so
-those previews run `ReconSteps::run` over a **row band** `[z − m, z + m]`
-through the new `RowBandReader` adapter (§6 #5), displaying the center row
-(m sized from the Paganin kernel support). Until #5 lands, phase/iterative
-previews are disabled with a tooltip, not silently wrong.
+Execution path: the worker preps row `z` with `tomoxide::prep_band(z, z + 1)`
+and reconstructs that one sinogram with `recon::recon`, for every algorithm
+including the iterative ones. Phase retrieval couples rows, so `prep_band`
+reads `prep::phase::margin_rows` more on each side and drops them before
+stripe removal: the center row's retrieval is exact and the preview stays
+one-slice cheap however wide the kernel is.
 
 ### 2.3 Center — finding and evaluating the rotation axis
 
@@ -415,10 +413,9 @@ UI thread (eframe/egui, all rsplot widgets)
 - **Backend residency**: `Engine::new(kind)` runs on the worker; CUDA
   context and FFT plans stay thread-local to it. Changing backend rebuilds
   the worker's engine.
-- **Preview results**: `InMemoryWriter::write_chunk` doubles as the
-  progress signal — each chunk is published to a shared buffer and the UI
-  copies row-major `&[f32]` into `Plot2D::try_update_image` (zoom and
-  colormap preserved).
+- **Preview results**: one slice per request, returned whole in
+  `Event::Preview` with the request's generation; the UI drops a result
+  whose generation was superseded while it was in flight.
 - **Cancellation**, two regimes:
   - *in-process* (preview/sweep/auto-center/live): library `CancelToken`
     (§6 #1), checked between chunks. Until it lands, previews are short
@@ -466,7 +463,7 @@ vice versa.
 | 2 | P0 | **`io::InMemoryWriter`** | Implements `VolumeWriter`: `reserve` sizes a `Vec<f32>` (dims fixed at first chunk), `write_chunk` copies into the global range and invokes an optional `on_chunk: FnMut(usize, usize) + Send` — which is also the in-process progress callback (no new trait). |
 | 3 | P0 | **Config into the library** | `tomoxide-cli/src/config.rs` → `tomoxide::config` behind a `config` feature (optional serde/toml); add `dtype`/`lamino_angle`/output fields; CLI re-exports. |
 | 4 | P0 (CLI) | **`--progress-json`** | One flushed JSON line per completed chunk on stdout (`{"start":s,"end":e,"total":nz,"secs":t}`), implemented as a thin `VolumeWriter` tee in the CLI. The GUI's progress channel for subprocess runs. |
-| 5 | P1 | **`io::RowBandReader`** | Wraps any `DatasetReader`, restricting to rows `[r0, r1)` (remapped `read_sizes`/`read_all`/`read_chunk*`). Enables banded previews for phase retrieval (row-coupled) and iterative methods without reading the whole file. |
+| 5 | P1 | **`io::RowBandReader`** — *done*. | Wraps any `DatasetReader`, restricting to rows `[r0, r1)` (remapped `read_sizes`/`read_all`/`read_chunk*`). Banded previews ended up on `tomoxide::prep_band` instead (`read_chunk` widened by `margin_rows`, shared with the CLI's `--start_row` path), so nothing outside its test reads through the adapter. |
 | 6 | P1 | **Expose the Vo stripe variants** | `VoSort/VoFilter/VoLarge/VoDead/VoFit` exist in the library but are not wired through params/config/CLI parsing; wire them so the GUI's stripe combo is complete. |
 | 7 | P2 | **Ortho X/Y slice kernels** | tomostream-parity `orthox`/`orthoy` single-slice backprojection (CUDA first, CPU reference): `recon_ortho(data, theta, center, axis, idx) -> Array2<f32>`. Without it, Live is Z-only and offline vertical cuts require full-volume recon. The largest new library work in this design. |
 | 8 | P2/P3 | **Incremental ring-buffer recon** | `obj += bp(new) − bp(old)` over the circular buffer for the live loop; only needed if per-loop recompute misses the frame budget on large detectors. |
@@ -490,7 +487,7 @@ vice versa.
 - **M2 — Full offline**: `--progress-json` (#4); Run screen with subprocess
   fan-out, GPU picker, pre-flight estimates, latest-slice live view, cancel;
   center sweep montage (`write_center` + StackView + metric Plot1D);
-  `RowBandReader` (#5) unlocking phase/iterative previews; Vo stripe
+  banded phase-retrieval previews (#5, through `prep_band`); Vo stripe
   variants (#6); Output screen (browsing, ScalarFieldView 3D, rescale
   export); batch queue.
 - **M3 — Live streaming** *(first cut done)*: rsdm PVA source + ring buffer

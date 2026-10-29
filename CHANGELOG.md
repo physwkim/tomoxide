@@ -16,6 +16,29 @@ All notable changes to this project are documented here. The format is based on
   up rsplot 0.5.3's `VolumeRaycaster` rendering fixes (thickness cue,
   faint-voxel hue) for the XANES 3-D view.
 
+### Fixed
+
+- **`find_center_rings` and `find_center_sift` read half a pixel right.** Both
+  register an image against its left–right flip, which mirrors about column
+  `(n − 1)/2`, but converted the shift about `n/2`. They now use `(n − 1)/2`,
+  the axis `find_center_pc` and `find_center_vo` already use. A synthetic
+  bullseye now reads its own column (was +0.50); the aligned pouch scan reads
+  397.00 against a known 396 (was 397.50). tomocupy's SIFT formula `n//2 −
+  shift/2` carries the same half pixel on even widths and is not copied.
+- **Fourier laminography (`recon::lamino`, CUDA `Fourierrec`) came out flipped
+  in y** against Linerec, FBP and the volume it was projected from. The USFFT
+  divker kept tomocupy's `n1−ty−1` row, which matches tomocupy's own y-flipped
+  linerec; tomoxide's linerec is not flipped. The row is now `ty`, so
+  `lamino_project` at zero tilt equals the parallel projection and Fourierrec
+  volumes are the y-flip of earlier ones and of tomocupy's.
+- **Fourier laminography filtered its projections with its own ramp**, a plain
+  linear `|f|` on a `2·detw` edge pad, while tomocupy's `LamFourierRec` uses its
+  FBP filter: the `_wint` quadrature ramp on `4·detw`. Every backend now builds
+  the lamino filter from `make_fbp_filter` (`RampShape::Wint`), and Pearson
+  against tomocupy on the 261003 scan (parzen) rose from 0.9975 to 0.99996
+  8×-binned and from 0.99933 to 0.999998 2×-binned. `--filter none` is now no filter, as for every other method, rather
+  than the bare ramp.
+
 ## [0.7.0] - 2026-07-18
 
 ### Changed
@@ -60,7 +83,7 @@ All notable changes to this project are documented here. The format is based on
   reports a `prominence` — `(peak − median)/MAD` of the registration profile —
   and flags the scan when the rings never closed, which is the acquisition-time
   misalignment no reconstruction geometry repairs (measured: aligned scan 397.50
-  at prominence 21.0 → trustworthy; misaligned scan 281.72 at 2.22 → flagged, and
+  at prominence 21.0 → trustworthy; misaligned scan 281.09 at 2.44 → flagged, and
   `align` stops there unless `--force`). `cuda::center_probe` / `center_probe_sweep`
   then refine it: `cfunc_linerec`'s `backprojection_try` reconstructs one slice at
   N candidate centres in **one** launch off a single filtering. A probe slice

@@ -386,8 +386,9 @@ pub enum RampShape {
     /// tomopy's classic straight-line ramp `r = 2·fk/pad`. The CPU and wgpu
     /// backends port tomopy, so they build this shape.
     Linear,
-    /// tomocupy's degree-12 `_wint` quadrature ramp ([`wint_ramp`]). The CUDA
-    /// backend ports tomocupy, so it builds this shape; combined with the
+    /// tomocupy's degree-12 `_wint` quadrature ramp (`wint_ramp`). The CUDA
+    /// backend ports tomocupy, so it builds this shape, as does `recon::lamino`
+    /// on every backend (tomocupy is its only reference); combined with the
     /// `0.5/pad` gain in `build_filter_w` it reproduces tomocupy's net FBP
     /// filter bit-for-bit.
     Wint,
@@ -421,12 +422,12 @@ pub enum RampShape {
 /// The base ramp is the physical inversion filter `|ω|` in cycles/pixel, so it
 /// runs `0` at DC to `0.5` at Nyquist and `name` apodizes it.
 /// [`RampShape::Linear`] is the plain `k/pad` line (tomopy's ramp shape);
-/// [`RampShape::Wint`] is `pad·wint(t)` ([`wint_ramp`], tomocupy's degree-12
+/// [`RampShape::Wint`] is `pad·wint(t)` (`wint_ramp`, tomocupy's degree-12
 /// quadrature ramp). Both tomopy and tomocupy carry an extra factor `2` here
 /// (their ramp peaks at `1` at Nyquist), which puts every analytic
 /// reconstruction at `2×` the physical attenuation μ; tomoxide drops it so the
 /// analytic output is μ per pixel-unit — the same scale the iterative solvers
-/// and `recon::lamino`'s own `|f|/ne` ramp converge to. Either way tomocupy's
+/// converge to. Either way tomocupy's
 /// post-processing is mirrored: the windowed ramp is clamped to `≥0` and the DC
 /// bin is doubled (a no-op here since the ramp is `0` at DC). A grid too short
 /// for the order-12 rule falls back to the linear ramp even when `Wint` is
@@ -489,10 +490,8 @@ pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<V
 /// Apply the `name` apodisation window to a base ramp value at normalised
 /// frequency `r ∈ [0, 1]` (`1` = Nyquist), clamped to ≥ 0. This is the window
 /// *shape* only — the caller supplies the base `ramp` and handles the DC bin and
-/// the `None` = identity case. Shared by [`make_fbp_filter`] and the
-/// laminography ramp filter ([`lam_ramp_weights`]) so the window definitions
-/// have a single source of truth.
-pub(crate) fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
+/// the `None` = identity case.
+fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
     let pi = std::f32::consts::PI;
     let v = match name {
         // No window: plain ramp. (`make_fbp_filter` treats `None` as full
@@ -522,25 +521,6 @@ pub(crate) fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
     }
 }
 
-/// Per-frequency real multiplier for the laminography projection ramp filter,
-/// length `ne` (the edge-padded FFT length `2·detw`). Bin `k` maps to the
-/// centred frequency `f = min(k, ne−k)`; the base is the plain linear ramp
-/// `f/ne` (tomoxide's lamino ramp convention — no wint quadrature), apodised by
-/// `name`. `Ramp`/`None` leave the plain ramp unchanged (the prior behaviour);
-/// `Parzen` (the default) and the others match tomocupy's `LamFourierRec`, which
-/// filters projections with the selected FBP filter. Applied on the FFT'd,
-/// edge-padded projection lines in place of the old hard-coded `|f|/ne` ramp.
-pub(crate) fn lam_ramp_weights(ne: usize, name: FilterName) -> Vec<f32> {
-    (0..ne)
-        .map(|k| {
-            let fk = if k <= ne / 2 { k } else { ne - k };
-            let ramp = fk as f32 / ne as f32;
-            let r = 2.0 * fk as f32 / ne as f32;
-            apodize(name, ramp, r)
-        })
-        .collect()
-}
-
 /// Fused, device-resident analytic reconstruction (raw sinogram → volume):
 /// the backend applies the FBP filter and the back-projection / Fourier
 /// gridding itself, keeping all intermediates on the device. Lets the analytic
@@ -560,13 +540,13 @@ pub trait AnalyticReconstruct {
     /// Build a [`StreamingAnalytic`] bound to fixed `(algorithm, params, ncols,
     /// max_nz)` so a multi-chunk streaming job creates the FBP-filter / back-
     /// projection handles (cuFFT plans, f16 textures) **once** and reuses them
-    /// across z-chunks, instead of the per-chunk new/free [`reconstruct`] does.
+    /// across z-chunks, instead of the per-chunk new/free [`reconstruct`](Self::reconstruct) does.
     ///
     /// `geom` supplies the (chunk-invariant) projection angles; per-chunk centre
     /// shifts are taken from the geometry handed to
     /// [`StreamingAnalytic::reconstruct_chunk`]. Returns `Ok(None)` when this
     /// backend cannot reuse handles for `algorithm` (e.g. the CPU backend, or
-    /// gridrec/lprec) — the caller falls back to per-chunk [`reconstruct`].
+    /// gridrec/lprec) — the caller falls back to per-chunk [`reconstruct`](Self::reconstruct).
     fn streaming(
         &self,
         _algorithm: crate::params::Algorithm,
@@ -606,7 +586,7 @@ pub trait StreamingAnalytic {
     /// requested `stripe` method on the device. `StripeMethod::None` is always
     /// handled (no-op). This keeps the device/host gating decision inside the
     /// backend: the caller simply falls back to host normalize + transpose +
-    /// host `remove_stripe` + [`reconstruct_chunk`] whenever this returns `None`.
+    /// host `remove_stripe` + [`reconstruct_chunk`](Self::reconstruct_chunk) whenever this returns `None`.
     ///
     /// `data` is the contiguous, C-order raw projection chunk in
     /// [`Layout::Projection`](crate::data::Layout) — `[nproj, nz, ncols]` with

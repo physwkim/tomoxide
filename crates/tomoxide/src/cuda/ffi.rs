@@ -968,7 +968,7 @@ unsafe extern "C" {
     // `recon/lamino.rs`; the Rust orchestrator drives `tomoxide_fft_1d/2d`
     // between these stages. All complex buffers are interleaved float2.
     /// ramp_filter_detw: edge-replicate real `proj [nlines, detw]` into complex
-    /// lines `[nlines, ne]` (`ne = 2*detw`, `pad = (ne-detw)/2`).
+    /// lines `[nlines, ne]` (`ne`, `pad` from `recon::lamino::projection_filter`).
     pub fn tomoxide_lam_ramp_pad(
         proj: *const c_void,
         buf: *mut c_void,
@@ -1082,7 +1082,7 @@ unsafe extern "C" {
         m1: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// usfft2d divker (adj): deapodize -> `f [n1,nky,n0]` complex (n1-ty-1 y-flip).
+    /// usfft2d divker (adj): deapodize -> `f [n1,nky,n0]` complex.
     #[allow(clippy::too_many_arguments)]
     pub fn tomoxide_lam_divker2d_adj(
         fdee: *const c_void,

@@ -51,9 +51,10 @@
 //! differs from tomocupy's raw fourierrec by a global sign only. The self-consistent
 //! fwd/adj pair and the `fft2d_inv(fft2d_fwd) == id` round-trip are unaffected.
 
-use crate::backend::Fft;
+use crate::backend::{make_fbp_filter, Fft, RampShape};
 use crate::dtype::Complex32;
 use crate::error::Result;
+use crate::geometry::lamino_phi;
 use crate::params::FilterName;
 use rayon::prelude::*;
 use std::f32::consts::PI;
@@ -551,13 +552,15 @@ pub fn usfft2d_adj(
     // Centered inverse 2-D FFT over the (x,y) window, per ky slice.
     centered_fft2d(&mut fdee, n0, n1, m0, m1, nky, true, fft)?;
 
-    // divker2d (adj): deapodize → f[n1, nky, n0] (note the n1−ty−1 y-flip).
+    // divker2d (adj): deapodize → f[n1, nky, n0]. tomocupy writes row
+    // n1−ty−1 to match its own y-flipped linerec; tomoxide's linerec is not
+    // flipped, so neither is this.
     // Parallel over ty (f is contiguous per ty; fdee read-only).
     let mut f = vec![Complex32::new(0.0, 0.0); n1 * nky * n0];
     f.par_chunks_mut(nky * n0)
         .enumerate()
         .for_each(|(ty, fchunk)| {
-            let yg = (n1 - ty - 1) + n1 / 2 + m1;
+            let yg = ty + n1 / 2 + m1;
             for ky in 0..nky {
                 for tx in 0..n0 {
                     let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
@@ -595,10 +598,10 @@ pub fn usfft2d_fwd(
     let (xs, ys) = usfft2d_xy(theta, phi, ntheta, nky, detw);
     let mut fdee = vec![Complex32::new(0.0, 0.0); nky * gy * gx];
 
-    // divker2d (fwd): f → oversampled grid interior (n1−ty−1 y-flip).
+    // divker2d (fwd): f → oversampled grid interior, unflipped as the adjoint.
     for ky in 0..nky {
         for ty in 0..n1 {
-            let yg = (n1 - ty - 1) + n1 / 2 + m1;
+            let yg = ty + n1 / 2 + m1;
             for tx in 0..n0 {
                 let ker = (-mu0 * (tx as f32 - n0 as f32 / 2.0).powi(2)
                     - mu1 * (ty as f32 - n1 as f32 / 2.0).powi(2))
@@ -679,12 +682,20 @@ fn wrap2d(fdee: &mut [Complex32], n0: usize, n1: usize, m0: usize, m1: usize, ad
 // Ramp filtering + 3-D entry points.
 // ===========================================================================
 
-/// Ramp-filter each projection along the detector-width (`detw`) axis, with
-/// `ne = 2·detw` edge-padding (tomocupy filters projections, not sinograms;
-/// `center = detw/2`, no sub-pixel shift). `filter` selects the apodisation
-/// window folded into the ramp ([`crate::backend::lam_ramp_weights`]);
-/// `FilterName::Ramp` is the plain `|f|` ramp, `Parzen` (the tomocupy default)
-/// and the others match tomocupy's `LamFourierRec` FBP-filtered projections.
+/// The projection filter every lamino backend applies, and the left edge pad
+/// that centres a `detw` line in it. tomocupy filters lamino projections with
+/// its FBP filter (`FBPFilter(4·detw)`: `_wint` ramp, `ne//2 − detw//2` edge
+/// pad), so this is [`make_fbp_filter`] with [`RampShape::Wint`] on every
+/// backend, not only CUDA.
+pub(crate) fn projection_filter(filter: FilterName, detw: usize) -> Result<(Vec<f32>, usize)> {
+    let w = make_fbp_filter(filter, detw, RampShape::Wint)?;
+    let pad = w.len() / 2 - detw / 2;
+    Ok((w, pad))
+}
+
+/// Filter each projection along the detector-width (`detw`) axis with
+/// [`projection_filter`] (tomocupy filters projections, not sinograms;
+/// `center = detw/2`, no sub-pixel shift).
 fn ramp_filter_detw(
     proj: &mut [f32],
     ntheta: usize,
@@ -693,8 +704,8 @@ fn ramp_filter_detw(
     filter: FilterName,
     fft: &dyn Fft,
 ) -> Result<()> {
-    let ne = 2 * detw;
-    let pad = (ne - detw) / 2;
+    let (ramp, pad) = projection_filter(filter, detw)?;
+    let ne = ramp.len();
     let nlines = ntheta * deth;
     // Edge-padded complex lines [nlines, ne].
     let mut buf = vec![Complex32::new(0.0, 0.0); nlines * ne];
@@ -712,9 +723,6 @@ fn ramp_filter_detw(
         }
     }
     fft.fft_1d(&mut buf, ne, nlines, false)?;
-    // Ramp × apodisation window on centered frequencies (DC..Nyquist..−1),
-    // magnitude in cycles. `Ramp` reduces to the plain `|f|/ne`.
-    let ramp: Vec<f32> = crate::backend::lam_ramp_weights(ne, filter);
     for l in 0..nlines {
         for k in 0..ne {
             buf[l * ne + k] *= ramp[k];
@@ -727,12 +735,6 @@ fn ramp_filter_detw(
         }
     }
     Ok(())
-}
-
-/// `phi = π/2 + lamino_angle·π/180` (tomocupy's tilt convention).
-#[inline]
-fn lamino_phi(lamino_angle_deg: f32) -> f32 {
-    std::f32::consts::FRAC_PI_2 + lamino_angle_deg / 180.0 * PI
 }
 
 /// Reconstruct a 3-D laminographic volume from tilted parallel-beam projections

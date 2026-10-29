@@ -587,7 +587,7 @@ impl RayProject for CpuBackend {
     /// Sparse forward-operator rows for the row-action methods (ART/BART).
     ///
     /// Delegates to the shared, backend-independent geometry
-    /// [`crate::backend::parallel_ray_rows`] (the rows are geometry-only, so CPU
+    /// `crate::backend::parallel_ray_rows` (the rows are geometry-only, so CPU
     /// and CUDA produce identical rows).
     fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>> {
         crate::backend::parallel_ray_rows(geom, n)

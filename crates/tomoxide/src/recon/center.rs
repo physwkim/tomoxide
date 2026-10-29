@@ -16,7 +16,7 @@ use crate::data::{Layout, Tomo};
 use crate::dtype::Complex32;
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
-use ndarray::{Array2, Array3, ArrayViewMut2, Axis, Slice};
+use ndarray::{Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut2, Axis, Slice};
 
 /// What [`find_center_rings`] found, and whether to believe it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,7 +43,8 @@ pub struct RingCenter {
 /// `x(θ) = c + r·cos(θ + φ)`, so the mean projection smears each point into a
 /// ring centred on the axis: a bullseye whose centre column is `c`. Rings are
 /// mirror-symmetric about that column, so registering the mean projection
-/// against its own left–right flip puts the axis at `dx = 2·(c − nx/2)`. `tomo`
+/// against its own left–right flip, a mirror about column `(nx − 1)/2`, puts the
+/// axis at `dx = 2c − (nx − 1)`. `tomo`
 /// is the flat-corrected, minus-log projection stack; every `step`-th projection
 /// is averaged (`step = 10` over 1800 projections is plenty — the rings are a
 /// bulk feature).
@@ -67,8 +68,8 @@ pub struct RingCenter {
 ///
 /// | scan | `center` | truth | `prominence` |
 /// |---|---|---|---|
-/// | 0.55 s, closed concentric rings | 397.4 | 396 | **16.2** |
-/// | 0.6 s, arcs that never close | 281.7 | 138 | **2.2** |
+/// | 0.55 s, closed concentric rings | 397.0 | 396 | **21.0** |
+/// | 0.6 s, arcs that never close | 280.6 | 138 | **2.4** |
 ///
 /// The mis-aligned scan's profile sits at 80 % of its own peak height even at the
 /// array edges — it is flat, and its `argmax` is noise. Hence
@@ -76,34 +77,37 @@ pub struct RingCenter {
 /// but **calibrated on exactly those two scans**. Treat a `prominence` near the
 /// threshold as "look at the mean projection yourself", not as a verdict.
 ///
-/// (The doc quotes 397.5/281.1 and prominence 21.0/2.4 for its NumPy reference,
-/// which clips at `1e-4` before the log where this goes through
-/// [`prep::normalize`](crate::prep::normalize). The centre lands within 0.13 px
-/// either way; the prominence scale differs, so the numbers above — not the
-/// doc's — are the ones this function returns.)
+/// These are the doc's NumPy reference numbers too, given line integrals:
+/// [`normalize_dataset`](crate::prep::normalize::normalize_dataset) already
+/// ends in the minus-log, and a second one reads 396.9/281.2 at 16.2/2.2.
 pub fn find_center_rings(
     tomo: &Tomo<f32>,
     backend: &dyn Backend,
     step: usize,
 ) -> Result<RingCenter> {
+    find_center_rings_from_mean(mean_projection(tomo, step)?.view(), backend)
+}
+
+/// [`find_center_rings`] on a [`mean_projection`] already in hand, or on a band
+/// of its rows. Concentric rings register at the same column in every row band,
+/// so estimating per band (`ring_center.py` takes quarters) and finding the
+/// bands disagree is a second misalignment flag next to
+/// [`RingCenter::prominence`].
+pub fn find_center_rings_from_mean(
+    mean: ArrayView2<f32>,
+    backend: &dyn Backend,
+) -> Result<RingCenter> {
     let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
         backend: backend.name(),
         capability: "Fft",
     })?;
-    if step == 0 {
-        return Err(Error::InvalidParam(
-            "find_center_rings: step must be ≥1".into(),
-        ));
-    }
-    let p = tomo.as_layout(Layout::Projection); // [nproj, ny, nx]
-    let (nproj, ny, nx) = p.array.dim();
-    if nproj == 0 || ny < 5 || nx < 4 {
+    let (ny, nx) = mean.dim();
+    if ny < 5 || nx < 4 {
         return Err(Error::InvalidParam(format!(
-            "find_center_rings needs ≥1 projection and ≥5×4 pixels; got {nproj}×{ny}×{nx}"
+            "find_center_rings needs ≥5×4 pixels; got {ny}×{nx}"
         )));
     }
-
-    let prof = flip_registration_profile(&mean_projection(tomo, step)?, fft)?;
+    let prof = flip_registration_profile(&mean, fft)?;
     Ok(ring_center_from_profile(&prof, nx))
 }
 
@@ -140,7 +144,7 @@ pub fn mean_projection(tomo: &Tomo<f32>, step: usize) -> Result<Array2<f32>> {
 /// Row-summed cross-correlation of `m` against its own left–right flip.
 /// Rings put their signature on the middle rows, so only those are summed —
 /// following `docs/LAMINOGRAPHY_ALIGNMENT.md`.
-fn flip_registration_profile(m: &Array2<f32>, fft: &dyn Fft) -> Result<Vec<f32>> {
+fn flip_registration_profile(m: &ArrayView2<f32>, fft: &dyn Fft) -> Result<Vec<f32>> {
     let (ny, nx) = m.dim();
     let mean = m.sum() / (ny * nx) as f32;
 
@@ -199,7 +203,10 @@ fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
             (y0 - y2) / den
         }
     };
-    let center = nx as f32 / 2.0 + ((i as f32 + d) - (nx / 2) as f32) / 2.0;
+    // The flip mirrors about column (nx − 1)/2, so rings centred on `c` peak at
+    // lag 2c − (nx − 1).
+    let lag = i as f32 + d - (nx / 2) as f32;
+    let center = (nx as f32 - 1.0 + lag) / 2.0;
 
     // Robust prominence: (peak − median) / MAD.
     let mut sorted: Vec<f32> = prof.to_vec();
@@ -249,6 +256,18 @@ pub fn slice_focus(img: &ndarray::ArrayView2<f32>) -> f64 {
         }
     }
     acc / cnt.max(1) as f64
+}
+
+/// [`slice_focus`] of every slice along axis 0, in order: a volume's
+/// focus-by-z profile, or a centre sweep's score per candidate. The one place
+/// slices are scored in bulk, so the tilt scan, the sweep and a volume
+/// inspection rank by the same number.
+pub fn focus_by_z(vol: ArrayView3<f32>) -> Vec<f64> {
+    use rayon::prelude::*;
+    (0..vol.len_of(Axis(0)))
+        .into_par_iter()
+        .map(|z| slice_focus(&vol.index_axis(Axis(0), z)))
+        .collect()
 }
 
 /// Another local maximum of a sweep that the metric did not rule out — see
@@ -652,9 +671,7 @@ pub fn lamino_tilt_scan(
     let mut out = Vec::with_capacity(tilts_deg.len());
     for &tilt_deg in tilts_deg {
         let geom = Geometry {
-            beam: Beam::Laminography {
-                phi: std::f32::consts::FRAC_PI_2 + tilt_deg * std::f32::consts::PI / 180.0,
-            },
+            beam: Beam::laminography(tilt_deg),
             ..geom.clone()
         };
         let rh = rh_for(tilt_deg);
@@ -663,20 +680,19 @@ pub fn lamino_tilt_scan(
             .map(|b| band_at(b, rh_for(b.tilt_deg), tilt_deg, rh));
         // The volume is streamed and dropped tile by tile, so the winning slice
         // has to be kept as it goes past — it is gone by the time the scan knows
-        // it won. Tiles arrive in ascending row order, so `focus_by_z` is built by
+        // it won. Tiles arrive in ascending row order, so the profile is built by
         // appending; the whole profile is kept even under a band, because the
         // profile is how the *next* band gets read.
         let mut best: Option<(f64, usize, Array2<f32>)> = None;
-        let mut focus_by_z: Vec<f64> = Vec::new();
+        let mut profile: Vec<f64> = Vec::new();
         let (depth, _, _) = {
             let mut on_tile = |z0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
-                for (k, img) in tile.array.outer_iter().enumerate() {
+                for (k, f) in focus_by_z(tile.array.view()).into_iter().enumerate() {
                     let z = z0 + k;
-                    let f = slice_focus(&img);
-                    focus_by_z.push(f);
+                    profile.push(f);
                     let in_band = scored.is_none_or(|(lo, hi)| (lo..=hi).contains(&z));
                     if in_band && best.as_ref().is_none_or(|b| f > b.0) {
-                        best = Some((f, z, img.to_owned()));
+                        best = Some((f, z, tile.array.index_axis(Axis(0), k).to_owned()));
                     }
                 }
                 Ok(())
@@ -702,10 +718,10 @@ pub fn lamino_tilt_scan(
             ))
         })?;
         // The profile is only indexable by z if every row arrived exactly once.
-        if focus_by_z.len() != depth {
+        if profile.len() != depth {
             return Err(Error::Backend(format!(
                 "tilt {tilt_deg}°: scored {} slices but the reconstruction is {depth} deep",
-                focus_by_z.len()
+                profile.len()
             )));
         }
         let r = TiltFocus {
@@ -714,7 +730,7 @@ pub fn lamino_tilt_scan(
             z_peak,
             band: scored,
             depth,
-            focus_by_z,
+            focus_by_z: profile,
         };
         on_tilt(&r, img.view())?;
         out.push(r);
@@ -910,10 +926,45 @@ pub fn find_center_pc(
     Ok((center + imgshift) as f32)
 }
 
+/// The `(row, col)` shift that registers `moving` onto `reference`: `moving`
+/// moved by it lines up with `reference`. Phase cross-correlation, the same
+/// registration [`find_center_pc`] runs (skimage `phase_cross_correlation`,
+/// `normalization="phase"`), resolved to `1/upsample` px; `upsample = 1` gives
+/// whole pixels. The refinement costs `~1.5·upsample·nrow·ncol` complex
+/// exponentials.
+///
+/// Outside the centre finder this is the drift check: the 0° and 360°
+/// projections of a full turn see the same object, so a shift between them is
+/// the stage's, not the sample's.
+pub fn register_shift(
+    reference: &Array2<f32>,
+    moving: &Array2<f32>,
+    backend: &dyn Backend,
+    upsample: f64,
+) -> Result<(f64, f64)> {
+    let fft = backend.fft().ok_or_else(|| Error::MissingCapability {
+        backend: backend.name(),
+        capability: "Fft",
+    })?;
+    if reference.dim() != moving.dim() {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{}x{}", reference.dim().0, reference.dim().1),
+            found: format!("{}x{}", moving.dim().0, moving.dim().1),
+        });
+    }
+    if reference.is_empty() || !(upsample >= 1.0 && upsample.is_finite()) {
+        return Err(Error::InvalidParam(format!(
+            "register_shift needs a non-empty image and upsample ≥ 1; got {:?}, {upsample}",
+            reference.dim()
+        )));
+    }
+    phase_cross_correlation(reference, moving, upsample, fft)
+}
+
 /// SIFT-feature center detection (tomocupy `find_center.py:99`).
 ///
 /// Available only with the **`sift-center`** feature (pure-Rust `lowe-sift`).
-/// See [`sift`] for the implementation.
+/// See `sift` for the implementation.
 #[cfg(not(feature = "sift-center"))]
 pub fn find_center_sift(
     _proj0: &Array2<f32>,
@@ -930,7 +981,8 @@ pub fn find_center_sift(
 pub use sift::{find_center_sift, register_shift_sift};
 
 /// SIFT-feature rotation-center finding (tomocupy `find_center.py`
-/// `_register_shift_sift` + the `n//2 - shift_x/2` center formula). Requires the
+/// `_register_shift_sift` + the `(n − 1)/2 − shift_x/2` center formula; tomocupy
+/// has `n//2`, see [`find_center_sift`]). Requires the
 /// `sift-center` feature.
 #[cfg(feature = "sift-center")]
 pub mod sift {
@@ -1071,8 +1123,12 @@ pub mod sift {
     /// Rotation center from a 0°/180° projection pair via SIFT feature matching
     /// (tomocupy `find_center_sift`). The 180° projection is flipped left-right
     /// (`data[..., ::-1]`), matched against the 0° projection, and the center is
-    /// `ncol/2 - mean_horizontal_shift/2`. `threshold` is the Lowe ratio (0.5
-    /// upstream).
+    /// `(ncol − 1)/2 − mean_horizontal_shift/2`. `threshold` is the Lowe ratio
+    /// (0.5 upstream).
+    ///
+    /// tomocupy writes `n//2 − shift/2`, which is half a pixel right on even
+    /// widths: the flip mirrors about `(n − 1)/2`, the axis `find_center_pc` and
+    /// `find_center_vo` use too.
     pub fn find_center_sift(
         proj0: &Array2<f32>,
         proj180: &Array2<f32>,
@@ -1088,7 +1144,7 @@ pub mod sift {
         let datap1 = [proj0.clone()];
         let datap2 = [fliplr(proj180)];
         let (shifts, _) = register_shift_sift(&datap1, &datap2, threshold)?;
-        Ok(ncol as f32 / 2.0 - shifts[[0, 1]] / 2.0)
+        Ok((ncol as f32 - 1.0) / 2.0 - shifts[[0, 1]] / 2.0)
     }
 }
 

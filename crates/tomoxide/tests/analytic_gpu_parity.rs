@@ -424,7 +424,7 @@ fn lamino_phantom(rh: usize, n: usize) -> Vec<f32> {
 /// Laminography uses only the `Fft` capability: the ramp filter and the three
 /// USFFT operators (`fft2d`, `usfft2d`, `usfft1d`) are centered 1-D/2-D FFTs
 /// plus host-side Gaussian gridding. With `n=16`, `rh=8`, `nz=16` every
-/// transform length (`detw=16`, `deth=16`, `2·rh=16`, `2·n=32`, `ne=2·detw=32`)
+/// transform length (`detw=16`, `deth=16`, `2·rh=16`, `2·n=32`, `ne=4·detw=64`)
 /// is power-of-two, so the whole pipeline hits the wgpu radix-2 path and only the
 /// FFT backend (wgpu vs rustfft) differs from CPU.
 #[test]

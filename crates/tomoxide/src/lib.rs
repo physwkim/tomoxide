@@ -8,7 +8,7 @@
 //! backend traits ([`backend`], [`data`], [`dtype`], [`error`], [`geometry`],
 //! [`params`]), the backends ([`cpu`], [`cuda`], [`wgpu`]), reconstruction
 //! ([`recon`]), preprocessing ([`prep`]), I/O ([`io`]), simulation ([`sim`]),
-//! and the high-level [`engine`] + [`pipeline`].
+//! and the high-level [`engine`] + [`pipeline`] + [`align`].
 //!
 //! ```no_run
 //! use tomoxide::{Engine, BackendKind};
@@ -45,12 +45,13 @@ pub mod sim;
 pub mod xanes;
 
 // High-level orchestration.
+pub mod align;
 pub mod engine;
 pub mod pipeline;
 
 pub use engine::Engine;
 pub use pipeline::{
-    reconstruct, reconstruct_lamino_streaming, CancelToken, PrepOptions, ReconSteps,
+    prep_band, reconstruct, reconstruct_lamino_streaming, CancelToken, PrepOptions, ReconSteps,
 };
 
 // Flat re-exports of the common building blocks (was tomoxide-core's root).
@@ -63,7 +64,7 @@ pub use cuda::CudaBackend;
 pub use data::{Dataset, Frames, Layout, Slice2D, Tomo, Volume};
 pub use dtype::{Complex32, Dtype, Element};
 pub use error::{Error, Result};
-pub use geometry::{Angles, Beam, Center, Detector, Geometry};
+pub use geometry::{Angles, Beam, Center, Detector, Geometry, ValidFov};
 pub use params::{Algorithm, BackendKind, FilterName, PhaseMethod, ReconParams, StripeMethod};
 
 #[cfg(test)]

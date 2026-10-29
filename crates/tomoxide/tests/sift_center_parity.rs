@@ -65,13 +65,14 @@ fn shifts_and_center_match_cv2() {
     // Independent SIFT implementation vs the cv2 golden → measured ≈ 0.034 px.
     assert!(max_d < 0.2, "SIFT shift max abs diff {max_d}");
 
-    // center = ncol/2 - mean(shift_x)/2 (mean over pairs), matching the golden.
+    // The golden center is tomocupy's `n//2 - mean(shift_x)/2`; on this even
+    // width tomoxide's `(n - 1)/2 - mean(shift_x)/2` sits half a pixel left.
     let ncol = datap1.dim().2 as f32;
     let mean_dx = (0..shifts.dim().0).map(|i| shifts[[i, 1]]).sum::<f32>() / shifts.dim().0 as f32;
-    let center = ncol / 2.0 - mean_dx / 2.0;
+    let center = (ncol - 1.0) / 2.0 - mean_dx / 2.0;
     assert!(
-        (center - g_center[0]).abs() < 0.1,
-        "center {center} vs {}",
+        (center - (g_center[0] - 0.5)).abs() < 0.1,
+        "center {center} vs {} - 0.5",
         g_center[0]
     );
 
@@ -80,6 +81,22 @@ fn shifts_and_center_match_cv2() {
     let proj0 = d1[0].clone();
     let proj180 = fliplr(&d2[0]);
     let c0 = find_center_sift(&proj0, &proj180, 0.5).unwrap();
-    let want0 = ncol / 2.0 - g_shifts[[0, 1]] / 2.0;
+    let want0 = (ncol - 1.0) / 2.0 - g_shifts[[0, 1]] / 2.0;
     assert!((c0 - want0).abs() < 0.1, "find_center_sift {c0} vs {want0}");
+}
+
+/// A 180° projection that is the 0° one mirrored about column `c` gives back
+/// `c`, on a whole and a half column alike. At `c = 47.5` the pair is an exact
+/// flip of a 96-wide frame, the shift is 0, and `n/2` would read 48.
+#[test]
+fn find_center_sift_returns_the_mirror_axis() {
+    let datap1: Array3<f32> = read_npy(format!("{FIXTURES}/sift_datap1.npy")).unwrap();
+    let proj0 = datap1.index_axis(ndarray::Axis(0), 0).to_owned();
+    let (nr, nc) = proj0.dim();
+    for c in [50.0f32, 47.5] {
+        let two_c = (2.0 * c) as usize;
+        let proj180 = Array2::from_shape_fn((nr, nc), |(i, j)| proj0[[i, (two_c + nc - j) % nc]]);
+        let got = find_center_sift(&proj0, &proj180, 0.5).unwrap();
+        assert!((got - c).abs() < 0.1, "mirror about {c}: got {got}");
+    }
 }

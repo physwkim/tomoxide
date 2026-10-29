@@ -752,7 +752,7 @@ impl Fft for WgpuBackend {
     /// Batched 2-D FFT. Power-of-two `rows` and `cols` run the fast on-device
     /// path — a row pass + transpose + row pass + transpose, so both axes run as
     /// contiguous radix-2 transforms. Any other dims fall back to a separable
-    /// pair of [`fft_1d`] passes (each radix-2 or Bluestein per length) with a
+    /// pair of [`fft_1d`](crate::backend::Fft::fft_1d) passes (each radix-2 or Bluestein per length) with a
     /// host transpose between them, so the GPU handles arbitrary 2-D shapes like
     /// the CPU backend rather than erroring. `inverse` divides by `rows·cols`.
     fn fft_2d(
@@ -972,7 +972,7 @@ struct FrParams {
 impl FourierReconstruct for WgpuBackend {
     /// Device-resident Gaussian-USFFT (tomocupy `cfunc_fourierrec`) — the whole
     /// gather / wrap / FFT / deapodize chain runs on the GPU, mirroring
-    /// [`crate::recon::fourierrec`] step-for-step. Only the filtered sinogram is
+    /// `crate::recon::fourierrec` step-for-step. Only the filtered sinogram is
     /// uploaded and the volume downloaded, replacing the host-gridding + per-call
     /// FFT-round-trip path that dominated wgpu fourierrec wall time.
     fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>> {
@@ -1389,10 +1389,10 @@ impl WgpuBackend {
 impl LpRecReconstruct for WgpuBackend {
     /// Device-resident log-polar reconstruction (tomocupy `lprec`) — the cubic
     /// B-spline prefilter, the polar↔log-polar↔Cartesian gather/scatter, and the
-    /// 2-D FFT convolution all run on the GPU, mirroring [`crate::recon::lprec`]
+    /// 2-D FFT convolution all run on the GPU, mirroring `crate::recon::lprec`
     /// step-for-step. Composes the once-per-call grid precompute
-    /// ([`WgpuBackend::build_lprec_grids`]) with the per-chunk core
-    /// ([`WgpuBackend::lprec_run`]); the streaming path reuses the same two pieces
+    /// (`WgpuBackend::build_lprec_grids`) with the per-chunk core
+    /// (`WgpuBackend::lprec_run`); the streaming path reuses the same two pieces
     /// but caches the grids across chunks.
     fn reconstruct(&self, filtered: &Tomo<f32>, geom: &Geometry, n: usize) -> Result<Volume<f32>> {
         let grids = self.build_lprec_grids(geom, n)?;

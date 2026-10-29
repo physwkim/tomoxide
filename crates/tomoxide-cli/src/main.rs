@@ -206,7 +206,7 @@ struct CommonRecon {
     save_format: Option<String>,
     /// Output base path — each writer adds its own suffix (tiff:
     /// `<base>_NNNNN.tiff` per slice; h5: `<base>.h5`; zarr: `<base>.zarr`)
-    /// [default: <input-without-extension>_rec].
+    /// [default: the input path without its extension, plus _rec].
     #[arg(long)]
     output: Option<PathBuf>,
     /// Apodization filter (none|ramp|shepp|cosine|cosine2|hamming|hann|parzen).
@@ -367,133 +367,6 @@ struct ReconPlan {
     prep: PrepOptions,
     stripe_str: String,
     phase_str: String,
-    stripe_params: StripeParams,
-    phase_params: PhaseParams,
-}
-
-/// Resolved stripe-removal parameters for the selected method (config merged with
-/// flags). Only the selected method's fields are consulted by [`build_stripe`].
-#[derive(Clone, Copy)]
-struct StripeParams {
-    fw_sigma: f32,
-    fw_level: Option<usize>,
-    ti_nblock: usize,
-    ti_beta: f32,
-    sf_size: usize,
-    vo_snr: f32,
-    vo_la_size: usize,
-    vo_sm_size: usize,
-    vo_sort_size: Option<usize>,
-    vo_sort_dim: u8,
-    vo_filter_sigma: f32,
-    vo_filter_size: Option<usize>,
-    vo_filter_dim: u8,
-    vo_large_snr: f32,
-    vo_large_size: usize,
-    vo_large_drop_ratio: f32,
-    vo_large_norm: bool,
-    vo_dead_snr: f32,
-    vo_dead_size: usize,
-    vo_dead_norm: bool,
-    vo_fit_order: usize,
-    vo_fit_sigma: (f32, f32),
-}
-
-/// Resolved phase-retrieval physics for the selected method (config merged with
-/// flags). Only the selected method's fields are consulted by [`build_phase`].
-#[derive(Clone, Copy)]
-struct PhaseParams {
-    pixel_size: f32,
-    dist: f32,
-    energy: f32,
-    alpha: f32,
-    db: f32,
-    w: f32,
-}
-
-/// Map a stripe-removal method name (matching `Config::remove_stripe_method`) to a
-/// [`StripeMethod`], filling the selected variant from the resolved [`StripeParams`]
-/// (config merged with CLI flags; defaults are the tomopy/tomocupy values).
-fn build_stripe(name: &str, p: &StripeParams) -> anyhow::Result<StripeMethod> {
-    Ok(match name.to_ascii_lowercase().as_str() {
-        "none" => StripeMethod::None,
-        "fw" => StripeMethod::Fw {
-            sigma: p.fw_sigma,
-            level: p.fw_level,
-        },
-        "ti" => StripeMethod::Ti {
-            nblock: p.ti_nblock,
-            beta: p.ti_beta,
-        },
-        "sf" => StripeMethod::Sf { size: p.sf_size },
-        "vo-all" | "vo_all" | "voall" => StripeMethod::VoAll {
-            snr: p.vo_snr,
-            la_size: p.vo_la_size,
-            sm_size: p.vo_sm_size,
-        },
-        "vo-sort" | "vo_sort" => StripeMethod::VoSort {
-            size: p.vo_sort_size,
-            dim: p.vo_sort_dim,
-        },
-        "vo-filter" | "vo_filter" => StripeMethod::VoFilter {
-            sigma: p.vo_filter_sigma,
-            size: p.vo_filter_size,
-            dim: p.vo_filter_dim,
-        },
-        "vo-large" | "vo_large" => StripeMethod::VoLarge {
-            snr: p.vo_large_snr,
-            size: p.vo_large_size,
-            drop_ratio: p.vo_large_drop_ratio,
-            norm: p.vo_large_norm,
-        },
-        "vo-dead" | "vo_dead" => StripeMethod::VoDead {
-            snr: p.vo_dead_snr,
-            size: p.vo_dead_size,
-            norm: p.vo_dead_norm,
-        },
-        "vo-fit" | "vo_fit" => StripeMethod::VoFit {
-            order: p.vo_fit_order,
-            sigma: p.vo_fit_sigma,
-        },
-        other => {
-            return Err(anyhow!(
-                "unknown stripe method '{other}' \
-                 (none|fw|ti|sf|vo-all|vo-sort|vo-filter|vo-large|vo-dead|vo-fit)"
-            ))
-        }
-    })
-}
-
-/// Map a phase-retrieval method name to a [`PhaseMethod`], filling the selected
-/// variant from the resolved [`PhaseParams`] (config merged with CLI flags).
-fn build_phase(name: &str, p: &PhaseParams) -> anyhow::Result<PhaseMethod> {
-    Ok(match name.to_ascii_lowercase().as_str() {
-        "none" => PhaseMethod::None,
-        "paganin" => PhaseMethod::Paganin {
-            pixel_size: p.pixel_size,
-            dist: p.dist,
-            energy: p.energy,
-            alpha: p.alpha,
-        },
-        "gpaganin" => PhaseMethod::GPaganin {
-            pixel_size: p.pixel_size,
-            dist: p.dist,
-            energy: p.energy,
-            db: p.db,
-            w: p.w,
-        },
-        "farago" => PhaseMethod::Farago {
-            pixel_size: p.pixel_size,
-            dist: p.dist,
-            energy: p.energy,
-            db: p.db,
-        },
-        other => {
-            return Err(anyhow!(
-                "unknown phase method '{other}' (none|paganin|Gpaganin|farago)"
-            ))
-        }
-    })
 }
 
 /// Parse a comma-separated `f32` list (empty string ⇒ empty vector).
@@ -541,11 +414,18 @@ fn parse_chain_stage(seg: &str, default_iter: usize) -> anyhow::Result<ChainStag
     })
 }
 
+/// Overwrite `slot` with an explicitly given flag.
+fn set<T>(slot: &mut T, flag: Option<T>) {
+    if let Some(v) = flag {
+        *slot = v;
+    }
+}
+
 /// Resolve the effective reconstruction settings: load the optional config, then
 /// override each field with any explicitly-given CLI flag. Returns the plan plus
 /// the loaded config (the caller reads `config.backend` for backend fallback).
 fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
-    let cfg = match &c.config {
+    let mut cfg = match &c.config {
         Some(p) => Config::load(p).with_context(|| format!("loading {}", p.display()))?,
         None => Config::default(),
     };
@@ -594,67 +474,48 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         None => cfg.reg_par.clone(),
     };
     let ext_pad = c.ext_pad.unwrap_or(cfg.ext_pad);
-    let stripe_str = c
-        .remove_stripe
-        .clone()
-        .unwrap_or_else(|| cfg.remove_stripe_method.clone());
-    let phase_str = c
-        .retrieve_phase
-        .clone()
-        .unwrap_or_else(|| cfg.retrieve_phase_method.clone());
-    // Per-method parameters: each = explicit flag, else config, else built-in
-    // default (already baked into `Config::default`). `fw_level` 0 ⇒ auto (None).
-    let stripe_params = StripeParams {
-        fw_sigma: c.fw_sigma.unwrap_or(cfg.fw_sigma),
-        fw_level: {
-            let l = c.fw_level.unwrap_or(cfg.fw_level);
-            (l != 0).then_some(l)
-        },
-        ti_nblock: c.ti_nblock.unwrap_or(cfg.ti_nblock),
-        ti_beta: c.ti_beta.unwrap_or(cfg.ti_beta),
-        sf_size: c.sf_size.unwrap_or(cfg.sf_size),
-        vo_snr: c.vo_snr.unwrap_or(cfg.vo_snr),
-        vo_la_size: c.vo_la_size.unwrap_or(cfg.vo_la_size),
-        vo_sm_size: c.vo_sm_size.unwrap_or(cfg.vo_sm_size),
-        // Median sizes follow the `fw_level` convention: `0` ⇒ auto (None).
-        vo_sort_size: {
-            let s = c.vo_sort_size.unwrap_or(cfg.vo_sort_size);
-            (s != 0).then_some(s)
-        },
-        vo_sort_dim: c.vo_sort_dim.unwrap_or(cfg.vo_sort_dim),
-        vo_filter_sigma: c.vo_filter_sigma.unwrap_or(cfg.vo_filter_sigma),
-        vo_filter_size: {
-            let s = c.vo_filter_size.unwrap_or(cfg.vo_filter_size);
-            (s != 0).then_some(s)
-        },
-        vo_filter_dim: c.vo_filter_dim.unwrap_or(cfg.vo_filter_dim),
-        vo_large_snr: c.vo_large_snr.unwrap_or(cfg.vo_large_snr),
-        vo_large_size: c.vo_large_size.unwrap_or(cfg.vo_large_size),
-        vo_large_drop_ratio: c.vo_large_drop_ratio.unwrap_or(cfg.vo_large_drop_ratio),
-        vo_large_norm: c.vo_large_norm.unwrap_or(cfg.vo_large_norm),
-        vo_dead_snr: c.vo_dead_snr.unwrap_or(cfg.vo_dead_snr),
-        vo_dead_size: c.vo_dead_size.unwrap_or(cfg.vo_dead_size),
-        vo_dead_norm: c.vo_dead_norm.unwrap_or(cfg.vo_dead_norm),
-        vo_fit_order: c.vo_fit_order.unwrap_or(cfg.vo_fit_order),
-        vo_fit_sigma: (
-            c.vo_fit_sigma_x.unwrap_or(cfg.vo_fit_sigma_x),
-            c.vo_fit_sigma_y.unwrap_or(cfg.vo_fit_sigma_y),
-        ),
-    };
-    // Config physics are f64 (clean TOML); cast to the f32 the phase methods use.
-    let phase_params = PhaseParams {
-        pixel_size: c.pixel_size.unwrap_or(cfg.pixel_size as f32),
-        dist: c
-            .propagation_distance
-            .unwrap_or(cfg.propagation_distance as f32),
-        energy: c.energy.unwrap_or(cfg.energy as f32),
-        alpha: c.alpha.unwrap_or(cfg.alpha as f32),
-        db: c.db.unwrap_or(cfg.db as f32),
-        w: c.w.unwrap_or(cfg.w as f32),
-    };
+    // Stripe/phase: each flag overrides its config value, then the config
+    // builds the methods, so the CLI and a recipe file parse one way.
+    set(&mut cfg.remove_stripe_method, c.remove_stripe.clone());
+    set(&mut cfg.retrieve_phase_method, c.retrieve_phase.clone());
+    set(&mut cfg.fw_sigma, c.fw_sigma);
+    set(&mut cfg.fw_level, c.fw_level);
+    set(&mut cfg.ti_nblock, c.ti_nblock);
+    set(&mut cfg.ti_beta, c.ti_beta);
+    set(&mut cfg.sf_size, c.sf_size);
+    set(&mut cfg.vo_snr, c.vo_snr);
+    set(&mut cfg.vo_la_size, c.vo_la_size);
+    set(&mut cfg.vo_sm_size, c.vo_sm_size);
+    set(&mut cfg.vo_sort_size, c.vo_sort_size);
+    set(&mut cfg.vo_sort_dim, c.vo_sort_dim);
+    set(&mut cfg.vo_filter_sigma, c.vo_filter_sigma);
+    set(&mut cfg.vo_filter_size, c.vo_filter_size);
+    set(&mut cfg.vo_filter_dim, c.vo_filter_dim);
+    set(&mut cfg.vo_large_snr, c.vo_large_snr);
+    set(&mut cfg.vo_large_size, c.vo_large_size);
+    set(&mut cfg.vo_large_drop_ratio, c.vo_large_drop_ratio);
+    set(&mut cfg.vo_large_norm, c.vo_large_norm);
+    set(&mut cfg.vo_dead_snr, c.vo_dead_snr);
+    set(&mut cfg.vo_dead_size, c.vo_dead_size);
+    set(&mut cfg.vo_dead_norm, c.vo_dead_norm);
+    set(&mut cfg.vo_fit_order, c.vo_fit_order);
+    set(&mut cfg.vo_fit_sigma_x, c.vo_fit_sigma_x);
+    set(&mut cfg.vo_fit_sigma_y, c.vo_fit_sigma_y);
+    // f32 flag -> f64 config -> f32 method is exact.
+    set(&mut cfg.pixel_size, c.pixel_size.map(f64::from));
+    set(
+        &mut cfg.propagation_distance,
+        c.propagation_distance.map(f64::from),
+    );
+    set(&mut cfg.energy, c.energy.map(f64::from));
+    set(&mut cfg.alpha, c.alpha.map(f64::from));
+    set(&mut cfg.db, c.db.map(f64::from));
+    set(&mut cfg.w, c.w.map(f64::from));
+    let stripe_str = cfg.remove_stripe_method.clone();
+    let phase_str = cfg.retrieve_phase_method.clone();
     let prep = PrepOptions {
-        stripe: build_stripe(&stripe_str, &stripe_params)?,
-        phase: build_phase(&phase_str, &phase_params)?,
+        stripe: cfg.stripe_method()?,
+        phase: cfg.phase_method()?,
     };
     Ok((
         ReconPlan {
@@ -674,8 +535,6 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
             prep,
             stripe_str,
             phase_str,
-            stripe_params,
-            phase_params,
         },
         cfg,
     ))
@@ -789,14 +648,6 @@ fn pick(axis: &str, cands: &[f32], focus: &[f64], widen: &str) -> anyhow::Result
     }
 }
 
-fn grid(center: f32, half_width: f32, step: f32) -> Vec<f32> {
-    if step <= 0.0 || half_width < 0.0 {
-        return vec![center];
-    }
-    let n = (half_width / step).floor() as i32;
-    (-n..=n).map(|k| center + k as f32 * step).collect()
-}
-
 /// `LO:HI` → an inclusive slice band, for `--focus_z`.
 fn parse_zband(s: &str) -> Result<(usize, usize), String> {
     let (a, b) = s
@@ -826,10 +677,8 @@ fn run_align(
     focus_z: Option<(usize, usize)>,
     force: bool,
 ) -> anyhow::Result<()> {
-    use tomoxide::geometry::{Angles, Beam, Center, Detector, Geometry};
-    use tomoxide::prep::normalize::normalize_dataset;
-    use tomoxide::recon::center::{find_center_rings, lamino_tilt_scan, slice_focus, SampleBand};
-    use tomoxide::ReconParams;
+    use tomoxide::align::{grid, PreppedStack};
+    use tomoxide::recon::center::SampleBand;
 
     // The tilt scan reconstructs at `--lamino_angle ± --tilt_width`, so without a
     // tilt there is nothing to search around — and a parallel-beam scan has no
@@ -844,15 +693,11 @@ fn run_align(
     // The band also anchors the centre sweep (its midpoint is the default
     // `--slice`), so unlike before it is meaningful without a tilt scan.
 
-    let path = file.to_string_lossy().to_string();
     let engine = Engine::new(backend_kind)?;
-    let mut reader = tomoxide::io::open_dxchange(&path)?;
-    let theta = reader.read_theta()?;
-    let mut ds = reader.read_all()?;
-    normalize_dataset(&mut ds, engine.backend())?;
+    let st = PreppedStack::load(engine.backend(), file)?;
 
     // --- step 1: the rings. One pass, and the acquisition check. ---
-    let ring = find_center_rings(&ds.data, engine.backend(), ring_step)?;
+    let ring = st.rings(engine.backend(), ring_step)?;
     println!("rings (mean projection, every {ring_step}th frame):");
     println!("  centre      = {:.2}", ring.center);
     println!(
@@ -892,50 +737,15 @@ fn run_align(
             engine.name()
         );
     }
-    let p = ds.data.as_layout(tomoxide::data::Layout::Projection);
-    let (nproj, nz, nx) = p.array.dim();
-    // Defaults are the tuned analytic path (parzen filter), which is what the
-    // laminography goldens reconstruct with. The centre probes read only
-    // `filter_name` and `num_gridx` — each does a single plane, so `lamino_rh`
-    // never enters. Leaving it `None` also lets the tilt scan give every tilt its
-    // own natural depth, which is the point of scoring the max over all of it.
-    let params = ReconParams::default();
-    let mk_geom = |center: f32, tilt_deg: Option<f32>| Geometry {
-        angles: Angles(theta.clone()),
-        center: Center::Scalar(center),
-        beam: match tilt_deg {
-            Some(d) => Beam::Laminography {
-                phi: std::f32::consts::FRAC_PI_2 + d * std::f32::consts::PI / 180.0,
-            },
-            None => Beam::Parallel,
-        },
-        detector: Detector {
-            width: nx,
-            height: nz,
-            pixel_size: 1.0,
-        },
-    };
-    // `sz` indexes the output volume: rows `[0, nz)` for parallel beam, `[0, rh)`
-    // for laminography, whose depth exceeds the detector's because the tilt
-    // stretches it. Since the z-centring unification it is the same volume z in
+    let (nproj, _nz, nx) = st.shape();
+    // `sz` indexes the output volume, whose depth under a tilt exceeds the
+    // detector's. Since the z-centring unification it is the same volume z in
     // every algorithm — a Fourierrec slice index names the same plane here.
-    //
-    // The centre response lives where the sample is, and which plane holds the
-    // sample is a property of the scan, not of the geometry — so when the user
-    // states the sample band (`--focus_z`, read off a reconstruction at
-    // `--lamino_angle`), its midpoint is the default slice. Without a band the
-    // only neutral default is the middle of the volume; read the -v curve to
-    // tell a peak from a flat line (flat = the slice is empty; give --focus_z
-    // or --slice).
-    let sz = slice.unwrap_or_else(|| match (focus_z, lamino_angle) {
-        (Some((lo, hi)), _) => (lo + hi) / 2,
-        (None, Some(deg)) => tomoxide::cuda::lamino_recon_height(nz, deg) / 2,
-        (None, None) => nz / 2,
-    }) as i32;
-    let depth = match lamino_angle {
-        Some(deg) => tomoxide::cuda::lamino_recon_height(nz, deg),
-        None => nz,
-    };
+    // Without --focus_z the default is the middle of the volume; read the -v
+    // curve to tell a peak from a flat line (flat = the slice is empty; give
+    // --focus_z or --slice).
+    let sz = slice.unwrap_or_else(|| st.default_slice(lamino_angle, focus_z));
+    let depth = st.depth(lamino_angle);
     println!(
         "\nrefining on output slice {sz} of {depth} ({} centre candidates)",
         grid(0.0, center_width, center_step).len()
@@ -953,16 +763,7 @@ fn run_align(
     };
 
     let cands = grid(ring.center, center_width, center_step);
-    let probe = tomoxide::cuda::center_probe_sweep(
-        &ds.data,
-        &mk_geom(ring.center, lamino_angle),
-        &params,
-        &cands,
-        sz,
-    )?;
-    let f: Vec<f64> = (0..cands.len())
-        .map(|i| slice_focus(&probe.index_axis(ndarray::Axis(0), i)))
-        .collect();
+    let f = st.center_sweep(lamino_angle, sz, &cands)?.focus;
     curve(&cands, &f, "");
     let center = pick("centre", &cands, &f, "--center_width")?;
     println!(
@@ -1000,11 +801,8 @@ fn run_align(
                 ),
             }
             let t_start = Instant::now();
-            let scores = lamino_tilt_scan(
-                &ds.data,
-                &mk_geom(center, Some(t0)), // beam ignored — `tilts` supplies it
-                Algorithm::Fourierrec,
-                &params,
+            let scores = st.tilt_scan(
+                center,
                 &tilts,
                 focus_z.map(|z| SampleBand { z, tilt_deg: t0 }),
                 // The winning slice is `align`'s to ignore: it prints, and
@@ -1176,27 +974,22 @@ fn main() -> anyhow::Result<()> {
             // previous stage's volume, which needs the whole prior volume — so it
             // takes the whole-volume path and never the per-slice pipeline/shard.
             // Laminography is likewise whole-stack only (the tilt couples all
-            // detector rows into every output voxel).
+            // detector rows into every output voxel), and so is a prep that is
+            // not `row_separable` (phase retrieval couples each projection's rows).
             if plan.chain.len() > 1 {
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
                 let (z0, z1, banded) =
                     row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
                 if let Some(deg) = lamino_angle {
-                    use std::f32::consts::PI;
-                    geom.beam = tomoxide::Beam::Laminography {
-                        phi: PI / 2.0 + deg * PI / 180.0,
-                    };
+                    geom.beam = tomoxide::Beam::laminography(deg);
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
                 let nz_total = geom.detector.height;
-                let ds = if banded {
-                    geom.detector.height = z1 - z0;
-                    reader.read_chunk(z0, z1)?
-                } else {
-                    reader.read_all()?
-                };
-                let vol = reconstruct_chain(ds, &geom, &plan, lamino_rh, &engine)?;
+                geom.detector.height = z1 - z0;
+                let sino =
+                    tomoxide::prep_band(reader.as_mut(), z0, z1, &plan.prep, engine.backend())?;
+                let vol = reconstruct_chain(&sino, &geom, &plan, lamino_rh, &engine)?;
                 let mut writer = maybe_progress(
                     tomoxide::io::create_writer(&out, save_format)?,
                     common.progress_json,
@@ -1210,7 +1003,10 @@ fn main() -> anyhow::Result<()> {
                     writer.write_chunk(&vol, 0, nz)?;
                 }
                 writer.finalize()?;
-            } else if pipelines_well(&engine, plan.algo) && lamino_angle.is_none() {
+            } else if pipelines_well(&engine, plan.algo)
+                && lamino_angle.is_none()
+                && plan.prep.row_separable()
+            {
                 // Resolve the streaming chunk: explicit `--chunk` wins, else the
                 // tuned value cached by `tune_chunk` for this file/algorithm/GPU,
                 // else the safe default.
@@ -1279,8 +1075,8 @@ fn main() -> anyhow::Result<()> {
                     )?;
                 }
             } else {
-                // Whole-volume path (CPU/wgpu, chunking-hostile GPU methods, or
-                // laminography).
+                // Whole-volume path (CPU/wgpu, chunking-hostile GPU methods,
+                // laminography, or phase retrieval).
                 let mut reader = tomoxide::io::open_dxchange(&file.to_string_lossy())?;
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
                 let (z0, z1, banded) =
@@ -1294,20 +1090,12 @@ fn main() -> anyhow::Result<()> {
                     plan.ext_pad,
                 );
                 if let Some(deg) = lamino_angle {
-                    use std::f32::consts::PI;
-                    geom.beam = tomoxide::Beam::Laminography {
-                        phi: PI / 2.0 + deg * PI / 180.0,
-                    };
+                    geom.beam = tomoxide::Beam::laminography(deg);
                     params.lamino_rh = lamino_rh;
                     println!("  laminography: tilt={deg}° rh={lamino_rh:?}");
                 }
                 let nz_total = geom.detector.height;
-                let ds = if banded {
-                    geom.detector.height = z1 - z0;
-                    reader.read_chunk(z0, z1)?
-                } else {
-                    reader.read_all()?
-                };
+                geom.detector.height = z1 - z0;
                 if let Some(deg) = lamino_angle.filter(|_| engine.name() == "cuda") {
                     // Laminography on CUDA: disk-stream the OUTPUT. Reconstruct the
                     // rh volume tile-by-tile and write each tile as it lands, so
@@ -1324,7 +1112,7 @@ fn main() -> anyhow::Result<()> {
                     );
                     writer.reserve(rh)?;
                     tomoxide::reconstruct_lamino_streaming(
-                        ds,
+                        reader.read_all()?,
                         &geom,
                         plan.algo,
                         &params,
@@ -1334,8 +1122,10 @@ fn main() -> anyhow::Result<()> {
                     )?;
                     writer.finalize()?;
                 } else {
+                    let sino =
+                        tomoxide::prep_band(reader.as_mut(), z0, z1, &plan.prep, engine.backend())?;
                     let vol =
-                        tomoxide::reconstruct(ds, &geom, plan.algo, &params, &plan.prep, &engine)?;
+                        tomoxide::recon::recon(&sino, &geom, plan.algo, &params, engine.backend())?;
                     let mut writer = maybe_progress(
                         tomoxide::io::create_writer(&out, save_format)?,
                         common.progress_json,
@@ -1367,6 +1157,14 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow!(
                     "lamino_angle (from config) needs the whole-volume path; it is \
                      supported only by `recon`, not the streaming `recon_steps`"
+                ));
+            }
+            if !plan.prep.row_separable() {
+                return Err(anyhow!(
+                    "phase retrieval ({}) couples detector rows, so it needs the \
+                     whole-volume path; it is supported only by `recon`, not the \
+                     streaming `recon_steps`",
+                    plan.phase_str
                 ));
             }
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
@@ -1499,7 +1297,8 @@ fn maybe_progress(
 /// Run the overlapped read‖compute‖write streaming pipeline for one file.
 ///
 /// Probes geometry (metadata only) on the calling thread, then hands
-/// reader/writer **factories** to [`ReconSteps::run_streaming_pipelined`] — the
+/// reader/writer **factories** to
+/// [`ReconSteps::run_streaming_pipelined_range`](tomoxide::ReconSteps::run_streaming_pipelined_range) — the
 /// `rust-hdf5` handles are `!Send`, so each I/O object is built on the thread
 /// that owns it. Shared by `recon` (auto-pipelined GPU path) and `recon_steps`.
 #[allow(clippy::too_many_arguments)]
@@ -1633,90 +1432,124 @@ fn run_sharded_subprocesses(
         }
         // Forward only the selected stripe method's parameters (the others would be
         // ignored) so each shard reproduces the parent's stripe removal exactly.
-        let sp = &plan.stripe_params;
-        match plan.stripe_str.to_ascii_lowercase().as_str() {
-            "fw" => {
-                cmd.arg("--fw_sigma").arg(sp.fw_sigma.to_string());
-                if let Some(l) = sp.fw_level {
+        match plan.prep.stripe {
+            StripeMethod::None => {}
+            StripeMethod::Fw { sigma, level } => {
+                cmd.arg("--fw_sigma").arg(sigma.to_string());
+                if let Some(l) = level {
                     cmd.arg("--fw_level").arg(l.to_string());
                 }
             }
-            "ti" => {
+            StripeMethod::Ti { nblock, beta } => {
                 cmd.arg("--ti_nblock")
-                    .arg(sp.ti_nblock.to_string())
+                    .arg(nblock.to_string())
                     .arg("--ti_beta")
-                    .arg(sp.ti_beta.to_string());
+                    .arg(beta.to_string());
             }
-            "sf" => {
-                cmd.arg("--sf_size").arg(sp.sf_size.to_string());
+            StripeMethod::Sf { size } => {
+                cmd.arg("--sf_size").arg(size.to_string());
             }
-            "vo-all" | "vo_all" | "voall" => {
+            StripeMethod::VoAll {
+                snr,
+                la_size,
+                sm_size,
+            } => {
                 cmd.arg("--vo_snr")
-                    .arg(sp.vo_snr.to_string())
+                    .arg(snr.to_string())
                     .arg("--vo_la_size")
-                    .arg(sp.vo_la_size.to_string())
+                    .arg(la_size.to_string())
                     .arg("--vo_sm_size")
-                    .arg(sp.vo_sm_size.to_string());
+                    .arg(sm_size.to_string());
             }
-            "vo-sort" | "vo_sort" => {
+            StripeMethod::VoSort { size, dim } => {
                 // `0` round-trips as auto (`None`), the `fw_level` convention.
                 cmd.arg("--vo_sort_size")
-                    .arg(sp.vo_sort_size.unwrap_or(0).to_string())
+                    .arg(size.unwrap_or(0).to_string())
                     .arg("--vo_sort_dim")
-                    .arg(sp.vo_sort_dim.to_string());
+                    .arg(dim.to_string());
             }
-            "vo-filter" | "vo_filter" => {
+            StripeMethod::VoFilter { sigma, size, dim } => {
                 cmd.arg("--vo_filter_sigma")
-                    .arg(sp.vo_filter_sigma.to_string())
+                    .arg(sigma.to_string())
                     .arg("--vo_filter_size")
-                    .arg(sp.vo_filter_size.unwrap_or(0).to_string())
+                    .arg(size.unwrap_or(0).to_string())
                     .arg("--vo_filter_dim")
-                    .arg(sp.vo_filter_dim.to_string());
+                    .arg(dim.to_string());
             }
-            "vo-large" | "vo_large" => {
+            StripeMethod::VoLarge {
+                snr,
+                size,
+                drop_ratio,
+                norm,
+            } => {
                 cmd.arg("--vo_large_snr")
-                    .arg(sp.vo_large_snr.to_string())
+                    .arg(snr.to_string())
                     .arg("--vo_large_size")
-                    .arg(sp.vo_large_size.to_string())
+                    .arg(size.to_string())
                     .arg("--vo_large_drop_ratio")
-                    .arg(sp.vo_large_drop_ratio.to_string())
+                    .arg(drop_ratio.to_string())
                     .arg("--vo_large_norm")
-                    .arg(sp.vo_large_norm.to_string());
+                    .arg(norm.to_string());
             }
-            "vo-dead" | "vo_dead" => {
+            StripeMethod::VoDead { snr, size, norm } => {
                 cmd.arg("--vo_dead_snr")
-                    .arg(sp.vo_dead_snr.to_string())
+                    .arg(snr.to_string())
                     .arg("--vo_dead_size")
-                    .arg(sp.vo_dead_size.to_string())
+                    .arg(size.to_string())
                     .arg("--vo_dead_norm")
-                    .arg(sp.vo_dead_norm.to_string());
+                    .arg(norm.to_string());
             }
-            "vo-fit" | "vo_fit" => {
+            StripeMethod::VoFit { order, sigma } => {
                 cmd.arg("--vo_fit_order")
-                    .arg(sp.vo_fit_order.to_string())
+                    .arg(order.to_string())
                     .arg("--vo_fit_sigma_x")
-                    .arg(sp.vo_fit_sigma.0.to_string())
+                    .arg(sigma.0.to_string())
                     .arg("--vo_fit_sigma_y")
-                    .arg(sp.vo_fit_sigma.1.to_string());
+                    .arg(sigma.1.to_string());
             }
-            _ => {}
         }
-        // Phase-retrieval physics only matters when a phase method is selected;
-        // forward it so the shards match the parent exactly.
-        if !plan.phase_str.eq_ignore_ascii_case("none") {
-            let pp = &plan.phase_params;
+        // Likewise only the selected phase method's physics.
+        let physics = |cmd: &mut std::process::Command, px: f32, dist: f32, energy: f32| {
             cmd.arg("--pixel_size")
-                .arg(pp.pixel_size.to_string())
+                .arg(px.to_string())
                 .arg("--propagation_distance")
-                .arg(pp.dist.to_string())
+                .arg(dist.to_string())
                 .arg("--energy")
-                .arg(pp.energy.to_string())
-                .arg("--alpha")
-                .arg(pp.alpha.to_string())
-                .arg("--db")
-                .arg(pp.db.to_string())
-                .arg("--w")
-                .arg(pp.w.to_string());
+                .arg(energy.to_string());
+        };
+        match plan.prep.phase {
+            PhaseMethod::None => {}
+            PhaseMethod::Paganin {
+                pixel_size,
+                dist,
+                energy,
+                alpha,
+            } => {
+                physics(&mut cmd, pixel_size, dist, energy);
+                cmd.arg("--alpha").arg(alpha.to_string());
+            }
+            PhaseMethod::GPaganin {
+                pixel_size,
+                dist,
+                energy,
+                db,
+                w,
+            } => {
+                physics(&mut cmd, pixel_size, dist, energy);
+                cmd.arg("--db")
+                    .arg(db.to_string())
+                    .arg("--w")
+                    .arg(w.to_string());
+            }
+            PhaseMethod::Farago {
+                pixel_size,
+                dist,
+                energy,
+                db,
+            } => {
+                physics(&mut cmd, pixel_size, dist, energy);
+                cmd.arg("--db").arg(db.to_string());
+            }
         }
         if let Some(c) = plan.center {
             cmd.arg("--center").arg(c.to_string());
@@ -2064,27 +1897,22 @@ fn recon_params(
 /// Reconstruct through an algorithm chain (`--algorithm a,b,c`), warm-starting each
 /// stage from the previous stage's volume via [`ReconParams::init`].
 ///
-/// Preprocessing (flat/dark + minus-log → phase retrieval → sinogram → stripe
-/// removal) runs **once** — mirroring [`tomoxide::reconstruct`] — then each stage
-/// reconstructs the same prepared sinogram, seeding its initial estimate with the
-/// prior stage's output. The classic use is `fbp,sirt`: the analytic FBP gives a
+/// Every stage reconstructs the same sinograms, prepped once by
+/// [`tomoxide::prep_band`], seeding its initial estimate with the prior stage's
+/// output. The classic use is `fbp,sirt`: the analytic FBP gives a
 /// fast seed the iterative SIRT then refines (fewer iterations for the same
 /// quality). Each stage uses its own `num_iter` (from a `name:iters` suffix, else
 /// the global `--num_iter`); `reg_par`/`filter` still apply to every stage
 /// (analytic stages ignore iterations). Whole-volume only (the warm-start needs
 /// the full prior volume). Returns the final stage's volume.
 fn reconstruct_chain(
-    mut ds: tomoxide::Dataset<f32>,
+    sino: &tomoxide::Tomo<f32>,
     geom: &Geometry,
     plan: &ReconPlan,
     lamino_rh: Option<usize>,
     engine: &Engine,
 ) -> anyhow::Result<tomoxide::Volume<f32>> {
     let backend = engine.backend();
-    tomoxide::prep::normalize_dataset(&mut ds, backend)?;
-    tomoxide::prep::retrieve_phase(&mut ds.data, plan.prep.phase, backend)?;
-    let mut sino = ds.data.to_layout(tomoxide::Layout::Sinogram);
-    tomoxide::prep::remove_stripe(&mut sino, plan.prep.stripe)?;
 
     let n = plan.chain.len();
     let mut init: Option<tomoxide::Volume<f32>> = None;
@@ -2100,7 +1928,7 @@ fn reconstruct_chain(
         params.lamino_rh = lamino_rh;
         params.init = init.take();
         let warm = params.init.is_some();
-        let vol = tomoxide::recon::recon(&sino, geom, stage.algo, &params, backend)?;
+        let vol = tomoxide::recon::recon(sino, geom, stage.algo, &params, backend)?;
         let iters_note = if stage.algo.is_analytic() {
             String::new()
         } else {
@@ -2124,7 +1952,7 @@ fn recon_out_path(file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{grid, pick};
+    use super::pick;
 
     /// An interior maximum with no rival is an answer.
     #[test]
@@ -2205,16 +2033,6 @@ mod tests {
         );
     }
 
-    /// The sweep is centred on the estimate it refines, so the starting guess is
-    /// always a candidate — a grid that skipped it could only ever move away.
-    #[test]
-    fn grid_is_centred_and_symmetric() {
-        let g = grid(396.0, 1.0, 0.5);
-        assert_eq!(g, vec![395.0, 395.5, 396.0, 396.5, 397.0]);
-        assert_eq!(grid(396.0, 0.0, 0.25), vec![396.0]);
-        assert_eq!(grid(396.0, 8.0, 0.0), vec![396.0]);
-    }
-
     use super::*;
 
     #[test]
@@ -2264,75 +2082,6 @@ mod tests {
     #[test]
     fn unknown_algorithm_rejected() {
         assert!(parse_chain_stage("nope", 25).is_err());
-    }
-
-    /// Every `remove_stripe_method` spelling maps to its `StripeMethod`
-    /// variant with the resolved parameters (the Vo 2018 single-method
-    /// variants included), and unknown names list the full set.
-    #[test]
-    fn vo_variant_stripe_methods_parse() {
-        let p = StripeParams {
-            fw_sigma: 2.0,
-            fw_level: None,
-            ti_nblock: 0,
-            ti_beta: 1.5,
-            sf_size: 5,
-            vo_snr: 3.0,
-            vo_la_size: 61,
-            vo_sm_size: 21,
-            vo_sort_size: None,
-            vo_sort_dim: 1,
-            vo_filter_sigma: 3.0,
-            vo_filter_size: Some(7),
-            vo_filter_dim: 2,
-            vo_large_snr: 3.0,
-            vo_large_size: 51,
-            vo_large_drop_ratio: 0.1,
-            vo_large_norm: true,
-            vo_dead_snr: 4.0,
-            vo_dead_size: 41,
-            vo_dead_norm: false,
-            vo_fit_order: 3,
-            vo_fit_sigma: (5.0, 20.0),
-        };
-        assert_eq!(
-            build_stripe("vo-sort", &p).unwrap(),
-            StripeMethod::VoSort { size: None, dim: 1 }
-        );
-        assert_eq!(
-            build_stripe("vo_filter", &p).unwrap(),
-            StripeMethod::VoFilter {
-                sigma: 3.0,
-                size: Some(7),
-                dim: 2
-            }
-        );
-        assert_eq!(
-            build_stripe("vo-large", &p).unwrap(),
-            StripeMethod::VoLarge {
-                snr: 3.0,
-                size: 51,
-                drop_ratio: 0.1,
-                norm: true
-            }
-        );
-        assert_eq!(
-            build_stripe("vo-dead", &p).unwrap(),
-            StripeMethod::VoDead {
-                snr: 4.0,
-                size: 41,
-                norm: false
-            }
-        );
-        assert_eq!(
-            build_stripe("vo-fit", &p).unwrap(),
-            StripeMethod::VoFit {
-                order: 3,
-                sigma: (5.0, 20.0)
-            }
-        );
-        let err = build_stripe("nope", &p).unwrap_err().to_string();
-        assert!(err.contains("vo-fit"), "{err}");
     }
 
     #[test]
