@@ -16,6 +16,9 @@ gpu-wgpu = ["tomoxide/gpu-wgpu"]
 [[bin]]
 name = "tomoxide"
 path = "src/main.rs"
+# Same name as the library: `cargo doc --workspace` would write both to
+# doc/tomoxide/ and one would overwrite the other.
+doc = false
 
 [dependencies]
 tomoxide = { workspace = true, features = ["config"] }
