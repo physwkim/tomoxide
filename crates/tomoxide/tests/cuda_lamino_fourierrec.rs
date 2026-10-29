@@ -3,8 +3,8 @@
 //! golden [`tomoxide::recon::lamino::lamino`] — the same algorithm, the same
 //! ramp filter, the same Gaussian USFFT gridding. The only differences are the
 //! `atomicAdd` accumulation order (gather/wrap adjoints) and `expf` vs the host
-//! `f32::exp`, so the two agree to ~f32 rounding, not bit-exactly (the CPU golden
-//! matches tomocupy at Pearson 0.99995 once tomocupy's y-flip is undone).
+//! `f32::exp`, so the two agree to ~f32 rounding, not bit-exactly (tomocupy
+//! parity is in docs/PORTING.md `recon::lamino`).
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
 

@@ -6,9 +6,9 @@ carry: the **rotation center** and the **laminographic tilt**
 BL7C data, in the order it should be run.
 
 > **Scope of the claims.** Every step below was validated on a scan whose answer
-> was already known independently (`center = 396`, recovered earlier and confirmed
-> against tomocupy at Pearson 0.99995 — see [`PORTING.md`](PORTING.md)
-> `recon::lamino`). Steps that failed that validation are listed in
+> was already known independently (`center = 396`, found earlier with tomocupy's
+> `try` sweeps and a full-volume center × tilt grid). Steps that failed that
+> validation are listed in
 > [§6](#6-methods-that-failed-validation--do-not-retry) rather than quietly
 > dropped. The numbers are from one instrument and one sample class; the
 > *procedure* is the transferable part, not the values.

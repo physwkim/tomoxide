@@ -1,7 +1,7 @@
 // Device-resident gridding + modulation kernels for Fourier/USFFT laminography
 // (tomocupy `LamFourierRec`). These are a faithful, full-complex GPU port of the
-// host loops in `crates/tomoxide/src/recon/lamino.rs` — the CPU golden, which
-// matches tomocupy at Pearson 0.99995 once tomocupy's y-flip is undone. The FFTs
+// host loops in `crates/tomoxide/src/recon/lamino.rs` — the CPU golden; its
+// tomocupy parity is in docs/PORTING.md `recon::lamino`. The FFTs
 // themselves are NOT here: the Rust orchestrator drives the existing
 // device-resident cuFFT (`tomoxide_fft_1d`/`tomoxide_fft_2d`, bound to
 // `cudaStreamPerThread`) between these gridding stages, so the whole pipeline
