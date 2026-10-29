@@ -20,7 +20,7 @@ use tomoxide::config::Config;
 
 /// GPU/CPU tomographic reconstruction (tomopy + tomocupy, in Rust).
 #[derive(Parser, Debug)]
-#[command(name = "tomoxide", version, about)]
+#[command(name = "tomoxide", version = env!("TOMOXIDE_VERSION"), about)]
 struct Cli {
     /// Backend: auto | cpu | cuda | wgpu.
     #[arg(long, global = true, default_value = "auto")]

@@ -11,6 +11,9 @@ All notable changes to this project are documented here. The format is based on
 - **`SampleBand::at`**: the band carried into another tilt's volume through the
   detector rows, which `lamino_tilt_scan` already did privately. A caller that
   read the band at one tilt can place it at another without a scan.
+- **`tomoxide --version` names the commit** it was built from
+  (`git describe --always --dirty --abbrev=12`), so a job log identifies the
+  build. A copy built outside tomoxide's own checkout prints the version alone.
 
 ### Changed
 
