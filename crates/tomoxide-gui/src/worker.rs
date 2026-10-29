@@ -13,8 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use rsplot::egui;
 use tomoxide::align::PreppedStack;
 use tomoxide::{
-    Algorithm, Angles, BackendKind, CancelToken, Center, Engine, FilterName, Geometry, PhaseMethod,
-    ReconParams, StripeMethod,
+    Algorithm, Angles, BackendKind, CancelToken, Center, Engine, Geometry, PrepOptions, ReconParams,
 };
 
 /// Metadata of the opened DXchange dataset (read once per open).
@@ -42,16 +41,11 @@ pub struct PreviewSpec {
     pub algorithm: Algorithm,
     /// Rotation-axis column; `None` ⇒ detector midline.
     pub center: Option<f32>,
-    pub filter: FilterName,
-    pub num_iter: usize,
-    pub reg_par: Vec<f32>,
-    /// Truncated-projection support extension (iterative methods; see
-    /// `ReconParams::ext_pad`).
-    pub ext_pad: bool,
-    pub stripe: StripeMethod,
-    /// Phase retrieval. A non-`None` method widens the preview's read around
-    /// the slice (the retrieval couples detector rows) — see [`run_preview`].
-    pub phase: PhaseMethod,
+    /// On the detector-width grid (`num_gridx` unset).
+    pub params: ReconParams,
+    /// A non-`None` phase method widens the preview's read around the slice
+    /// (the retrieval couples detector rows) — see [`run_preview`].
+    pub prep: PrepOptions,
 }
 
 /// Rotation-axis auto-detection method (docs/GUI.md §2 Center).
@@ -547,8 +541,7 @@ fn run_preview(
 ) -> tomoxide::Result<(usize, usize, Vec<f32>)> {
     let backend = engine.backend();
     let (one, geom) = prep_slice(engine, path, spec)?;
-    let params = recon_params(spec, one.array.dim().2, spec.reg_par.clone());
-    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
+    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &spec.params, backend)?;
     let (_nz1, ny, nxo) = vol.dims();
     Ok((ny, nxo, vol.array.iter().copied().collect()))
 }
@@ -563,30 +556,19 @@ fn prep_slice(
     let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
     let (_nproj, nz, nx, _nflat, _ndark) = reader.read_sizes()?;
     let slice = spec.slice.min(nz.saturating_sub(1));
-    let prep = tomoxide::PrepOptions {
-        stripe: spec.stripe,
-        phase: spec.phase,
-    };
-    let one = tomoxide::prep_band(reader.as_mut(), slice, slice + 1, &prep, engine.backend())?;
+    let one = tomoxide::prep_band(
+        reader.as_mut(),
+        slice,
+        slice + 1,
+        &spec.prep,
+        engine.backend(),
+    )?;
 
     let mut geom = Geometry::parallel(Angles(reader.read_theta()?), nx, 1, 1.0);
     if let Some(c) = spec.center {
         geom.center = Center::Scalar(c);
     }
     Ok((one, geom))
-}
-
-/// Reconstruction parameters for a preview, with `reg_par` supplied by the
-/// caller (the λ sweep overrides `reg_par[0]` per frame).
-fn recon_params(spec: &PreviewSpec, nx: usize, reg_par: Vec<f32>) -> ReconParams {
-    ReconParams {
-        num_gridx: Some(nx),
-        filter_name: spec.filter,
-        num_iter: spec.num_iter,
-        reg_par,
-        ext_pad: spec.ext_pad,
-        ..Default::default()
-    }
 }
 
 /// Reconstruct the preview slice once per λ (overriding `reg_par[0]`, keeping
@@ -608,19 +590,17 @@ fn run_lambda_sweep(
 ) -> tomoxide::Result<LambdaSweepOut> {
     let backend = engine.backend();
     let (one, geom) = prep_slice(engine, path, spec)?;
-    let nx = one.array.dim().2;
 
     let mut frames = Vec::new();
     let mut residual = Vec::with_capacity(lambdas.len());
     let mut roughness = Vec::with_capacity(lambdas.len());
     let (mut ny, mut nxo) = (0usize, 0usize);
     for &lam in lambdas {
-        let mut reg_par = spec.reg_par.clone();
-        match reg_par.first_mut() {
+        let mut params = spec.params.clone();
+        match params.reg_par.first_mut() {
             Some(first) => *first = lam,
-            None => reg_par.push(lam),
+            None => params.reg_par.push(lam),
         }
-        let params = recon_params(spec, nx, reg_par);
         let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
         let (_nz1, y, x) = vol.dims();
         (ny, nxo) = (y, x);
@@ -831,6 +811,7 @@ fn read_sinogram(path: &std::path::Path, row: usize) -> tomoxide::Result<(usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tomoxide::{FilterName, PhaseMethod, StripeMethod};
 
     fn fixture() -> PathBuf {
         PathBuf::from(concat!(
@@ -891,12 +872,11 @@ mod tests {
             slice: 3,
             algorithm: Algorithm::Fbp,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 1,
-            reg_par: Vec::new(),
-            ext_pad: false,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -914,16 +894,18 @@ mod tests {
             slice: 3,
             algorithm: Algorithm::Fbp,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 1,
-            reg_par: Vec::new(),
-            ext_pad: false,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::Paganin {
-                pixel_size: 1e-4,
-                dist: 50.0,
-                energy: 30.0,
-                alpha: 1e-3,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                ..Default::default()
+            },
+            prep: PrepOptions {
+                stripe: StripeMethod::None,
+                phase: PhaseMethod::Paganin {
+                    pixel_size: 1e-4,
+                    dist: 50.0,
+                    energy: 30.0,
+                    alpha: 1e-3,
+                },
             },
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
@@ -952,13 +934,14 @@ mod tests {
             slice: 3,
             algorithm: Algorithm::Sirt,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 10,
-            reg_par: Vec::new(),
-            // The Tune panel default: iterative previews run support-extended.
-            ext_pad: true,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                num_iter: 10,
+                // The Tune panel default: iterative previews run support-extended.
+                ext_pad: true,
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -977,12 +960,14 @@ mod tests {
             slice: usize::MAX,
             algorithm: Algorithm::Fbp,
             center: Some(16.0),
-            filter: FilterName::Shepp,
-            num_iter: 1,
-            reg_par: Vec::new(),
-            ext_pad: false,
-            stripe: StripeMethod::Sf { size: 3 },
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Shepp,
+                ..Default::default()
+            },
+            prep: PrepOptions {
+                stripe: StripeMethod::Sf { size: 3 },
+                phase: PhaseMethod::None,
+            },
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -1052,12 +1037,13 @@ mod tests {
             slice: meta.nz / 2,
             algorithm: Algorithm::Tv,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 20,
-            reg_par: vec![0.001],
-            ext_pad: false,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                num_iter: 20,
+                reg_par: vec![0.001],
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let lambdas = [0.001_f32, 0.01, 0.1];
         let (ny, nx, frames, residual, roughness) =
@@ -1101,12 +1087,14 @@ mod tests {
             slice: meta.nz / 2,
             algorithm: Algorithm::Tv,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 20,
-            reg_par: vec![0.001],
-            ext_pad: true,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                num_iter: 20,
+                reg_par: vec![0.001],
+                ext_pad: true,
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let lambdas = [0.001_f32, 0.01, 0.1];
         let (_ny, _nx, _frames, residual, roughness) =

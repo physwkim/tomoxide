@@ -7,7 +7,6 @@ use std::sync::mpsc::Sender;
 
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{CompareImages, CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
-use tomoxide::Algorithm;
 
 use crate::worker::{DatasetMeta, Job, PreviewSpec};
 
@@ -603,22 +602,18 @@ impl TuneView {
         self.dirty = true;
     }
 
-    /// Resolve the panel state into a fully-typed spec (errors → session log).
+    /// Resolve the panel state into a fully-typed spec through the recipe
+    /// config, so the preview runs what a saved recipe would (errors → session
+    /// log).
     fn build_spec(&self) -> Result<PreviewSpec, String> {
-        let algorithm: Algorithm = self.algorithm.parse().map_err(|e| format!("{e}"))?;
-        let filter = self.filter.parse().map_err(|e| format!("{e}"))?;
-        let reg_par = parse_reg_par(&self.reg_par)?;
-        let prep = self.prep_config();
+        let mut cfg = tomoxide::config::Config::default();
+        self.write_config(&mut cfg)?;
         Ok(PreviewSpec {
             slice: self.slice,
-            algorithm,
-            center: (!self.center_auto).then_some(self.center),
-            filter,
-            num_iter: self.num_iter,
-            reg_par,
-            ext_pad: self.ext_pad,
-            stripe: prep.stripe_method().map_err(|e| e.to_string())?,
-            phase: prep.phase_method().map_err(|e| e.to_string())?,
+            algorithm: cfg.algorithm().map_err(|e| e.to_string())?,
+            center: cfg.rotation_axis,
+            params: cfg.recon_params().map_err(|e| e.to_string())?,
+            prep: cfg.prep().map_err(|e| e.to_string())?,
         })
     }
 
