@@ -8,14 +8,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use rsplot::egui;
 use tomoxide::align::PreppedStack;
 use tomoxide::{
-    Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PhaseMethod, ReconParams,
-    StripeMethod,
+    Algorithm, Angles, BackendKind, CancelToken, Center, Engine, FilterName, Geometry, PhaseMethod,
+    ReconParams, StripeMethod,
 };
 
 /// Metadata of the opened DXchange dataset (read once per open).
@@ -124,15 +123,19 @@ pub enum Job {
     /// **refines a prior** — the axis from step 1 — rather than searching for
     /// one. [`tomoxide::recon::center::judge_sweep`] is what enforces that; see
     /// its verdicts before adopting anything from here.
+    ///
+    /// `cancel` stops it at the next probe boundary →
+    /// [`Event::LaminoCenterSweepCancelled`].
     LaminoCenterSweep {
         tilt_deg: Option<f32>,
         slice: Option<usize>,
         centers: Vec<f32>,
+        cancel: CancelToken,
     },
     /// Score each tilt by a FULL reconstruction
     /// (`recon::center::lamino_tilt_scan`) → one [`Event::LaminoTilt`] per
     /// candidate as it lands, then [`Event::LaminoTiltDone`]. Minutes per
-    /// candidate; [`Worker::cancel`] stops it at the next boundary.
+    /// candidate; `cancel` stops it before the next one.
     ///
     /// `band` is the sample's z range, and passing it is what makes the score
     /// mean anything on real data: the focus metric ranks noise planes above the
@@ -143,6 +146,7 @@ pub enum Job {
         center: f32,
         tilts: Vec<f32>,
         band: Option<tomoxide::recon::center::SampleBand>,
+        cancel: CancelToken,
     },
     /// Exit the worker loop.
     Shutdown,
@@ -220,6 +224,8 @@ pub enum Event {
         slice: usize,
         millis: u128,
     },
+    /// The centre sweep stopped on its token.
+    LaminoCenterSweepCancelled { millis: u128 },
     /// One tilt candidate finished: its score, the in-focus slice `[ny, nx]` the
     /// reconstruction peaked on, and the focus of every slice — the profile that
     /// says whether `z_peak` is a hump on the sample or a spike at a z-edge.
@@ -248,10 +254,6 @@ pub enum Event {
 pub struct Worker {
     pub jobs: Sender<Job>,
     pub events: Receiver<Event>,
-    /// Stops the tilt scan at the next candidate boundary. A `Job` cannot do
-    /// this: the scan owns the worker for minutes and the job channel is only
-    /// drained between jobs, so the request has to reach it out of band.
-    pub cancel: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -259,16 +261,13 @@ impl Worker {
     pub fn spawn(ctx: egui::Context) -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("tomoxide-worker".into())
-            .spawn(move || worker_main(job_rx, event_tx, ctx, worker_cancel))
+            .spawn(move || worker_main(job_rx, event_tx, ctx))
             .expect("spawning the worker thread");
         Worker {
             jobs: job_tx,
             events: event_rx,
-            cancel,
             thread: Some(thread),
         }
     }
@@ -283,12 +282,7 @@ impl Drop for Worker {
     }
 }
 
-fn worker_main(
-    jobs: Receiver<Job>,
-    events: Sender<Event>,
-    ctx: egui::Context,
-    cancel: Arc<AtomicBool>,
-) {
+fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     let send = |event: Event| {
         let _ = events.send(event);
         ctx.request_repaint();
@@ -439,6 +433,7 @@ fn worker_main(
                 tilt_deg,
                 slice,
                 centers,
+                cancel,
             } => {
                 let Some(path) = current.clone() else {
                     continue;
@@ -446,7 +441,7 @@ fn worker_main(
                 let t0 = std::time::Instant::now();
                 match ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
                     let slice = slice.unwrap_or_else(|| st.default_slice(tilt_deg, None));
-                    st.center_sweep(tilt_deg, slice, &centers)
+                    st.center_sweep(tilt_deg, slice, &centers, Some(&cancel))
                 }) {
                     Ok(sweep) => {
                         let (_n, ny, nx) = sweep.frames.dim();
@@ -460,6 +455,9 @@ fn worker_main(
                             millis: t0.elapsed().as_millis(),
                         })
                     }
+                    Err(tomoxide::Error::Cancelled) => send(Event::LaminoCenterSweepCancelled {
+                        millis: t0.elapsed().as_millis(),
+                    }),
                     Err(e) => send(Event::JobFailed {
                         what: "lamino center sweep".into(),
                         error: e.to_string(),
@@ -470,17 +468,16 @@ fn worker_main(
                 center,
                 tilts,
                 band,
+                cancel,
             } => {
                 let Some(path) = current.clone() else {
                     continue;
                 };
-                // A cancel from a previous scan must not kill this one.
-                cancel.store(false, Ordering::Relaxed);
                 let t0 = std::time::Instant::now();
                 let total = tilts.len();
                 let mut done = 0usize;
                 let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
-                    st.tilt_scan(center, &tilts, band, &mut |r, views| {
+                    st.tilt_scan(center, &tilts, band, Some(&cancel), &mut |r, views| {
                         done += 1;
                         let img = views.slice;
                         let (ny, nx) = img.dim();
@@ -497,21 +494,15 @@ fn worker_main(
                             done,
                             total,
                         });
-                        if cancel.load(Ordering::Relaxed) {
-                            return Err(tomoxide::Error::Backend("cancelled".into()));
-                        }
                         Ok(())
                     })
                 });
-                let cancelled = cancel.swap(false, Ordering::Relaxed);
                 match r {
                     Ok(_) => send(Event::LaminoTiltDone {
                         cancelled: false,
                         millis: t0.elapsed().as_millis(),
                     }),
-                    // A cancel unwinds through the callback as an error; that is
-                    // the scan stopping as asked, not a failure to report.
-                    Err(_) if cancelled => send(Event::LaminoTiltDone {
+                    Err(tomoxide::Error::Cancelled) => send(Event::LaminoTiltDone {
                         cancelled: true,
                         millis: t0.elapsed().as_millis(),
                     }),

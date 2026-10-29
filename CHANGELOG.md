@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format is based on
   the whole depth) instead of the slice alone. The xz plane is how the layers
   stack, which the eye compares across tilts and which the streamed volume was
   dropped before a caller could read.
+- **Breaking: the align sweeps take a `cancel: Option<&CancelToken>`**:
+  `PreppedStack::center_sweep` and `tilt_scan`, `cuda::center_probe`,
+  `center_probe_sweep` and `lamino_tilt_probe` stop with `Error::Cancelled` at
+  the next probe, angle-chunk, tilt or tile boundary. `lamino_tilt_scan` takes
+  its tilts and band as one `TiltCandidates`. The GUI cancels both the centre
+  sweep and the tilt scan with a per-job token.
 
 ## [0.8.0] - 2026-10-29
 

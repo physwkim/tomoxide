@@ -15,8 +15,8 @@ use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
 use crate::params::{Algorithm, ReconParams};
-use crate::pipeline::PrepOptions;
-use crate::recon::center::{RingCenter, SampleBand, TiltFocus, TiltViews};
+use crate::pipeline::{CancelToken, PrepOptions};
+use crate::recon::center::{RingCenter, SampleBand, TiltCandidates, TiltFocus, TiltViews};
 use crate::recon::tilt_flow::TiltFlow;
 
 /// The whole flat/dark-corrected, minus-log projection stack, held in host RAM.
@@ -181,12 +181,14 @@ impl PreppedStack {
     }
 
     /// Reconstruct output slice `slice` at every candidate centre in one probe
-    /// sweep and score each. CUDA-only.
+    /// sweep and score each; a fired `cancel` stops it at the next probe
+    /// boundary with [`Error::Cancelled`]. CUDA-only.
     pub fn center_sweep(
         &self,
         tilt_deg: Option<f32>,
         slice: usize,
         centers: &[f32],
+        cancel: Option<&CancelToken>,
     ) -> Result<CenterSweep> {
         // The probe anchors each candidate on its own nominal, so the
         // geometry's centre is not read.
@@ -196,6 +198,7 @@ impl PreppedStack {
             &ReconParams::default(),
             centers,
             slice as i32,
+            cancel,
         )?;
         let focus = crate::recon::center::focus_by_z(frames.view());
         Ok(CenterSweep {
@@ -213,6 +216,7 @@ impl PreppedStack {
         center: f32,
         tilts_deg: &[f32],
         band: Option<SampleBand>,
+        cancel: Option<&CancelToken>,
         on_tilt: &mut dyn FnMut(&TiltFocus, TiltViews<'_>) -> Result<()>,
     ) -> Result<Vec<TiltFocus>> {
         // Default parameters are the tuned analytic path (parzen filter) the
@@ -224,8 +228,8 @@ impl PreppedStack {
             &self.geometry(center, Some(0.0)), // beam ignored — `tilts_deg` supplies it
             Algorithm::Fourierrec,
             &ReconParams::default(),
-            tilts_deg,
-            band,
+            TiltCandidates { tilts_deg, band },
+            cancel,
             on_tilt,
         )
     }

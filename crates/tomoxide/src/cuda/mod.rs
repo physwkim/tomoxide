@@ -164,23 +164,25 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 /// `geom.center`; `geom.beam` is ignored, since `tilts_deg` supplies the tilt.
 /// `sz` is a volume z: the same slice index a full reconstruction at that tilt
 /// produces, in any algorithm — every path centres z on the recon height's
-/// midpoint (`tests/cuda_lamino_z_convention.rs` pins this). Errors without the
-/// `cuda` feature.
+/// midpoint (`tests/cuda_lamino_z_convention.rs` pins this). `cancel`, if
+/// given, is checked before the filtering, before the back-projection and
+/// between angle chunks. Errors without the `cuda` feature.
 pub fn lamino_tilt_probe(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     params: &crate::params::ReconParams,
     tilts_deg: &[f32],
     sz: i32,
+    cancel: Option<&crate::pipeline::CancelToken>,
 ) -> Result<ndarray::Array3<f32>> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, params, tilts_deg, sz);
+        let _ = (sino, geom, params, tilts_deg, sz, cancel);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::lamino_tilt_probe(sino, geom, params, tilts_deg, sz)
+        cuda_impl::lamino_tilt_probe(sino, geom, params, tilts_deg, sz, cancel)
     }
 }
 
@@ -213,21 +215,24 @@ pub fn lamino_tilt_probe(
 /// Outside the reconstruction disk the two differ by ~12 % of peak at any shift,
 /// integer or not — the shift moves where the sampling leaves the detector, so
 /// the field boundary is not the same set of voxels. Score inside the disk.
+///
+/// `cancel` is checked as in [`lamino_tilt_probe`].
 pub fn center_probe(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     params: &crate::params::ReconParams,
     centers: &[f32],
     sz: i32,
+    cancel: Option<&crate::pipeline::CancelToken>,
 ) -> Result<ndarray::Array3<f32>> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, params, centers, sz);
+        let _ = (sino, geom, params, centers, sz, cancel);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::center_probe(sino, geom, params, centers, sz)
+        cuda_impl::center_probe(sino, geom, params, centers, sz, cancel)
     }
 }
 
@@ -249,21 +254,25 @@ pub fn center_probe(
 /// of how many candidates share it: an integer sweep of any width costs one, a
 /// quarter-pixel grid costs four. (Candidates on no common lattice — irrational
 /// spacings — degenerate to one probe each: still exact, just not amortised.)
+///
+/// `cancel` is checked within each probe as in [`center_probe`], so also
+/// between them.
 pub fn center_probe_sweep(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     params: &crate::params::ReconParams,
     centers: &[f32],
     sz: i32,
+    cancel: Option<&crate::pipeline::CancelToken>,
 ) -> Result<ndarray::Array3<f32>> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, params, centers, sz);
+        let _ = (sino, geom, params, centers, sz, cancel);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::center_probe_sweep(sino, geom, params, centers, sz)
+        cuda_impl::center_probe_sweep(sino, geom, params, centers, sz, cancel)
     }
 }
 
@@ -446,6 +455,7 @@ mod cuda_impl {
     use crate::error::{Error, Result};
     use crate::geometry::{lamino_phi, lamino_tilt_deg, Beam, Center, Geometry};
     use crate::params::{FilterName, StripeMethod};
+    use crate::pipeline::{check_cancel, CancelToken};
     use ndarray::{Array3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -2538,11 +2548,13 @@ mod cuda_impl {
         pad: usize,
         pad_side: usize,
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<f32>> {
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
         let ncand = sweep.len();
         let free = device_free_bytes();
+        check_cancel(cancel)?;
         let (host_gf, angle_chunks) =
             lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
         let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
@@ -2561,6 +2573,7 @@ mod cuda_impl {
         let f_dev = DevBuf::zeroed(ncand * n * n * fsz)?;
 
         for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
+            check_cancel(cancel)?;
             gf_dev.copy_from_host_f32(&host_gf[c])?;
             let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
             // `nproj` global (fixes the π/nproj quadrature scale), `alen` local
@@ -2614,6 +2627,7 @@ mod cuda_impl {
         params: &crate::params::ReconParams,
         centers: &[f32],
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Array3<f32>> {
         use crate::backend::make_fbp_filter;
 
@@ -2701,6 +2715,7 @@ mod cuda_impl {
             pad,
             pad_side,
             sz,
+            cancel,
         )?;
         Array3::from_shape_vec((centers.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
@@ -2713,6 +2728,7 @@ mod cuda_impl {
         params: &crate::params::ReconParams,
         centers: &[f32],
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Array3<f32>> {
         if centers.is_empty() {
             return Err(Error::InvalidParam(
@@ -2762,7 +2778,7 @@ mod cuda_impl {
                 detector: geom.detector,
             };
             let cands: Vec<f32> = idx.iter().map(|&i| centers[i]).collect();
-            let probe = center_probe(sino, &g, params, &cands, sz)?;
+            let probe = center_probe(sino, &g, params, &cands, sz, cancel)?;
             for (j, &i) in idx.iter().enumerate() {
                 out.index_axis_mut(Axis(0), i)
                     .assign(&probe.index_axis(Axis(0), j));
@@ -2778,6 +2794,7 @@ mod cuda_impl {
         params: &crate::params::ReconParams,
         tilts_deg: &[f32],
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Array3<f32>> {
         use crate::backend::make_fbp_filter;
 
@@ -2840,6 +2857,7 @@ mod cuda_impl {
             pad,
             pad_side,
             sz,
+            cancel,
         )?;
         Array3::from_shape_vec((phi.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda tilt-probe shape: {e}")))

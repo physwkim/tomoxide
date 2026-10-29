@@ -255,6 +255,11 @@ impl App {
                     self.lamino
                         .on_center_sweep(centers, ny, nx, &frames, focus, slice);
                 }
+                Event::LaminoCenterSweepCancelled { millis } => {
+                    self.log
+                        .push(format!("lamino centre sweep cancelled — {millis} ms"));
+                    self.lamino.on_center_cancelled();
+                }
                 Event::LaminoTilt {
                     tilt_deg,
                     focus,
@@ -457,12 +462,7 @@ impl App {
                 });
                 ui.separator();
                 if self.lamino_beam {
-                    self.lamino.ui(
-                        ui,
-                        &self.worker.jobs,
-                        &self.worker.cancel,
-                        self.meta.as_ref(),
-                    );
+                    self.lamino.ui(ui, &self.worker.jobs, self.meta.as_ref());
                     if let Some(c) = self.lamino.take_accepted() {
                         self.tune.center = c;
                         self.tune.center_auto = false;

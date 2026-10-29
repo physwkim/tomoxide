@@ -184,11 +184,11 @@ pub(crate) fn lamino_streaming_normalized(
     }
 }
 
-/// Cooperative cancellation flag for the chunked drivers.
+/// Cooperative cancellation flag for the chunked drivers and the align sweeps.
 ///
-/// Clone the token, hand one clone to [`ReconSteps::with_cancel`], and call
-/// [`cancel`](CancelToken::cancel) from any thread; the driver checks the flag
-/// **between chunks** (never mid-kernel) and returns
+/// Clone the token, hand one clone to [`ReconSteps::with_cancel`] (or to a
+/// sweep's `cancel`), and call [`cancel`](CancelToken::cancel) from any thread;
+/// the driver checks the flag **between chunks** (never mid-kernel) and returns
 /// [`Error::Cancelled`](crate::error::Error::Cancelled). Chunks already handed
 /// to the writer stay written — cancellation truncates the run, it does not
 /// roll it back. A default token never cancels.
@@ -209,6 +209,14 @@ impl CancelToken {
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `Err(Cancelled)` once `cancel`, if given, has fired.
+pub(crate) fn check_cancel(cancel: Option<&CancelToken>) -> Result<()> {
+    match cancel {
+        Some(c) if c.is_cancelled() => Err(crate::error::Error::Cancelled),
+        _ => Ok(()),
     }
 }
 
@@ -254,11 +262,7 @@ impl ReconSteps {
     /// `Err(Cancelled)` once the token has fired — the drivers call this at
     /// every chunk boundary.
     fn check_cancel(&self) -> Result<()> {
-        if self.cancel.is_cancelled() {
-            Err(crate::error::Error::Cancelled)
-        } else {
-            Ok(())
-        }
+        check_cancel(Some(&self.cancel))
     }
 
     /// Run the chunked pipeline: read → normalize → phase → (per z-chunk:

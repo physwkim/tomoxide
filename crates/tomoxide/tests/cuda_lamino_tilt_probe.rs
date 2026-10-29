@@ -91,6 +91,7 @@ fn cuda_lamino_tilt_probe_matches_linerec_recon() {
         &params,
         &tilts,
         z as i32,
+        None,
     )
     .unwrap();
     assert_eq!(probe.dim(), (tilts.len(), n, n));
@@ -137,6 +138,7 @@ fn cuda_lamino_tilt_probe_rows_are_distinct_tilts() {
         &params,
         &tilts,
         17,
+        None,
     )
     .unwrap();
 
@@ -197,6 +199,7 @@ fn cuda_lamino_tilt_probe_finds_the_same_peak_as_full_recons() {
         &params,
         &tilts,
         z as i32,
+        None,
     )
     .unwrap();
     let from_probe: Vec<f64> = (0..tilts.len())
@@ -269,10 +272,10 @@ fn cuda_lamino_tilt_probe_is_unchanged_when_the_stack_is_angle_chunked() {
     let tilts = [12.0f32, 20.0, 31.5];
     let geom = geom_lamino(&angles, n, nz, 0.0);
 
-    let single = cuda::lamino_tilt_probe(&sino, &geom, &params, &tilts, z as i32).unwrap();
+    let single = cuda::lamino_tilt_probe(&sino, &geom, &params, &tilts, z as i32, None).unwrap();
 
     std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
-    let chunked = cuda::lamino_tilt_probe(&sino, &geom, &params, &tilts, z as i32);
+    let chunked = cuda::lamino_tilt_probe(&sino, &geom, &params, &tilts, z as i32, None);
     std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
     let chunked = chunked.unwrap();
 

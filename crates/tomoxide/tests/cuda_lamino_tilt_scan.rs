@@ -11,10 +11,12 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::{Array2, Axis};
-use tomoxide::recon::center::{lamino_tilt_scan, slice_focus, SampleBand, TiltFocus};
+use tomoxide::recon::center::{
+    lamino_tilt_scan, slice_focus, SampleBand, TiltCandidates, TiltFocus,
+};
 use tomoxide::{
-    cuda, sim, Algorithm, Angles, Beam, Center, CudaBackend, Detector, Geometry, ReconParams,
-    Volume,
+    cuda, sim, Algorithm, Angles, Beam, CancelToken, Center, CudaBackend, Detector, Error,
+    Geometry, ReconParams, Volume,
 };
 
 const TRUE_TILT: f32 = 20.0;
@@ -78,8 +80,11 @@ fn scan_banded(
         &geom_lamino(&angles, n, nz, 0.0), // beam ignored — `tilts` supplies it
         Algorithm::Fourierrec,
         &params,
-        tilts,
-        band,
+        TiltCandidates {
+            tilts_deg: tilts,
+            band,
+        },
+        None,
         &mut |r, views| {
             assert_eq!(
                 views.slice.dim(),
@@ -312,4 +317,39 @@ fn cuda_lamino_tilt_scan_scores_only_the_sample_band() {
     );
     // The profile is never truncated to the band: the next band is read off it.
     assert_eq!(r.focus_by_z.len(), r.depth);
+}
+
+/// A token fired while a tilt is reported stops the scan before the next one.
+#[test]
+fn cuda_lamino_tilt_scan_stops_at_the_tilt_after_a_cancel() {
+    let Ok(cuda) = CudaBackend::new() else {
+        eprintln!("skipping CUDA test: no CUDA device");
+        return;
+    };
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let rh = cuda::lamino_recon_height(nz, TRUE_TILT);
+    let angles = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI);
+    let geom = geom_lamino(&angles, n, nz, TRUE_TILT);
+    let sino = sim::project(&slab_volume(n, rh, rh / 4, rh / 4 + 4), &geom, &cuda).unwrap();
+
+    let token = CancelToken::new();
+    let mut seen = Vec::new();
+    let r = lamino_tilt_scan(
+        &sino,
+        &geom,
+        Algorithm::Fourierrec,
+        &ReconParams::default(),
+        TiltCandidates {
+            tilts_deg: &[15.0, 20.0, 25.0],
+            band: None,
+        },
+        Some(&token),
+        &mut |f, _| {
+            seen.push(f.tilt_deg);
+            token.cancel();
+            Ok(())
+        },
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert_eq!(seen, [15.0]);
 }

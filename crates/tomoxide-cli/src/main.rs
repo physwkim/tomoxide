@@ -753,7 +753,7 @@ fn run_align(
     };
 
     let cands = grid(ring.center, center_width, center_step);
-    let f = st.center_sweep(lamino_angle, sz, &cands)?.focus;
+    let f = st.center_sweep(lamino_angle, sz, &cands, None)?.focus;
     curve(&cands, &f, "");
     let center = pick("centre", &cands, &f, "--center_width")?;
     println!(
@@ -795,6 +795,7 @@ fn run_align(
                 center,
                 &tilts,
                 focus_z.map(|z| SampleBand { z, tilt_deg: t0 }),
+                None,
                 // The views are `align`'s to ignore: it prints, and
                 // docs/LAMINOGRAPHY_ALIGNMENT.md §3 says confirm on a montage.
                 &mut |r, _views| {

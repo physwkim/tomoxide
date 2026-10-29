@@ -614,9 +614,20 @@ pub struct TiltViews<'a> {
     pub xz: ArrayView2<'a, f32>,
 }
 
-/// Score each tilt in `tilts_deg` by fully reconstructing at it and taking the
-/// maximum [`slice_focus`] over the scored z range — every slice when `band` is
-/// `None`, the sample's own slices when a [`SampleBand`] carries a prior.
+/// The candidates [`lamino_tilt_scan`] reconstructs, and where in each volume it
+/// scores them.
+#[derive(Debug, Clone, Copy)]
+pub struct TiltCandidates<'a> {
+    /// The tilts, in degrees, scored in this order.
+    pub tilts_deg: &'a [f32],
+    /// The sample's slices; `None` scores every slice.
+    pub band: Option<SampleBand>,
+}
+
+/// Score each tilt in `cands.tilts_deg` by fully reconstructing at it and taking
+/// the maximum [`slice_focus`] over the scored z range — every slice when
+/// `cands.band` is `None`, the sample's own slices when a [`SampleBand`] carries
+/// a prior.
 ///
 /// Pass the band whenever one can be read. Without it the score is the max over
 /// a volume in which, on real data, mean |∇|² ranks noise planes above the
@@ -639,7 +650,7 @@ pub struct TiltViews<'a> {
 /// answer, so that probe refines a prior rather than finding one. See
 /// [`cuda::center_probe_sweep`](crate::cuda::center_probe_sweep).
 ///
-/// `geom`'s beam is ignored; `tilts_deg` supplies it. `params.lamino_rh` is
+/// `geom`'s beam is ignored; `cands.tilts_deg` supplies it. `params.lamino_rh` is
 /// honoured if set, but leaving it `None` lets each tilt take its own natural
 /// depth, which is what the scan wants. The volume is never assembled: focus is
 /// scored per streamed tile, so the memory cost is one tile and one xz plane
@@ -649,10 +660,13 @@ pub struct TiltViews<'a> {
 ///
 /// `on_tilt(result, views)` is called with each result as it lands — one full
 /// reconstruction apart, so a caller with a user attached should report it — and
-/// returning `Err` from it aborts the scan. `views` are the [`TiltViews`] of
-/// that reconstruction: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming
-/// the winner by eye part of the method, and this is the one reconstruction that
+/// returning `Err` from it aborts the scan. `views` are the [`TiltViews`] of that
+/// reconstruction: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming the
+/// winner by eye part of the method, and this is the one reconstruction that
 /// already found it. Callers that only want the numbers ignore them.
+///
+/// A fired `cancel` stops the scan with [`Error::Cancelled`] before the next
+/// tilt or at the next streamed tile.
 ///
 /// CUDA-only: the streaming laminography reconstruction this rides on exists only
 /// there.
@@ -661,10 +675,11 @@ pub fn lamino_tilt_scan(
     geom: &Geometry,
     algorithm: crate::params::Algorithm,
     params: &crate::params::ReconParams,
-    tilts_deg: &[f32],
-    band: Option<SampleBand>,
+    cands: TiltCandidates<'_>,
+    cancel: Option<&crate::pipeline::CancelToken>,
     on_tilt: &mut dyn FnMut(&TiltFocus, TiltViews<'_>) -> Result<()>,
 ) -> Result<Vec<TiltFocus>> {
+    let TiltCandidates { tilts_deg, band } = cands;
     if let Some(b) = &band {
         if b.z.0 > b.z.1 {
             return Err(Error::Backend(format!(
@@ -683,6 +698,7 @@ pub fn lamino_tilt_scan(
     };
     let mut out = Vec::with_capacity(tilts_deg.len());
     for &tilt_deg in tilts_deg {
+        crate::pipeline::check_cancel(cancel)?;
         let geom = Geometry {
             beam: Beam::laminography(tilt_deg),
             ..geom.clone()
@@ -701,6 +717,7 @@ pub fn lamino_tilt_scan(
         let mut xz: Vec<f32> = Vec::new();
         let (depth, _, nx) = {
             let mut on_tile = |z0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
+                crate::pipeline::check_cancel(cancel)?;
                 let ny = tile.array.dim().1;
                 xz.extend(tile.array.index_axis(Axis(1), ny / 2).iter());
                 for (k, f) in focus_by_z(tile.array.view()).into_iter().enumerate() {
