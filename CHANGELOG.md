@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`SampleBand::at`**: the band carried into another tilt's volume through the
+  detector rows, which `lamino_tilt_scan` already did privately. A caller that
+  read the band at one tilt can place it at another without a scan.
+
 ### Changed
 
 - **Breaking: `lamino_tilt_scan` and `PreppedStack::tilt_scan` hand `on_tilt` a

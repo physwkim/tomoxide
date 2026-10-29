@@ -558,17 +558,20 @@ pub struct SampleBand {
     pub tilt_deg: f32,
 }
 
-/// Carry `band` into the volume of another tilt: through the detector rows
-/// (`v − nz/2 = cos(tilt)·(z − rh/2)`, the kernel's own axis mapping), clamped to
-/// the target depth. `rh_from` is the depth of the volume the band was read
-/// from, `rh_to` the depth at `tilt_to_deg`.
-fn band_at(band: &SampleBand, rh_from: usize, tilt_to_deg: f32, rh_to: usize) -> (usize, usize) {
-    let map = |z: usize| -> usize {
-        let row = (z as f64 - rh_from as f64 / 2.0) * f64::from(band.tilt_deg).to_radians().cos();
-        let z = row / f64::from(tilt_to_deg).to_radians().cos() + rh_to as f64 / 2.0;
-        z.round().clamp(0.0, rh_to as f64 - 1.0) as usize
-    };
-    (map(band.z.0), map(band.z.1))
+impl SampleBand {
+    /// The band carried into the volume of another tilt: through the detector
+    /// rows (`v − nz/2 = cos(tilt)·(z − rh/2)`, the kernel's own axis mapping),
+    /// clamped to the target depth. `rh_from` is the depth of the volume the
+    /// band was read from, `rh_to` the depth at `tilt_to_deg`.
+    pub fn at(&self, rh_from: usize, tilt_to_deg: f32, rh_to: usize) -> (usize, usize) {
+        let map = |z: usize| -> usize {
+            let row =
+                (z as f64 - rh_from as f64 / 2.0) * f64::from(self.tilt_deg).to_radians().cos();
+            let z = row / f64::from(tilt_to_deg).to_radians().cos() + rh_to as f64 / 2.0;
+            z.round().clamp(0.0, rh_to as f64 - 1.0) as usize
+        };
+        (map(self.z.0), map(self.z.1))
+    }
 }
 
 /// What one laminography tilt candidate scored, from [`lamino_tilt_scan`].
@@ -687,7 +690,7 @@ pub fn lamino_tilt_scan(
         let rh = rh_for(tilt_deg);
         let scored = band
             .as_ref()
-            .map(|b| band_at(b, rh_for(b.tilt_deg), tilt_deg, rh));
+            .map(|b| b.at(rh_for(b.tilt_deg), tilt_deg, rh));
         // The volume is streamed and dropped tile by tile, so the winning slice
         // has to be kept as it goes past — it is gone by the time the scan knows
         // it won. Tiles arrive in ascending row order, so the profile is built by
@@ -2208,7 +2211,7 @@ fn beta3(t: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{band_at, judge_sweep, ndimage_shift_spline3_constant, SampleBand, SweepVerdict};
+    use super::{judge_sweep, ndimage_shift_spline3_constant, SampleBand, SweepVerdict};
     use ndarray::{Array2, Array3};
     use ndarray_npy::read_npy;
 
@@ -2369,16 +2372,16 @@ mod tests {
             z: (890, 890),
             tilt_deg: 44.0,
         };
-        assert_eq!(band_at(&b, 1424, 40.0, 1338), (836, 836));
-        assert_eq!(band_at(&b, 1424, 48.0, 1532), (957, 957));
+        assert_eq!(b.at(1424, 40.0, 1338), (836, 836));
+        assert_eq!(b.at(1424, 48.0, 1532), (957, 957));
         // At its own tilt the band is itself.
-        assert_eq!(band_at(&b, 1424, 44.0, 1424), (890, 890));
+        assert_eq!(b.at(1424, 44.0, 1424), (890, 890));
         // A band touching the volume edges stays inside the target volume.
         let wide = SampleBand {
             z: (0, 1423),
             tilt_deg: 44.0,
         };
-        let (lo, hi) = band_at(&wide, 1424, 40.0, 1338);
+        let (lo, hi) = wide.at(1424, 40.0, 1338);
         assert!(hi < 1338, "hi {hi} escaped the 1338-deep target volume");
         assert_eq!(lo, 0);
     }
