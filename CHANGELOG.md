@@ -15,6 +15,39 @@ All notable changes to this project are documented here. The format is based on
   in lockstep because rsdm 0.5.5 requires `rsplot ^0.5.5`; the jump also picks
   up rsplot 0.5.3's `VolumeRaycaster` rendering fixes (thickness cue,
   faint-voxel hue) for the XANES 3-D view.
+- **Every tilt↔phi conversion goes through `geometry::lamino_phi` /
+  `lamino_tilt_deg`.** The CPU lamino path spelled it `d/180·π`, which differs
+  by 1 ULP from `d·π/180` at 298 of 1801 tenth-degree tilts; it now takes the
+  latter, as the CLI, GUI and CUDA sites already did.
+
+### Added
+
+- **`tomoxide::align::PreppedStack` — the one alignment driver.** Loads and
+  preps the stack once, then runs the rings estimate, the tilt-flow estimate,
+  the centre probe sweep and the tilt scan on it (`align::grid` builds the
+  sweep candidates). `tomoxide align` and the GUI each carried their own copy;
+  both now drive this one.
+- **`recon::tilt_flow::estimate_tilt_flow` — the laminography tilt with no
+  reconstruction.** Fits the vertical flow between projections a few steps apart
+  to a plane whose slope is the tilt and whose zero is the axis column. On the
+  261003 step scan (bin 2, 20° nominal) it reads 19.40 ± 1.46°, every pair
+  matching the Python original it ports.
+- **`recon::center::register_shift`, `find_center_rings_from_mean`,
+  `focus_by_z`.** `register_shift` is the phase-correlation registration
+  `find_center_pc` runs, exposed for the 0°-vs-360° drift check.
+  `find_center_rings_from_mean` runs the rings estimate on a mean projection
+  already in hand or on a band of its rows; `find_center_rings` delegates to it.
+  `focus_by_z` is the one bulk `slice_focus` scorer, which the tilt scan and
+  the centre sweep now share.
+- **`Geometry::valid_fov`** — per slice, the radius every projection saw. Off
+  the middle of a laminography volume a voxel leaves the detector for part of
+  the orbit, and the slice there is no longer the sample's.
+- **`prep_band` and `PrepOptions::row_separable`; `Config::stripe_method` /
+  `phase_method`.** `prep_band` preps a detector-row band as the whole stack is
+  prepped, widening the read by the phase kernel's margin. `row_separable` says
+  whether a prep may be run chunk by chunk. The two `Config` methods are the one
+  method-name parser for the CLI and the GUI, so the GUI now accepts every case
+  and the `vo_all` / `vo_sort` spellings the CLI did.
 
 ### Fixed
 
@@ -36,8 +69,16 @@ All notable changes to this project are documented here. The format is based on
   FBP filter: the `_wint` quadrature ramp on `4·detw`. Every backend now builds
   the lamino filter from `make_fbp_filter` (`RampShape::Wint`), and Pearson
   against tomocupy on the 261003 scan (parzen) rose from 0.9975 to 0.99996
-  8×-binned and from 0.99933 to 0.999998 2×-binned. `--filter none` is now no filter, as for every other method, rather
-  than the bare ramp.
+  8×-binned and from 0.99933 to 0.999998 2×-binned. `--filter none` is now no
+  filter, as for every other method, rather than the bare ramp.
+- **`tomoxide recon` with phase retrieval took the row-chunked paths**, the
+  CUDA/wgpu streaming pipeline and the multi-GPU shard, which refuse phase
+  retrieval because a 2D phase filter couples rows. A plan that is not
+  `row_separable` now takes the whole-volume path, and `recon_steps` refuses it
+  as it does `chain` and `--lamino_angle`.
+- **`--start_row` bands truncated the Paganin kernel at their edges.** The band
+  was read as bare rows `z0..z1` before phase retrieval (relative error 0.25 at
+  the edge rows of a 400..600 band); it now preps through `prep_band`.
 
 ## [0.7.0] - 2026-07-18
 
