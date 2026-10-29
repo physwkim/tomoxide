@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-29
+
 ### Changed
 
 - **`tomoxide-gui` now depends on `rsplot` / `rsdm` `=0.5.5`** (was `=0.5.2`).
@@ -973,7 +975,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/physwkim/tomoxide/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/physwkim/tomoxide/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/physwkim/tomoxide/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/physwkim/tomoxide/compare/v0.5.0...v0.5.1
