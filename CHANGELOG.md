@@ -23,7 +23,7 @@ All notable changes to this project are documented here. The format is based on
   `(n − 1)/2`, but converted the shift about `n/2`. They now use `(n − 1)/2`,
   the axis `find_center_pc` and `find_center_vo` already use. A synthetic
   bullseye now reads its own column (was +0.50); the aligned pouch scan reads
-  396.87 against a known 396 (was 397.37). tomocupy's SIFT formula `n//2 −
+  397.00 against a known 396 (was 397.50). tomocupy's SIFT formula `n//2 −
   shift/2` carries the same half pixel on even widths and is not copied.
 - **Fourier laminography (`recon::lamino`, CUDA `Fourierrec`) came out flipped
   in y** against Linerec, FBP and the volume it was projected from. The USFFT
@@ -83,7 +83,7 @@ All notable changes to this project are documented here. The format is based on
   reports a `prominence` — `(peak − median)/MAD` of the registration profile —
   and flags the scan when the rings never closed, which is the acquisition-time
   misalignment no reconstruction geometry repairs (measured: aligned scan 397.50
-  at prominence 21.0 → trustworthy; misaligned scan 281.72 at 2.22 → flagged, and
+  at prominence 21.0 → trustworthy; misaligned scan 281.09 at 2.44 → flagged, and
   `align` stops there unless `--force`). `cuda::center_probe` / `center_probe_sweep`
   then refine it: `cfunc_linerec`'s `backprojection_try` reconstructs one slice at
   N candidate centres in **one** launch off a single filtering. A probe slice

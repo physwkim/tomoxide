@@ -68,8 +68,8 @@ pub struct RingCenter {
 ///
 /// | scan | `center` | truth | `prominence` |
 /// |---|---|---|---|
-/// | 0.55 s, closed concentric rings | 396.9 | 396 | **16.2** |
-/// | 0.6 s, arcs that never close | 281.2 | 138 | **2.2** |
+/// | 0.55 s, closed concentric rings | 397.0 | 396 | **21.0** |
+/// | 0.6 s, arcs that never close | 280.6 | 138 | **2.4** |
 ///
 /// The mis-aligned scan's profile sits at 80 % of its own peak height even at the
 /// array edges — it is flat, and its `argmax` is noise. Hence
@@ -77,11 +77,9 @@ pub struct RingCenter {
 /// but **calibrated on exactly those two scans**. Treat a `prominence` near the
 /// threshold as "look at the mean projection yourself", not as a verdict.
 ///
-/// (The doc quotes 397.0/280.6 and prominence 21.0/2.4 for its NumPy reference,
-/// which clips at `1e-4` before the log where this goes through
-/// [`prep::normalize`](fn@crate::prep::normalize). The centre lands within 0.13 px
-/// either way; the prominence scale differs, so the numbers above — not the
-/// doc's — are the ones this function returns.)
+/// These are the doc's NumPy reference numbers too, given line integrals:
+/// [`normalize_dataset`](crate::prep::normalize::normalize_dataset) already
+/// ends in the minus-log, and a second one reads 396.9/281.2 at 16.2/2.2.
 pub fn find_center_rings(
     tomo: &Tomo<f32>,
     backend: &dyn Backend,
