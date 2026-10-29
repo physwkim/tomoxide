@@ -157,7 +157,7 @@ fn cuda_lamino_center_probe_sz_is_the_volume_z() {
 
     let energy = |sz: usize| -> f64 {
         let probe =
-            cuda::center_probe(&sino, &geom, &params, &[n as f32 / 2.0], sz as i32).unwrap();
+            cuda::center_probe(&sino, &geom, &params, &[n as f32 / 2.0], sz as i32, None).unwrap();
         probe.iter().map(|&v| (v as f64) * (v as f64)).sum()
     };
 

@@ -164,23 +164,25 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 /// `geom.center`; `geom.beam` is ignored, since `tilts_deg` supplies the tilt.
 /// `sz` is a volume z: the same slice index a full reconstruction at that tilt
 /// produces, in any algorithm — every path centres z on the recon height's
-/// midpoint (`tests/cuda_lamino_z_convention.rs` pins this). Errors without the
-/// `cuda` feature.
+/// midpoint (`tests/cuda_lamino_z_convention.rs` pins this). `cancel`, if
+/// given, is checked before the filtering, before the back-projection and
+/// between angle chunks. Errors without the `cuda` feature.
 pub fn lamino_tilt_probe(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     params: &crate::params::ReconParams,
     tilts_deg: &[f32],
     sz: i32,
+    cancel: Option<&crate::pipeline::CancelToken>,
 ) -> Result<ndarray::Array3<f32>> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, params, tilts_deg, sz);
+        let _ = (sino, geom, params, tilts_deg, sz, cancel);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::lamino_tilt_probe(sino, geom, params, tilts_deg, sz)
+        cuda_impl::lamino_tilt_probe(sino, geom, params, tilts_deg, sz, cancel)
     }
 }
 
@@ -213,21 +215,24 @@ pub fn lamino_tilt_probe(
 /// Outside the reconstruction disk the two differ by ~12 % of peak at any shift,
 /// integer or not — the shift moves where the sampling leaves the detector, so
 /// the field boundary is not the same set of voxels. Score inside the disk.
+///
+/// `cancel` is checked as in [`lamino_tilt_probe`].
 pub fn center_probe(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     params: &crate::params::ReconParams,
     centers: &[f32],
     sz: i32,
+    cancel: Option<&crate::pipeline::CancelToken>,
 ) -> Result<ndarray::Array3<f32>> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, params, centers, sz);
+        let _ = (sino, geom, params, centers, sz, cancel);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::center_probe(sino, geom, params, centers, sz)
+        cuda_impl::center_probe(sino, geom, params, centers, sz, cancel)
     }
 }
 
@@ -249,21 +254,25 @@ pub fn center_probe(
 /// of how many candidates share it: an integer sweep of any width costs one, a
 /// quarter-pixel grid costs four. (Candidates on no common lattice — irrational
 /// spacings — degenerate to one probe each: still exact, just not amortised.)
+///
+/// `cancel` is checked within each probe as in [`center_probe`], so also
+/// between them.
 pub fn center_probe_sweep(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     params: &crate::params::ReconParams,
     centers: &[f32],
     sz: i32,
+    cancel: Option<&crate::pipeline::CancelToken>,
 ) -> Result<ndarray::Array3<f32>> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, params, centers, sz);
+        let _ = (sino, geom, params, centers, sz, cancel);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::center_probe_sweep(sino, geom, params, centers, sz)
+        cuda_impl::center_probe_sweep(sino, geom, params, centers, sz, cancel)
     }
 }
 
@@ -446,6 +455,7 @@ mod cuda_impl {
     use crate::error::{Error, Result};
     use crate::geometry::{lamino_phi, lamino_tilt_deg, Beam, Center, Geometry};
     use crate::params::{FilterName, StripeMethod};
+    use crate::pipeline::{check_cancel, CancelToken};
     use ndarray::{Array3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -2538,11 +2548,13 @@ mod cuda_impl {
         pad: usize,
         pad_side: usize,
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<f32>> {
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
         let ncand = sweep.len();
         let free = device_free_bytes();
+        check_cancel(cancel)?;
         let (host_gf, angle_chunks) =
             lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
         let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
@@ -2561,6 +2573,7 @@ mod cuda_impl {
         let f_dev = DevBuf::zeroed(ncand * n * n * fsz)?;
 
         for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
+            check_cancel(cancel)?;
             gf_dev.copy_from_host_f32(&host_gf[c])?;
             let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
             // `nproj` global (fixes the π/nproj quadrature scale), `alen` local
@@ -2614,6 +2627,7 @@ mod cuda_impl {
         params: &crate::params::ReconParams,
         centers: &[f32],
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Array3<f32>> {
         use crate::backend::make_fbp_filter;
 
@@ -2701,6 +2715,7 @@ mod cuda_impl {
             pad,
             pad_side,
             sz,
+            cancel,
         )?;
         Array3::from_shape_vec((centers.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
@@ -2713,6 +2728,7 @@ mod cuda_impl {
         params: &crate::params::ReconParams,
         centers: &[f32],
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Array3<f32>> {
         if centers.is_empty() {
             return Err(Error::InvalidParam(
@@ -2762,7 +2778,7 @@ mod cuda_impl {
                 detector: geom.detector,
             };
             let cands: Vec<f32> = idx.iter().map(|&i| centers[i]).collect();
-            let probe = center_probe(sino, &g, params, &cands, sz)?;
+            let probe = center_probe(sino, &g, params, &cands, sz, cancel)?;
             for (j, &i) in idx.iter().enumerate() {
                 out.index_axis_mut(Axis(0), i)
                     .assign(&probe.index_axis(Axis(0), j));
@@ -2778,6 +2794,7 @@ mod cuda_impl {
         params: &crate::params::ReconParams,
         tilts_deg: &[f32],
         sz: i32,
+        cancel: Option<&CancelToken>,
     ) -> Result<Array3<f32>> {
         use crate::backend::make_fbp_filter;
 
@@ -2840,6 +2857,7 @@ mod cuda_impl {
             pad,
             pad_side,
             sz,
+            cancel,
         )?;
         Array3::from_shape_vec((phi.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda tilt-probe shape: {e}")))
@@ -5356,7 +5374,8 @@ mod cuda_impl {
         theta: &[f32],
         p: LamFourierParams,
         norm: Option<&super::LamNorm>,
-    ) -> Result<Vec<f32>> {
+        on_tile: &mut super::LaminoTileFn,
+    ) -> Result<()> {
         let LamFourierParams {
             phi,
             n,
@@ -5773,19 +5792,71 @@ mod cuda_impl {
         }
         drop(p11);
 
-        // --- copyTransposed: p00 [n1, rh, n2] -> vol [rh, n1, n2] (host) ---
-        let mut vol = vec![0.0f32; rh * n1 * n];
-        // vol is rh blocks of n1*n; each tz-plane is disjoint, so transpose planes
-        // across cores (the gather from p00 within a plane stays strided).
-        vol.par_chunks_mut(n1 * n)
-            .enumerate()
-            .for_each(|(tz, plane)| {
-                for ty in 0..n1 {
-                    let src = (ty * rh + tz) * n;
-                    plane[ty * n..ty * n + n].copy_from_slice(&p00[src..src + n]);
+        emit_p00_tiles(&p00, (n1, rh, n), LAM_FOURIER_TILE_BYTES, on_tile)
+    }
+
+    /// Host bytes per Fourierrec output tile: 16 planes at 2048², small beside
+    /// the `p00` the tiles are transposed from.
+    const LAM_FOURIER_TILE_BYTES: usize = 256 << 20;
+
+    /// copyTransposed, a tile at a time: hand `p00` `[n1, rh, n]` to `on_tile`
+    /// as ascending `[tlen, n1, n]` z-tiles of at most `tile_bytes`, each
+    /// transposed as it is emitted, so the `[rh, n1, n]` volume is never held
+    /// beside `p00`.
+    fn emit_p00_tiles(
+        p00: &[f32],
+        (n1, rh, n): (usize, usize, usize),
+        tile_bytes: usize,
+        on_tile: &mut super::LaminoTileFn,
+    ) -> Result<()> {
+        let rows = tile_bytes / (n1 * n * std::mem::size_of::<f32>()).max(1);
+        for (z0, tlen) in chunk_ranges(rh, rows) {
+            let mut tile = vec![0.0f32; tlen * n1 * n];
+            // Planes are disjoint, so they transpose across cores (the gather
+            // from p00 within a plane stays strided).
+            tile.par_chunks_mut(n1 * n)
+                .enumerate()
+                .for_each(|(i, plane)| {
+                    for ty in 0..n1 {
+                        let src = (ty * rh + z0 + i) * n;
+                        plane[ty * n..ty * n + n].copy_from_slice(&p00[src..src + n]);
+                    }
+                });
+            let arr = Array3::from_shape_vec((tlen, n1, n), tile)
+                .map_err(|e| Error::InvalidParam(format!("cuda lamino tile shape: {e}")))?;
+            on_tile(z0, &Volume::new(arr))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod lam_fourier_tile_tests {
+        use super::*;
+
+        // Tiles of 3 planes over rh = 8 (a short last tile) reassemble to the
+        // whole-volume transpose, ascending and each plane once.
+        #[test]
+        fn p00_tiles_reassemble_the_transposed_volume() {
+            let (n1, rh, n) = (5usize, 8usize, 4usize);
+            let p00: Vec<f32> = (0..n1 * rh * n).map(|i| i as f32).collect();
+            let plane = n1 * n * std::mem::size_of::<f32>();
+            let mut tiles = Vec::new();
+            let mut vol = Vec::<f32>::new();
+            emit_p00_tiles(&p00, (n1, rh, n), 3 * plane + 1, &mut |z0, tile| {
+                tiles.push((z0, tile.array.dim()));
+                vol.extend(tile.array.iter());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(tiles, [(0, (3, n1, n)), (3, (3, n1, n)), (6, (2, n1, n))]);
+            for z in 0..rh {
+                for y in 0..n1 {
+                    for x in 0..n {
+                        assert_eq!(vol[(z * n1 + y) * n + x], p00[(y * rh + z) * n + x]);
+                    }
                 }
-            });
-        Ok(vol)
+            }
+        }
     }
 
     /// Parallel `dst.copy_from_slice(src)` for the large contiguous host-spectrum
@@ -6019,7 +6090,7 @@ mod cuda_impl {
     /// stream/double-buffer plumbing.
     ///
     /// `p00` is streamed to the host per stage-3 chunk rather than kept resident:
-    /// the final transpose to `vol` runs on the host anyway, and holding only
+    /// the final transpose to output tiles runs on the host anyway, and holding only
     /// `p22`+`p11` (~24 GB at 1024²) leaves comfortable headroom for large grid
     /// chunks and cuFFT plan scratch, where all-three-resident (~30 GB) would leave
     /// almost none. The dispatcher [`analytic_lamino_fourierrec`] falls back to
@@ -6033,7 +6104,8 @@ mod cuda_impl {
         theta: &[f32],
         p: LamFourierParams,
         norm: Option<&super::LamNorm>,
-    ) -> Result<Vec<f32>> {
+        on_tile: &mut super::LaminoTileFn,
+    ) -> Result<()> {
         let LamFourierParams {
             phi,
             n,
@@ -6492,20 +6564,12 @@ mod cuda_impl {
         drop(p11);
         drop(p22);
 
-        // --- copyTransposed: p00 [n1, rh, n2] -> vol [rh, n1, n2] (host) ---
-        let p00 = pin_p00.as_slice();
-        let mut vol = vec![0.0f32; rh * n1 * n];
-        // vol is rh blocks of n1*n; each tz-plane is disjoint, so transpose planes
-        // across cores (the gather from p00 within a plane stays strided).
-        vol.par_chunks_mut(n1 * n)
-            .enumerate()
-            .for_each(|(tz, plane)| {
-                for ty in 0..n1 {
-                    let src = (ty * rh + tz) * n;
-                    plane[ty * n..ty * n + n].copy_from_slice(&p00[src..src + n]);
-                }
-            });
-        Ok(vol)
+        emit_p00_tiles(
+            pin_p00.as_slice(),
+            (n1, rh, n),
+            LAM_FOURIER_TILE_BYTES,
+            on_tile,
+        )
     }
 
     /// Fourier/USFFT laminography dispatcher: prefers the device-resident path
@@ -6519,12 +6583,17 @@ mod cuda_impl {
     /// Setting `TOMOXIDE_LAM_FOURIERREC_HOST=1` forces the host-resident path
     /// regardless of the fit test — an escape hatch for a shared card where the
     /// device path's ~95 % VRAM peak would collide with another process.
+    ///
+    /// Either path hands the `[rh, n, n]` volume to `on_tile` as ascending
+    /// z-tiles, and only once all three stages are done: no stage is separable
+    /// over the output rows, so the whole output is first held as `p00`.
     fn analytic_lamino_fourierrec(
         proj: &[f32],
         theta: &[f32],
         p: LamFourierParams,
         norm: Option<&super::LamNorm>,
-    ) -> Result<Vec<f32>> {
+        on_tile: &mut super::LaminoTileFn,
+    ) -> Result<()> {
         let n = p.n;
         let csz = 2 * std::mem::size_of::<f32>();
         let nproj = theta.len();
@@ -6543,9 +6612,9 @@ mod cuda_impl {
         let free = device_free_bytes();
         let force_host = std::env::var_os("TOMOXIDE_LAM_FOURIERREC_HOST").is_some_and(|v| v == "1");
         if !force_host && base.saturating_mul(5) <= free.saturating_mul(4) {
-            analytic_lamino_fourierrec_device(proj, theta, p, norm)
+            analytic_lamino_fourierrec_device(proj, theta, p, norm, on_tile)
         } else {
-            analytic_lamino_fourierrec_host(proj, theta, p, norm)
+            analytic_lamino_fourierrec_host(proj, theta, p, norm, on_tile)
         }
     }
 
@@ -6690,6 +6759,10 @@ mod cuda_impl {
     /// Numerically equal to the whole-volume [`CudaBackend::reconstruct`]
     /// laminography path (same filter-to-host + accumulate-per-angle-chunk), which
     /// itself matches the un-streamed single shot to the f32 floor.
+    ///
+    /// Fourierrec is not separable over the output rows: it reconstructs the
+    /// whole volume into host `p00` before the first tile, so its host peak is
+    /// `p00` plus one tile and `on_tile` is first called after all of the work.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn reconstruct_lamino_streaming(
         sino: &Tomo<f32>,
@@ -6726,10 +6799,8 @@ mod cuda_impl {
                 found: theta.len().to_string(),
             });
         }
-        // Fourier/USFFT laminography is whole-volume (not slice/tile separable):
-        // reconstruct the entire volume once, then emit it as a single tile so the
-        // disk-streaming caller still works. (Output-tile streaming for this
-        // algorithm is the same follow-up as its input chunking.)
+        // Fourier/USFFT laminography holds the whole output as `p00` and
+        // emits its tiles from there; host peak is `p00` plus one tile.
         if matches!(algorithm, Algorithm::Fourierrec) {
             let lamino_angle_deg = lamino_tilt_deg(phi);
             let rh = params
@@ -6742,7 +6813,7 @@ mod cuda_impl {
                 .ok_or_else(|| Error::InvalidParam("non-contiguous projection stack".into()))?;
             let devices = selected_devices();
             unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-            let vol = analytic_lamino_fourierrec(
+            analytic_lamino_fourierrec(
                 proj,
                 theta,
                 LamFourierParams {
@@ -6753,10 +6824,8 @@ mod cuda_impl {
                     filter: params.filter_name,
                 },
                 norm,
+                on_tile,
             )?;
-            let arr = Array3::from_shape_vec((rh, n, n), vol)
-                .map_err(|e| Error::InvalidParam(format!("cuda lamino tile shape: {e}")))?;
-            on_tile(0, &Volume::new(arr))?;
             return Ok((rh, n, n));
         }
         if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
@@ -6933,7 +7002,8 @@ mod cuda_impl {
                     unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
                     // In-memory AnalyticReconstruct receives an already-normalized
                     // sinogram, so no fused correction (norm = None).
-                    let vol = analytic_lamino_fourierrec(
+                    let mut vol = Vec::with_capacity(rh * n * n);
+                    analytic_lamino_fourierrec(
                         proj,
                         theta,
                         LamFourierParams {
@@ -6944,6 +7014,10 @@ mod cuda_impl {
                             filter: params.filter_name,
                         },
                         None,
+                        &mut |_, tile| {
+                            vol.extend(tile.array.iter());
+                            Ok(())
+                        },
                     )?;
                     return Ok(Volume::new(
                         Array3::from_shape_vec((rh, n, n), vol)

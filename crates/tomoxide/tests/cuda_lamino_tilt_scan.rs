@@ -11,10 +11,12 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::{Array2, Axis};
-use tomoxide::recon::center::{lamino_tilt_scan, slice_focus, SampleBand, TiltFocus};
+use tomoxide::recon::center::{
+    lamino_tilt_scan, slice_focus, SampleBand, TiltCandidates, TiltFocus,
+};
 use tomoxide::{
-    cuda, sim, Algorithm, Angles, Beam, Center, CudaBackend, Detector, Geometry, ReconParams,
-    Volume,
+    cuda, sim, Algorithm, Angles, Beam, CancelToken, Center, CudaBackend, Detector, Error,
+    Geometry, ReconParams, Volume,
 };
 
 const TRUE_TILT: f32 = 20.0;
@@ -47,17 +49,20 @@ fn slab_volume(n: usize, rh: usize, z_lo: usize, z_hi: usize) -> Volume<f32> {
     Volume::new(stack)
 }
 
+/// The in-focus slice and the xz plane `on_tilt` handed over for one tilt.
+type Views = (Array2<f32>, Array2<f32>);
+
 /// The scan, the phantom, and the tilts the data was actually projected at.
-/// Returns the scores, the in-focus slice `on_tilt` handed over for each, and
-/// the slab bounds.
-fn scan(tilts: &[f32]) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
+/// Returns the scores, the views `on_tilt` handed over for each, and the slab
+/// bounds.
+fn scan(tilts: &[f32]) -> (Vec<TiltFocus>, Vec<Views>, usize, usize) {
     scan_banded(tilts, None)
 }
 
 fn scan_banded(
     tilts: &[f32],
     band: Option<SampleBand>,
-) -> (Vec<TiltFocus>, Vec<Array2<f32>>, usize, usize) {
+) -> (Vec<TiltFocus>, Vec<Views>, usize, usize) {
     let cuda = CudaBackend::new().expect("checked by the caller");
     let (n, nproj, nz) = (64usize, 90usize, 32usize);
     let rh = cuda::lamino_recon_height(nz, TRUE_TILT);
@@ -75,19 +80,27 @@ fn scan_banded(
         &geom_lamino(&angles, n, nz, 0.0), // beam ignored — `tilts` supplies it
         Algorithm::Fourierrec,
         &params,
-        tilts,
-        band,
-        &mut |r, slice| {
+        TiltCandidates {
+            tilts_deg: tilts,
+            band,
+        },
+        None,
+        &mut |r, views| {
             assert_eq!(
-                slice.dim(),
+                views.slice.dim(),
                 (n, n),
                 "the slice handed to on_tilt is not an [n, n] reconstruction plane"
+            );
+            assert_eq!(
+                views.xz.dim(),
+                (r.depth, n),
+                "the xz plane handed to on_tilt is not [depth, n]"
             );
             eprintln!(
                 "  {:5.1}°  focus {:.4e}  z_peak {} of {}",
                 r.tilt_deg, r.focus, r.z_peak, r.depth
             );
-            slices.push(slice.to_owned());
+            slices.push((views.slice.to_owned(), views.xz.to_owned()));
             Ok(())
         },
     )
@@ -198,6 +211,7 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
     // peak, not by round-off.
     let peak = named.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let d = slices[0]
+        .0
         .iter()
         .zip(named.iter())
         .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
@@ -210,6 +224,25 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
         d / peak < 1e-5,
         "the slice on_tilt handed over differs from the z_peak slice it named by \
          {:.2e} of peak",
+        d / peak
+    );
+    // The xz plane is row n/2 of every tile, in z order: a tile offset off by
+    // one would shift the slab's rows, a whole tile's worth of difference.
+    let row = vol.array.index_axis(Axis(1), n / 2);
+    let d = slices[0]
+        .1
+        .iter()
+        .zip(row.iter())
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+    eprintln!(
+        "handed-over xz vs recon row {}: {:.2e} of peak",
+        n / 2,
+        d / peak
+    );
+    assert!(
+        d / peak < 1e-5,
+        "the xz plane on_tilt handed over differs from the volume's row {} by {:.2e} of peak",
+        n / 2,
         d / peak
     );
     // ...and it really is the best one, i.e. the running max kept the right tile.
@@ -284,4 +317,39 @@ fn cuda_lamino_tilt_scan_scores_only_the_sample_band() {
     );
     // The profile is never truncated to the band: the next band is read off it.
     assert_eq!(r.focus_by_z.len(), r.depth);
+}
+
+/// A token fired while a tilt is reported stops the scan before the next one.
+#[test]
+fn cuda_lamino_tilt_scan_stops_at_the_tilt_after_a_cancel() {
+    let Ok(cuda) = CudaBackend::new() else {
+        eprintln!("skipping CUDA test: no CUDA device");
+        return;
+    };
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let rh = cuda::lamino_recon_height(nz, TRUE_TILT);
+    let angles = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI);
+    let geom = geom_lamino(&angles, n, nz, TRUE_TILT);
+    let sino = sim::project(&slab_volume(n, rh, rh / 4, rh / 4 + 4), &geom, &cuda).unwrap();
+
+    let token = CancelToken::new();
+    let mut seen = Vec::new();
+    let r = lamino_tilt_scan(
+        &sino,
+        &geom,
+        Algorithm::Fourierrec,
+        &ReconParams::default(),
+        TiltCandidates {
+            tilts_deg: &[15.0, 20.0, 25.0],
+            band: None,
+        },
+        Some(&token),
+        &mut |f, _| {
+            seen.push(f.tilt_deg);
+            token.cancel();
+            Ok(())
+        },
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert_eq!(seen, [15.0]);
 }

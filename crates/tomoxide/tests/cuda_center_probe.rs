@@ -15,8 +15,8 @@
 
 use ndarray::{Array2, Array3, Axis};
 use tomoxide::{
-    cuda, recon, sim, Algorithm, Angles, Beam, Center, CpuBackend, CudaBackend, Detector, Geometry,
-    ReconParams, Tomo, Volume,
+    cuda, recon, sim, Algorithm, Angles, Beam, CancelToken, Center, CpuBackend, CudaBackend,
+    Detector, Error, Geometry, ReconParams, Tomo, Volume,
 };
 
 const N: usize = 128;
@@ -100,9 +100,15 @@ fn cuda_center_probe_is_exact_on_the_integer_lattice() {
 
     for &nominal in &[64.0f32, 64.25, 63.75, 61.3] {
         let cands: Vec<f32> = (-3..=3).map(|k| nominal - k as f32).collect();
-        let probe =
-            cuda::center_probe(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32)
-                .unwrap();
+        let probe = cuda::center_probe(
+            &sino,
+            &geom_at(&angles, nominal),
+            &params,
+            &cands,
+            Z as i32,
+            None,
+        )
+        .unwrap();
         assert_eq!(probe.dim(), (cands.len(), N, N));
         for (i, &c) in cands.iter().enumerate() {
             let want = recon_slice(&sino, &angles, c, &cuda);
@@ -140,8 +146,15 @@ fn cuda_center_probe_is_smoothed_off_the_lattice() {
 
     let nominal = 64.0f32;
     let cands: Vec<f32> = (-3..=3).map(|k| nominal - k as f32 - 0.5).collect();
-    let probe =
-        cuda::center_probe(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32).unwrap();
+    let probe = cuda::center_probe(
+        &sino,
+        &geom_at(&angles, nominal),
+        &params,
+        &cands,
+        Z as i32,
+        None,
+    )
+    .unwrap();
     let mut worst = 0.0f32;
     for (i, &c) in cands.iter().enumerate() {
         let want = recon_slice(&sino, &angles, c, &cuda);
@@ -180,6 +193,7 @@ fn cuda_center_probe_sweep_is_exact_at_sub_pixel_spacing() {
         &params,
         &cands,
         Z as i32,
+        None,
     )
     .unwrap();
     assert_eq!(got.dim(), (cands.len(), N, N));
@@ -213,13 +227,40 @@ fn cuda_center_probe_sweep_preserves_candidate_order() {
 
     // Interleaved fractions, so grouping must reorder to do its job.
     let cands = [64.0f32, 62.5, 65.0, 63.5, 61.0];
-    let got = cuda::center_probe_sweep(&sino, &geom_at(&angles, 64.0), &params, &cands, Z as i32)
-        .unwrap();
+    let got = cuda::center_probe_sweep(
+        &sino,
+        &geom_at(&angles, 64.0),
+        &params,
+        &cands,
+        Z as i32,
+        None,
+    )
+    .unwrap();
     for (i, &c) in cands.iter().enumerate() {
         let want = recon_slice(&sino, &angles, c, &cuda);
         let rel = interior_rel(&want, &got.index_axis(Axis(0), i).to_owned());
         assert!(rel < 1e-5, "slot {i} should hold centre {c}, rel {rel:e}");
     }
+}
+
+/// A fired token stops the sweep with `Cancelled`; one that never fires leaves
+/// it as it is without one.
+#[test]
+fn cuda_center_probe_sweep_stops_on_a_fired_token() {
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping CUDA test: {e}");
+        return;
+    }
+    let (sino, angles) = setup(&CpuBackend::new());
+    let params = ReconParams::default();
+    let cands = [63.0f32, 63.5, 64.0];
+    let geom = geom_at(&angles, 64.0);
+    let sweep = |cancel| cuda::center_probe_sweep(&sino, &geom, &params, &cands, Z as i32, cancel);
+
+    let token = CancelToken::new();
+    assert_eq!(sweep(Some(&token)).unwrap(), sweep(None).unwrap());
+    token.cancel();
+    assert!(matches!(sweep(Some(&token)), Err(Error::Cancelled)));
 }
 
 /// A sweep the raw probe would mis-rank must now rank correctly: the sharpest
@@ -273,9 +314,15 @@ fn cuda_center_probe_sweep_argmax_matches_full_recons() {
     // Nominals that put the true optimum at a half-integer offset — exactly the
     // case where the raw probe's argmax slides onto the integer lattice.
     for &nominal in &[64.0f32, 61.5, 65.5] {
-        let sweep =
-            cuda::center_probe_sweep(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32)
-                .unwrap();
+        let sweep = cuda::center_probe_sweep(
+            &sino,
+            &geom_at(&angles, nominal),
+            &params,
+            &cands,
+            Z as i32,
+            None,
+        )
+        .unwrap();
         let sf: Vec<f64> = (0..cands.len())
             .map(|i| focus(&sweep.index_axis(Axis(0), i).to_owned()))
             .collect();
@@ -355,7 +402,8 @@ fn cuda_lamino_probe_sz_is_the_reconstruction_z() {
     let cands = [LN as f32 / 2.0];
     let f_probe: Vec<f64> = (0..rh)
         .map(|sz| {
-            let p = cuda::center_probe_sweep(&sino, &geom, &params, &cands, sz as i32).unwrap();
+            let p =
+                cuda::center_probe_sweep(&sino, &geom, &params, &cands, sz as i32, None).unwrap();
             recon::center::slice_focus(&p.index_axis(Axis(0), 0))
         })
         .collect();
@@ -432,12 +480,26 @@ fn cuda_center_probe_is_unchanged_when_the_stack_is_angle_chunked() {
     let params = ReconParams::default();
 
     // Real budget: `lamino_ncproj` returns nproj → a single angle chunk.
-    let single =
-        cuda::center_probe(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32).unwrap();
+    let single = cuda::center_probe(
+        &sino,
+        &geom_at(&angles, nominal),
+        &params,
+        &cands,
+        Z as i32,
+        None,
+    )
+    .unwrap();
 
     // Tiny budget: ncproj < nproj → the accumulate-per-angle-chunk path.
     std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
-    let chunked = cuda::center_probe(&sino, &geom_at(&angles, nominal), &params, &cands, Z as i32);
+    let chunked = cuda::center_probe(
+        &sino,
+        &geom_at(&angles, nominal),
+        &params,
+        &cands,
+        Z as i32,
+        None,
+    );
     std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
     let chunked = chunked.unwrap();
 

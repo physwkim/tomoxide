@@ -37,6 +37,7 @@ use std::sync::mpsc::Sender;
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
 
+use tomoxide::CancelToken;
 use tomoxide::align::grid;
 use tomoxide::recon::center::{SweepVerdict, judge_sweep};
 
@@ -126,6 +127,13 @@ struct Tilt {
     slice: Vec<f32>,
 }
 
+/// A running tilt scan: candidates landed so far, and the token that stops it.
+struct TiltRun {
+    done: usize,
+    total: usize,
+    cancel: CancelToken,
+}
+
 pub struct LaminoView {
     /// Ring-estimate subsampling: average every Nth projection.
     ring_step: usize,
@@ -142,7 +150,8 @@ pub struct LaminoView {
 
     center_half: f32,
     center_step: f32,
-    center_pending: bool,
+    /// `Some` while a sweep runs; firing it stops the sweep.
+    center_run: Option<CancelToken>,
     center_sweep: Option<Sweep>,
     center_slice: usize,
     center_stack: ImageStack,
@@ -155,8 +164,7 @@ pub struct LaminoView {
     /// the working tilt. Off ⇒ the max over the whole volume.
     sample_z: (usize, usize),
     sample_z_on: bool,
-    /// `Some((done, total))` while a scan is running.
-    tilt_progress: Option<(usize, usize)>,
+    tilt_run: Option<TiltRun>,
     tilts: Vec<Tilt>,
     tilt_stack: ImageStack,
     tilt_plot: Plot1D,
@@ -204,7 +212,7 @@ impl LaminoView {
             slice: None,
             center_half: 8.0,
             center_step: 0.25,
-            center_pending: false,
+            center_run: None,
             center_sweep: None,
             center_slice: 0,
             center_stack,
@@ -214,7 +222,7 @@ impl LaminoView {
             tilt_step: 1.0,
             sample_z: (0, 0),
             sample_z_on: false,
-            tilt_progress: None,
+            tilt_run: None,
             tilts: Vec::new(),
             tilt_stack,
             tilt_plot,
@@ -235,10 +243,10 @@ impl LaminoView {
         self.slice = None;
         self.rings = None;
         self.rings_pending = false;
-        self.center_pending = false;
+        self.center_run = None;
         self.center_sweep = None;
         self.center_stack.set_frames(Vec::new());
-        self.tilt_progress = None;
+        self.tilt_run = None;
         self.tilts.clear();
         self.tilt_stack.set_frames(Vec::new());
     }
@@ -282,7 +290,7 @@ impl LaminoView {
         focus: Vec<f64>,
         slice: usize,
     ) {
-        self.center_pending = false;
+        self.center_run = None;
         if centers.is_empty() || ny * nx == 0 {
             return;
         }
@@ -349,7 +357,9 @@ impl LaminoView {
         done: usize,
         total: usize,
     ) {
-        self.tilt_progress = Some((done, total));
+        if let Some(run) = &mut self.tilt_run {
+            (run.done, run.total) = (done, total);
+        }
         self.tilts.push(Tilt {
             tilt_deg,
             focus,
@@ -383,8 +393,12 @@ impl LaminoView {
         self.refresh_tilt_curves();
     }
 
+    pub fn on_center_cancelled(&mut self) {
+        self.center_run = None;
+    }
+
     pub fn on_tilt_done(&mut self, _cancelled: bool) {
-        self.tilt_progress = None;
+        self.tilt_run = None;
         if let Some(value) = self
             .tilt_sweep()
             .and_then(|s| s.judge())
@@ -396,8 +410,8 @@ impl LaminoView {
 
     pub fn on_failed(&mut self) {
         self.rings_pending = false;
-        self.center_pending = false;
-        self.tilt_progress = None;
+        self.center_run = None;
+        self.tilt_run = None;
     }
 
     pub fn take_accepted(&mut self) -> Option<f32> {
@@ -470,7 +484,6 @@ impl LaminoView {
         &mut self,
         ui: &mut egui::Ui,
         jobs: &Sender<Job>,
-        cancel: &std::sync::atomic::AtomicBool,
         meta: Option<&std::sync::Arc<DatasetMeta>>,
     ) {
         let Some(meta) = meta.cloned() else {
@@ -482,7 +495,7 @@ impl LaminoView {
             ui.separator();
             self.step_center(ui, jobs);
             ui.separator();
-            self.step_tilt(ui, jobs, cancel);
+            self.step_tilt(ui, jobs);
         });
     }
 
@@ -606,7 +619,7 @@ impl LaminoView {
             } else {
                 ui.label("auto (middle of the volume)");
             }
-            let idle = !self.center_pending && self.have_prior();
+            let idle = self.center_run.is_none() && self.have_prior();
             if ui
                 .add_enabled(idle, egui::Button::new("Sweep the centre"))
                 .on_hover_text(if idle {
@@ -622,19 +635,24 @@ impl LaminoView {
                 .clicked()
             {
                 let cands = grid(self.center, self.center_half, self.center_step);
+                let cancel = CancelToken::new();
                 if jobs
                     .send(Job::LaminoCenterSweep {
                         tilt_deg: Some(self.tilt),
                         slice: self.slice,
                         centers: cands,
+                        cancel: cancel.clone(),
                     })
                     .is_ok()
                 {
-                    self.center_pending = true;
+                    self.center_run = Some(cancel);
                 }
             }
-            if self.center_pending {
+            if let Some(cancel) = &self.center_run {
                 ui.spinner();
+                if ui.button("Cancel").clicked() {
+                    cancel.cancel();
+                }
             }
         });
 
@@ -666,14 +684,7 @@ impl LaminoView {
         });
     }
 
-    fn step_tilt(
-        &mut self,
-        ui: &mut egui::Ui,
-        jobs: &Sender<Job>,
-        cancel: &std::sync::atomic::AtomicBool,
-    ) {
-        use std::sync::atomic::Ordering;
-
+    fn step_tilt(&mut self, ui: &mut egui::Ui, jobs: &Sender<Job>) {
         ui.heading("3 · Tilt — a full reconstruction per candidate");
         ui.label(
             "The tilt drags the in-focus layer through z (measured: slice 800 → 1120 as the \
@@ -718,7 +729,7 @@ impl LaminoView {
         });
         ui.horizontal(|ui| {
             let band_ok = !self.sample_z_on || self.sample_z.0 <= self.sample_z.1;
-            let idle = self.tilt_progress.is_none() && self.have_prior() && band_ok;
+            let idle = self.tilt_run.is_none() && self.have_prior() && band_ok;
             if ui
                 .add_enabled(idle, egui::Button::new("Scan the tilt"))
                 .on_hover_text(
@@ -729,6 +740,7 @@ impl LaminoView {
             {
                 self.tilts.clear();
                 self.tilt_stack.set_frames(Vec::new());
+                let cancel = CancelToken::new();
                 if jobs
                     .send(Job::LaminoTiltScan {
                         center: self.center,
@@ -739,18 +751,23 @@ impl LaminoView {
                                 z: self.sample_z,
                                 tilt_deg: self.tilt,
                             }),
+                        cancel: cancel.clone(),
                     })
                     .is_ok()
                 {
-                    self.tilt_progress = Some((0, 0));
+                    self.tilt_run = Some(TiltRun {
+                        done: 0,
+                        total: 0,
+                        cancel,
+                    });
                 }
             }
             ui.label(format!("at centre {:.2}", self.center));
-            if let Some((done, total)) = self.tilt_progress {
+            if let Some(run) = &self.tilt_run {
                 ui.spinner();
-                ui.label(format!("{done} of {total}"));
+                ui.label(format!("{} of {}", run.done, run.total));
                 if ui.button("Cancel").clicked() {
-                    cancel.store(true, Ordering::Relaxed);
+                    run.cancel.cancel();
                 }
             }
         });

@@ -8,14 +8,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use rsplot::egui;
 use tomoxide::align::PreppedStack;
 use tomoxide::{
-    Algorithm, Angles, BackendKind, Center, Engine, FilterName, Geometry, PhaseMethod, ReconParams,
-    StripeMethod,
+    Algorithm, Angles, BackendKind, CancelToken, Center, Engine, Geometry, PrepOptions, ReconParams,
 };
 
 /// Metadata of the opened DXchange dataset (read once per open).
@@ -43,16 +41,11 @@ pub struct PreviewSpec {
     pub algorithm: Algorithm,
     /// Rotation-axis column; `None` ⇒ detector midline.
     pub center: Option<f32>,
-    pub filter: FilterName,
-    pub num_iter: usize,
-    pub reg_par: Vec<f32>,
-    /// Truncated-projection support extension (iterative methods; see
-    /// `ReconParams::ext_pad`).
-    pub ext_pad: bool,
-    pub stripe: StripeMethod,
-    /// Phase retrieval. A non-`None` method widens the preview's read around
-    /// the slice (the retrieval couples detector rows) — see [`run_preview`].
-    pub phase: PhaseMethod,
+    /// On the detector-width grid (`num_gridx` unset).
+    pub params: ReconParams,
+    /// A non-`None` phase method widens the preview's read around the slice
+    /// (the retrieval couples detector rows) — see [`run_preview`].
+    pub prep: PrepOptions,
 }
 
 /// Rotation-axis auto-detection method (docs/GUI.md §2 Center).
@@ -124,15 +117,19 @@ pub enum Job {
     /// **refines a prior** — the axis from step 1 — rather than searching for
     /// one. [`tomoxide::recon::center::judge_sweep`] is what enforces that; see
     /// its verdicts before adopting anything from here.
+    ///
+    /// `cancel` stops it at the next probe boundary →
+    /// [`Event::LaminoCenterSweepCancelled`].
     LaminoCenterSweep {
         tilt_deg: Option<f32>,
         slice: Option<usize>,
         centers: Vec<f32>,
+        cancel: CancelToken,
     },
     /// Score each tilt by a FULL reconstruction
     /// (`recon::center::lamino_tilt_scan`) → one [`Event::LaminoTilt`] per
     /// candidate as it lands, then [`Event::LaminoTiltDone`]. Minutes per
-    /// candidate; [`Worker::cancel`] stops it at the next boundary.
+    /// candidate; `cancel` stops it before the next one.
     ///
     /// `band` is the sample's z range, and passing it is what makes the score
     /// mean anything on real data: the focus metric ranks noise planes above the
@@ -143,6 +140,7 @@ pub enum Job {
         center: f32,
         tilts: Vec<f32>,
         band: Option<tomoxide::recon::center::SampleBand>,
+        cancel: CancelToken,
     },
     /// Exit the worker loop.
     Shutdown,
@@ -220,6 +218,8 @@ pub enum Event {
         slice: usize,
         millis: u128,
     },
+    /// The centre sweep stopped on its token.
+    LaminoCenterSweepCancelled { millis: u128 },
     /// One tilt candidate finished: its score, the in-focus slice `[ny, nx]` the
     /// reconstruction peaked on, and the focus of every slice — the profile that
     /// says whether `z_peak` is a hump on the sample or a spike at a z-edge.
@@ -248,10 +248,6 @@ pub enum Event {
 pub struct Worker {
     pub jobs: Sender<Job>,
     pub events: Receiver<Event>,
-    /// Stops the tilt scan at the next candidate boundary. A `Job` cannot do
-    /// this: the scan owns the worker for minutes and the job channel is only
-    /// drained between jobs, so the request has to reach it out of band.
-    pub cancel: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -259,16 +255,13 @@ impl Worker {
     pub fn spawn(ctx: egui::Context) -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("tomoxide-worker".into())
-            .spawn(move || worker_main(job_rx, event_tx, ctx, worker_cancel))
+            .spawn(move || worker_main(job_rx, event_tx, ctx))
             .expect("spawning the worker thread");
         Worker {
             jobs: job_tx,
             events: event_rx,
-            cancel,
             thread: Some(thread),
         }
     }
@@ -283,12 +276,7 @@ impl Drop for Worker {
     }
 }
 
-fn worker_main(
-    jobs: Receiver<Job>,
-    events: Sender<Event>,
-    ctx: egui::Context,
-    cancel: Arc<AtomicBool>,
-) {
+fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
     let send = |event: Event| {
         let _ = events.send(event);
         ctx.request_repaint();
@@ -439,6 +427,7 @@ fn worker_main(
                 tilt_deg,
                 slice,
                 centers,
+                cancel,
             } => {
                 let Some(path) = current.clone() else {
                     continue;
@@ -446,7 +435,7 @@ fn worker_main(
                 let t0 = std::time::Instant::now();
                 match ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
                     let slice = slice.unwrap_or_else(|| st.default_slice(tilt_deg, None));
-                    st.center_sweep(tilt_deg, slice, &centers)
+                    st.center_sweep(tilt_deg, slice, &centers, Some(&cancel))
                 }) {
                     Ok(sweep) => {
                         let (_n, ny, nx) = sweep.frames.dim();
@@ -460,6 +449,9 @@ fn worker_main(
                             millis: t0.elapsed().as_millis(),
                         })
                     }
+                    Err(tomoxide::Error::Cancelled) => send(Event::LaminoCenterSweepCancelled {
+                        millis: t0.elapsed().as_millis(),
+                    }),
                     Err(e) => send(Event::JobFailed {
                         what: "lamino center sweep".into(),
                         error: e.to_string(),
@@ -470,18 +462,18 @@ fn worker_main(
                 center,
                 tilts,
                 band,
+                cancel,
             } => {
                 let Some(path) = current.clone() else {
                     continue;
                 };
-                // A cancel from a previous scan must not kill this one.
-                cancel.store(false, Ordering::Relaxed);
                 let t0 = std::time::Instant::now();
                 let total = tilts.len();
                 let mut done = 0usize;
                 let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
-                    st.tilt_scan(center, &tilts, band, &mut |r, img| {
+                    st.tilt_scan(center, &tilts, band, Some(&cancel), &mut |r, views| {
                         done += 1;
+                        let img = views.slice;
                         let (ny, nx) = img.dim();
                         send(Event::LaminoTilt {
                             tilt_deg: r.tilt_deg,
@@ -496,21 +488,15 @@ fn worker_main(
                             done,
                             total,
                         });
-                        if cancel.load(Ordering::Relaxed) {
-                            return Err(tomoxide::Error::Backend("cancelled".into()));
-                        }
                         Ok(())
                     })
                 });
-                let cancelled = cancel.swap(false, Ordering::Relaxed);
                 match r {
                     Ok(_) => send(Event::LaminoTiltDone {
                         cancelled: false,
                         millis: t0.elapsed().as_millis(),
                     }),
-                    // A cancel unwinds through the callback as an error; that is
-                    // the scan stopping as asked, not a failure to report.
-                    Err(_) if cancelled => send(Event::LaminoTiltDone {
+                    Err(tomoxide::Error::Cancelled) => send(Event::LaminoTiltDone {
                         cancelled: true,
                         millis: t0.elapsed().as_millis(),
                     }),
@@ -555,8 +541,7 @@ fn run_preview(
 ) -> tomoxide::Result<(usize, usize, Vec<f32>)> {
     let backend = engine.backend();
     let (one, geom) = prep_slice(engine, path, spec)?;
-    let params = recon_params(spec, one.array.dim().2, spec.reg_par.clone());
-    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
+    let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &spec.params, backend)?;
     let (_nz1, ny, nxo) = vol.dims();
     Ok((ny, nxo, vol.array.iter().copied().collect()))
 }
@@ -571,30 +556,19 @@ fn prep_slice(
     let mut reader = tomoxide::io::open_dxchange(&path.to_string_lossy())?;
     let (_nproj, nz, nx, _nflat, _ndark) = reader.read_sizes()?;
     let slice = spec.slice.min(nz.saturating_sub(1));
-    let prep = tomoxide::PrepOptions {
-        stripe: spec.stripe,
-        phase: spec.phase,
-    };
-    let one = tomoxide::prep_band(reader.as_mut(), slice, slice + 1, &prep, engine.backend())?;
+    let one = tomoxide::prep_band(
+        reader.as_mut(),
+        slice,
+        slice + 1,
+        &spec.prep,
+        engine.backend(),
+    )?;
 
     let mut geom = Geometry::parallel(Angles(reader.read_theta()?), nx, 1, 1.0);
     if let Some(c) = spec.center {
         geom.center = Center::Scalar(c);
     }
     Ok((one, geom))
-}
-
-/// Reconstruction parameters for a preview, with `reg_par` supplied by the
-/// caller (the λ sweep overrides `reg_par[0]` per frame).
-fn recon_params(spec: &PreviewSpec, nx: usize, reg_par: Vec<f32>) -> ReconParams {
-    ReconParams {
-        num_gridx: Some(nx),
-        filter_name: spec.filter,
-        num_iter: spec.num_iter,
-        reg_par,
-        ext_pad: spec.ext_pad,
-        ..Default::default()
-    }
 }
 
 /// Reconstruct the preview slice once per λ (overriding `reg_par[0]`, keeping
@@ -616,19 +590,17 @@ fn run_lambda_sweep(
 ) -> tomoxide::Result<LambdaSweepOut> {
     let backend = engine.backend();
     let (one, geom) = prep_slice(engine, path, spec)?;
-    let nx = one.array.dim().2;
 
     let mut frames = Vec::new();
     let mut residual = Vec::with_capacity(lambdas.len());
     let mut roughness = Vec::with_capacity(lambdas.len());
     let (mut ny, mut nxo) = (0usize, 0usize);
     for &lam in lambdas {
-        let mut reg_par = spec.reg_par.clone();
-        match reg_par.first_mut() {
+        let mut params = spec.params.clone();
+        match params.reg_par.first_mut() {
             Some(first) => *first = lam,
-            None => reg_par.push(lam),
+            None => params.reg_par.push(lam),
         }
-        let params = recon_params(spec, nx, reg_par);
         let vol = tomoxide::recon::recon(&one, &geom, spec.algorithm, &params, backend)?;
         let (_nz1, y, x) = vol.dims();
         (ny, nxo) = (y, x);
@@ -839,6 +811,7 @@ fn read_sinogram(path: &std::path::Path, row: usize) -> tomoxide::Result<(usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tomoxide::{FilterName, PhaseMethod, StripeMethod};
 
     fn fixture() -> PathBuf {
         PathBuf::from(concat!(
@@ -899,12 +872,11 @@ mod tests {
             slice: 3,
             algorithm: Algorithm::Fbp,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 1,
-            reg_par: Vec::new(),
-            ext_pad: false,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -922,16 +894,18 @@ mod tests {
             slice: 3,
             algorithm: Algorithm::Fbp,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 1,
-            reg_par: Vec::new(),
-            ext_pad: false,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::Paganin {
-                pixel_size: 1e-4,
-                dist: 50.0,
-                energy: 30.0,
-                alpha: 1e-3,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                ..Default::default()
+            },
+            prep: PrepOptions {
+                stripe: StripeMethod::None,
+                phase: PhaseMethod::Paganin {
+                    pixel_size: 1e-4,
+                    dist: 50.0,
+                    energy: 30.0,
+                    alpha: 1e-3,
+                },
             },
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
@@ -960,13 +934,14 @@ mod tests {
             slice: 3,
             algorithm: Algorithm::Sirt,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 10,
-            reg_par: Vec::new(),
-            // The Tune panel default: iterative previews run support-extended.
-            ext_pad: true,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                num_iter: 10,
+                // The Tune panel default: iterative previews run support-extended.
+                ext_pad: true,
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -985,12 +960,14 @@ mod tests {
             slice: usize::MAX,
             algorithm: Algorithm::Fbp,
             center: Some(16.0),
-            filter: FilterName::Shepp,
-            num_iter: 1,
-            reg_par: Vec::new(),
-            ext_pad: false,
-            stripe: StripeMethod::Sf { size: 3 },
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Shepp,
+                ..Default::default()
+            },
+            prep: PrepOptions {
+                stripe: StripeMethod::Sf { size: 3 },
+                phase: PhaseMethod::None,
+            },
         };
         let (ny, nx, data) = run_preview(&engine, &fixture(), &spec).unwrap();
         assert_eq!(data.len(), ny * nx);
@@ -1060,12 +1037,13 @@ mod tests {
             slice: meta.nz / 2,
             algorithm: Algorithm::Tv,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 20,
-            reg_par: vec![0.001],
-            ext_pad: false,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                num_iter: 20,
+                reg_par: vec![0.001],
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let lambdas = [0.001_f32, 0.01, 0.1];
         let (ny, nx, frames, residual, roughness) =
@@ -1109,12 +1087,14 @@ mod tests {
             slice: meta.nz / 2,
             algorithm: Algorithm::Tv,
             center: None,
-            filter: FilterName::Parzen,
-            num_iter: 20,
-            reg_par: vec![0.001],
-            ext_pad: true,
-            stripe: StripeMethod::None,
-            phase: PhaseMethod::None,
+            params: ReconParams {
+                filter_name: FilterName::Parzen,
+                num_iter: 20,
+                reg_par: vec![0.001],
+                ext_pad: true,
+                ..Default::default()
+            },
+            prep: PrepOptions::default(),
         };
         let lambdas = [0.001_f32, 0.01, 0.1];
         let (_ny, _nx, _frames, residual, roughness) =

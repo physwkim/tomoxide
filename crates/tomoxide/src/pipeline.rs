@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::geometry::Geometry;
 use crate::params::{Algorithm, PhaseMethod, ReconParams, StripeMethod};
 use ndarray::Array3;
+use std::borrow::Cow;
 
 use crate::engine::Engine;
 
@@ -140,7 +141,32 @@ pub fn reconstruct_lamino_streaming(
         );
     }
     crate::prep::normalize_dataset(&mut ds, backend)?;
-    crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+    lamino_streaming_normalized(
+        Cow::Owned(ds.data),
+        geom,
+        algorithm,
+        params,
+        prep,
+        backend,
+        on_tile,
+    )
+}
+
+/// The rest of [`reconstruct_lamino_streaming`] on an already normalized
+/// stack: phase, stripe, then the CUDA recon. A borrowed stack is copied only
+/// for phase retrieval, which works in place.
+pub(crate) fn lamino_streaming_normalized(
+    mut data: Cow<'_, Tomo<f32>>,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+    backend: &dyn crate::backend::Backend,
+    on_tile: &mut crate::cuda::LaminoTileFn,
+) -> Result<(usize, usize, usize)> {
+    if prep.phase != PhaseMethod::None {
+        crate::prep::retrieve_phase(data.to_mut(), prep.phase, backend)?;
+    }
     // Stripe removal is the only sinogram-domain prep step here. When it is
     // disabled (`StripeMethod::None`), hand the recon the native projection stack
     // instead of transposing to sinogram order: the CUDA fourierrec laminography
@@ -150,19 +176,19 @@ pub fn reconstruct_lamino_streaming(
     // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
     // nothing. Fbp/Linerec still transpose to sinogram once inside the recon.
     if prep.stripe == StripeMethod::None {
-        crate::cuda::reconstruct_lamino_streaming(&ds.data, geom, algorithm, params, None, on_tile)
+        crate::cuda::reconstruct_lamino_streaming(&data, geom, algorithm, params, None, on_tile)
     } else {
-        let mut sino = ds.data.to_layout(Layout::Sinogram);
+        let mut sino = data.to_layout(Layout::Sinogram);
         crate::prep::remove_stripe(&mut sino, prep.stripe)?;
         crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, None, on_tile)
     }
 }
 
-/// Cooperative cancellation flag for the chunked drivers.
+/// Cooperative cancellation flag for the chunked drivers and the align sweeps.
 ///
-/// Clone the token, hand one clone to [`ReconSteps::with_cancel`], and call
-/// [`cancel`](CancelToken::cancel) from any thread; the driver checks the flag
-/// **between chunks** (never mid-kernel) and returns
+/// Clone the token, hand one clone to [`ReconSteps::with_cancel`] (or to a
+/// sweep's `cancel`), and call [`cancel`](CancelToken::cancel) from any thread;
+/// the driver checks the flag **between chunks** (never mid-kernel) and returns
 /// [`Error::Cancelled`](crate::error::Error::Cancelled). Chunks already handed
 /// to the writer stay written — cancellation truncates the run, it does not
 /// roll it back. A default token never cancels.
@@ -183,6 +209,14 @@ impl CancelToken {
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `Err(Cancelled)` once `cancel`, if given, has fired.
+pub(crate) fn check_cancel(cancel: Option<&CancelToken>) -> Result<()> {
+    match cancel {
+        Some(c) if c.is_cancelled() => Err(crate::error::Error::Cancelled),
+        _ => Ok(()),
     }
 }
 
@@ -228,11 +262,7 @@ impl ReconSteps {
     /// `Err(Cancelled)` once the token has fired — the drivers call this at
     /// every chunk boundary.
     fn check_cancel(&self) -> Result<()> {
-        if self.cancel.is_cancelled() {
-            Err(crate::error::Error::Cancelled)
-        } else {
-            Ok(())
-        }
+        check_cancel(Some(&self.cancel))
     }
 
     /// Run the chunked pipeline: read → normalize → phase → (per z-chunk:

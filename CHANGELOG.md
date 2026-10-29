@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`SampleBand::at`**: the band carried into another tilt's volume through the
+  detector rows, which `lamino_tilt_scan` already did privately. A caller that
+  read the band at one tilt can place it at another without a scan.
+- **`tomoxide --version` names the commit** it was built from
+  (`git describe --always --dirty --abbrev=12`), so a job log identifies the
+  build. A copy built outside tomoxide's own checkout prints the version alone.
+
+### Changed
+
+- **Breaking: `lamino_tilt_scan` and `PreppedStack::tilt_scan` hand `on_tilt` a
+  `TiltViews`** (the `z_peak` slice and the xz plane through `y = ny / 2` over
+  the whole depth) instead of the slice alone. The xz plane is how the layers
+  stack, which the eye compares across tilts and which the streamed volume was
+  dropped before a caller could read.
+- **Breaking: the align sweeps take a `cancel: Option<&CancelToken>`**:
+  `PreppedStack::center_sweep` and `tilt_scan`, `cuda::center_probe`,
+  `center_probe_sweep` and `lamino_tilt_probe` stop with `Error::Cancelled` at
+  the next probe, angle-chunk, tilt or tile boundary. `lamino_tilt_scan` takes
+  its tilts and band as one `TiltCandidates`. The GUI cancels both the centre
+  sweep and the tilt scan with a per-job token.
+- **CUDA Fourierrec laminography streams its output in z-tiles** of ≤256 MiB,
+  each transposed from `p00` as it is emitted, where it built the whole
+  volume beside `p00` and emitted it as one tile. Host peak drops by one
+  volume; tiles still arrive only once the reconstruction is done.
+
 ## [0.8.0] - 2026-10-29
 
 ### Changed

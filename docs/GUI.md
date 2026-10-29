@@ -417,10 +417,13 @@ UI thread (eframe/egui, all rsplot widgets)
   `Event::Preview` with the request's generation; the UI drops a result
   whose generation was superseded while it was in flight.
 - **Cancellation**, two regimes:
-  - *in-process* (preview/sweep/auto-center/live): library `CancelToken`
-    (§6 #1), checked between chunks. Until it lands, previews are short
-    enough that "let it finish, discard by generation counter" is the
-    stopgap.
+  - *in-process*: library `CancelToken` (§6 #1). Each job that can run for
+    minutes is sent with its own token, fired by its Cancel button: the
+    laminography centre sweep and tilt scan (checked at probe, angle-chunk,
+    tilt and tile boundaries) and the XANES fit (between bands). A preview
+    is one slice, so it is let finish and dropped by its generation counter
+    if superseded; the parallel-beam centre and λ sweeps have no cancel and
+    run to the end; Live stops between loops on a command.
   - *subprocess* (all full-volume runs): kill the children — a main reason
     the subprocess model is chosen for full volumes.
 - **Rule**: in-process for everything interactive; subprocess for every
@@ -459,7 +462,7 @@ vice versa.
 
 | # | Priority | Addition | Shape |
 |---|----------|----------|-------|
-| 1 | P0 | **Cancellation** | `CancelToken(Arc<AtomicBool>)` + `Error::Cancelled`; checked between chunks in the `ReconSteps` drivers, propagated to the I/O threads via channel close. Per-iteration checks inside iterative solvers are a follow-up. |
+| 1 | P0 | **Cancellation** — *done*. | `CancelToken(Arc<AtomicBool>)` + `Error::Cancelled`; checked between chunks in the `ReconSteps` drivers, propagated to the I/O threads via channel close, and at the boundaries of the align sweeps and the XANES fit bands. Per-iteration checks inside iterative solvers are a follow-up. |
 | 2 | P0 | **`io::InMemoryWriter`** | Implements `VolumeWriter`: `reserve` sizes a `Vec<f32>` (dims fixed at first chunk), `write_chunk` copies into the global range and invokes an optional `on_chunk: FnMut(usize, usize) + Send` — which is also the in-process progress callback (no new trait). |
 | 3 | P0 | **Config into the library** | `tomoxide-cli/src/config.rs` → `tomoxide::config` behind a `config` feature (optional serde/toml); add `dtype`/`lamino_angle`/output fields; CLI re-exports. |
 | 4 | P0 (CLI) | **`--progress-json`** | One flushed JSON line per completed chunk on stdout (`{"start":s,"end":e,"total":nz,"secs":t}`), implemented as a thin `VolumeWriter` tee in the CLI. The GUI's progress channel for subprocess runs. |

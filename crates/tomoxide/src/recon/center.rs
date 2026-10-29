@@ -558,17 +558,20 @@ pub struct SampleBand {
     pub tilt_deg: f32,
 }
 
-/// Carry `band` into the volume of another tilt: through the detector rows
-/// (`v − nz/2 = cos(tilt)·(z − rh/2)`, the kernel's own axis mapping), clamped to
-/// the target depth. `rh_from` is the depth of the volume the band was read
-/// from, `rh_to` the depth at `tilt_to_deg`.
-fn band_at(band: &SampleBand, rh_from: usize, tilt_to_deg: f32, rh_to: usize) -> (usize, usize) {
-    let map = |z: usize| -> usize {
-        let row = (z as f64 - rh_from as f64 / 2.0) * f64::from(band.tilt_deg).to_radians().cos();
-        let z = row / f64::from(tilt_to_deg).to_radians().cos() + rh_to as f64 / 2.0;
-        z.round().clamp(0.0, rh_to as f64 - 1.0) as usize
-    };
-    (map(band.z.0), map(band.z.1))
+impl SampleBand {
+    /// The band carried into the volume of another tilt: through the detector
+    /// rows (`v − nz/2 = cos(tilt)·(z − rh/2)`, the kernel's own axis mapping),
+    /// clamped to the target depth. `rh_from` is the depth of the volume the
+    /// band was read from, `rh_to` the depth at `tilt_to_deg`.
+    pub fn at(&self, rh_from: usize, tilt_to_deg: f32, rh_to: usize) -> (usize, usize) {
+        let map = |z: usize| -> usize {
+            let row =
+                (z as f64 - rh_from as f64 / 2.0) * f64::from(self.tilt_deg).to_radians().cos();
+            let z = row / f64::from(tilt_to_deg).to_radians().cos() + rh_to as f64 / 2.0;
+            z.round().clamp(0.0, rh_to as f64 - 1.0) as usize
+        };
+        (map(self.z.0), map(self.z.1))
+    }
 }
 
 /// What one laminography tilt candidate scored, from [`lamino_tilt_scan`].
@@ -602,9 +605,29 @@ pub struct TiltFocus {
     pub focus_by_z: Vec<f64>,
 }
 
-/// Score each tilt in `tilts_deg` by fully reconstructing at it and taking the
-/// maximum [`slice_focus`] over the scored z range — every slice when `band` is
-/// `None`, the sample's own slices when a [`SampleBand`] carries a prior.
+/// What [`lamino_tilt_scan`] shows the eye of one tilt's reconstruction.
+pub struct TiltViews<'a> {
+    /// The `z_peak` slice, `[y, x]`: the in-focus layer.
+    pub slice: ArrayView2<'a, f32>,
+    /// The xz plane through the middle row `y = ny / 2`, `[z, x]` over the whole
+    /// depth: how the layers stack, which a wrong tilt doubles or smears.
+    pub xz: ArrayView2<'a, f32>,
+}
+
+/// The candidates [`lamino_tilt_scan`] reconstructs, and where in each volume it
+/// scores them.
+#[derive(Debug, Clone, Copy)]
+pub struct TiltCandidates<'a> {
+    /// The tilts, in degrees, scored in this order.
+    pub tilts_deg: &'a [f32],
+    /// The sample's slices; `None` scores every slice.
+    pub band: Option<SampleBand>,
+}
+
+/// Score each tilt in `cands.tilts_deg` by fully reconstructing at it and taking
+/// the maximum [`slice_focus`] over the scored z range — every slice when
+/// `cands.band` is `None`, the sample's own slices when a [`SampleBand`] carries
+/// a prior.
 ///
 /// Pass the band whenever one can be read. Without it the score is the max over
 /// a volume in which, on real data, mean |∇|² ranks noise planes above the
@@ -627,19 +650,23 @@ pub struct TiltFocus {
 /// answer, so that probe refines a prior rather than finding one. See
 /// [`cuda::center_probe_sweep`](crate::cuda::center_probe_sweep).
 ///
-/// `geom`'s beam is ignored; `tilts_deg` supplies it. `params.lamino_rh` is
+/// `geom`'s beam is ignored; `cands.tilts_deg` supplies it. `params.lamino_rh` is
 /// honoured if set, but leaving it `None` lets each tilt take its own natural
 /// depth, which is what the scan wants. The volume is never assembled: focus is
-/// scored per streamed tile, so the memory cost is one tile regardless of `rh`.
+/// scored per streamed tile, so the memory cost is one tile and one xz plane
+/// regardless of `rh`.
 ///
 /// `sino` must already be prepped (flat/dark, minus-log, stripe removal).
 ///
-/// `on_tilt(result, slice)` is called with each result as it lands — one full
+/// `on_tilt(result, views)` is called with each result as it lands — one full
 /// reconstruction apart, so a caller with a user attached should report it — and
-/// returning `Err` from it aborts the scan. `slice` is the `z_peak` slice, the
-/// in-focus layer itself: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming
-/// the winner by eye part of the method, and this is the one reconstruction that
-/// already found it. Callers that only want the numbers ignore it.
+/// returning `Err` from it aborts the scan. `views` are the [`TiltViews`] of that
+/// reconstruction: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming the
+/// winner by eye part of the method, and this is the one reconstruction that
+/// already found it. Callers that only want the numbers ignore them.
+///
+/// A fired `cancel` stops the scan with [`Error::Cancelled`] before the next
+/// tilt or at the next streamed tile.
 ///
 /// CUDA-only: the streaming laminography reconstruction this rides on exists only
 /// there.
@@ -648,10 +675,11 @@ pub fn lamino_tilt_scan(
     geom: &Geometry,
     algorithm: crate::params::Algorithm,
     params: &crate::params::ReconParams,
-    tilts_deg: &[f32],
-    band: Option<SampleBand>,
-    on_tilt: &mut dyn FnMut(&TiltFocus, ndarray::ArrayView2<f32>) -> Result<()>,
+    cands: TiltCandidates<'_>,
+    cancel: Option<&crate::pipeline::CancelToken>,
+    on_tilt: &mut dyn FnMut(&TiltFocus, TiltViews<'_>) -> Result<()>,
 ) -> Result<Vec<TiltFocus>> {
+    let TiltCandidates { tilts_deg, band } = cands;
     if let Some(b) = &band {
         if b.z.0 > b.z.1 {
             return Err(Error::Backend(format!(
@@ -670,6 +698,7 @@ pub fn lamino_tilt_scan(
     };
     let mut out = Vec::with_capacity(tilts_deg.len());
     for &tilt_deg in tilts_deg {
+        crate::pipeline::check_cancel(cancel)?;
         let geom = Geometry {
             beam: Beam::laminography(tilt_deg),
             ..geom.clone()
@@ -677,7 +706,7 @@ pub fn lamino_tilt_scan(
         let rh = rh_for(tilt_deg);
         let scored = band
             .as_ref()
-            .map(|b| band_at(b, rh_for(b.tilt_deg), tilt_deg, rh));
+            .map(|b| b.at(rh_for(b.tilt_deg), tilt_deg, rh));
         // The volume is streamed and dropped tile by tile, so the winning slice
         // has to be kept as it goes past — it is gone by the time the scan knows
         // it won. Tiles arrive in ascending row order, so the profile is built by
@@ -685,8 +714,12 @@ pub fn lamino_tilt_scan(
         // profile is how the *next* band gets read.
         let mut best: Option<(f64, usize, Array2<f32>)> = None;
         let mut profile: Vec<f64> = Vec::new();
-        let (depth, _, _) = {
+        let mut xz: Vec<f32> = Vec::new();
+        let (depth, _, nx) = {
             let mut on_tile = |z0: usize, tile: &crate::data::Volume<f32>| -> Result<()> {
+                crate::pipeline::check_cancel(cancel)?;
+                let ny = tile.array.dim().1;
+                xz.extend(tile.array.index_axis(Axis(1), ny / 2).iter());
                 for (k, f) in focus_by_z(tile.array.view()).into_iter().enumerate() {
                     let z = z0 + k;
                     profile.push(f);
@@ -724,6 +757,8 @@ pub fn lamino_tilt_scan(
                 profile.len()
             )));
         }
+        let xz = Array2::from_shape_vec((depth, nx), xz)
+            .map_err(|e| Error::Backend(format!("tilt {tilt_deg}°: the xz plane: {e}")))?;
         let r = TiltFocus {
             tilt_deg,
             focus,
@@ -732,7 +767,13 @@ pub fn lamino_tilt_scan(
             depth,
             focus_by_z: profile,
         };
-        on_tilt(&r, img.view())?;
+        on_tilt(
+            &r,
+            TiltViews {
+                slice: img.view(),
+                xz: xz.view(),
+            },
+        )?;
         out.push(r);
     }
     Ok(out)
@@ -2187,7 +2228,7 @@ fn beta3(t: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{band_at, judge_sweep, ndimage_shift_spline3_constant, SampleBand, SweepVerdict};
+    use super::{judge_sweep, ndimage_shift_spline3_constant, SampleBand, SweepVerdict};
     use ndarray::{Array2, Array3};
     use ndarray_npy::read_npy;
 
@@ -2348,16 +2389,16 @@ mod tests {
             z: (890, 890),
             tilt_deg: 44.0,
         };
-        assert_eq!(band_at(&b, 1424, 40.0, 1338), (836, 836));
-        assert_eq!(band_at(&b, 1424, 48.0, 1532), (957, 957));
+        assert_eq!(b.at(1424, 40.0, 1338), (836, 836));
+        assert_eq!(b.at(1424, 48.0, 1532), (957, 957));
         // At its own tilt the band is itself.
-        assert_eq!(band_at(&b, 1424, 44.0, 1424), (890, 890));
+        assert_eq!(b.at(1424, 44.0, 1424), (890, 890));
         // A band touching the volume edges stays inside the target volume.
         let wide = SampleBand {
             z: (0, 1423),
             tilt_deg: 44.0,
         };
-        let (lo, hi) = band_at(&wide, 1424, 40.0, 1338);
+        let (lo, hi) = wide.at(1424, 40.0, 1338);
         assert!(hi < 1338, "hi {hi} escaped the 1338-deep target volume");
         assert_eq!(lo, 0);
     }
