@@ -4,15 +4,18 @@
 //! drive these; judging a sweep ([`judge_sweep`](crate::recon::center::judge_sweep))
 //! and reporting it stay with them.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use ndarray::{Array3, ArrayView2};
+use ndarray::{Array3, ArrayView2, Axis};
 
 use crate::backend::Backend;
+use crate::cuda::LaminoTileFn;
 use crate::data::{Layout, Tomo};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
 use crate::params::{Algorithm, ReconParams};
+use crate::pipeline::PrepOptions;
 use crate::recon::center::{RingCenter, SampleBand, TiltFocus};
 use crate::recon::tilt_flow::TiltFlow;
 
@@ -80,8 +83,53 @@ impl PreppedStack {
         self.data.array.len() * std::mem::size_of::<f32>()
     }
 
+    /// The stack of only the projections at `indices`, in their order: a
+    /// half (even/odd) for a resolution check, or a subset of the turn.
+    pub fn select(&self, indices: &[usize]) -> Result<PreppedStack> {
+        if let Some(&i) = indices.iter().find(|&&i| i >= self.nproj) {
+            return Err(Error::InvalidParam(format!(
+                "projection {i} out of range (nproj {})",
+                self.nproj
+            )));
+        }
+        let proj = self.data.as_layout(Layout::Projection);
+        Ok(PreppedStack {
+            path: self.path.clone(),
+            data: Tomo::new(proj.array.select(Axis(0), indices), Layout::Projection),
+            theta: indices.iter().map(|&i| self.theta[i]).collect(),
+            nproj: indices.len(),
+            nz: self.nz,
+            nx: self.nx,
+        })
+    }
+
+    /// Laminography reconstruction of this stack at `geom` (from
+    /// [`geometry`](Self::geometry)), streaming its rh-tiles to `on_tile` as
+    /// [`reconstruct_lamino_streaming`](crate::reconstruct_lamino_streaming)
+    /// does for a file, with `prep` applied after the normalization this stack
+    /// already holds. Returns `(rh, n, n)`. CUDA-only.
+    pub fn reconstruct(
+        &self,
+        backend: &dyn Backend,
+        geom: &Geometry,
+        algorithm: Algorithm,
+        params: &ReconParams,
+        prep: &PrepOptions,
+        on_tile: &mut LaminoTileFn,
+    ) -> Result<(usize, usize, usize)> {
+        crate::pipeline::lamino_streaming_normalized(
+            Cow::Borrowed(&self.data),
+            geom,
+            algorithm,
+            params,
+            prep,
+            backend,
+            on_tile,
+        )
+    }
+
     /// Geometry at `center`/`tilt_deg`. `tilt_deg = None` is parallel beam.
-    fn geometry(&self, center: f32, tilt_deg: Option<f32>) -> Geometry {
+    pub fn geometry(&self, center: f32, tilt_deg: Option<f32>) -> Geometry {
         Geometry {
             angles: Angles(self.theta.clone()),
             center: Center::Scalar(center),

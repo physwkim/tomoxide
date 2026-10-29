@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::geometry::Geometry;
 use crate::params::{Algorithm, PhaseMethod, ReconParams, StripeMethod};
 use ndarray::Array3;
+use std::borrow::Cow;
 
 use crate::engine::Engine;
 
@@ -140,7 +141,32 @@ pub fn reconstruct_lamino_streaming(
         );
     }
     crate::prep::normalize_dataset(&mut ds, backend)?;
-    crate::prep::retrieve_phase(&mut ds.data, prep.phase, backend)?;
+    lamino_streaming_normalized(
+        Cow::Owned(ds.data),
+        geom,
+        algorithm,
+        params,
+        prep,
+        backend,
+        on_tile,
+    )
+}
+
+/// The rest of [`reconstruct_lamino_streaming`] on an already normalized
+/// stack: phase, stripe, then the CUDA recon. A borrowed stack is copied only
+/// for phase retrieval, which works in place.
+pub(crate) fn lamino_streaming_normalized(
+    mut data: Cow<'_, Tomo<f32>>,
+    geom: &Geometry,
+    algorithm: Algorithm,
+    params: &ReconParams,
+    prep: &PrepOptions,
+    backend: &dyn crate::backend::Backend,
+    on_tile: &mut crate::cuda::LaminoTileFn,
+) -> Result<(usize, usize, usize)> {
+    if prep.phase != PhaseMethod::None {
+        crate::prep::retrieve_phase(data.to_mut(), prep.phase, backend)?;
+    }
     // Stripe removal is the only sinogram-domain prep step here. When it is
     // disabled (`StripeMethod::None`), hand the recon the native projection stack
     // instead of transposing to sinogram order: the CUDA fourierrec laminography
@@ -150,9 +176,9 @@ pub fn reconstruct_lamino_streaming(
     // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
     // nothing. Fbp/Linerec still transpose to sinogram once inside the recon.
     if prep.stripe == StripeMethod::None {
-        crate::cuda::reconstruct_lamino_streaming(&ds.data, geom, algorithm, params, None, on_tile)
+        crate::cuda::reconstruct_lamino_streaming(&data, geom, algorithm, params, None, on_tile)
     } else {
-        let mut sino = ds.data.to_layout(Layout::Sinogram);
+        let mut sino = data.to_layout(Layout::Sinogram);
         crate::prep::remove_stripe(&mut sino, prep.stripe)?;
         crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, None, on_tile)
     }
