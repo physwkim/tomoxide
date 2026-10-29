@@ -12,8 +12,8 @@ use tomoxide::io::DatasetReader;
 use tomoxide::Algorithm;
 use tomoxide::Center;
 use tomoxide::{
-    Angles, BackendKind, Dtype, Engine, FilterName, Geometry, PhaseMethod, PrepOptions,
-    ReconParams, StripeMethod,
+    Angles, BackendKind, Dtype, Engine, Geometry, PhaseMethod, PrepOptions, ReconParams,
+    StripeMethod,
 };
 
 use tomoxide::config::Config;
@@ -353,17 +353,15 @@ struct ReconPlan {
     /// First (and, for a non-chain, only) algorithm — drives path dispatch.
     algo: Algorithm,
     center: Option<f32>,
-    dtype: Dtype,
     /// Output base path override (`--output`/config); `None` ⇒ derive
     /// `<input-without-extension>_rec` from the input file.
     out: Option<String>,
     save_format: tomoxide::io::SaveFormat,
     save_format_str: String,
-    filter: FilterName,
     filter_str: String,
-    num_iter: usize,
-    reg_par: Vec<f32>,
-    ext_pad: bool,
+    /// The config's params with the flags laid over it, `num_iter` the first
+    /// stage's.
+    params: ReconParams,
     prep: PrepOptions,
     stripe_str: String,
     phase_str: String,
@@ -447,12 +445,6 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         .ok_or_else(|| anyhow!("no algorithm given (empty --algorithm)"))?
         .algo;
     let center = c.center.or(cfg.rotation_axis);
-    let dtype: Dtype = c
-        .dtype
-        .clone()
-        .unwrap_or_else(|| cfg.dtype.clone())
-        .parse()
-        .map_err(|e| anyhow!("{e}"))?;
     let out = c
         .output
         .as_ref()
@@ -464,18 +456,16 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
         .unwrap_or_else(|| cfg.save_format.clone());
     let save_format: tomoxide::io::SaveFormat =
         save_format_str.parse().map_err(|e| anyhow!("{e}"))?;
-    let filter_str = c.filter.clone().unwrap_or_else(|| cfg.filter_name.clone());
-    let filter: FilterName = filter_str.parse().map_err(|e| anyhow!("{e}"))?;
-    // The primary stage's resolved iters — used by the single-algorithm paths
-    // (streaming/whole-volume/shard). The chain path reads each stage directly.
-    let num_iter = chain[0].num_iter;
-    let reg_par = match &c.reg_par {
-        Some(s) => parse_f32_list(s)?,
-        None => cfg.reg_par.clone(),
-    };
-    let ext_pad = c.ext_pad.unwrap_or(cfg.ext_pad);
-    // Stripe/phase: each flag overrides its config value, then the config
-    // builds the methods, so the CLI and a recipe file parse one way.
+    // Each flag overrides its config value, then the config builds the
+    // params and the stripe/phase methods, so the CLI and a recipe file
+    // parse one way.
+    set(&mut cfg.dtype, c.dtype.clone());
+    set(&mut cfg.filter_name, c.filter.clone());
+    set(
+        &mut cfg.reg_par,
+        c.reg_par.as_deref().map(parse_f32_list).transpose()?,
+    );
+    set(&mut cfg.ext_pad, c.ext_pad);
     set(&mut cfg.remove_stripe_method, c.remove_stripe.clone());
     set(&mut cfg.retrieve_phase_method, c.retrieve_phase.clone());
     set(&mut cfg.fw_sigma, c.fw_sigma);
@@ -513,25 +503,25 @@ fn resolve(c: &CommonRecon) -> anyhow::Result<(ReconPlan, Config)> {
     set(&mut cfg.w, c.w.map(f64::from));
     let stripe_str = cfg.remove_stripe_method.clone();
     let phase_str = cfg.retrieve_phase_method.clone();
-    let prep = PrepOptions {
-        stripe: cfg.stripe_method()?,
-        phase: cfg.phase_method()?,
+    let filter_str = cfg.filter_name.clone();
+    // The primary stage's iters drive the single-algorithm paths
+    // (streaming/whole-volume/shard); the chain path reads each stage's.
+    let params = ReconParams {
+        num_iter: chain[0].num_iter,
+        ..cfg.recon_params()?
     };
+    let prep = cfg.prep()?;
     Ok((
         ReconPlan {
             algorithm,
             chain,
             algo,
             center,
-            dtype,
             out,
             save_format,
             save_format_str,
-            filter,
             filter_str,
-            num_iter,
-            reg_par,
-            ext_pad,
+            params,
             prep,
             stripe_str,
             phase_str,
@@ -950,7 +940,7 @@ fn main() -> anyhow::Result<()> {
             let engine = Engine::new(resolve_backend(&backend_flag, &cfg)?)?;
             let file = common.file.clone();
             let lamino_angle = lamino_angle.or(cfg.lamino_angle);
-            let dtype = plan.dtype;
+            let dtype = plan.params.dtype;
             let save_format = plan.save_format;
             println!(
                 "recon: file={} algorithm={:?} center={:?} dtype={} filter={} stripe={} phase={} backend={}",
@@ -966,8 +956,8 @@ fn main() -> anyhow::Result<()> {
             log::debug!(
                 "resolved prep={:?} num_iter={} reg_par={:?}",
                 plan.prep,
-                plan.num_iter,
-                plan.reg_par
+                plan.params.num_iter,
+                plan.params.reg_par
             );
             let out = plan.out.clone().unwrap_or_else(|| recon_out_path(&file));
             // Algorithm chaining (`--algorithm a,b`) warm-starts each stage from the
@@ -1060,15 +1050,11 @@ fn main() -> anyhow::Result<()> {
                         &out,
                         plan.algo,
                         plan.center,
-                        dtype,
+                        plan.params.clone(),
                         save_format,
                         chunk,
                         start_row,
                         end_row,
-                        plan.filter,
-                        plan.num_iter,
-                        plan.reg_par.clone(),
-                        plan.ext_pad,
                         plan.prep,
                         common.progress_json,
                         &engine,
@@ -1081,14 +1067,7 @@ fn main() -> anyhow::Result<()> {
                 let mut geom = geometry_from_reader(reader.as_mut(), plan.center)?;
                 let (z0, z1, banded) =
                     row_band(start_row, end_row, geom.detector.height, lamino_angle)?;
-                let mut params = recon_params(
-                    &geom,
-                    dtype,
-                    plan.filter,
-                    plan.num_iter,
-                    plan.reg_par.clone(),
-                    plan.ext_pad,
-                );
+                let mut params = plan.params.clone();
                 if let Some(deg) = lamino_angle {
                     geom.beam = tomoxide::Beam::laminography(deg);
                     params.lamino_rh = lamino_rh;
@@ -1175,7 +1154,7 @@ fn main() -> anyhow::Result<()> {
                 file.display(),
                 plan.algo,
                 plan.center,
-                plan.dtype.as_str(),
+                plan.params.dtype.as_str(),
                 plan.filter_str,
                 plan.stripe_str,
                 plan.phase_str,
@@ -1185,8 +1164,8 @@ fn main() -> anyhow::Result<()> {
             log::debug!(
                 "resolved prep={:?} num_iter={} reg_par={:?}",
                 plan.prep,
-                plan.num_iter,
-                plan.reg_par
+                plan.params.num_iter,
+                plan.params.reg_par
             );
             let out = plan.out.clone().unwrap_or_else(|| recon_out_path(&file));
             run_pipelined(
@@ -1194,15 +1173,11 @@ fn main() -> anyhow::Result<()> {
                 &out,
                 plan.algo,
                 plan.center,
-                plan.dtype,
+                plan.params,
                 plan.save_format,
                 chunk,
                 None,
                 None,
-                plan.filter,
-                plan.num_iter,
-                plan.reg_par,
-                plan.ext_pad,
                 plan.prep,
                 common.progress_json,
                 &engine,
@@ -1307,15 +1282,11 @@ fn run_pipelined(
     out: &str,
     algo: Algorithm,
     center: Option<f32>,
-    dtype: Dtype,
+    params: ReconParams,
     save_format: tomoxide::io::SaveFormat,
     chunk: usize,
     start_row: Option<usize>,
     end_row: Option<usize>,
-    filter: FilterName,
-    num_iter: usize,
-    reg_par: Vec<f32>,
-    ext_pad: bool,
     prep: PrepOptions,
     progress_json: bool,
     engine: &Engine,
@@ -1326,7 +1297,6 @@ fn run_pipelined(
     let mut probe = tomoxide::io::open_dxchange(&path)?;
     let geom = geometry_from_reader(probe.as_mut(), center)?;
     drop(probe);
-    let params = recon_params(&geom, dtype, filter, num_iter, reg_par, ext_pad);
     let read_path = path;
     let write_path = out.to_string();
     // Reconstruct only `[start_row, end_row)` (a z-shard); both omitted ⇒ the
@@ -1397,7 +1367,7 @@ fn run_sharded_subprocesses(
             .arg("--algorithm")
             .arg(&plan.algorithm)
             .arg("--dtype")
-            .arg(plan.dtype.as_str())
+            .arg(plan.params.dtype.as_str())
             .arg("--save_format")
             .arg(&plan.save_format_str)
             .arg("--filter")
@@ -1407,7 +1377,7 @@ fn run_sharded_subprocesses(
             .arg("--retrieve_phase")
             .arg(&plan.phase_str)
             .arg("--num_iter")
-            .arg(plan.num_iter.to_string())
+            .arg(plan.params.num_iter.to_string())
             .arg("--chunk")
             .arg(chunk.to_string())
             .arg("--start_row")
@@ -1418,11 +1388,12 @@ fn run_sharded_subprocesses(
             // reaches every shard (children never see the parent's `--config`).
             .arg("--output")
             .arg(out);
-        if plan.ext_pad {
+        if plan.params.ext_pad {
             cmd.arg("--ext_pad").arg("true");
         }
-        if !plan.reg_par.is_empty() {
+        if !plan.params.reg_par.is_empty() {
             let csv = plan
+                .params
                 .reg_par
                 .iter()
                 .map(|v| v.to_string())
@@ -1872,28 +1843,6 @@ fn geometry_from_reader(
     Ok(geom)
 }
 
-/// Reconstruction params with the grid sized to the detector width, plus the
-/// filter (analytic methods) and iteration count / regularization (iterative
-/// methods). Fields not relevant to the chosen algorithm are ignored downstream.
-fn recon_params(
-    geom: &Geometry,
-    dtype: Dtype,
-    filter_name: FilterName,
-    num_iter: usize,
-    reg_par: Vec<f32>,
-    ext_pad: bool,
-) -> ReconParams {
-    ReconParams {
-        num_gridx: Some(geom.detector.width),
-        dtype,
-        filter_name,
-        num_iter,
-        reg_par,
-        ext_pad,
-        ..Default::default()
-    }
-}
-
 /// Reconstruct through an algorithm chain (`--algorithm a,b,c`), warm-starting each
 /// stage from the previous stage's volume via [`ReconParams::init`].
 ///
@@ -1917,14 +1866,10 @@ fn reconstruct_chain(
     let n = plan.chain.len();
     let mut init: Option<tomoxide::Volume<f32>> = None;
     for (i, stage) in plan.chain.iter().enumerate() {
-        let mut params = recon_params(
-            geom,
-            plan.dtype,
-            plan.filter,
-            stage.num_iter,
-            plan.reg_par.clone(),
-            plan.ext_pad,
-        );
+        let mut params = ReconParams {
+            num_iter: stage.num_iter,
+            ..plan.params.clone()
+        };
         params.lamino_rh = lamino_rh;
         params.init = init.take();
         let warm = params.init.is_some();

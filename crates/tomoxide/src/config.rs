@@ -16,7 +16,8 @@
 //! CLI.
 
 use crate::error::{Error, Result};
-use crate::params::{PhaseMethod, StripeMethod};
+use crate::params::{Algorithm, PhaseMethod, ReconParams, StripeMethod};
+use crate::pipeline::PrepOptions;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -302,6 +303,38 @@ impl Config {
             },
         )
     }
+
+    /// The one [`Algorithm`] named by `algorithm`. A warm-start chain
+    /// (`fbp,sirt`) is the CLI's to run and is refused here.
+    pub fn algorithm(&self) -> Result<Algorithm> {
+        if self.algorithm.contains(',') {
+            return Err(Error::InvalidParam(format!(
+                "algorithm '{}' is a chain; name one algorithm",
+                self.algorithm
+            )));
+        }
+        self.algorithm.trim().parse()
+    }
+
+    /// The [`ReconParams`] this config names, on the detector-width grid.
+    pub fn recon_params(&self) -> Result<ReconParams> {
+        Ok(ReconParams {
+            dtype: self.dtype.parse().map_err(Error::InvalidParam)?,
+            filter_name: self.filter_name.parse()?,
+            num_iter: self.num_iter,
+            reg_par: self.reg_par.clone(),
+            ext_pad: self.ext_pad,
+            ..Default::default()
+        })
+    }
+
+    /// The stripe and phase prep this config names.
+    pub fn prep(&self) -> Result<PrepOptions> {
+        Ok(PrepOptions {
+            stripe: self.stripe_method()?,
+            phase: self.phase_method()?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -405,5 +438,48 @@ mod tests {
             ..Config::default()
         };
         assert!(c.phase_method().unwrap_err().to_string().contains("farago"));
+    }
+
+    /// A recipe's algorithm, params and prep come from its own fields; a
+    /// chain or an unknown dtype is refused rather than read as a default.
+    #[test]
+    fn recipe_reads_algorithm_params_and_prep() {
+        let c: Config = toml::from_str(
+            r#"
+            algorithm = "fourierrec"
+            filter_name = "shepp"
+            dtype = "float16"
+            num_iter = 7
+            reg_par = [0.5, 2.0]
+            ext_pad = true
+            remove_stripe_method = "fw"
+            retrieve_phase_method = "paganin"
+            alpha = 0.001
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.algorithm().unwrap(), Algorithm::Fourierrec);
+        let p = c.recon_params().unwrap();
+        assert_eq!(p.filter_name, crate::params::FilterName::Shepp);
+        assert_eq!(p.dtype, crate::dtype::Dtype::F16);
+        assert_eq!(
+            (p.num_iter, p.reg_par, p.ext_pad),
+            (7, vec![0.5, 2.0], true)
+        );
+        assert_eq!(p.num_gridx, None);
+        let prep = c.prep().unwrap();
+        assert!(matches!(prep.stripe, StripeMethod::Fw { .. }));
+        assert!(matches!(prep.phase, PhaseMethod::Paganin { alpha, .. } if alpha == 0.001));
+
+        let chain = Config {
+            algorithm: "fbp,sirt".into(),
+            ..Config::default()
+        };
+        assert!(chain.algorithm().unwrap_err().to_string().contains("chain"));
+        let bad = Config {
+            dtype: "int8".into(),
+            ..Config::default()
+        };
+        assert!(bad.recon_params().unwrap_err().to_string().contains("int8"));
     }
 }
