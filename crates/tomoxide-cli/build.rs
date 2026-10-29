@@ -21,9 +21,10 @@ fn main() {
     // Only tomoxide's own checkout: an unpacked or vendored copy can sit inside
     // some other repository, whose commit this is not.
     let rev = match git(&dir, &["rev-parse", "--show-prefix"]) {
-        Some(prefix) if prefix == "crates/tomoxide-cli/" => {
-            git(&dir, &["describe", "--always", "--dirty", "--abbrev=12"])
-        }
+        Some(prefix) if prefix == "crates/tomoxide-cli/" => git(
+            &dir,
+            &["describe", "--tags", "--always", "--dirty", "--abbrev=12"],
+        ),
         _ => None,
     };
     let Some(rev) = rev else {
