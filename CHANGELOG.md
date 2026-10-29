@@ -31,6 +31,13 @@ All notable changes to this project are documented here. The format is based on
   linerec; tomoxide's linerec is not flipped. The row is now `ty`, so
   `lamino_project` at zero tilt equals the parallel projection and Fourierrec
   volumes are the y-flip of earlier ones and of tomocupy's.
+- **Fourier laminography filtered its projections with its own ramp**, a plain
+  linear `|f|` on a `2·detw` edge pad, while tomocupy's `LamFourierRec` uses its
+  FBP filter: the `_wint` quadrature ramp on `4·detw`. Every backend now builds
+  the lamino filter from `make_fbp_filter` (`RampShape::Wint`), and Pearson
+  against tomocupy on the 261003 scan (parzen) rose from 0.9975 to 0.99996
+  8×-binned and from 0.99933 to 0.999998 2×-binned. `--filter none` is now no filter, as for every other method, rather
+  than the bare ramp.
 
 ## [0.7.0] - 2026-07-18
 

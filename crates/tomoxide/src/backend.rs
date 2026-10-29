@@ -387,7 +387,8 @@ pub enum RampShape {
     /// backends port tomopy, so they build this shape.
     Linear,
     /// tomocupy's degree-12 `_wint` quadrature ramp (`wint_ramp`). The CUDA
-    /// backend ports tomocupy, so it builds this shape; combined with the
+    /// backend ports tomocupy, so it builds this shape, as does `recon::lamino`
+    /// on every backend (tomocupy is its only reference); combined with the
     /// `0.5/pad` gain in `build_filter_w` it reproduces tomocupy's net FBP
     /// filter bit-for-bit.
     Wint,
@@ -426,7 +427,7 @@ pub enum RampShape {
 /// (their ramp peaks at `1` at Nyquist), which puts every analytic
 /// reconstruction at `2×` the physical attenuation μ; tomoxide drops it so the
 /// analytic output is μ per pixel-unit — the same scale the iterative solvers
-/// and `recon::lamino`'s own `|f|/ne` ramp converge to. Either way tomocupy's
+/// converge to. Either way tomocupy's
 /// post-processing is mirrored: the windowed ramp is clamped to `≥0` and the DC
 /// bin is doubled (a no-op here since the ramp is `0` at DC). A grid too short
 /// for the order-12 rule falls back to the linear ramp even when `Wint` is
@@ -489,10 +490,8 @@ pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<V
 /// Apply the `name` apodisation window to a base ramp value at normalised
 /// frequency `r ∈ [0, 1]` (`1` = Nyquist), clamped to ≥ 0. This is the window
 /// *shape* only — the caller supplies the base `ramp` and handles the DC bin and
-/// the `None` = identity case. Shared by [`make_fbp_filter`] and the
-/// laminography ramp filter ([`lam_ramp_weights`]) so the window definitions
-/// have a single source of truth.
-pub(crate) fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
+/// the `None` = identity case.
+fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
     let pi = std::f32::consts::PI;
     let v = match name {
         // No window: plain ramp. (`make_fbp_filter` treats `None` as full
@@ -520,25 +519,6 @@ pub(crate) fn apodize(name: FilterName, ramp: f32, r: f32) -> f32 {
     } else {
         v
     }
-}
-
-/// Per-frequency real multiplier for the laminography projection ramp filter,
-/// length `ne` (the edge-padded FFT length `2·detw`). Bin `k` maps to the
-/// centred frequency `f = min(k, ne−k)`; the base is the plain linear ramp
-/// `f/ne` (tomoxide's lamino ramp convention — no wint quadrature), apodised by
-/// `name`. `Ramp`/`None` leave the plain ramp unchanged (the prior behaviour);
-/// `Parzen` (the default) and the others match tomocupy's `LamFourierRec`, which
-/// filters projections with the selected FBP filter. Applied on the FFT'd,
-/// edge-padded projection lines in place of the old hard-coded `|f|/ne` ramp.
-pub(crate) fn lam_ramp_weights(ne: usize, name: FilterName) -> Vec<f32> {
-    (0..ne)
-        .map(|k| {
-            let fk = if k <= ne / 2 { k } else { ne - k };
-            let ramp = fk as f32 / ne as f32;
-            let r = 2.0 * fk as f32 / ne as f32;
-            apodize(name, ramp, r)
-        })
-        .collect()
 }
 
 /// Fused, device-resident analytic reconstruction (raw sinogram → volume):

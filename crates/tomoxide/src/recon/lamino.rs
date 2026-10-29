@@ -51,7 +51,7 @@
 //! differs from tomocupy's raw fourierrec by a global sign only. The self-consistent
 //! fwd/adj pair and the `fft2d_inv(fft2d_fwd) == id` round-trip are unaffected.
 
-use crate::backend::Fft;
+use crate::backend::{make_fbp_filter, Fft, RampShape};
 use crate::dtype::Complex32;
 use crate::error::Result;
 use crate::geometry::lamino_phi;
@@ -682,12 +682,20 @@ fn wrap2d(fdee: &mut [Complex32], n0: usize, n1: usize, m0: usize, m1: usize, ad
 // Ramp filtering + 3-D entry points.
 // ===========================================================================
 
-/// Ramp-filter each projection along the detector-width (`detw`) axis, with
-/// `ne = 2·detw` edge-padding (tomocupy filters projections, not sinograms;
-/// `center = detw/2`, no sub-pixel shift). `filter` selects the apodisation
-/// window folded into the ramp ([`crate::backend::lam_ramp_weights`]);
-/// `FilterName::Ramp` is the plain `|f|` ramp, `Parzen` (the tomocupy default)
-/// and the others match tomocupy's `LamFourierRec` FBP-filtered projections.
+/// The projection filter every lamino backend applies, and the left edge pad
+/// that centres a `detw` line in it. tomocupy filters lamino projections with
+/// its FBP filter (`FBPFilter(4·detw)`: `_wint` ramp, `ne//2 − detw//2` edge
+/// pad), so this is [`make_fbp_filter`] with [`RampShape::Wint`] on every
+/// backend, not only CUDA.
+pub(crate) fn projection_filter(filter: FilterName, detw: usize) -> Result<(Vec<f32>, usize)> {
+    let w = make_fbp_filter(filter, detw, RampShape::Wint)?;
+    let pad = w.len() / 2 - detw / 2;
+    Ok((w, pad))
+}
+
+/// Filter each projection along the detector-width (`detw`) axis with
+/// [`projection_filter`] (tomocupy filters projections, not sinograms;
+/// `center = detw/2`, no sub-pixel shift).
 fn ramp_filter_detw(
     proj: &mut [f32],
     ntheta: usize,
@@ -696,8 +704,8 @@ fn ramp_filter_detw(
     filter: FilterName,
     fft: &dyn Fft,
 ) -> Result<()> {
-    let ne = 2 * detw;
-    let pad = (ne - detw) / 2;
+    let (ramp, pad) = projection_filter(filter, detw)?;
+    let ne = ramp.len();
     let nlines = ntheta * deth;
     // Edge-padded complex lines [nlines, ne].
     let mut buf = vec![Complex32::new(0.0, 0.0); nlines * ne];
@@ -715,9 +723,6 @@ fn ramp_filter_detw(
         }
     }
     fft.fft_1d(&mut buf, ne, nlines, false)?;
-    // Ramp × apodisation window on centered frequencies (DC..Nyquist..−1),
-    // magnitude in cycles. `Ramp` reduces to the plain `|f|/ne`.
-    let ramp: Vec<f32> = crate::backend::lam_ramp_weights(ne, filter);
     for l in 0..nlines {
         for k in 0..ne {
             buf[l * ne + k] *= ramp[k];

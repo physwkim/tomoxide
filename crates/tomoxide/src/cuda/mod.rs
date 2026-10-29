@@ -438,9 +438,9 @@ impl Backend for CudaBackend {
 mod cuda_impl {
     use super::{ffi, CudaBackend};
     use crate::backend::{
-        lam_ramp_weights, make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter,
-        FilteredBackproject, ForwardProject, FourierReconstruct, IterativeReconstruct,
-        LpRecReconstruct, RampShape, RayProject, RayRow, StreamingAnalytic,
+        make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter, FilteredBackproject,
+        ForwardProject, FourierReconstruct, IterativeReconstruct, LpRecReconstruct, RampShape,
+        RayProject, RayRow, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -5384,14 +5384,14 @@ mod cuda_impl {
         let gx = 2 * n0 + 2 * m0;
         let gy = 2 * n1 + 2 * m1;
         let ng = 2 * rh + 2 * m2;
-        let ne = 2 * detw;
-        let pad = (ne - detw) / 2;
+        let (filt, pad) = crate::recon::lamino::projection_filter(filter, detw)?;
+        let ne = filt.len();
         let shift = detw as f32 / 2.0 - center; // rotation-center linear phase
 
         let theta_dev = DevBuf::from_host_f32(theta)?;
         // FBP filter weights (ramp × apodisation window), uploaded once and
         // reused across every theta-chunk's stage-1 ramp multiply.
-        let filt_dev = DevBuf::from_host_f32(&lam_ramp_weights(ne, filter))?;
+        let filt_dev = DevBuf::from_host_f32(&filt)?;
 
         // Per-chunk device footprint bounds the chunk count to ≤30% of free VRAM.
         // The conveyor double-buffers each stage's streamed input and output slab
@@ -6060,14 +6060,14 @@ mod cuda_impl {
         let gx = 2 * n0 + 2 * m0;
         let gy = 2 * n1 + 2 * m1;
         let ng = 2 * rh + 2 * m2;
-        let ne = 2 * detw;
-        let pad = (ne - detw) / 2;
+        let (filt, pad) = crate::recon::lamino::projection_filter(filter, detw)?;
+        let ne = filt.len();
         let shift = detw as f32 / 2.0 - center; // rotation-center linear phase
 
         let theta_dev = DevBuf::from_host_f32(theta)?;
         // FBP filter weights (ramp × apodisation window), uploaded once and
         // reused across every theta-chunk's stage-1 ramp multiply.
-        let filt_dev = DevBuf::from_host_f32(&lam_ramp_weights(ne, filter))?;
+        let filt_dev = DevBuf::from_host_f32(&filt)?;
 
         // Resident spectra (complex, interleaved f32 pairs). p00 is streamed to a
         // pinned host buffer in stage 3. No memset: stage 1 fully overwrites p22 and

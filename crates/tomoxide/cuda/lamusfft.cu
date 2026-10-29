@@ -45,8 +45,9 @@ static inline unsigned int lam_grid(long long total, int block) {
 extern "C" {
 
 // ===========================================================================
-// ramp_filter_detw  (lamino.rs:668) — plain |f| ramp on detector-width lines.
-//   proj [ntheta, deth, detw] real, ne = 2*detw, pad = (ne-detw)/2, nlines = ntheta*deth.
+// ramp_filter_detw (lamino.rs) — FBP filter on detector-width lines.
+//   proj [ntheta, deth, detw] real, nlines = ntheta*deth; ne and pad come from
+//   recon::lamino::projection_filter.
 // ===========================================================================
 
 // Edge-replicate real proj into complex padded lines [nlines, ne].
@@ -65,7 +66,7 @@ __global__ void lam_ramp_pad_ker(const float* proj, float2* buf, long long nline
 }
 
 // Multiply each frequency by the per-bin filter weight filt[k] (the ramp folded
-// with the chosen FBP apodisation window; see backend::lam_ramp_weights), then
+// with the chosen FBP apodisation window; see recon::lamino::projection_filter), then
 // by the rotation-center linear phase exp(-2*pi*i * t * shift) with
 // t = fftfreq(ne) and shift = detw/2 - center (tomocupy `fbp_filter_center`).
 // shift == 0 (center == detw/2) leaves the filter unchanged. filt has length ne.

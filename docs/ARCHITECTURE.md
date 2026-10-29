@@ -267,9 +267,8 @@ is anchored to an absolute scale: the `make_fbp_filter` base ramp is the physica
 `|ω|` inversion filter (peak `0.5` at Nyquist), not tomopy/tomocupy's doubled
 ramp (peak `1`), and `recon::gridrec`'s `ramp_scale` is `π/nang` with no matching
 empirical `×2`. So every analytic method reconstructs the attenuation μ per
-pixel-unit rather than `2×μ` — the same scale the iterative solvers and
-`recon::lamino`'s own `|f|/ne` ramp converge to, which makes fbp→iterative
-warm-starts scale-consistent. Pinned by `tests/analytic_amplitude.rs` (a unit
+pixel-unit rather than `2×μ` — the same scale the iterative solvers converge
+to, which makes fbp→iterative warm-starts scale-consistent. Pinned by `tests/analytic_amplitude.rs` (a unit
 disk reconstructs to core mean ≈ 1.0). This is a deliberate departure from both
 upstreams, whose absolute analytic amplitude is itself convention-dependent
 (tomopy gridrec ≈ 1.16×μ via an empirical `winv` fudge; tomocupy ≈ 4/π×μ).
@@ -277,8 +276,8 @@ upstreams, whose absolute analytic amplitude is itself convention-dependent
 **Ramp shape (the remaining cuda/cpu residual).** The base ramp still differs per
 backend: CPU/wgpu build tomopy's plain linear ramp (`k/pad`), CUDA builds
 tomocupy's degree-12 `_wint` quadrature ramp (`pad·wint(t)`), selected via
-`backend::RampShape` (`Linear` for CPU/wgpu, `Wint` for CUDA) in the single
-shared `make_fbp_filter`. This leaves
+`backend::RampShape` (`Linear` for CPU/wgpu, `Wint` for CUDA and for
+`recon::lamino` on every backend) in the single shared `make_fbp_filter`. This leaves
 a deterministic **~1.6%** amplitude residual on the unified paths (the measured
 `cuda/cpu` scale is ≈1.016, not exactly 1); Pearson stays ≈1.0 because the shape
 difference is small and smooth. This is a shape convention, not a numerical error.
@@ -286,9 +285,8 @@ difference is small and smooth. This is a shape convention, not a numerical erro
 **Laminography is excluded from the *scale* unification** — but not from the
 orientation one. The CUDA lamino path (`cfunc_linerec` tilted back-projector) and
 the CPU lamino path (`recon::lamino`, a USFFT algorithm) are *different
-reconstruction algorithms* with different filter frameworks (CUDA:
-`make_fbp_filter(Wint)`; CPU: a bare `|f|/ne` ramp), so their **amplitudes** are
-not comparable and are **not** unified.
+reconstruction algorithms*, so their **amplitudes** are not comparable and are
+**not** unified.
 
 Their handedness and sign, however, are shared with everything else:
 

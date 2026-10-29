@@ -968,7 +968,7 @@ unsafe extern "C" {
     // `recon/lamino.rs`; the Rust orchestrator drives `tomoxide_fft_1d/2d`
     // between these stages. All complex buffers are interleaved float2.
     /// ramp_filter_detw: edge-replicate real `proj [nlines, detw]` into complex
-    /// lines `[nlines, ne]` (`ne = 2*detw`, `pad = (ne-detw)/2`).
+    /// lines `[nlines, ne]` (`ne`, `pad` from `recon::lamino::projection_filter`).
     pub fn tomoxide_lam_ramp_pad(
         proj: *const c_void,
         buf: *mut c_void,
