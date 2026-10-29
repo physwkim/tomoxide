@@ -38,6 +38,18 @@ fn main() {
         println!("cargo:rerun-if-changed={git_dir}/logs/HEAD");
         println!("cargo:rerun-if-changed={git_dir}/index");
     }
+    // A new tag renames the commit; cargo reruns on every build for a path
+    // that does not exist.
+    for refs in ["refs/tags", "packed-refs"] {
+        if let Some(path) = git(
+            &dir,
+            &["rev-parse", "--path-format=absolute", "--git-path", refs],
+        )
+        .filter(|path| Path::new(path).exists())
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
     let root = dir.join("../..");
     for path in [
         "crates/tomoxide",
