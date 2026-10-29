@@ -25,6 +25,10 @@ All notable changes to this project are documented here. The format is based on
   the next probe, angle-chunk, tilt or tile boundary. `lamino_tilt_scan` takes
   its tilts and band as one `TiltCandidates`. The GUI cancels both the centre
   sweep and the tilt scan with a per-job token.
+- **CUDA Fourierrec laminography streams its output in z-tiles** of ≤256 MiB,
+  each transposed from `p00` as it is emitted, where it built the whole
+  volume beside `p00` and emitted it as one tile. Host peak drops by one
+  volume; tiles still arrive only once the reconstruction is done.
 
 ## [0.8.0] - 2026-10-29
 
