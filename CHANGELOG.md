@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **`PreppedStack::reconstruct` and `select`.** `reconstruct` runs the phase,
+  stripe and CUDA laminography tail of `reconstruct_lamino_streaming` on the
+  normalized stack the driver already holds, so a preview does not reload the
+  file; `select` keeps a subset of the projections (an even/odd half).
+- **`Config::algorithm`, `recon_params` and `prep`** — the one reading of a
+  recipe's algorithm, reconstruction parameters and stripe/phase prep.
+  `tomoxide recon` lays its flags over the config and calls them, and the GUI
+  builds its preview from them, so a preview runs what the saved recipe would.
 - **`SampleBand::at`**: the band carried into another tilt's volume through the
   detector rows, which `lamino_tilt_scan` already did privately. A caller that
   read the band at one tilt can place it at another without a scan.
