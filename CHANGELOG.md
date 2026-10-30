@@ -14,6 +14,12 @@ All notable changes to this project are documented here. The format is based on
   18–24° on one scan), so the montage compared different planes; the band
   middle is one layer at every tilt. `PreppedStack::default_slice` reads the
   same rule, and the GUI tilt montage shows that layer.
+- **Breaking: `cuda::reconstruct_lamino_streaming` takes a
+  `cancel: Option<&CancelToken>`** before `on_tile`, checked between the
+  chunks of every stage and every Fbp/Linerec round; the device path drains
+  its in-flight work before it returns `Error::Cancelled`. `lamino_tilt_scan`
+  hands its token through, so a cancelled Fourierrec tilt stops before its
+  first tile where it ran on for the whole volume.
 
 ### Fixed
 
@@ -21,6 +27,11 @@ All notable changes to this project are documented here. The format is based on
   from v0.7.0 on are lightweight, which `git describe` skips without
   `--tags`, so a v0.9.0 build read `v0.6.0-126-gf7ba8ec7fcb1`. Tagging the
   built commit now reruns the build script, which kept the old name.
+- **`cuda::center_probe` and `lamino_tilt_probe` stop at the next tile.** They
+  transposed the stack to sinogram order before their first cancel check, and
+  `lamino_filter_to_host` then filtered every tile unchecked, so a step1000
+  bin-2 sweep could not stop for up to 8 s. Each tile now reads its rows in
+  place and checks the token.
 
 ## [0.9.0] - 2026-10-29
 
