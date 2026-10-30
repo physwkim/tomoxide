@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
+use ndarray::Array2;
 use rsplot::egui;
 use tomoxide::align::PreppedStack;
+use tomoxide::recon::center::{RingCenter, TiltFocus};
 use tomoxide::{
     Algorithm, Angles, BackendKind, CancelToken, Center, Engine, Geometry, PrepOptions, ReconParams,
 };
@@ -198,9 +200,7 @@ pub enum Event {
     /// The ring estimate and the mean projection `[ny, nx]` it came from.
     /// `bytes` is what the cached prepped stack now costs in host RAM.
     LaminoRings {
-        center: f32,
-        prominence: f32,
-        trustworthy: bool,
+        ring: RingCenter,
         ny: usize,
         nx: usize,
         mean: Vec<f32>,
@@ -220,23 +220,13 @@ pub enum Event {
     },
     /// The centre sweep stopped on its token.
     LaminoCenterSweepCancelled { millis: u128 },
-    /// One tilt candidate finished: its score, slice `layer_z` `[ny, nx]` (the
-    /// band middle, the same layer at every tilt), and the focus of every slice
-    /// — the profile that says whether `z_peak` is a hump on the sample or a
-    /// spike at a z-edge.
+    /// One tilt candidate finished: its score, whose `focus_by_z` says whether
+    /// `z_peak` is a hump on the sample or a spike at a z-edge, and slice
+    /// `layer_z` (the band middle, the same layer at every tilt).
     LaminoTilt {
-        tilt_deg: f32,
-        focus: f64,
-        z_peak: usize,
-        /// The inclusive z range that was scored at this tilt — the sample band
-        /// carried into this tilt's own volume — or `None` for every slice.
-        band: Option<(usize, usize)>,
-        depth: usize,
-        focus_by_z: Vec<f64>,
-        ny: usize,
-        nx: usize,
+        score: TiltFocus,
         layer_z: usize,
-        layer: Vec<f32>,
+        layer: Array2<f32>,
         done: usize,
         total: usize,
     },
@@ -409,9 +399,7 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                     Ok((ring, mean)) => {
                         let (ny, nx) = mean.dim();
                         send(Event::LaminoRings {
-                            center: ring.center,
-                            prominence: ring.prominence,
-                            trustworthy: ring.trustworthy,
+                            ring,
                             ny,
                             nx,
                             mean: mean.iter().copied().collect(),
@@ -475,19 +463,10 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                 let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
                     st.tilt_scan(center, &tilts, band, Some(&cancel), &mut |r, views| {
                         done += 1;
-                        let img = views.layer;
-                        let (ny, nx) = img.dim();
                         send(Event::LaminoTilt {
-                            tilt_deg: r.tilt_deg,
-                            focus: r.focus,
-                            z_peak: r.z_peak,
-                            band: r.band,
-                            depth: r.depth,
-                            focus_by_z: r.focus_by_z.clone(),
-                            ny,
-                            nx,
+                            score: r.clone(),
                             layer_z: views.layer_z,
-                            layer: img.iter().copied().collect(),
+                            layer: views.layer.to_owned(),
                             done,
                             total,
                         });
@@ -658,7 +637,7 @@ fn lamino_rings(
     st: &PreppedStack,
     backend: &dyn tomoxide::Backend,
     step: usize,
-) -> tomoxide::Result<(tomoxide::recon::center::RingCenter, ndarray::Array2<f32>)> {
+) -> tomoxide::Result<(RingCenter, Array2<f32>)> {
     let ring = st.rings(backend, step)?;
     let mean = tomoxide::recon::center::mean_projection(st.data(), step)?;
     Ok((ring, mean))

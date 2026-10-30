@@ -34,12 +34,13 @@
 
 use std::sync::mpsc::Sender;
 
+use ndarray::Array2;
 use rsplot::egui_wgpu::RenderState;
 use rsplot::{CurveData, Frame, ImageStack, ImageView, ItemHandle, Plot1D, egui};
 
 use tomoxide::CancelToken;
 use tomoxide::align::grid;
-use tomoxide::recon::center::{SweepVerdict, judge_sweep};
+use tomoxide::recon::center::{RingCenter, SweepVerdict, TiltFocus, judge_sweep};
 
 use crate::worker::{DatasetMeta, Job};
 
@@ -104,9 +105,7 @@ fn verdict_line(
 
 /// What the ring step found, plus the image it found it in.
 struct Rings {
-    center: f32,
-    prominence: f32,
-    trustworthy: bool,
+    ring: RingCenter,
     bytes: usize,
 }
 
@@ -114,18 +113,8 @@ struct Rings {
 /// because the montage is rebuilt as candidates land and `ImageStack` does not
 /// hand its frames back.
 struct Tilt {
-    tilt_deg: f32,
-    focus: f64,
-    z_peak: usize,
-    /// The inclusive z range the scan scored at this tilt (the sample band
-    /// carried into this tilt's own volume), `None` = every slice.
-    band: Option<(usize, usize)>,
-    depth: usize,
-    focus_by_z: Vec<f64>,
-    ny: usize,
-    nx: usize,
-    layer_z: usize,
-    layer: Vec<f32>,
+    score: TiltFocus,
+    layer: Frame,
 }
 
 /// A running tilt scan: candidates landed so far, and the token that stops it.
@@ -252,17 +241,7 @@ impl LaminoView {
         self.tilt_stack.set_frames(Vec::new());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn on_rings(
-        &mut self,
-        center: f32,
-        prominence: f32,
-        trustworthy: bool,
-        ny: usize,
-        nx: usize,
-        mean: &[f32],
-        bytes: usize,
-    ) {
+    pub fn on_rings(&mut self, ring: RingCenter, ny: usize, nx: usize, mean: &[f32], bytes: usize) {
         self.rings_pending = false;
         let _ =
             self.mean_view
@@ -271,15 +250,10 @@ impl LaminoView {
         // mis-aligned scan the lopsided arcs drag the correlation peak (280.6
         // against a known 138), so adopting it silently would hand step 2 a
         // starting guess that is 143 px out.
-        if trustworthy {
-            self.center = center;
+        if ring.trustworthy {
+            self.center = ring.center;
         }
-        self.rings = Some(Rings {
-            center,
-            prominence,
-            trustworthy,
-            bytes,
-        });
+        self.rings = Some(Rings { ring, bytes });
     }
 
     pub fn on_center_sweep(
@@ -343,55 +317,33 @@ impl LaminoView {
 
     /// One tilt candidate landed. Results arrive one full reconstruction apart,
     /// so the screen grows as they come rather than waiting for the set.
-    #[allow(clippy::too_many_arguments)]
     pub fn on_tilt(
         &mut self,
-        tilt_deg: f32,
-        focus: f64,
-        z_peak: usize,
-        band: Option<(usize, usize)>,
-        depth: usize,
-        focus_by_z: Vec<f64>,
-        ny: usize,
-        nx: usize,
+        score: TiltFocus,
         layer_z: usize,
-        layer: &[f32],
+        layer: Array2<f32>,
         done: usize,
         total: usize,
     ) {
         if let Some(run) = &mut self.tilt_run {
             (run.done, run.total) = (done, total);
         }
-        self.tilts.push(Tilt {
-            tilt_deg,
-            focus,
-            z_peak,
-            band,
-            depth,
-            focus_by_z,
-            ny,
-            nx,
-            layer_z,
-            layer: layer.to_vec(),
-        });
-        let frames: Vec<Option<Frame>> = self
-            .tilts
-            .iter()
-            .map(|t| {
-                Some(Frame::new(
-                    t.nx as u32,
-                    t.ny as u32,
-                    t.layer.clone(),
-                    Some(format!(
-                        "{:.2}° — slice {} of {}",
-                        t.tilt_deg, t.layer_z, t.depth
-                    )),
-                ))
-            })
-            .collect();
+        let (ny, nx) = layer.dim();
+        let label = format!(
+            "{:.2}° — slice {layer_z} of {}",
+            score.tilt_deg, score.depth
+        );
+        let layer = Frame::new(
+            nx as u32,
+            ny as u32,
+            layer.iter().copied().collect(),
+            Some(label),
+        );
+        let cmap = super::autoscale_viridis(&layer.data);
+        self.tilts.push(Tilt { score, layer });
+        let frames: Vec<Option<Frame>> = self.tilts.iter().map(|t| Some(t.layer.clone())).collect();
         self.tilt_stack.set_frames(frames);
-        self.tilt_stack
-            .set_colormap(super::autoscale_viridis(layer));
+        self.tilt_stack.set_colormap(cmap);
         self.tilt_stack.set_current(self.tilts.len() - 1);
         self.refresh_tilt_curves();
     }
@@ -426,8 +378,8 @@ impl LaminoView {
             return None;
         }
         Some(Sweep {
-            cands: self.tilts.iter().map(|t| t.tilt_deg).collect(),
-            focus: self.tilts.iter().map(|t| t.focus).collect(),
+            cands: self.tilts.iter().map(|t| t.score.tilt_deg).collect(),
+            focus: self.tilts.iter().map(|t| t.score.focus).collect(),
         })
     }
 
@@ -457,7 +409,7 @@ impl LaminoView {
     /// projections contribute and the streaks are the gradient.
     fn refresh_z_curve(&mut self) {
         let i = self.tilt_stack.current();
-        let Some(t) = self.tilts.get(i) else {
+        let Some(Tilt { score: t, .. }) = self.tilts.get(i) else {
             return;
         };
         let x: Vec<f64> = (0..t.focus_by_z.len()).map(|z| z as f64).collect();
@@ -547,12 +499,12 @@ impl LaminoView {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "centre {:.2}   prominence {:.2} (trustworthy ≥ 8.0)   stack {:.1} GB",
-                    r.center,
-                    r.prominence,
+                    r.ring.center,
+                    r.ring.prominence,
                     r.bytes as f64 / 1e9
                 ));
             });
-            if r.trustworthy {
+            if r.ring.trustworthy {
                 ui.colored_label(
                     egui::Color32::LIGHT_GREEN,
                     "Closed concentric rings — the estimate is worth refining.",
@@ -779,7 +731,7 @@ impl LaminoView {
             return;
         }
         if let Some(v) = self.tilt_sweep().and_then(|s| s.judge()) {
-            let cands: Vec<f32> = self.tilts.iter().map(|t| t.tilt_deg).collect();
+            let cands: Vec<f32> = self.tilts.iter().map(|t| t.score.tilt_deg).collect();
             let (colour, text) = verdict_line(&v, "tilt", "°", &cands, "");
             ui.horizontal(|ui| {
                 ui.colored_label(colour, text);
@@ -814,7 +766,7 @@ impl LaminoView {
                         && let Some(pos) = resp.response.interact_pointer_pos()
                     {
                         let (x, _y) = resp.transform.pixel_to_data(pos);
-                        let cands: Vec<f32> = self.tilts.iter().map(|t| t.tilt_deg).collect();
+                        let cands: Vec<f32> = self.tilts.iter().map(|t| t.score.tilt_deg).collect();
                         if let Some(i) = nearest_index(&cands, x as f32) {
                             self.tilt_stack.set_current(i);
                             self.refresh_z_curve();
@@ -841,7 +793,7 @@ impl LaminoView {
 /// they closed, or the user says so having looked — §1 makes the eye the
 /// authority and the number the hint, so the number may not lock the user out.
 fn have_prior(rings: Option<&Rings>, closed_by_eye: bool) -> bool {
-    rings.is_some_and(|r| r.trustworthy || closed_by_eye)
+    rings.is_some_and(|r| r.ring.trustworthy || closed_by_eye)
 }
 
 /// Index of the candidate closest to `x` (`None` on an empty list).
@@ -867,9 +819,11 @@ mod tests {
 
     fn rings(trustworthy: bool) -> Rings {
         Rings {
-            center: 396.0,
-            prominence: if trustworthy { 12.0 } else { 2.0 },
-            trustworthy,
+            ring: RingCenter {
+                center: 396.0,
+                prominence: if trustworthy { 12.0 } else { 2.0 },
+                trustworthy,
+            },
             bytes: 0,
         }
     }
