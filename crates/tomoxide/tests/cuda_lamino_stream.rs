@@ -10,7 +10,7 @@
 use ndarray::{Array2, Axis};
 use tomoxide::{
     recon, sim, Algorithm, Angles, Beam, Center, CpuBackend, CudaBackend, Detector, Geometry,
-    ReconParams, Volume,
+    Layout, ReconParams, Tomo, Volume,
 };
 
 fn pearson(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
@@ -302,4 +302,62 @@ fn cuda_lamino_streaming_tiles_match_whole_volume() {
     let err = nrmse(&streamed, whole.array.as_slice().unwrap());
     eprintln!("streamed-tiles vs whole-volume lamino: global NRMSE = {err:.3e}");
     assert!(err < 1e-3, "streamed lamino NRMSE too large: {err:.3e}");
+}
+
+/// The streaming Linerec path reads a projection-order stack in place, a tile
+/// at a time; with the stack split over z and angle tiles every tile must
+/// gather the same rows the sinogram-order stack gives it.
+#[test]
+fn cuda_lamino_streaming_reads_a_projection_stack_alike() {
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping CUDA test: {e}");
+        return;
+    }
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let angles = Angles::uniform(nproj, 0.0, std::f32::consts::PI);
+    let geom_p = Geometry::parallel(angles.clone(), n, nz, 1.0);
+    let sino = sim::project(&Volume::new(stack), &geom_p, &cpu).unwrap();
+    let proj = sino.to_layout(Layout::Projection);
+    let geom = Geometry {
+        angles,
+        center: Center::Scalar(n as f32 / 2.0),
+        beam: Beam::Laminography {
+            phi: std::f32::consts::FRAC_PI_2 + 20.0f32.to_radians(),
+        },
+        detector: Detector {
+            width: n,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    let params = ReconParams {
+        lamino_rh: Some(48),
+        ..Default::default()
+    };
+    let stream = |s: &Tomo<f32>| {
+        let mut vol = Vec::<f32>::new();
+        tomoxide::cuda::reconstruct_lamino_streaming(
+            s,
+            &geom,
+            Algorithm::Linerec,
+            &params,
+            None,
+            &mut |_, tile| {
+                vol.extend(tile.array.iter());
+                Ok(())
+            },
+        )
+        .map(|_| vol)
+    };
+
+    std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
+    let (a, b) = (stream(&proj), stream(&sino));
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    assert_eq!(a.unwrap(), b.unwrap());
 }

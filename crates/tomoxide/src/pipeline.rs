@@ -174,7 +174,7 @@ pub(crate) fn lamino_streaming_normalized(
     // `to_layout(Sinogram)` was a wasted round-trip — transpose the whole stack to
     // sinogram order, then transpose it straight back to projection order inside
     // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
-    // nothing. Fbp/Linerec still transpose to sinogram once inside the recon.
+    // nothing. Fbp/Linerec read the projection stack in place, a tile at a time.
     if prep.stripe == StripeMethod::None {
         crate::cuda::reconstruct_lamino_streaming(&data, geom, algorithm, params, None, on_tile)
     } else {

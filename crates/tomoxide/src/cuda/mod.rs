@@ -456,7 +456,7 @@ mod cuda_impl {
     use crate::geometry::{lamino_phi, lamino_tilt_deg, Beam, Center, Geometry};
     use crate::params::{FilterName, StripeMethod};
     use crate::pipeline::{check_cancel, CancelToken};
-    use ndarray::{Array3, ArrayViewMut2, Axis};
+    use ndarray::{s, Array3, ArrayView3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
     use std::cell::RefCell;
@@ -2537,13 +2537,10 @@ mod cuda_impl {
     /// each chunk contributes its own angles at the global `dθ` weight.
     #[allow(clippy::too_many_arguments)]
     fn try_probe_chunk(
-        raw: &[f32],
+        raw: ArrayView3<'_, f32>,
         w: &[f32],
         theta: &[f32],
         sweep: TrySweep<'_>,
-        nz: usize,
-        nproj: usize,
-        ncols: usize,
         n: usize,
         pad: usize,
         pad_side: usize,
@@ -2553,10 +2550,9 @@ mod cuda_impl {
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
         let ncand = sweep.len();
+        let (nz, nproj, ncols) = raw.dim();
         let free = device_free_bytes();
-        check_cancel(cancel)?;
-        let (host_gf, angle_chunks) =
-            lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
+        let (host_gf, angle_chunks) = lamino_filter_to_host(raw, w, pad, pad_side, free, cancel)?;
         let ncproj_max = angle_chunks.iter().map(|&(_, l)| l).max().unwrap_or(0);
 
         let theta_dev = DevBuf::from_host_f32(theta)?;
@@ -2634,8 +2630,8 @@ mod cuda_impl {
         if centers.is_empty() {
             return Err(Error::InvalidParam("center_probe needs ≥1 centre".into()));
         }
-        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
-        let (nz, nproj, ncols) = s.array.dim();
+        let raw = sinogram_view(sino);
+        let (nz, nproj, ncols) = raw.dim();
         let n = params.num_gridx.unwrap_or(ncols);
         if n != ncols {
             return Err(Error::InvalidParam(format!(
@@ -2669,10 +2665,6 @@ mod cuda_impl {
                 first
             }
         };
-        let raw = s
-            .array
-            .as_slice()
-            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
         let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
         let pad = filter.len();
@@ -2708,9 +2700,6 @@ mod cuda_impl {
             &w,
             theta,
             TrySweep::Center { sh: &sh, phi, rh },
-            nz,
-            nproj,
-            ncols,
             n,
             pad,
             pad_side,
@@ -2762,10 +2751,7 @@ mod cuda_impl {
             }
         }
 
-        let n_out = {
-            let s = sino.as_layout(Layout::Sinogram);
-            params.num_gridx.unwrap_or(s.array.dim().2)
-        };
+        let n_out = params.num_gridx.unwrap_or(sino.n_cols());
         let mut out = Array3::<f32>::zeros((centers.len(), n_out, n_out));
         for (_, idx) in &groups {
             // Anchor on a member of the group: every other member is then an
@@ -2803,8 +2789,8 @@ mod cuda_impl {
                 "lamino_tilt_probe needs ≥1 tilt".into(),
             ));
         }
-        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
-        let (nz, nproj, ncols) = s.array.dim();
+        let raw = sinogram_view(sino);
+        let (nz, nproj, ncols) = raw.dim();
         let n = params.num_gridx.unwrap_or(ncols);
         if n != ncols {
             return Err(Error::InvalidParam(format!(
@@ -2818,10 +2804,6 @@ mod cuda_impl {
                 found: theta.len().to_string(),
             });
         }
-        let raw = s
-            .array
-            .as_slice()
-            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
         // The rotation center rides in the filter (as every analytic CUDA path
         // does), so it comes from `geom`; only the tilt is swept here, and
@@ -2850,9 +2832,6 @@ mod cuda_impl {
             &w,
             theta,
             TrySweep::Tilt { phi: &phi, rh: &rh },
-            nz,
-            nproj,
-            ncols,
             n,
             pad,
             pad_side,
@@ -2962,8 +2941,9 @@ mod cuda_impl {
         }
 
         // ---- Out-of-core path: filter once to host, back-project the full rh ----
-        let (host_gf, angle_chunks) =
-            lamino_filter_to_host(raw, w, nz, nproj, ncols, pad, pad_side, free)?;
+        let view = ArrayView3::from_shape((nz, nproj, ncols), raw)
+            .map_err(|e| Error::InvalidParam(format!("cuda lamino sinogram shape: {e}")))?;
+        let (host_gf, angle_chunks) = lamino_filter_to_host(view, w, pad, pad_side, free, None)?;
         lamino_backproject_shard(
             &host_gf,
             &angle_chunks,
@@ -2986,28 +2966,37 @@ mod cuda_impl {
     /// consumed read-only by [`lamino_backproject_shard`] (shared across GPUs).
     type LaminoHostStack = (Vec<Vec<f32>>, Vec<(usize, usize)>);
 
+    /// `sino` as `[nz, nproj, ncols]` whichever layout it is stored in, without
+    /// copying: a whole-stack transpose here is seconds of work no token can stop.
+    fn sinogram_view(sino: &Tomo<f32>) -> ArrayView3<'_, f32> {
+        match sino.layout {
+            Layout::Sinogram => sino.array.view(),
+            Layout::Projection => sino.array.view().permuted_axes([1, 0, 2]),
+        }
+    }
+
     /// Filter the whole projection stack into host memory, angle-major, for
     /// streamed laminography. Returns `(host_gf, angle_chunks)` where
     /// `host_gf[c]` is the filtered projections of angle chunk `c` as
     /// `[nz, alen, ncols]` contiguous (the exact layout `backprojection_ker`
     /// reads) and `angle_chunks[c] = (a0, alen)`. Filtering is nz-sub-chunked so
     /// the padded scratch stays within VRAM and under the 32-bit index ceiling.
+    /// `raw` is `[nz, nproj, ncols]` in any strides; each tile gathers its own
+    /// rows, so `cancel` is honoured per tile, not after the whole stack.
     /// Runs on the **current** device; the host result is device-independent, so
     /// a multi-GPU driver filters once here and shares it read-only across the
     /// per-device back-projection shards.
-    #[allow(clippy::too_many_arguments)]
     fn lamino_filter_to_host(
-        raw: &[f32],
+        raw: ArrayView3<'_, f32>,
         w: &[f32],
-        nz: usize,
-        nproj: usize,
-        ncols: usize,
         pad: usize,
         pad_side: usize,
         free: usize,
+        cancel: Option<&CancelToken>,
     ) -> Result<LaminoHostStack> {
         let fsz = std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
+        let (nz, nproj, ncols) = raw.dim();
         let nfreq2 = (pad / 2 + 1) * 2; // floats per z row of `w`
                                         // Angle chunks: fixed count, even split ≤ ncproj so each stays under the
                                         // index/memory bound.
@@ -3021,12 +3010,14 @@ mod cuda_impl {
             let ztile = filter_tile_z(alen, pad, free).min(nz.max(1));
             let zk = nz.div_ceil(ztile.max(1));
             for &(z0, zlen) in &even_z_chunks(nz, zk.max(1)) {
+                check_cancel(cancel)?;
                 // Gather raw[z0:z0+zlen, a0:a0+alen, :] into a contiguous stage.
-                let mut stage = vec![0.0f32; zlen * alen * ncols];
-                for z in 0..zlen {
-                    let src = ((z0 + z) * nproj + a0) * ncols;
-                    let dst = z * alen * ncols;
-                    stage[dst..dst + alen * ncols].copy_from_slice(&raw[src..src + alen * ncols]);
+                let mut stage = Vec::with_capacity(zlen * alen * ncols);
+                for row in raw.slice(s![z0..z0 + zlen, a0..a0 + alen, ..]).rows() {
+                    match row.as_slice() {
+                        Some(r) => stage.extend_from_slice(r),
+                        None => stage.extend(row.iter().copied()),
+                    }
                 }
                 let sino_dev = DevBuf::from_host_f32(&stage)?;
                 let gpad = DevBuf::zeroed(zlen * alen * pad * fsz)?;
@@ -3069,6 +3060,24 @@ mod cuda_impl {
             host_gf.push(gf_host);
         }
         Ok((host_gf, angle_chunks))
+    }
+
+    #[cfg(test)]
+    mod lam_filter_cancel_tests {
+        use super::*;
+
+        // The token is read before the first tile's gather and upload, so a
+        // fired one returns without touching the device.
+        #[test]
+        fn a_fired_token_stops_the_filter_before_its_first_tile() {
+            let (nz, nproj, ncols, pad) = (4usize, 6usize, 8usize, 32usize);
+            let raw = Array3::<f32>::zeros((nz, nproj, ncols));
+            let w = vec![0.0f32; nz * (pad / 2 + 1) * 2];
+            let token = CancelToken::new();
+            token.cancel();
+            let r = lamino_filter_to_host(raw.view(), &w, pad, 12, 1 << 30, Some(&token));
+            assert!(matches!(r, Err(Error::Cancelled)));
+        }
     }
 
     /// Back-project the global output rows `[rh0, rh0+rh_len)` from an
@@ -6784,8 +6793,8 @@ mod cuda_impl {
                 "cuda laminography f16 path is not implemented; use the default f32 dtype".into(),
             ));
         }
-        let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols]
-        let (nz, nproj, ncols) = s.array.dim();
+        let raw = sinogram_view(sino);
+        let (nz, nproj, ncols) = raw.dim();
         let n = params.num_gridx.unwrap_or(ncols);
         if n != ncols {
             return Err(Error::InvalidParam(format!(
@@ -6840,10 +6849,6 @@ mod cuda_impl {
                 "cuda laminography fused normalization (LamNorm) is Fourierrec-only".into(),
             ));
         }
-        let raw = s
-            .array
-            .as_slice()
-            .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
         let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
         let pad = filter.len();
         let pad_side = pad / 2 - ncols / 2;
@@ -6855,16 +6860,8 @@ mod cuda_impl {
 
         let devices = selected_devices();
         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-        let (host_gf, angle_chunks) = lamino_filter_to_host(
-            raw,
-            &w,
-            nz,
-            nproj,
-            ncols,
-            pad,
-            pad_side,
-            device_free_bytes(),
-        )?;
+        let (host_gf, angle_chunks) =
+            lamino_filter_to_host(raw, &w, pad, pad_side, device_free_bytes(), None)?;
         let host_gf: &[Vec<f32>] = &host_gf;
         let angle_chunks: &[(usize, usize)] = &angle_chunks;
 
@@ -7056,14 +7053,12 @@ mod cuda_impl {
                 }
                 unsafe { ffi::tomoxide_cuda_set_device(devices[0]) };
                 let (host_gf, angle_chunks) = lamino_filter_to_host(
-                    raw,
+                    s.array.view(),
                     &w,
-                    nz,
-                    nproj,
-                    ncols,
                     pad,
                     pad_side,
                     device_free_bytes(),
+                    None,
                 )?;
                 let host_gf: &[Vec<f32>] = &host_gf;
                 let angle_chunks: &[(usize, usize)] = &angle_chunks;
