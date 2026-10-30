@@ -160,12 +160,10 @@ impl PreppedStack {
     /// of the scan, not of the geometry — so a stated sample band (`band`, read
     /// off a reconstruction at `tilt_deg`) supplies its midpoint. Without one the
     /// only neutral default is the middle of the volume, which is not the
-    /// detector's middle row under a tilt.
+    /// detector's middle row under a tilt. It is the layer
+    /// [`tilt_scan`](Self::tilt_scan) shows, so a sweep and a scan agree on it.
     pub fn default_slice(&self, tilt_deg: Option<f32>, band: Option<(usize, usize)>) -> usize {
-        match band {
-            Some((lo, hi)) => (lo + hi) / 2,
-            None => self.depth(tilt_deg) / 2,
-        }
+        crate::recon::center::middle_slice(band, self.depth(tilt_deg))
     }
 
     /// The axis read off the mean of every `step`th projection.

@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `TiltViews` hands over the band-middle layer** (`layer`, at
+  `layer_z` = `recon::center::middle_slice`) instead of the `z_peak` slice.
+  Across a thick band the argmax wanders (z 843 at 16° against 387–467 at
+  18–24° on one scan), so the montage compared different planes; the band
+  middle is one layer at every tilt. `PreppedStack::default_slice` reads the
+  same rule, and the GUI tilt montage shows that layer.
+
 ### Fixed
 
 - **`tomoxide --version` names lightweight release tags.** The release tags

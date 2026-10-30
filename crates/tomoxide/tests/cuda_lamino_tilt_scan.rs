@@ -49,8 +49,8 @@ fn slab_volume(n: usize, rh: usize, z_lo: usize, z_hi: usize) -> Volume<f32> {
     Volume::new(stack)
 }
 
-/// The in-focus slice and the xz plane `on_tilt` handed over for one tilt.
-type Views = (Array2<f32>, Array2<f32>);
+/// The layer's row, the layer and the xz plane `on_tilt` handed over for one tilt.
+type Views = (usize, Array2<f32>, Array2<f32>);
 
 /// The scan, the phantom, and the tilts the data was actually projected at.
 /// Returns the scores, the views `on_tilt` handed over for each, and the slab
@@ -87,9 +87,9 @@ fn scan_banded(
         None,
         &mut |r, views| {
             assert_eq!(
-                views.slice.dim(),
+                views.layer.dim(),
                 (n, n),
-                "the slice handed to on_tilt is not an [n, n] reconstruction plane"
+                "the layer handed to on_tilt is not an [n, n] reconstruction plane"
             );
             assert_eq!(
                 views.xz.dim(),
@@ -100,7 +100,7 @@ fn scan_banded(
                 "  {:5.1}°  focus {:.4e}  z_peak {} of {}",
                 r.tilt_deg, r.focus, r.z_peak, r.depth
             );
-            slices.push((views.slice.to_owned(), views.xz.to_owned()));
+            slices.push((views.layer_z, views.layer.to_owned(), views.xz.to_owned()));
             Ok(())
         },
     )
@@ -203,34 +203,14 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
         r.focus,
         r.z_peak
     );
-    // The image handed to `on_tilt` is that same slice — the streamed tile is
-    // dropped long before the scan knows it won, so this is what says the right
-    // one was kept and not its neighbour. Not bit-equality: the scan streams the
-    // volume in rh-tiles while this reference reconstructs it whole, and the two
-    // batch their FFTs differently. A neighbouring slice would miss by ~100 % of
-    // peak, not by round-off.
-    let peak = named.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let d = slices[0]
-        .0
-        .iter()
-        .zip(named.iter())
-        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
-    eprintln!(
-        "handed-over slice vs recon slice {}: {:.2e} of peak",
-        r.z_peak,
-        d / peak
-    );
-    assert!(
-        d / peak < 1e-5,
-        "the slice on_tilt handed over differs from the z_peak slice it named by \
-         {:.2e} of peak",
-        d / peak
-    );
     // The xz plane is row n/2 of every tile, in z order: a tile offset off by
-    // one would shift the slab's rows, a whole tile's worth of difference.
+    // one would shift the slab's rows, a whole tile's worth of difference. Not
+    // bit-equality: the scan streams the volume in rh-tiles while this reference
+    // reconstructs it whole, and the two batch their FFTs differently.
+    let peak = named.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let row = vol.array.index_axis(Axis(1), n / 2);
     let d = slices[0]
-        .1
+        .2
         .iter()
         .zip(row.iter())
         .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
@@ -252,6 +232,71 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
             f <= r.focus * (1.0 + 1e-6),
             "slice {z} scores {f:.6e}, above the reported max {:.6e}",
             r.focus
+        );
+    }
+}
+
+/// The image `on_tilt` hands over is one physical layer at every tilt — the
+/// middle of the band carried to that tilt, as the whole reconstruction has it —
+/// so the eye compares tilts on the same layer. A band reaching past the slab
+/// puts that middle off the slab's `z_peak` at the true tilt, where the two
+/// images differ; a tile offset off by one would hand over a neighbour.
+#[test]
+fn cuda_lamino_tilt_scan_hands_over_the_band_middle_at_every_tilt() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let rh = cuda::lamino_recon_height(nz, TRUE_TILT);
+    let (z_lo, z_hi) = (rh / 4, rh / 4 + 4);
+    let band = SampleBand {
+        z: (z_lo, z_hi + 8),
+        tilt_deg: TRUE_TILT,
+    };
+    let tilts = [TRUE_TILT - 5.0, TRUE_TILT, TRUE_TILT + 5.0];
+    let (scores, views, _, _) = scan_banded(&tilts, Some(band));
+
+    let angles = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI);
+    let sino = sim::project(
+        &slab_volume(n, rh, z_lo, z_hi),
+        &geom_lamino(&angles, n, nz, TRUE_TILT),
+        &cuda,
+    )
+    .unwrap();
+    for (r, (z, layer, _)) in scores.iter().zip(&views) {
+        let (lo, hi) = r.band.expect("the band is carried to every tilt");
+        assert_eq!(*z, (lo + hi) / 2, "tilt {}°", r.tilt_deg);
+        if r.tilt_deg == TRUE_TILT {
+            assert_ne!(*z, r.z_peak, "the band middle must sit off the slab");
+        }
+        let vol = tomoxide::recon::recon(
+            &sino,
+            &geom_lamino(&angles, n, nz, r.tilt_deg),
+            Algorithm::Fourierrec,
+            &ReconParams::default(),
+            &cuda,
+        )
+        .unwrap();
+        let peak = vol.array.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let row = vol.array.index_axis(Axis(0), *z);
+        let d = layer
+            .iter()
+            .zip(row.iter())
+            .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+        eprintln!(
+            "  {:5.1}°: layer {z} vs recon: {:.2e} of peak",
+            r.tilt_deg,
+            d / peak
+        );
+        assert!(
+            d / peak < 1e-5,
+            "tilt {}°: the layer on_tilt handed over differs from slice {z} by {:.2e} of peak",
+            r.tilt_deg,
+            d / peak
         );
     }
 }

@@ -219,9 +219,7 @@ impl App {
                         .on_lambda_sweep(lambdas, ny, nx, &frames, residual, roughness);
                 }
                 Event::LaminoRings {
-                    center,
-                    prominence,
-                    trustworthy,
+                    ring,
                     ny,
                     nx,
                     mean,
@@ -229,15 +227,16 @@ impl App {
                     millis,
                 } => {
                     self.log.push(format!(
-                        "rings: centre {center:.2}, prominence {prominence:.2} — {} — {millis} ms",
-                        if trustworthy {
+                        "rings: centre {:.2}, prominence {:.2} — {} — {millis} ms",
+                        ring.center,
+                        ring.prominence,
+                        if ring.trustworthy {
                             "closed concentric rings"
                         } else {
                             "NOT trustworthy: no bullseye, likely mis-aligned at acquisition"
                         }
                     ));
-                    self.lamino
-                        .on_rings(center, prominence, trustworthy, ny, nx, &mean, bytes);
+                    self.lamino.on_rings(ring, ny, nx, &mean, bytes);
                 }
                 Event::LaminoCenterSweep {
                     centers,
@@ -261,29 +260,21 @@ impl App {
                     self.lamino.on_center_cancelled();
                 }
                 Event::LaminoTilt {
-                    tilt_deg,
-                    focus,
-                    z_peak,
-                    band,
-                    depth,
-                    focus_by_z,
-                    ny,
-                    nx,
-                    slice,
+                    score,
+                    layer_z,
+                    layer,
                     done,
                     total,
                 } => {
-                    let scored = match band {
+                    let scored = match score.band {
                         Some((lo, hi)) => format!(", band {lo}..{hi}"),
                         None => String::new(),
                     };
                     self.log.push(format!(
-                        "tilt {tilt_deg:.2}°: focus {focus:.4e}, peak slice {z_peak} of {depth}{scored} ({done}/{total})"
+                        "tilt {:.2}°: focus {:.4e}, peak slice {} of {}{scored} ({done}/{total})",
+                        score.tilt_deg, score.focus, score.z_peak, score.depth
                     ));
-                    self.lamino.on_tilt(
-                        tilt_deg, focus, z_peak, band, depth, focus_by_z, ny, nx, &slice, done,
-                        total,
-                    );
+                    self.lamino.on_tilt(score, layer_z, layer, done, total);
                 }
                 Event::LaminoTiltDone { cancelled, millis } => {
                     self.log.push(format!(
