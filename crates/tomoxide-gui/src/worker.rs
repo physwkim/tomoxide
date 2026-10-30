@@ -220,9 +220,10 @@ pub enum Event {
     },
     /// The centre sweep stopped on its token.
     LaminoCenterSweepCancelled { millis: u128 },
-    /// One tilt candidate finished: its score, the in-focus slice `[ny, nx]` the
-    /// reconstruction peaked on, and the focus of every slice — the profile that
-    /// says whether `z_peak` is a hump on the sample or a spike at a z-edge.
+    /// One tilt candidate finished: its score, slice `layer_z` `[ny, nx]` (the
+    /// band middle, the same layer at every tilt), and the focus of every slice
+    /// — the profile that says whether `z_peak` is a hump on the sample or a
+    /// spike at a z-edge.
     LaminoTilt {
         tilt_deg: f32,
         focus: f64,
@@ -234,7 +235,8 @@ pub enum Event {
         focus_by_z: Vec<f64>,
         ny: usize,
         nx: usize,
-        slice: Vec<f32>,
+        layer_z: usize,
+        layer: Vec<f32>,
         done: usize,
         total: usize,
     },
@@ -473,7 +475,7 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                 let r = ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
                     st.tilt_scan(center, &tilts, band, Some(&cancel), &mut |r, views| {
                         done += 1;
-                        let img = views.slice;
+                        let img = views.layer;
                         let (ny, nx) = img.dim();
                         send(Event::LaminoTilt {
                             tilt_deg: r.tilt_deg,
@@ -484,7 +486,8 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                             focus_by_z: r.focus_by_z.clone(),
                             ny,
                             nx,
-                            slice: img.iter().copied().collect(),
+                            layer_z: views.layer_z,
+                            layer: img.iter().copied().collect(),
                             done,
                             total,
                         });

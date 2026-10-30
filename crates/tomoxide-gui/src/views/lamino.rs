@@ -110,9 +110,9 @@ struct Rings {
     bytes: usize,
 }
 
-/// One finished tilt candidate, including the in-focus slice its reconstruction
-/// peaked on — kept here because the montage is rebuilt as candidates land and
-/// `ImageStack` does not hand its frames back.
+/// One finished tilt candidate, including its band-middle layer — kept here
+/// because the montage is rebuilt as candidates land and `ImageStack` does not
+/// hand its frames back.
 struct Tilt {
     tilt_deg: f32,
     focus: f64,
@@ -124,7 +124,8 @@ struct Tilt {
     focus_by_z: Vec<f64>,
     ny: usize,
     nx: usize,
-    slice: Vec<f32>,
+    layer_z: usize,
+    layer: Vec<f32>,
 }
 
 /// A running tilt scan: candidates landed so far, and the token that stops it.
@@ -353,7 +354,8 @@ impl LaminoView {
         focus_by_z: Vec<f64>,
         ny: usize,
         nx: usize,
-        slice: &[f32],
+        layer_z: usize,
+        layer: &[f32],
         done: usize,
         total: usize,
     ) {
@@ -369,7 +371,8 @@ impl LaminoView {
             focus_by_z,
             ny,
             nx,
-            slice: slice.to_vec(),
+            layer_z,
+            layer: layer.to_vec(),
         });
         let frames: Vec<Option<Frame>> = self
             .tilts
@@ -378,17 +381,17 @@ impl LaminoView {
                 Some(Frame::new(
                     t.nx as u32,
                     t.ny as u32,
-                    t.slice.clone(),
+                    t.layer.clone(),
                     Some(format!(
                         "{:.2}° — slice {} of {}",
-                        t.tilt_deg, t.z_peak, t.depth
+                        t.tilt_deg, t.layer_z, t.depth
                     )),
                 ))
             })
             .collect();
         self.tilt_stack.set_frames(frames);
         self.tilt_stack
-            .set_colormap(super::autoscale_viridis(slice));
+            .set_colormap(super::autoscale_viridis(layer));
         self.tilt_stack.set_current(self.tilts.len() - 1);
         self.refresh_tilt_curves();
     }

@@ -605,10 +605,26 @@ pub struct TiltFocus {
     pub focus_by_z: Vec<f64>,
 }
 
+/// The slice a tilt's reconstruction is shown and swept on: the middle of `band`
+/// (a [`SampleBand`] already carried to this tilt), else of the volume `depth`
+/// deep. Both ends of the band map linearly through the detector rows and the
+/// volume's middle always lands on row `nz/2`, so this is one physical layer at
+/// every tilt, to a row.
+pub fn middle_slice(band: Option<(usize, usize)>, depth: usize) -> usize {
+    match band {
+        Some((lo, hi)) => (lo + hi) / 2,
+        None => depth / 2,
+    }
+}
+
 /// What [`lamino_tilt_scan`] shows the eye of one tilt's reconstruction.
 pub struct TiltViews<'a> {
-    /// The `z_peak` slice, `[y, x]`: the in-focus layer.
-    pub slice: ArrayView2<'a, f32>,
+    /// Slice `layer_z`, `[y, x]`, at [`middle_slice`] — the same layer at every
+    /// tilt, so the eye compares tilts on one plane. `z_peak` is not: across a
+    /// thick band it wanders (measured: z 843 at 16° against 387–467 at 18–24°).
+    pub layer: ArrayView2<'a, f32>,
+    /// The z of `layer` in this tilt's volume.
+    pub layer_z: usize,
     /// The xz plane through the middle row `y = ny / 2`, `[z, x]` over the whole
     /// depth: how the layers stack, which a wrong tilt doubles or smears.
     pub xz: ArrayView2<'a, f32>,
@@ -662,8 +678,8 @@ pub struct TiltCandidates<'a> {
 /// reconstruction apart, so a caller with a user attached should report it — and
 /// returning `Err` from it aborts the scan. `views` are the [`TiltViews`] of that
 /// reconstruction: `docs/LAMINOGRAPHY_ALIGNMENT.md` §3 makes confirming the
-/// winner by eye part of the method, and this is the one reconstruction that
-/// already found it. Callers that only want the numbers ignore them.
+/// winner by eye part of the method, and the volume is gone once the scan moves
+/// on. Callers that only want the numbers ignore them.
 ///
 /// A fired `cancel` stops the scan with [`Error::Cancelled`] before the next
 /// tilt or at the next streamed tile.
@@ -707,12 +723,13 @@ pub fn lamino_tilt_scan(
         let scored = band
             .as_ref()
             .map(|b| b.at(rh_for(b.tilt_deg), tilt_deg, rh));
-        // The volume is streamed and dropped tile by tile, so the winning slice
-        // has to be kept as it goes past — it is gone by the time the scan knows
-        // it won. Tiles arrive in ascending row order, so the profile is built by
-        // appending; the whole profile is kept even under a band, because the
-        // profile is how the *next* band gets read.
-        let mut best: Option<(f64, usize, Array2<f32>)> = None;
+        // The volume is streamed and dropped tile by tile, so the shown layer has
+        // to be kept as it goes past. Tiles arrive in ascending row order, so the
+        // profile is built by appending; the whole profile is kept even under a
+        // band, because the profile is how the *next* band gets read.
+        let layer_z = middle_slice(scored, rh);
+        let mut layer: Option<Array2<f32>> = None;
+        let mut best: Option<(f64, usize)> = None;
         let mut profile: Vec<f64> = Vec::new();
         let mut xz: Vec<f32> = Vec::new();
         let (depth, _, nx) = {
@@ -724,8 +741,11 @@ pub fn lamino_tilt_scan(
                     let z = z0 + k;
                     profile.push(f);
                     let in_band = scored.is_none_or(|(lo, hi)| (lo..=hi).contains(&z));
-                    if in_band && best.as_ref().is_none_or(|b| f > b.0) {
-                        best = Some((f, z, tile.array.index_axis(Axis(0), k).to_owned()));
+                    if in_band && best.is_none_or(|(b, _)| f > b) {
+                        best = Some((f, z));
+                    }
+                    if z == layer_z {
+                        layer = Some(tile.array.index_axis(Axis(0), k).to_owned());
                     }
                 }
                 Ok(())
@@ -745,7 +765,7 @@ pub fn lamino_tilt_scan(
                  said {rh} — the sample band was mapped against the wrong depth"
             )));
         }
-        let (focus, z_peak, img) = best.ok_or_else(|| {
+        let (focus, z_peak) = best.ok_or_else(|| {
             Error::Backend(format!(
                 "the reconstruction at tilt {tilt_deg}° produced no slices to score"
             ))
@@ -757,6 +777,11 @@ pub fn lamino_tilt_scan(
                 profile.len()
             )));
         }
+        let layer = layer.ok_or_else(|| {
+            Error::Backend(format!(
+                "tilt {tilt_deg}°: slice {layer_z} never streamed past"
+            ))
+        })?;
         let xz = Array2::from_shape_vec((depth, nx), xz)
             .map_err(|e| Error::Backend(format!("tilt {tilt_deg}°: the xz plane: {e}")))?;
         let r = TiltFocus {
@@ -770,7 +795,8 @@ pub fn lamino_tilt_scan(
         on_tilt(
             &r,
             TiltViews {
-                slice: img.view(),
+                layer: layer.view(),
+                layer_z,
                 xz: xz.view(),
             },
         )?;
