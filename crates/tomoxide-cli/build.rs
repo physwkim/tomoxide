@@ -21,9 +21,10 @@ fn main() {
     // Only tomoxide's own checkout: an unpacked or vendored copy can sit inside
     // some other repository, whose commit this is not.
     let rev = match git(&dir, &["rev-parse", "--show-prefix"]) {
-        Some(prefix) if prefix == "crates/tomoxide-cli/" => {
-            git(&dir, &["describe", "--always", "--dirty", "--abbrev=12"])
-        }
+        Some(prefix) if prefix == "crates/tomoxide-cli/" => git(
+            &dir,
+            &["describe", "--tags", "--always", "--dirty", "--abbrev=12"],
+        ),
         _ => None,
     };
     let Some(rev) = rev else {
@@ -36,6 +37,18 @@ fn main() {
     if let Some(git_dir) = git(&dir, &["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={git_dir}/logs/HEAD");
         println!("cargo:rerun-if-changed={git_dir}/index");
+    }
+    // A new tag renames the commit; cargo reruns on every build for a path
+    // that does not exist.
+    for refs in ["refs/tags", "packed-refs"] {
+        if let Some(path) = git(
+            &dir,
+            &["rev-parse", "--path-format=absolute", "--git-path", refs],
+        )
+        .filter(|path| Path::new(path).exists())
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
     let root = dir.join("../..");
     for path in [

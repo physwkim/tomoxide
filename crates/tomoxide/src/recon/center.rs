@@ -756,6 +756,7 @@ pub fn lamino_tilt_scan(
                 algorithm,
                 params,
                 None,
+                cancel,
                 &mut on_tile,
             )?
         };

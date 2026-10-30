@@ -13,10 +13,10 @@
 //! integer exactness, and the sweep's exactness at arbitrary spacing.
 #![cfg(feature = "cuda")]
 
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array2, Array3, Axis, ShapeBuilder};
 use tomoxide::{
     cuda, recon, sim, Algorithm, Angles, Beam, CancelToken, Center, CpuBackend, CudaBackend,
-    Detector, Error, Geometry, ReconParams, Tomo, Volume,
+    Detector, Error, Geometry, Layout, ReconParams, Tomo, Volume,
 };
 
 const N: usize = 128;
@@ -261,6 +261,28 @@ fn cuda_center_probe_sweep_stops_on_a_fired_token() {
     assert_eq!(sweep(Some(&token)).unwrap(), sweep(None).unwrap());
     token.cancel();
     assert!(matches!(sweep(Some(&token)), Err(Error::Cancelled)));
+}
+
+/// The stack is read in place, not transposed or copied first; a
+/// projection-order or column-major stack must probe like the sinogram-order one.
+#[test]
+fn cuda_center_probe_sweep_reads_any_stack_layout_alike() {
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping CUDA test: {e}");
+        return;
+    }
+    let (sino, angles) = setup(&CpuBackend::new());
+    let proj = sino.to_layout(Layout::Projection);
+    let mut cols = Array3::zeros(sino.array.raw_dim().f());
+    cols.assign(&sino.array);
+    let cols = Tomo::new(cols, Layout::Sinogram);
+    let params = ReconParams::default();
+    let cands = [63.0f32, 63.5, 64.0];
+    let geom = geom_at(&angles, 64.0);
+    let sweep = |s| cuda::center_probe_sweep(s, &geom, &params, &cands, Z as i32, None);
+    let want = sweep(&sino).unwrap();
+    assert_eq!(sweep(&proj).unwrap(), want);
+    assert_eq!(sweep(&cols).unwrap(), want);
 }
 
 /// A sweep the raw probe would mis-rank must now rank correctly: the sharpest
