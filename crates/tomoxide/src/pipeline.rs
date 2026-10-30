@@ -137,6 +137,7 @@ pub fn reconstruct_lamino_streaming(
             algorithm,
             params,
             Some(&norm),
+            None,
             on_tile,
         );
     }
@@ -176,11 +177,15 @@ pub(crate) fn lamino_streaming_normalized(
     // the recon (`as_layout(Projection)`), i.e. two full-volume transposes for
     // nothing. Fbp/Linerec read the projection stack in place, a tile at a time.
     if prep.stripe == StripeMethod::None {
-        crate::cuda::reconstruct_lamino_streaming(&data, geom, algorithm, params, None, on_tile)
+        crate::cuda::reconstruct_lamino_streaming(
+            &data, geom, algorithm, params, None, None, on_tile,
+        )
     } else {
         let mut sino = data.to_layout(Layout::Sinogram);
         crate::prep::remove_stripe(&mut sino, prep.stripe)?;
-        crate::cuda::reconstruct_lamino_streaming(&sino, geom, algorithm, params, None, on_tile)
+        crate::cuda::reconstruct_lamino_streaming(
+            &sino, geom, algorithm, params, None, None, on_tile,
+        )
     }
 }
 

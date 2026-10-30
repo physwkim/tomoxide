@@ -276,6 +276,7 @@ fn cuda_lamino_streaming_tiles_match_whole_volume() {
         Algorithm::Linerec,
         &params,
         None,
+        None,
         &mut |rh0, tile| {
             let tlen = tile.array.dim().0;
             assert!(
@@ -347,6 +348,7 @@ fn cuda_lamino_streaming_reads_a_projection_stack_alike() {
             &geom,
             Algorithm::Linerec,
             &params,
+            None,
             None,
             &mut |_, tile| {
                 vol.extend(tile.array.iter());

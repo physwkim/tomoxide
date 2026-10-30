@@ -293,23 +293,27 @@ pub type LaminoTileFn<'a> = dyn FnMut(usize, &crate::data::Volume<f32>) -> Resul
 /// it defers flat/dark + minus-log into the recon's stage-1 upload (see
 /// [`LamNorm`]), so `sino` is then the raw (un-normalized) projection stack.
 /// `norm` is honoured only by the Fourierrec path; Fbp/Linerec always require a
-/// pre-normalized `sino` (`norm = None`).
+/// pre-normalized `sino` (`norm = None`). `cancel` is checked between the
+/// chunks of every stage, so Fourierrec stops before its first tile too.
 pub fn reconstruct_lamino_streaming(
     sino: &crate::data::Tomo<f32>,
     geom: &crate::geometry::Geometry,
     algorithm: crate::params::Algorithm,
     params: &crate::params::ReconParams,
     norm: Option<&LamNorm>,
+    cancel: Option<&crate::pipeline::CancelToken>,
     on_tile: &mut LaminoTileFn,
 ) -> Result<(usize, usize, usize)> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (sino, geom, algorithm, params, norm, on_tile);
+        let _ = (sino, geom, algorithm, params, norm, cancel, on_tile);
         Err(Error::Backend("cuda feature not enabled".into()))
     }
     #[cfg(feature = "cuda")]
     {
-        cuda_impl::reconstruct_lamino_streaming(sino, geom, algorithm, params, norm, on_tile)
+        cuda_impl::reconstruct_lamino_streaming(
+            sino, geom, algorithm, params, norm, cancel, on_tile,
+        )
     }
 }
 
@@ -5383,6 +5387,7 @@ mod cuda_impl {
         theta: &[f32],
         p: LamFourierParams,
         norm: Option<&super::LamNorm>,
+        cancel: Option<&CancelToken>,
         on_tile: &mut super::LaminoTileFn,
     ) -> Result<()> {
         let LamFourierParams {
@@ -5463,6 +5468,7 @@ mod cuda_impl {
                 &chunks1,
                 deth * detw * fsz,
                 deth * detw * csz,
+                cancel,
                 |slab, ci| {
                     let (t0, tc) = chunks1[ci];
                     let base = t0 * deth * detw;
@@ -5581,6 +5587,7 @@ mod cuda_impl {
                 &chunks2,
                 nproj * detw * csz,
                 n1 * n0 * csz,
+                cancel,
                 |slab, ci| {
                     let (k0, kc) = chunks2[ci];
                     // Strided gather p22[:, k0..k0+kc, :] → contiguous [nproj, kc, detw]
@@ -5718,6 +5725,7 @@ mod cuda_impl {
                 &chunks3,
                 deth * n0 * csz,
                 rh * n0 * fsz,
+                cancel,
                 |slab, ci| {
                     let (y0, yc) = chunks3[ci];
                     let base = y0 * deth * n0 * 2;
@@ -5801,7 +5809,7 @@ mod cuda_impl {
         }
         drop(p11);
 
-        emit_p00_tiles(&p00, (n1, rh, n), LAM_FOURIER_TILE_BYTES, on_tile)
+        emit_p00_tiles(&p00, (n1, rh, n), LAM_FOURIER_TILE_BYTES, cancel, on_tile)
     }
 
     /// Host bytes per Fourierrec output tile: 16 planes at 2048², small beside
@@ -5816,10 +5824,12 @@ mod cuda_impl {
         p00: &[f32],
         (n1, rh, n): (usize, usize, usize),
         tile_bytes: usize,
+        cancel: Option<&CancelToken>,
         on_tile: &mut super::LaminoTileFn,
     ) -> Result<()> {
         let rows = tile_bytes / (n1 * n * std::mem::size_of::<f32>()).max(1);
         for (z0, tlen) in chunk_ranges(rh, rows) {
+            check_cancel(cancel)?;
             let mut tile = vec![0.0f32; tlen * n1 * n];
             // Planes are disjoint, so they transpose across cores (the gather
             // from p00 within a plane stays strided).
@@ -5851,7 +5861,7 @@ mod cuda_impl {
             let plane = n1 * n * std::mem::size_of::<f32>();
             let mut tiles = Vec::new();
             let mut vol = Vec::<f32>::new();
-            emit_p00_tiles(&p00, (n1, rh, n), 3 * plane + 1, &mut |z0, tile| {
+            emit_p00_tiles(&p00, (n1, rh, n), 3 * plane + 1, None, &mut |z0, tile| {
                 tiles.push((z0, tile.array.dim()));
                 vol.extend(tile.array.iter());
                 Ok(())
@@ -5982,10 +5992,13 @@ mod cuda_impl {
     /// slots, so no cross-stream reuse event is needed. The one device→host order
     /// the host awaits mid-iteration is `ev_drained` (chunk `k-2`'s D2H) before its
     /// scatter, so that scatter overlaps `compute(k-1)` instead of the barrier.
+    /// That barrier also leaves nothing in flight at the top of an iteration,
+    /// which is where `cancel` is checked.
     fn run_lam_conveyor(
         chunks: &[(usize, usize)],
         in_stride: usize,
         out_stride: usize,
+        cancel: Option<&CancelToken>,
         mut prep_in: impl FnMut(&mut [f32], usize),
         mut compute: impl FnMut(*mut c_void, *mut c_void, usize) -> Result<()>,
         mut finalize: impl FnMut(&[f32], usize),
@@ -6019,6 +6032,7 @@ mod cuda_impl {
         let ev_drained = [Event::new()?, Event::new()?]; // D2H(slot) finished
 
         for k in 0..n + 2 {
+            check_cancel(cancel)?;
             // Launch compute(k-1) on the per-thread stream; the async FFTs mean this
             // returns at once, freeing the host to run the CPU copies below.
             if (1..=n).contains(&k) {
@@ -6113,6 +6127,7 @@ mod cuda_impl {
         theta: &[f32],
         p: LamFourierParams,
         norm: Option<&super::LamNorm>,
+        cancel: Option<&CancelToken>,
         on_tile: &mut super::LaminoTileFn,
     ) -> Result<()> {
         let LamFourierParams {
@@ -6223,6 +6238,7 @@ mod cuda_impl {
             ev_uploaded[0].record_on(&cstream)?;
 
             for (ci, &(t0, tc)) in chunks.iter().enumerate() {
+                check_cancel_drained(cancel)?;
                 let slot = ci % 2;
                 // Prefetch the next chunk into the other slot while we compute this.
                 if ci + 1 < chunks.len() {
@@ -6344,6 +6360,7 @@ mod cuda_impl {
             let win = DevBuf::new(dethc * wy * wx * csz)?;
             let mut k0 = 0;
             while k0 < deth {
+                check_cancel_drained(cancel)?;
                 let kc = dethc.min(deth - k0);
                 ck(
                     unsafe {
@@ -6478,6 +6495,7 @@ mod cuda_impl {
             let ev_drained = [Event::new()?, Event::new()?];
 
             for (ci, &(y0, yc)) in chunks.iter().enumerate() {
+                check_cancel_drained(cancel)?;
                 let slot = ci % 2;
                 // Don't overwrite an f00 slab still draining to the host.
                 if ci >= 2 {
@@ -6577,8 +6595,19 @@ mod cuda_impl {
             pin_p00.as_slice(),
             (n1, rh, n),
             LAM_FOURIER_TILE_BYTES,
+            cancel,
             on_tile,
         )
+    }
+
+    /// [`check_cancel`] inside a loop that leaves copies and kernels in flight
+    /// across iterations: the device finishes them before the early return
+    /// frees the buffers they use.
+    fn check_cancel_drained(cancel: Option<&CancelToken>) -> Result<()> {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+        }
+        check_cancel(cancel)
     }
 
     /// Fourier/USFFT laminography dispatcher: prefers the device-resident path
@@ -6601,6 +6630,7 @@ mod cuda_impl {
         theta: &[f32],
         p: LamFourierParams,
         norm: Option<&super::LamNorm>,
+        cancel: Option<&CancelToken>,
         on_tile: &mut super::LaminoTileFn,
     ) -> Result<()> {
         let n = p.n;
@@ -6621,9 +6651,9 @@ mod cuda_impl {
         let free = device_free_bytes();
         let force_host = std::env::var_os("TOMOXIDE_LAM_FOURIERREC_HOST").is_some_and(|v| v == "1");
         if !force_host && base.saturating_mul(5) <= free.saturating_mul(4) {
-            analytic_lamino_fourierrec_device(proj, theta, p, norm, on_tile)
+            analytic_lamino_fourierrec_device(proj, theta, p, norm, cancel, on_tile)
         } else {
-            analytic_lamino_fourierrec_host(proj, theta, p, norm, on_tile)
+            analytic_lamino_fourierrec_host(proj, theta, p, norm, cancel, on_tile)
         }
     }
 
@@ -6779,6 +6809,7 @@ mod cuda_impl {
         algorithm: crate::params::Algorithm,
         params: &crate::params::ReconParams,
         norm: Option<&super::LamNorm>,
+        cancel: Option<&CancelToken>,
         on_tile: &mut super::LaminoTileFn,
     ) -> Result<(usize, usize, usize)> {
         use crate::params::Algorithm;
@@ -6833,6 +6864,7 @@ mod cuda_impl {
                     filter: params.filter_name,
                 },
                 norm,
+                cancel,
                 on_tile,
             )?;
             return Ok((rh, n, n));
@@ -6861,7 +6893,7 @@ mod cuda_impl {
         let devices = selected_devices();
         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
         let (host_gf, angle_chunks) =
-            lamino_filter_to_host(raw, &w, pad, pad_side, device_free_bytes(), None)?;
+            lamino_filter_to_host(raw, &w, pad, pad_side, device_free_bytes(), cancel)?;
         let host_gf: &[Vec<f32>] = &host_gf;
         let angle_chunks: &[(usize, usize)] = &angle_chunks;
 
@@ -6873,6 +6905,7 @@ mod cuda_impl {
         let k = devices.len().max(1);
 
         for round in tiles.chunks(k) {
+            check_cancel(cancel)?;
             let parts: Vec<Result<Vec<f32>>> = std::thread::scope(|scope| {
                 round
                     .iter()
@@ -7010,6 +7043,7 @@ mod cuda_impl {
                             center: geom.center.at(0),
                             filter: params.filter_name,
                         },
+                        None,
                         None,
                         &mut |_, tile| {
                             vol.extend(tile.array.iter());
