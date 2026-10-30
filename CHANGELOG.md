@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-30
+
 ### Changed
 
 - **Breaking: `TiltViews` hands over the band-middle layer** (`layer`, at
@@ -1039,7 +1041,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/physwkim/tomoxide/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/physwkim/tomoxide/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/physwkim/tomoxide/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/physwkim/tomoxide/compare/v0.6.0...v0.7.0
