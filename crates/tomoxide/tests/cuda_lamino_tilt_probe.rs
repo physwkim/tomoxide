@@ -16,7 +16,7 @@
 use ndarray::{Array2, Axis};
 use tomoxide::{
     cuda, recon, sim, Algorithm, Angles, Beam, Center, CpuBackend, CudaBackend, Detector, Geometry,
-    ReconParams, Volume,
+    Layout, ReconParams, Volume,
 };
 
 fn lamino_sino(
@@ -295,4 +295,29 @@ fn cuda_lamino_tilt_probe_is_unchanged_when_the_stack_is_angle_chunked() {
             d / peak
         );
     }
+}
+
+/// A projection-order stack is read in place, a tile at a time; with the
+/// stack split over z and angle tiles every tile must gather the same rows.
+#[test]
+fn cuda_lamino_tilt_probe_reads_a_projection_stack_alike() {
+    if let Err(e) = CudaBackend::new() {
+        eprintln!("skipping CUDA test: {e}");
+        return;
+    }
+    let (n, nproj, nz) = (64usize, 90usize, 32usize);
+    let (sino, angles) = lamino_sino(n, nproj, nz, &CpuBackend::new());
+    let proj = sino.to_layout(Layout::Projection);
+    let params = ReconParams {
+        lamino_rh: Some(48),
+        ..Default::default()
+    };
+    let tilts = [12.0f32, 20.0, 31.5];
+    let geom = geom_lamino(&angles, n, nz, 0.0);
+    let probe = |s| cuda::lamino_tilt_probe(s, &geom, &params, &tilts, 17, None);
+
+    std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
+    let (a, b) = (probe(&proj), probe(&sino));
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    assert_eq!(a.unwrap(), b.unwrap());
 }

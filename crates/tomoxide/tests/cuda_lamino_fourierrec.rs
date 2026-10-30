@@ -224,6 +224,7 @@ fn cuda_fourierrec_lamino_fused_normalize_matches_separate() {
         Algorithm::Fourierrec,
         &params,
         None,
+        None,
         &mut |rh0, tile| {
             let tlen = tile.array.dim().0;
             ref_vol
@@ -243,6 +244,7 @@ fn cuda_fourierrec_lamino_fused_normalize_matches_separate() {
         Algorithm::Fourierrec,
         &params,
         Some(&norm),
+        None,
         &mut |rh0, tile| {
             let tlen = tile.array.dim().0;
             fused_vol
