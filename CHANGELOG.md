@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tomoxide --version` names lightweight release tags.** The release tags
+  from v0.7.0 on are lightweight, which `git describe` skips without
+  `--tags`, so a v0.9.0 build read `v0.6.0-126-gf7ba8ec7fcb1`. Tagging the
+  built commit now reruns the build script, which kept the old name.
+
 ## [0.9.0] - 2026-10-29
 
 ### Added
