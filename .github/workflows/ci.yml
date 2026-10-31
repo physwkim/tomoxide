@@ -3,7 +3,7 @@ name: CI
 # Runs on every branch push (and every PR). The workspace default build is
 # pure-CPU with no system dependencies, so it is exercised on all three
 # platforms; the optional GPU/cuda paths are compile-checked only (no runner
-# has a GPU or an nvcc toolkit).
+# has a GPU).
 on:
   push:
   pull_request:
@@ -75,7 +75,7 @@ jobs:
   # --- cuda backend: FFI type-check only (no nvcc on the runner) ------------
   # TOMOXIDE_CUDA_SKIP_BUILD makes build.rs skip the nvcc compile and the link
   # directives, so `cargo check` type-checks the CUDA FFI bindings without a
-  # CUDA toolkit. Linux/x86_64 only — the cuda path targets Linux.
+  # CUDA toolkit. Linux/x86_64; cuda-windows below builds it for real.
   cuda-typecheck:
     name: cuda FFI type-check
     runs-on: ubuntu-latest
@@ -90,3 +90,28 @@ jobs:
         with:
           key: cuda-typecheck
       - run: cargo check --workspace --features cuda --target x86_64-unknown-linux-gnu
+
+  # --- cuda backend on Windows: nvcc + cl.exe build and link, no GPU --------
+  # nvcc hands host code to cl.exe, so only a real build sees build.rs's MSVC
+  # side. One arch keeps nvcc short; windows-2022 because nvcc refuses an MSVC
+  # newer than its release knows.
+  cuda-windows:
+    name: cuda build (x86_64-pc-windows-msvc)
+    runs-on: windows-2022
+    env:
+      TOMOXIDE_CUDA_ARCH: "75"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.2"
+          method: network
+          sub-packages: '["nvcc", "nvvm", "crt", "cudart", "cufft", "cufft_dev"]'
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda-windows
+      - run: cargo build --workspace --all-targets --features cuda --target x86_64-pc-windows-msvc

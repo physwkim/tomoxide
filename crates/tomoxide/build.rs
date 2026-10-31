@@ -62,13 +62,26 @@ fn main() {
         }
     }
 
-    let lib = out_dir.join("libtomoxide_cuda_kernels.a");
+    // nvcc hands host code to cl.exe on Windows, whose static libraries and
+    // C++ runtime differ from gcc's.
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let lib = out_dir.join(if msvc {
+        "tomoxide_cuda_kernels.lib"
+    } else {
+        "libtomoxide_cuda_kernels.a"
+    });
     let mut cmd = Command::new("nvcc");
     cmd.arg("-lib").arg("-o").arg(&lib);
-    cmd.arg("-Xcompiler")
-        .arg("-fPIC")
-        .arg("-O3")
-        .arg("--std=c++17");
+    if msvc {
+        // cl.exe defaults to the static CRT; Rust links the one it is told to.
+        let crt_static = env::var("CARGO_CFG_TARGET_FEATURE")
+            .is_ok_and(|f| f.split(',').any(|f| f == "crt-static"));
+        cmd.arg("-Xcompiler")
+            .arg(if crt_static { "/MT" } else { "/MD" });
+    } else {
+        cmd.arg("-Xcompiler").arg("-fPIC");
+    }
+    cmd.arg("-O3").arg("--std=c++17");
     // Per-thread default stream: each host thread gets its own implicit stream,
     // so concurrent `for_each_slice` workers (one per GPU, fanned across host
     // cores) overlap their FFTs/copies instead of serializing on the legacy
@@ -96,8 +109,11 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=cudart");
     // cfunc_fourierrec uses cuFFT (plan1d/plan2d); cfunc_linerec does not.
     println!("cargo:rustc-link-lib=dylib=cufft");
-    // The shim is C++ (new/delete on the cfunc classes) → needs the C++ runtime.
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    // The shim is C++ (new/delete on the cfunc classes) → needs the C++ runtime,
+    // which cl.exe's objects name for the linker themselves.
+    if !msvc {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     if let Some(libdir) = cuda_lib_dir() {
         println!("cargo:rustc-link-search=native={}", libdir.display());
     }
@@ -109,12 +125,15 @@ fn tomocupy_include(kernel_dir: &Path) -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-/// Best-effort discovery of the CUDA runtime library directory.
+/// Best-effort discovery of the CUDA runtime library directory: `lib64` on
+/// Linux, `lib\x64` on Windows.
 fn cuda_lib_dir() -> Option<PathBuf> {
     if let Ok(root) = env::var("CUDA_PATH").or_else(|_| env::var("CUDA_HOME")) {
-        let p = PathBuf::from(root).join("lib64");
-        if p.exists() {
-            return Some(p);
+        let root = PathBuf::from(root);
+        for p in [root.join("lib64"), root.join("lib").join("x64")] {
+            if p.exists() {
+                return Some(p);
+            }
         }
     }
     let default = PathBuf::from("/usr/local/cuda/lib64");
