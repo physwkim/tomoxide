@@ -64,6 +64,12 @@ __device__ double ti_matxvec_elem(const double* x, int n, const double* h, const
   return acc;
 }
 
+// mysino[col][angle] = sino_z[angle*ncol + col], NaN -> 0 (matches _ring).
+__device__ __forceinline__ double ti_val(const float* sino_z, int ncol, int a, int c) {
+  double v = (double) sino_z[(long long) a * ncol + c];
+  return isnan(v) ? 0.0 : v;
+}
+
 // One thread block per slice z. `scratch` is nz * 7 * ncol doubles; block z owns
 // the 7*ncol window [r | w | z | x | pp | qA | qB].
 __global__ void ti_slice_ker(float* sino, int nproj, int ncol, float beta, double* scratch) {
@@ -78,10 +84,6 @@ __global__ void ti_slice_ker(float* sino, int nproj, int ncol, float beta, doubl
   double* pp = base + 4 * ncol;
   double* qA = base + 5 * ncol;
   double* qB = base + 6 * ncol;
-
-  // mysino[col][angle] = sino_z[angle*ncol + col], NaN -> 0 (matches _ring).
-  // val(a, c) reads that element with the NaN guard.
-#define TI_VAL(a, c) ({ double _v = (double) sino_z[(long long)(a) * ncol + (c)]; isnan(_v) ? 0.0 : _v; })
 
   for (int variant = 0; variant < 2; variant++) {
     // Finite-difference kernel h and its reverse hf.
@@ -99,7 +101,7 @@ __global__ void ti_slice_ker(float* sino, int nproj, int ncol, float beta, doubl
     // pp[col] = mean over angles of mysino[col][angle].
     for (int c = threadIdx.x; c < ncol; c += blockDim.x) {
       double s = 0.0;
-      for (int a = 0; a < nproj; a++) s += TI_VAL(a, c);
+      for (int a = 0; a < nproj; a++) s += ti_val(sino_z, ncol, a, c);
       pp[c] = s / (double) nproj;
     }
     __syncthreads();
@@ -108,7 +110,7 @@ __global__ void ti_slice_ker(float* sino, int nproj, int ncol, float beta, doubl
     double lmin = INFINITY, lmax = -INFINITY;
     for (int a = threadIdx.x; a < nproj; a += blockDim.x) {
       double s = 0.0;
-      for (int c = 0; c < ncol; c++) s += TI_VAL(a, c);
+      for (int c = 0; c < ncol; c++) s += ti_val(sino_z, ncol, a, c);
       lmin = fmin(lmin, s);
       lmax = fmax(lmax, s);
     }
@@ -159,7 +161,7 @@ __global__ void ti_slice_ker(float* sino, int nproj, int ncol, float beta, doubl
   for (long long idx = threadIdx.x; idx < total; idx += blockDim.x) {
     int c = (int) (idx % ncol);
     int rr = (int) (idx / ncol);
-    double v = TI_VAL(rr, c);
+    double v = ti_val(sino_z, ncol, rr, c);
     float d1 = (float) (v + qA[c]);
     float d2 = (float) (v + qB[c]);
     lpmin = fminf(lpmin, d1 * d2);
@@ -169,12 +171,11 @@ __global__ void ti_slice_ker(float* sino, int nproj, int ncol, float beta, doubl
   for (long long idx = threadIdx.x; idx < total; idx += blockDim.x) {
     int c = (int) (idx % ncol);
     int rr = (int) (idx / ncol);
-    double v = TI_VAL(rr, c);
+    double v = ti_val(sino_z, ncol, rr, c);
     float d1 = (float) (v + qA[c]);
     float d2 = (float) (v + qB[c]);
     sino_z[idx] = sqrtf(d1 * d2 + shift);
   }
-#undef TI_VAL
 }
 
 // ===========================================================================
