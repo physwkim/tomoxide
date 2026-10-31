@@ -62,7 +62,7 @@ __device__ float lprec_cubic_interp2d(const float *coeffs, int width, int height
     float sum = 0.0f;
     for (int j = 0; j < 4; ++j) {
         int py = lprec_wrap(iy - 1 + j, height);
-        long row = (long)py * stride;
+        long long row = (long long)py * stride;
         float acc = 0.0f;
         for (int i = 0; i < 4; ++i) {
             int px = lprec_wrap(ix - 1 + i, width);
@@ -85,48 +85,48 @@ __device__ void lprec_convert_coeffs(float *c, int n, int stride) {
     float zn = LPREC_POLE;
     float sum = c[0];
     for (int k = 0; k < horizon; ++k) {
-        sum += zn * c[(long)k * stride];
+        sum += zn * c[(long long)k * stride];
         zn *= LPREC_POLE;
     }
     c[0] = lambda * sum;
     float prev = c[0];
     for (int k = 1; k < n; ++k) {
-        float v = lambda * c[(long)k * stride] + LPREC_POLE * prev;
-        c[(long)k * stride] = v;
+        float v = lambda * c[(long long)k * stride] + LPREC_POLE * prev;
+        c[(long long)k * stride] = v;
         prev = v;
     }
-    long last = (long)(n - 1) * stride;
+    long long last = (long long)(n - 1) * stride;
     c[last] *= LPREC_POLE / (LPREC_POLE - 1.0f);
     prev = c[last];
     for (int k = n - 2; k >= 0; --k) {
-        float v = LPREC_POLE * (prev - c[(long)k * stride]);
-        c[(long)k * stride] = v;
+        float v = LPREC_POLE * (prev - c[(long long)k * stride]);
+        c[(long long)k * stride] = v;
         prev = v;
     }
 }
 
 // Spline prefilter along the detector axis: one thread per (slice, angle) line.
 __global__ void lprec_prefilter_rows_ker(float *g, int nz, int nproj, int n) {
-    long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
-    long total = (long)nz * nproj;
+    long long t = (long long)blockIdx.x * LPREC_BLK + threadIdx.x;
+    long long total = (long long)nz * nproj;
     if (t >= total) {
         return;
     }
-    long s = t / nproj;
-    long a = t % nproj;
+    long long s = t / nproj;
+    long long a = t % nproj;
     lprec_convert_coeffs(g + (s * nproj + a) * n, n, 1);
 }
 
 // Spline prefilter along the angle axis: one thread per (slice, detector) column.
 __global__ void lprec_prefilter_cols_ker(float *g, int nz, int nproj, int n) {
-    long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
-    long total = (long)nz * n;
+    long long t = (long long)blockIdx.x * LPREC_BLK + threadIdx.x;
+    long long total = (long long)nz * n;
     if (t >= total) {
         return;
     }
-    long s = t / n;
-    long d = t % n;
-    lprec_convert_coeffs(g + s * (long)nproj * n + d, nproj, n);
+    long long s = t / n;
+    long long d = t % n;
+    lprec_convert_coeffs(g + s * (long long)nproj * n + d, nproj, n);
 }
 
 // Gather: polar -> log-polar cubic interpolation, accumulated into the padded
@@ -139,28 +139,28 @@ __global__ void lprec_gather_ker(const float *g, float *flc, const int *targets,
                                  const float *xs, const float *ys, int npts,
                                  int nz, int nproj, int n, int nrho,
                                  int ntheta_pad) {
-    long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
-    long total = (long)nz * npts;
+    long long t = (long long)blockIdx.x * LPREC_BLK + threadIdx.x;
+    long long total = (long long)nz * npts;
     if (t >= total) {
         return;
     }
-    long s = t / npts;
+    long long s = t / npts;
     int idx = (int)(t % npts);
-    const float *gs = g + s * (long)nproj * n;
+    const float *gs = g + s * (long long)nproj * n;
     float val = lprec_cubic_interp2d(gs, n, nproj, n, xs[idx], ys[idx]);
-    long base = s * (long)nrho * ntheta_pad + targets[idx];
+    long long base = s * (long long)nrho * ntheta_pad + targets[idx];
     atomicAdd(&flc[base], val);
 }
 
 // Broadcast complex multiply on the half-complex spectrum: flc[s, i] *= kfull[i]
 // over the [nrho, ntheta_c] grid (ntheta_c = ntheta/2+1, the R2C half-width).
-__global__ void lprec_cmul_ker(float2 *flc, const float2 *kfull, int nz, long ng) {
-    long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
-    long total = (long)nz * ng;
+__global__ void lprec_cmul_ker(float2 *flc, const float2 *kfull, int nz, long long ng) {
+    long long t = (long long)blockIdx.x * LPREC_BLK + threadIdx.x;
+    long long total = (long long)nz * ng;
     if (t >= total) {
         return;
     }
-    long i = t % ng;
+    long long i = t % ng;
     float2 a = flc[t];
     float2 b = kfull[i];
     flc[t] = make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
@@ -176,23 +176,23 @@ __global__ void lprec_scatter_ker(const float *flc, float *f, const int *targets
                                   const float *xs, const float *ys, int npts,
                                   int nz, int n, int nrho, int ntheta,
                                   int ntheta_pad) {
-    long t = (long)blockIdx.x * LPREC_BLK + threadIdx.x;
-    long total = (long)nz * npts;
+    long long t = (long long)blockIdx.x * LPREC_BLK + threadIdx.x;
+    long long total = (long long)nz * npts;
     if (t >= total) {
         return;
     }
-    long s = t / npts;
+    long long s = t / npts;
     int idx = (int)(t % npts);
-    const float *fs = flc + s * (long)nrho * ntheta_pad;
+    const float *fs = flc + s * (long long)nrho * ntheta_pad;
     float val =
         2.0f * lprec_cubic_interp2d(fs, ntheta, nrho, ntheta_pad, xs[idx], ys[idx]);
-    f[s * (long)n * n + targets[idx]] += val;
+    f[s * (long long)n * n + targets[idx]] += val;
 }
 
 extern "C" {
 
 int tomoxide_lprec_prefilter_rows(void *g, int nz, int nproj, int n, void *stream) {
-    long total = (long)nz * nproj;
+    long long total = (long long)nz * nproj;
     int grid = (int)((total + LPREC_BLK - 1) / LPREC_BLK);
     lprec_prefilter_rows_ker<<<grid, LPREC_BLK, 0, (cudaStream_t)stream>>>(
         (float *)g, nz, nproj, n);
@@ -200,7 +200,7 @@ int tomoxide_lprec_prefilter_rows(void *g, int nz, int nproj, int n, void *strea
 }
 
 int tomoxide_lprec_prefilter_cols(void *g, int nz, int nproj, int n, void *stream) {
-    long total = (long)nz * n;
+    long long total = (long long)nz * n;
     int grid = (int)((total + LPREC_BLK - 1) / LPREC_BLK);
     lprec_prefilter_cols_ker<<<grid, LPREC_BLK, 0, (cudaStream_t)stream>>>(
         (float *)g, nz, nproj, n);
@@ -211,7 +211,7 @@ int tomoxide_lprec_gather(const void *g, void *flc, const void *targets,
                           const void *xs, const void *ys, int npts, int nz,
                           int nproj, int n, int nrho, int ntheta_pad,
                           void *stream) {
-    long total = (long)nz * npts;
+    long long total = (long long)nz * npts;
     if (total == 0) {
         return cudaSuccess;
     }
@@ -224,8 +224,8 @@ int tomoxide_lprec_gather(const void *g, void *flc, const void *targets,
 
 int tomoxide_lprec_cmul(void *flc, const void *kfull, int nz, int nrho,
                         int ntheta_c, void *stream) {
-    long ng = (long)nrho * ntheta_c;
-    long total = (long)nz * ng;
+    long long ng = (long long)nrho * ntheta_c;
+    long long total = (long long)nz * ng;
     int grid = (int)((total + LPREC_BLK - 1) / LPREC_BLK);
     lprec_cmul_ker<<<grid, LPREC_BLK, 0, (cudaStream_t)stream>>>(
         (float2 *)flc, (const float2 *)kfull, nz, ng);
@@ -236,7 +236,7 @@ int tomoxide_lprec_scatter(const void *flc, void *f, const void *targets,
                            const void *xs, const void *ys, int npts, int nz,
                            int n, int nrho, int ntheta, int ntheta_pad,
                            void *stream) {
-    long total = (long)nz * npts;
+    long long total = (long long)nz * npts;
     if (total == 0) {
         return cudaSuccess;
     }
