@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **lprec on CUDA indexes past 2^31 elements on Windows.** Its kernels
+  computed offsets in `long`, which is 32 bits under MSVC, so a chunk of
+  more than 2^31 floats (8 GiB) wrapped and read and wrote the wrong
+  memory. They use `long long` now, as every other kernel already did.
+
 ## [0.10.1] - 2026-11-01
 
 ### Fixed
