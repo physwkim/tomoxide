@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `cuda` feature builds with MSVC on Windows.** `build.rs` passed
+  gcc's `-fPIC` to cl.exe, linked a `stdc++` MSVC does not have, and looked
+  for the CUDA libraries only in `lib64`. It now builds the kernels against
+  the CRT Rust links (`/MD`, or `/MT` with `crt-static`), leaves the C++
+  runtime to cl.exe's objects, and also searches `%CUDA_PATH%\lib\x64`.
+  `stripe.cu` read the Titarenko sinogram through a GNU statement
+  expression, which nvcc rejects under cl.exe; it is a device function now.
+  CI builds and links it on Windows with CUDA 13.0.
+
 ## [0.10.0] - 2026-10-30
 
 ### Changed
