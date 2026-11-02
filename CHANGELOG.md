@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The CUDA lamino Fourier reconstruction no longer pins the whole
+  dataset.** Its device path page-locked the full projection stack and the
+  full output volume, and Windows pins at most about half of RAM, so a
+  large scan failed `cudaHostAlloc` with memory still free. Transfers now
+  go through two fixed 64 MiB pinned slabs; on Linux this also cut a
+  1024×900×512 reconstruction from 9.2–10.1 s to 8.85 s.
+
 ## [0.10.2] - 2026-11-01
 
 ### Fixed
