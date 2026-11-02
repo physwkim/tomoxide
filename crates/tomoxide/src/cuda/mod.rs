@@ -778,7 +778,18 @@ mod cuda_impl {
 
     impl<T: Copy> PinnedBuf<T> {
         fn new(len: usize) -> Result<Self> {
-            let ptr = unsafe { ffi::tomoxide_cuda_host_alloc(len * std::mem::size_of::<T>()) };
+            let bytes = len * std::mem::size_of::<T>();
+            // Test/debug hook: refuse a buffer above this many bytes, as a
+            // Windows host refuses one beyond its pinned share.
+            let refused = std::env::var("TOMOXIDE_CUDA_MAX_PINNED_BYTES")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .is_some_and(|cap| bytes > cap);
+            let ptr = if refused {
+                std::ptr::null_mut()
+            } else {
+                unsafe { ffi::tomoxide_cuda_host_alloc(bytes) }
+            };
             if ptr.is_null() {
                 return Err(Error::Backend(format!("cudaHostAlloc({len} elems) failed")));
             }
@@ -801,6 +812,124 @@ mod cuda_impl {
     impl<T> Drop for PinnedBuf<T> {
         fn drop(&mut self) {
             unsafe { ffi::tomoxide_cuda_host_free(self.ptr) };
+        }
+    }
+
+    /// Elements in each slab of a [`PinnedStage`] (64 MiB of `f32`).
+    const PINNED_STAGE_ELEMS: usize = 16 << 20;
+
+    /// Moves pageable host data to or from the device through two pinned slabs
+    /// of at most [`PINNED_STAGE_ELEMS`], the host filling or emptying one while
+    /// the other's DMA runs. The pinned footprint is fixed rather than sized to a
+    /// stack, a volume or a device chunk: Windows pins only a share of RAM, so a
+    /// buffer that large fails there with RAM to spare.
+    struct PinnedStage {
+        slab: [PinnedBuf<f32>; 2],
+        // Recorded after each slab's latest DMA; synced before the host refills it.
+        dma: [Event; 2],
+    }
+
+    impl PinnedStage {
+        /// Slabs for transfers of up to `len` elements.
+        fn new(len: usize) -> Result<Self> {
+            let elems = len.clamp(1, PINNED_STAGE_ELEMS);
+            Ok(PinnedStage {
+                slab: [PinnedBuf::new(elems)?, PinnedBuf::new(elems)?],
+                dma: [Event::new()?, Event::new()?],
+            })
+        }
+
+        /// Enqueue `src` → device `dst` on `stream`, returning once every piece
+        /// is staged; work that reads `dst` orders after `stream`.
+        fn upload(&mut self, dst: *mut c_void, src: &[f32], stream: &Stream) -> Result<()> {
+            let piece = self.slab[0].len;
+            for (k, part) in src.chunks(piece).enumerate() {
+                let s = k % 2;
+                ck(
+                    unsafe { ffi::tomoxide_cuda_event_sync(self.dma[s].ptr) },
+                    "stage_h2d_sync",
+                )?;
+                par_copy(&mut self.slab[s].as_mut_slice()[..part.len()], part);
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_h2d_async(
+                            (dst as *mut f32).add(k * piece) as *mut c_void,
+                            self.slab[s].ptr,
+                            std::mem::size_of_val(part),
+                            stream.ptr,
+                        )
+                    },
+                    "stage_h2d",
+                )?;
+                self.dma[s].record_on(stream)?;
+            }
+            Ok(())
+        }
+
+        /// Copy device `src` → `dst` after the work already on `stream`,
+        /// returning once `dst` holds it.
+        fn download(&self, dst: &mut [f32], src: *const c_void, stream: &Stream) -> Result<()> {
+            let (piece, total) = (self.slab[0].len, dst.len());
+            let issue = |k: usize| -> Result<()> {
+                let s = k % 2;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_d2h_async(
+                            self.slab[s].ptr,
+                            (src as *const f32).add(k * piece) as *const c_void,
+                            piece.min(total - k * piece) * std::mem::size_of::<f32>(),
+                            stream.ptr,
+                        )
+                    },
+                    "stage_d2h",
+                )?;
+                self.dma[s].record_on(stream)
+            };
+            issue(0)?;
+            // Piece k+1's DMA runs while the host empties piece k.
+            for (k, out) in dst.chunks_mut(piece).enumerate() {
+                if (k + 1) * piece < total {
+                    issue(k + 1)?;
+                }
+                let s = k % 2;
+                ck(
+                    unsafe { ffi::tomoxide_cuda_event_sync(self.dma[s].ptr) },
+                    "stage_d2h_sync",
+                )?;
+                let n = out.len();
+                par_copy(out, &self.slab[s].as_slice()[..n]);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod pinned_stage_tests {
+        use super::*;
+
+        // 2.5 slabs per transfer: pieces alternate slabs, the last one is short,
+        // and the second upload refills slabs the first one's DMA still owns.
+        #[test]
+        fn pieces_round_trip_through_two_slabs() {
+            let _b = CudaBackend::new().expect("cuda backend");
+            ck(unsafe { ffi::tomoxide_cuda_set_device(0) }, "set_device").unwrap();
+            let (slab, len) = (1000usize, 2500usize);
+            let mut stage = PinnedStage {
+                slab: [PinnedBuf::new(slab).unwrap(), PinnedBuf::new(slab).unwrap()],
+                dma: [Event::new().unwrap(), Event::new().unwrap()],
+            };
+            let a: Vec<f32> = (0..len).map(|i| i as f32).collect();
+            let b: Vec<f32> = (0..len).map(|i| -(i as f32) - 0.5).collect();
+            let bytes = len * std::mem::size_of::<f32>();
+            let dev = [DevBuf::new(bytes).unwrap(), DevBuf::new(bytes).unwrap()];
+            let stream = Stream::new().unwrap();
+            stage.upload(dev[0].ptr, &a, &stream).unwrap();
+            stage.upload(dev[1].ptr, &b, &stream).unwrap();
+            let (mut ra, mut rb) = (vec![0.0f32; len], vec![0.0f32; len]);
+            stage.download(&mut ra, dev[0].ptr, &stream).unwrap();
+            stage.download(&mut rb, dev[1].ptr, &stream).unwrap();
+            assert_eq!(ra, a);
+            assert_eq!(rb, b);
         }
     }
 
@@ -6188,6 +6317,7 @@ mod cuda_impl {
         // Conveyor: chunk ci+1's projections upload on a copy stream while chunk ci's
         // ramp+FFT runs on the compute (per-thread) stream; CUDA events order the
         // shared double buffer so a copy never overwrites a slab still being read.
+        // Uploads stage `proj` through a [`PinnedStage`].
         // Each theta-chunk is a contiguous slab of p22, written in place (no download).
         {
             let chunks: Vec<(usize, usize)> = {
@@ -6199,8 +6329,7 @@ mod cuda_impl {
                 }
                 v
             };
-            let mut pin_proj = PinnedBuf::<f32>::new(nproj * deth * detw)?;
-            pin_proj.as_mut_slice().copy_from_slice(proj);
+            let mut stage = PinnedStage::new(nthetac * deth * detw)?;
             let dev_in = [
                 DevBuf::new(nthetac * deth * detw * fsz)?,
                 DevBuf::new(nthetac * deth * detw * fsz)?,
@@ -6214,21 +6343,12 @@ mod cuda_impl {
             let ev_consumed = [Event::new()?, Event::new()?];
 
             // H2D one theta-chunk into `dev_in[slot]` on the copy stream.
-            let h2d = |slot: usize, t0: usize, tc: usize| -> Result<()> {
-                let bytes = tc * deth * detw * fsz;
-                let src = unsafe {
-                    (pin_proj.ptr as *const u8).add(t0 * deth * detw * fsz) as *const c_void
-                };
-                ck(
-                    unsafe {
-                        ffi::tomoxide_cuda_memcpy_h2d_async(
-                            dev_in[slot].ptr,
-                            src,
-                            bytes,
-                            cstream.ptr,
-                        )
-                    },
-                    "lam_s1_h2d",
+            let mut h2d = |slot: usize, t0: usize, tc: usize| -> Result<()> {
+                let frame = deth * detw;
+                stage.upload(
+                    dev_in[slot].ptr,
+                    &proj[t0 * frame..][..tc * frame],
+                    &cstream,
                 )
             };
 
@@ -6240,17 +6360,6 @@ mod cuda_impl {
             for (ci, &(t0, tc)) in chunks.iter().enumerate() {
                 check_cancel_drained(cancel)?;
                 let slot = ci % 2;
-                // Prefetch the next chunk into the other slot while we compute this.
-                if ci + 1 < chunks.len() {
-                    let nslot = (ci + 1) % 2;
-                    let (nt0, ntc) = chunks[ci + 1];
-                    // Don't overwrite a slab whose compute has not consumed it yet.
-                    if ci + 1 >= 2 {
-                        cstream.wait_event(&ev_consumed[nslot])?;
-                    }
-                    h2d(nslot, nt0, ntc)?;
-                    ev_uploaded[nslot].record_on(&cstream)?;
-                }
                 // Compute waits for this chunk's upload, then runs on the per-thread stream.
                 ev_uploaded[slot].wait_compute()?;
                 let din = &dev_in[slot];
@@ -6342,6 +6451,18 @@ mod cuda_impl {
                     },
                     "lam_fft2d_post",
                 )?;
+                // Prefetch the next chunk into the other slot while this one
+                // computes; queued after it, so the host-side staging overlaps it.
+                if ci + 1 < chunks.len() {
+                    let nslot = (ci + 1) % 2;
+                    let (nt0, ntc) = chunks[ci + 1];
+                    // Don't overwrite a slab whose compute has not consumed it yet.
+                    if ci + 1 >= 2 {
+                        cstream.wait_event(&ev_consumed[nslot])?;
+                    }
+                    h2d(nslot, nt0, ntc)?;
+                    ev_uploaded[nslot].record_on(&cstream)?;
+                }
             }
             ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         }
@@ -6464,11 +6585,12 @@ mod cuda_impl {
         }
 
         // --- stage 3: usfft1d_adj, chunked over y-frequency rows (n1) ---
-        // Conveyor mirror of stage 1: chunk ci's finished f00 slab drains to pinned
-        // host memory on a copy stream while chunk ci+1 computes; events guard the
-        // double-buffered f00 slabs. Each n1-chunk is a contiguous slab of the
-        // resident p11, read in place at its offset (no upload).
-        let pin_p00 = PinnedBuf::<f32>::new(n1 * rh * n0)?; // [n1, rh, n0] real
+        // Conveyor mirror of stage 1: chunk ci-1's finished f00 slab drains into
+        // `p00` through a [`PinnedStage`] on a copy stream while chunk ci computes.
+        // The drain returns before chunk ci+1, which reuses that slab, is queued.
+        // Each n1-chunk is a contiguous slab of the resident p11, read in place at
+        // its offset (no upload).
+        let mut p00 = vec![0.0f32; n1 * rh * n0]; // [n1, rh, n0] real
         {
             let z = DevBuf::new(deth * fsz)?;
             ck(
@@ -6490,17 +6612,24 @@ mod cuda_impl {
                 DevBuf::new(n1c * rh * n0 * fsz)?,
                 DevBuf::new(n1c * rh * n0 * fsz)?,
             ];
+            let stage = PinnedStage::new(n1c * rh * n0)?;
             let cstream = Stream::new()?;
             let ev_computed = [Event::new()?, Event::new()?];
-            let ev_drained = [Event::new()?, Event::new()?];
+            // D2H chunk `c` into `p00` once computed; its f00 slab is free on return.
+            let mut drain = |c: usize| -> Result<()> {
+                let (y0, yc) = chunks[c];
+                cstream.wait_event(&ev_computed[c % 2])?;
+                let plane = rh * n0;
+                stage.download(
+                    &mut p00[y0 * plane..][..yc * plane],
+                    f00[c % 2].ptr,
+                    &cstream,
+                )
+            };
 
             for (ci, &(y0, yc)) in chunks.iter().enumerate() {
                 check_cancel_drained(cancel)?;
                 let slot = ci % 2;
-                // Don't overwrite an f00 slab still draining to the host.
-                if ci >= 2 {
-                    ev_drained[slot].wait_compute()?;
-                }
                 let g_off =
                     unsafe { (p11.ptr as *mut u8).add(y0 * deth * n0 * csz) as *mut c_void };
                 // Zero only the yc grid; gather1d accumulates (atomicAdd) into it.
@@ -6572,32 +6701,19 @@ mod cuda_impl {
                     },
                     "lam_divker1d_adj",
                 )?;
-                // f00[slot] is ready; drain it to the host on the copy stream.
+                // f00[slot] is ready for the copy stream.
                 ev_computed[slot].record_compute()?;
-                cstream.wait_event(&ev_computed[slot])?;
-                let bytes = yc * rh * n0 * fsz;
-                let dst =
-                    unsafe { (pin_p00.ptr as *mut u8).add(y0 * rh * n0 * fsz) as *mut c_void };
-                ck(
-                    unsafe {
-                        ffi::tomoxide_cuda_memcpy_d2h_async(dst, f00[slot].ptr, bytes, cstream.ptr)
-                    },
-                    "lam_s3_d2h",
-                )?;
-                ev_drained[slot].record_on(&cstream)?;
+                if ci >= 1 {
+                    drain(ci - 1)?;
+                }
             }
+            drain(chunks.len() - 1)?;
             ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         }
         drop(p11);
         drop(p22);
 
-        emit_p00_tiles(
-            pin_p00.as_slice(),
-            (n1, rh, n),
-            LAM_FOURIER_TILE_BYTES,
-            cancel,
-            on_tile,
-        )
+        emit_p00_tiles(&p00, (n1, rh, n), LAM_FOURIER_TILE_BYTES, cancel, on_tile)
     }
 
     /// [`check_cancel`] inside a loop that leaves copies and kernels in flight
