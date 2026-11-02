@@ -7,6 +7,7 @@
 //! parity is in docs/PORTING.md `recon::lamino`).
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
+//! One test sets process-global env vars; nextest runs each in its own process.
 
 use ndarray::{s, Array2, Array3, Axis};
 use tomoxide::{
@@ -336,4 +337,71 @@ fn cuda_fourierrec_lamino_has_the_volume_orientation() {
             "{algorithm:?} reconstructs the volume at r = {r:.3}, its y-flip at {r_flip:.3}"
         );
     }
+}
+
+/// The device path moves the projections in and the volume out through
+/// fixed-size pinned slabs, so a host that pins less than either (Windows
+/// pins only a share of RAM) still runs it. With pinned buffers capped at half
+/// the smaller of the two and free memory at the device path's floor, which
+/// splits every stage into several chunks, it reconstructs the volume the
+/// uncapped one-chunk run does.
+#[test]
+fn cuda_fourierrec_lamino_device_path_pins_only_staging_slabs() {
+    let cuda = match CudaBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping CUDA test: {e}");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+
+    let (n, nproj, nz, rh) = (64usize, 90usize, 32usize, 48usize);
+    let phantom = sim::shepp2d(n).unwrap();
+    let mut stack = Array3::<f32>::zeros((nz, n, n));
+    for z in 0..nz {
+        stack.index_axis_mut(Axis(0), z).assign(&phantom);
+    }
+    let angles = Angles::uniform(nproj, 0.0, std::f32::consts::PI);
+    let geom_p = Geometry::parallel(angles.clone(), n, nz, 1.0);
+    let sino = sim::project(&Volume::new(stack), &geom_p, &cpu).unwrap();
+    let geom_lam = Geometry {
+        angles,
+        center: Center::Scalar(n as f32 / 2.0),
+        beam: Beam::laminography(20.0),
+        detector: Detector {
+            width: n,
+            height: nz,
+            pixel_size: 1.0,
+        },
+    };
+    let params = ReconParams {
+        lamino_rh: Some(rh),
+        ..Default::default()
+    };
+    let whole = recon::recon(&sino, &geom_lam, Algorithm::Fourierrec, &params, &cuda).unwrap();
+
+    // The device path runs while its resident p22 + p11 spectra fit 80 % of
+    // free memory.
+    let resident = (nproj + n) * nz * n * 8;
+    std::env::set_var(
+        "TOMOXIDE_CUDA_MAX_FREE_BYTES",
+        (resident * 5).div_ceil(4).to_string(),
+    );
+    let cap = (nproj * nz * n).min(rh * n * n) * 4 / 2;
+    std::env::set_var("TOMOXIDE_CUDA_MAX_PINNED_BYTES", cap.to_string());
+    let chunked = recon::recon(&sino, &geom_lam, Algorithm::Fourierrec, &params, &cuda);
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_PINNED_BYTES");
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    let chunked = chunked.unwrap();
+
+    let err = nrmse(
+        chunked.array.as_slice().unwrap(),
+        whole.array.as_slice().unwrap(),
+    );
+    eprintln!("chunked vs one-chunk device path: NRMSE = {err:.3e}");
+    assert!(
+        err < 1e-5,
+        "chunked device path diverges: NRMSE = {err:.3e}"
+    );
 }
