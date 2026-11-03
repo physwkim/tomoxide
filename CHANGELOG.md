@@ -6,6 +6,39 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`cuda::LaminoReprojector` keeps a band on the device across angle
+  chunks.** `lamino_reproject` uploads its band on every call, so a caller
+  splitting `theta` into launch-sized chunks sent the same band once per
+  chunk; the reprojector uploads it once. `lamino_reproject` is one call of
+  it.
+
+### Changed
+
+- **Breaking (ffi): the CUDA launch wrappers return `i32`, and
+  `tomoxide_linerec_backproject` / `tomoxide_linerec_fp16_backproject` take
+  `axis` after `phi`.** See the fixes below.
+
+### Fixed
+
+- **The CUDA projector pair projects about `geom.center`.**
+  `ForwardProject`, `FilteredBackproject` and the device-resident iterative
+  solvers put the volume's middle column on the detector's middle column
+  whatever the centre, so an off-centre scan was solved about the wrong axis
+  (CUDA against CPU SIRT at centre `n/2 + 5.5`: r = 0.12, now 1.0). They read
+  the centre now, and refuse a `Center::PerRow` whose rows differ, since the
+  kernels take one centre. The analytic paths centre the sinogram first and
+  are unchanged.
+- **A CUDA projector sample left of column 0 or above row 0 adds nothing.**
+  `(int)` truncates toward zero, so a sample at `u` or `v` in (−1, 0) landed
+  on column (row) 0 with a weight above 1 and on 1 with a negative one; the
+  forward and back-projection kernels drop it now, as the CPU does.
+- **A failed CUDA kernel launch reaches the caller.** The wrappers returned
+  nothing, and a launch error is not sticky, so the sync after it could
+  report success over a kernel that never ran. They return the launch error
+  now (a cuFFT refusal as −2), and every call site checks it.
+
 ## [0.11.0] - 2026-11-03
 
 ### Added
