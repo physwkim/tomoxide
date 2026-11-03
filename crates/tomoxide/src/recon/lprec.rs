@@ -43,7 +43,7 @@ const POLE: f32 = -0.267_949_2;
 /// Cubic-B-spline basis weights for a sample at fractional offset `f ∈ [0,1)`.
 /// Taps land at `floor−1 … floor+2`; matches `bspline_weights` in the reference.
 #[inline]
-fn bspline_weights(f: f32) -> [f32; 4] {
+pub(crate) fn bspline_weights(f: f32) -> [f32; 4] {
     let one = 1.0 - f;
     let sq = f * f;
     let one_sq = one * one;
@@ -85,7 +85,7 @@ fn cubic_interp2d(coeffs: &[f32], width: usize, height: usize, x: f32, y: f32) -
 
 /// In-place cubic-B-spline prefilter of one line (samples → spline coefficients),
 /// clamped boundaries — `ConvertToInterpolationCoefficients` from the reference.
-fn convert_to_coeffs(c: &mut [f32]) {
+pub(crate) fn convert_to_coeffs(c: &mut [f32]) {
     let n = c.len();
     if n < 2 {
         return;

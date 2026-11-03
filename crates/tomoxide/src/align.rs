@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use ndarray::{Array3, Axis};
+use rayon::prelude::*;
 
 use crate::backend::Backend;
 use crate::cuda::LaminoTileFn;
@@ -98,6 +99,36 @@ impl PreppedStack {
             data: Tomo::new(proj.array.select(Axis(0), indices), Layout::Projection),
             theta: indices.iter().map(|&i| self.theta[i]).collect(),
             nproj: indices.len(),
+            nz: self.nz,
+            nx: self.nx,
+        })
+    }
+
+    /// This stack with every projection moved by
+    /// [`move_frames`](crate::prep::alignment::move_frames): `dy`/`dx` per
+    /// projection, one `roll_deg` for all. The move is made on the
+    /// transmission `exp(−p)` and logged again, as moving the raw frames
+    /// before prep would.
+    pub fn moved(
+        &self,
+        backend: &dyn Backend,
+        dy: &[f32],
+        dx: &[f32],
+        roll_deg: f32,
+    ) -> Result<PreppedStack> {
+        let mut proj = self.data.to_layout(Layout::Projection);
+        proj.array
+            .as_slice_mut()
+            .expect("to_layout is standard")
+            .par_iter_mut()
+            .for_each(|p| *p = (-*p).exp());
+        crate::prep::alignment::move_frames(&mut proj, dy, dx, roll_deg)?;
+        crate::prep::minus_log(&mut proj, backend)?;
+        Ok(PreppedStack {
+            path: self.path.clone(),
+            data: proj,
+            theta: self.theta.clone(),
+            nproj: self.nproj,
             nz: self.nz,
             nx: self.nx,
         })
@@ -285,5 +316,24 @@ mod tests {
              got {tilted} for nz {nz}"
         );
         assert_eq!(st.default_slice(Some(44.0), Some((2, 7))), 4);
+    }
+
+    /// No move gives back the stack: the exp/log around the resampling is
+    /// the identity on prepped data.
+    #[test]
+    fn moved_by_nothing_is_the_same_stack() {
+        let cpu = crate::CpuBackend::new();
+        let st = PreppedStack::load(&cpu, &fixture()).unwrap();
+        let (nproj, _, _) = st.shape();
+        let zero = vec![0.0; nproj];
+        let m = st.moved(&cpu, &zero, &zero, 0.0).unwrap();
+        assert_eq!(m.shape(), st.shape());
+        assert_eq!(m.theta, st.theta);
+        let a = st.data.as_layout(Layout::Projection);
+        let b = m.data.as_layout(Layout::Projection);
+        let peak = a.array.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for (x, y) in a.array.iter().zip(b.array.iter()) {
+            assert!((x - y).abs() <= 1e-4 * peak.max(1.0), "{x} vs {y}");
+        }
     }
 }
