@@ -2,10 +2,19 @@
 //!
 //! `scale` and `blur_edges` are real (bit-exact, Δ=0); the rest of the alignment
 //! family (`shift_images`, `add_jitter`, `align_seq`/`align_joint`) is unported —
-//! see `docs/PORTING.md` §D.
+//! see `docs/PORTING.md` §D. [`move_frames`] is not a tomopy port: it applies a
+//! measured per-frame shift and a detector roll in one resampling.
+
+use rayon::prelude::*;
 
 use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
+use crate::recon::lprec::{bspline_weights, convert_to_coeffs};
+
+/// Edge-replicated margin the spline prefilter runs over around a frame
+/// (scipy's `npad` for mode `nearest`): its boundary term has decayed by
+/// `|pole|^12 ≈ 1.4e-7` where the frame starts.
+const SPLINE_PAD: usize = 12;
 
 /// Linearly scale a projection stack into `[−1, 1]` by its peak magnitude
 /// (tomopy `prep/alignment.py:460` `scale`). Divides every pixel by
@@ -97,6 +106,110 @@ pub fn blur_edges(data: &mut Tomo<f32>, low: f64, high: f64) -> Result<()> {
     Ok(())
 }
 
+/// Move every projection by its own shift and one common roll, in a single
+/// cubic-B-spline resampling per frame: `out[o] = in[M·(o + d − c) + c]` on
+/// `(row, col)`, with `d = (dy[k], dx[k])`, `c = ((rows−1)/2, (cols−1)/2)` and
+/// `M = [[cos r, sin r], [−sin r, cos r]]` for `r = roll_deg`. What sat at
+/// `o + d` in the rolled frame lands at `o`, so a measured displacement `d` is
+/// removed. Off the frame it reads the spline of the frame extended by its
+/// edges, as scipy does.
+///
+/// This is scipy's `shift(rotate(p, roll_deg, reshape=False), (−dy, −dx))`
+/// with `order=3, mode='nearest'`, made as one resampling instead of two.
+pub fn move_frames(data: &mut Tomo<f32>, dy: &[f32], dx: &[f32], roll_deg: f32) -> Result<()> {
+    let nproj = data.n_angles();
+    if dy.len() != nproj || dx.len() != nproj {
+        return Err(Error::InvalidParam(format!(
+            "move_frames: {} dy and {} dx for {nproj} projections",
+            dy.len(),
+            dx.len()
+        )));
+    }
+    if !roll_deg.is_finite() || dy.iter().chain(dx).any(|v| !v.is_finite()) {
+        return Err(Error::InvalidParam(
+            "move_frames: non-finite shift or roll".into(),
+        ));
+    }
+    let (rows, cols) = (data.n_rows(), data.n_cols());
+    if nproj == 0 || rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    let target = data.layout;
+    if target != Layout::Projection || !data.array.is_standard_layout() {
+        *data = data.to_layout(Layout::Projection);
+    }
+    let (sn, cs) = (roll_deg as f64).to_radians().sin_cos();
+    let (cy, cx) = ((rows - 1) as f64 / 2.0, (cols - 1) as f64 / 2.0);
+    let (h, w) = (rows + 2 * SPLINE_PAD, cols + 2 * SPLINE_PAD);
+    let frames = data.array.as_slice_mut().expect("standard layout");
+    frames
+        .par_chunks_mut(rows * cols)
+        .zip(dy.par_iter().zip(dx))
+        .for_each_init(
+            || (vec![0.0f32; h * w], vec![0.0f32; h]),
+            |(coef, line), (frame, (&dy, &dx))| {
+                spline_coeffs(frame, rows, cols, coef, line);
+                for (i, out) in frame.chunks_exact_mut(cols).enumerate() {
+                    let a = i as f64 + dy as f64 - cy;
+                    for (j, v) in out.iter_mut().enumerate() {
+                        let b = j as f64 + dx as f64 - cx;
+                        let (r, c) = (cs * a + sn * b + cy, cs * b - sn * a + cx);
+                        *v = spline_at(coef, h, w, r, c);
+                    }
+                }
+            },
+        );
+    if target != Layout::Projection {
+        *data = data.to_layout(target);
+    }
+    Ok(())
+}
+
+/// The cubic-B-spline coefficients of `frame` (`rows × cols`) padded by
+/// [`SPLINE_PAD`] edge-replicated samples on every side, into `coef`
+/// (`(rows + 2·pad) × (cols + 2·pad)`); `line` holds one padded column.
+fn spline_coeffs(frame: &[f32], rows: usize, cols: usize, coef: &mut [f32], line: &mut [f32]) {
+    let w = cols + 2 * SPLINE_PAD;
+    for (r, out) in coef.chunks_exact_mut(w).enumerate() {
+        let src = &frame[r.saturating_sub(SPLINE_PAD).min(rows - 1) * cols..][..cols];
+        out[..SPLINE_PAD].fill(src[0]);
+        out[SPLINE_PAD..SPLINE_PAD + cols].copy_from_slice(src);
+        out[SPLINE_PAD + cols..].fill(src[cols - 1]);
+        convert_to_coeffs(out);
+    }
+    for c in 0..w {
+        for (r, v) in line.iter_mut().enumerate() {
+            *v = coef[r * w + c];
+        }
+        convert_to_coeffs(line);
+        for (r, v) in line.iter().enumerate() {
+            coef[r * w + c] = *v;
+        }
+    }
+}
+
+/// The spline of padded coefficients `coef` (`h × w`) at frame position
+/// `(r, c)`. scipy neither clamps the position nor stops at the padding: a
+/// tap past it reads the padding's edge coefficient.
+fn spline_at(coef: &[f32], h: usize, w: usize, r: f64, c: f64) -> f32 {
+    let (r, c) = (r + SPLINE_PAD as f64, c + SPLINE_PAD as f64);
+    let (fr, fc) = (r.floor(), c.floor());
+    let wr = bspline_weights((r - fr) as f32);
+    let wc = bspline_weights((c - fc) as f32);
+    let tap = |f: f64, k: isize, n: usize| (f as isize - 1 + k).clamp(0, n as isize - 1) as usize;
+    let cols = [0, 1, 2, 3].map(|k| tap(fc, k, w));
+    let mut sum = 0.0f32;
+    for (k, &wk) in wr.iter().enumerate() {
+        let row = &coef[tap(fr, k as isize, h) * w..][..w];
+        sum += wk
+            * (wc[0] * row[cols[0]]
+                + wc[1] * row[cols[1]]
+                + wc[2] * row[cols[2]]
+                + wc[3] * row[cols[3]]);
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +244,102 @@ mod tests {
         assert_eq!(t.array[[0, 0, 0]], 0.0, "corner not blurred to 0");
         let mid = t.array[[0, 0, 2]];
         assert!(mid > 0.0 && mid < 1.0, "edge pixel {mid} not feathered");
+    }
+
+    /// A frame with no smooth structure, so a sample read from the wrong
+    /// pixel cannot pass for the right one.
+    fn rough(n: usize, rows: usize, cols: usize) -> Array3<f32> {
+        Array3::from_shape_fn((n, rows, cols), |(k, r, c)| {
+            ((k * 5 + r * 7 + c * 13) % 11) as f32
+        })
+    }
+
+    /// A whole-pixel move lands every sample on a node, where the spline
+    /// equals the data; the edge reads past the frame as the nearest pixel.
+    /// A zero move is the identity.
+    #[test]
+    fn move_frames_moves_by_whole_pixels() {
+        let (rows, cols) = (16, 20);
+        let src = rough(3, rows, cols);
+        let mut t = Tomo::new(src.clone(), Layout::Projection);
+        let (dy, dx) = ([2.0, -1.0, 0.0], [-3.0, 0.0, 0.0]);
+        move_frames(&mut t, &dy, &dx, 0.0).unwrap();
+        for ((k, i, j), &v) in t.array.indexed_iter() {
+            let si = (i as isize + dy[k] as isize).clamp(0, rows as isize - 1) as usize;
+            let sj = (j as isize + dx[k] as isize).clamp(0, cols as isize - 1) as usize;
+            let want = src[[k, si, sj]];
+            assert!((v - want).abs() < 1e-4, "[{k},{i},{j}] {v} want {want}");
+        }
+    }
+
+    /// Past the edge it reads what scipy 1.13.1's
+    /// `shift(f, (−0.4, 2.7), order=3, mode='nearest')` reads.
+    #[test]
+    fn move_frames_reads_past_the_edge_as_scipy_shift() {
+        let src = Array3::from_shape_fn((1, 4, 6), |(_, r, c)| {
+            ((3 * r + 7 * c) % 5) as f32 + 0.25 * r as f32
+        });
+        let mut t = Tomo::new(src, Layout::Projection);
+        move_frames(&mut t, &[0.4], &[-2.7], 0.0).unwrap();
+        #[rustfmt::skip]
+        let want = [
+            1.472188, 1.445359, 1.545486, 1.159575, 1.725208, 3.519763,
+            2.657169, 2.63813, 2.709184, 2.411628, 1.016459, 2.02057,
+            2.455581, 2.480741, 2.386841, 2.758071, 2.931692, 1.194648,
+            5.197221, 5.093313, 5.481104, 3.933387, 2.036161, 3.506029,
+        ];
+        for (k, (&v, &w)) in t.array.iter().zip(&want).enumerate() {
+            assert!((v - w).abs() < 1e-5, "[{}][{}] {v} want {w}", k / 6, k % 6);
+        }
+    }
+
+    /// A 90° roll of a square frame is `np.rot90`, which scipy's
+    /// `rotate(p, 90, reshape=False)` also gives: `out[i][j] = in[j][n−1−i]`.
+    #[test]
+    fn move_frames_rolls_a_quarter_turn_as_scipy_rotate() {
+        let n = 12;
+        let src = rough(1, n, n);
+        let mut t = Tomo::new(src.clone(), Layout::Projection);
+        move_frames(&mut t, &[0.0], &[0.0], 90.0).unwrap();
+        for ((_, i, j), &v) in t.array.indexed_iter() {
+            let want = src[[0, j, n - 1 - i]];
+            assert!((v - want).abs() < 1e-4, "[{i},{j}] {v} want {want}");
+        }
+    }
+
+    /// A cubic spline reproduces a linear ramp away from the edge, so a
+    /// sub-pixel shift under an odd roll reads the ramp exactly where
+    /// `M·(o + d − c) + c` says, on a non-square frame in sinogram layout.
+    #[test]
+    fn move_frames_samples_at_the_rolled_and_shifted_position() {
+        let (rows, cols) = (30, 40);
+        let ramp = |r: f64, c: f64| 0.5 * r + 0.25 * c;
+        let src =
+            Array3::from_shape_fn((1, rows, cols), |(_, r, c)| ramp(r as f64, c as f64) as f32);
+        let mut t = Tomo::new(src, Layout::Projection).to_layout(Layout::Sinogram);
+        let (dy, dx, roll) = (0.5f64, -1.25f64, 30.0f64);
+        move_frames(&mut t, &[dy as f32], &[dx as f32], roll as f32).unwrap();
+        assert_eq!(t.layout, Layout::Sinogram);
+        let (sn, cs) = roll.to_radians().sin_cos();
+        let (cy, cx) = ((rows - 1) as f64 / 2.0, (cols - 1) as f64 / 2.0);
+        let mut checked = 0;
+        for ((i, _, j), &v) in t.array.indexed_iter() {
+            let (a, b) = (i as f64 + dy - cy, j as f64 + dx - cx);
+            let (r, c) = (cs * a + sn * b + cy, cs * b - sn * a + cx);
+            if r < 4.0 || c < 4.0 || r > (rows - 5) as f64 || c > (cols - 5) as f64 {
+                continue;
+            }
+            let want = ramp(r, c) as f32;
+            assert!((v - want).abs() < 1e-3, "[{i},{j}] {v} want {want}");
+            checked += 1;
+        }
+        assert!(checked > 200, "only {checked} interior samples");
+    }
+
+    #[test]
+    fn move_frames_rejects_a_shift_per_projection_mismatch() {
+        let mut t = Tomo::new(rough(2, 4, 4), Layout::Projection);
+        let r = move_frames(&mut t, &[0.0], &[0.0, 0.0], 0.0);
+        assert!(matches!(r, Err(Error::InvalidParam(_))));
     }
 }
