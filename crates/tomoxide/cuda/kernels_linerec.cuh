@@ -35,7 +35,7 @@ void __global__ fill_tex_ker(cudaSurfaceObject_t surf, real *data, int ncz, int 
 // Centring z on nz/2 instead (the pre-fix convention) shifted every lamino
 // volume by (rh-nz)/2 slices against the Fourier (USFFT) reconstruction,
 // which has always centred on rh/2.
-void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *theta, float phi, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
+void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *theta, float phi, float axis, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -72,7 +72,7 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
         float stheta = ssc[nproj + t];
         R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
         R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
-        float u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2;
+        float u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+axis;
         float v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-rh/2) + nz/2;
 
         int ur = (int)(u-1e-5f);
@@ -80,7 +80,7 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
 
         // Keep the original in-bounds guard: out-of-bounds taps must add 0,
         // whereas the texture's clamp addressing would return edge texels.
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz-1))
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
         {
             // Texel i is sampled at coordinate i+0.5, so u+0.5 reproduces
             // (1-frac(u))*T[ur] + frac(u)*T[ur+1] (and likewise for v).
@@ -93,8 +93,9 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
 #else // !HALF: f32 direct-gather back-projection (see note above)
 
 // `rh` = full reconstruction height; volume z centres on rh/2, detector row on
-// nz/2 (see the note on `backprojection_tex_ker`).
-void __global__ backprojection_ker(real *f, real *data, float *theta, float phi, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
+// nz/2 (see the note on `backprojection_tex_ker`). `axis` = detector column
+// voxel column n/2 reads, as in forwardprojection_ker.
+void __global__ backprojection_ker(real *f, real *data, float *theta, float phi, float axis, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
@@ -135,14 +136,14 @@ void __global__ backprojection_ker(real *f, real *data, float *theta, float phi,
         float stheta = ssc[nproj + t];
         R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
         R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
-        u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2;
+        u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+axis;
         v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-rh/2) + nz/2;
 
         ur = (int)(u-1e-5f);
         vr = (int)(v-1e-5f);
 
-        // linear interp
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz-1))
+        // linear interp; the lower bound tests u and v, as in forwardprojection_ker
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
         {
             u = u-ur;
             v = v-vr;
@@ -204,7 +205,7 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
         vr = (int)(v-1e-5f);            
         
         // linear interp            
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz-1))
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
         {
             u = u-ur;
             v = v-vr;                
@@ -266,7 +267,7 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
         vr = (int)(v-1e-5f);                                    
         
         // linear interp            
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz - 1))
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
         {
             u = u-ur;
             v = v-vr;                

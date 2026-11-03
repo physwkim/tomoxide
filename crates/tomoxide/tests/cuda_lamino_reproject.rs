@@ -1,6 +1,6 @@
 //! `cuda::lamino_reproject` gives the frames a laminography reconstruction at
 //! a given centre reads a band of its volume from: it is the existing
-//! projector at centre `n/2`, a band projects where it sits in the volume, the
+//! projector, a band projects where it sits in the volume, the
 //! centre moves the frames along the detector, and Fourierrec at that centre
 //! puts what was projected back in place, sharpest at that centre.
 //!
@@ -70,8 +70,8 @@ fn cuda_or_skip() -> Option<CudaBackend> {
     }
 }
 
-/// At centre `n/2` the whole volume reprojects as `sim::project` projects
-/// it, and two bands at their own `z0` add up to the whole.
+/// At a centre off `n/2` the whole volume reprojects as `sim::project`
+/// projects it, and two bands at their own `z0` add up to the whole.
 #[test]
 fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
     let Some(cudab) = cuda_or_skip() else { return };
@@ -85,10 +85,10 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
             (36.0, 40.0, 30.0, 2.0),
         ],
     );
-    let geom = geometry(nproj, tilt, n as f32 / 2.0, n, rows);
+    let center = n as f32 / 2.0 + 3.5;
+    let geom = geometry(nproj, tilt, center, n, rows);
     let theta = geom.angles.0.clone();
-    let whole =
-        cuda::lamino_reproject(vol.view(), 0, depth, &theta, tilt, n as f32 / 2.0, rows).unwrap();
+    let whole = cuda::lamino_reproject(vol.view(), 0, depth, &theta, tilt, center, rows).unwrap();
     assert_eq!(whole.dim(), (nproj, rows, n));
 
     let sino = sim::project(&Volume::new(vol.clone()), &geom, &cudab).unwrap();
@@ -106,7 +106,7 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
         depth,
         &theta,
         tilt,
-        32.0,
+        center,
         rows,
     );
     let high = cuda::lamino_reproject(
@@ -115,7 +115,7 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
         depth,
         &theta,
         tilt,
-        32.0,
+        center,
         rows,
     );
     let sum = low.unwrap() + high.unwrap();
@@ -124,6 +124,32 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
         d < 1e-5,
         "bands at their z0 sum to the whole within {d:e} of peak"
     );
+}
+
+/// One `LaminoReprojector` projecting angle chunks gives the frames one call
+/// over every angle gives, and refuses an empty chunk.
+#[test]
+fn cuda_lamino_reprojector_chunks_are_the_whole() {
+    if cuda_or_skip().is_none() {
+        return;
+    }
+    let (n, nproj, rows, depth, tilt, center) =
+        (64usize, 50usize, 40usize, 48usize, 20.0f32, 33.5f32);
+    let vol = blobs(
+        depth,
+        n,
+        &[(20.0, 26.0, 38.0, 2.5), (28.0, 36.0, 24.0, 3.0)],
+    );
+    let band = vol.slice(s![10..40, .., ..]);
+    let theta = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI).0;
+    let whole = cuda::lamino_reproject(band, 10, depth, &theta, tilt, center, rows).unwrap();
+    let rp = cuda::LaminoReprojector::new(band, 10, depth, tilt, center, rows).unwrap();
+    let parts: Vec<_> = theta.chunks(16).map(|t| rp.project(t).unwrap()).collect();
+    let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+    // The kernel scatters with atomicAdd, so two launches agree to rounding.
+    let d = max_rel_diff(&ndarray::concatenate(Axis(0), &views).unwrap(), &whole);
+    assert!(d < 1e-5, "chunks differ from the whole by {d:e} of peak");
+    assert!(rp.project(&[]).is_err());
 }
 
 /// A centre `k` columns right of `n/2` is the same frames moved `k` columns
@@ -148,6 +174,38 @@ fn cuda_lamino_reproject_centre_moves_the_frames_along_the_detector() {
             );
         }
     }
+}
+
+/// A voxel that projects left of column 0 or above row 0 adds nothing. `(int)`
+/// truncates toward zero, so such a sample once landed on column (row) 0 with
+/// weight 1.5 and on column (row) 1 with −0.5.
+#[test]
+fn cuda_lamino_reproject_drops_a_sample_left_of_column_0_or_above_row_0() {
+    if cuda_or_skip().is_none() {
+        return;
+    }
+    let (n, rows, depth) = (32usize, 24usize, 32usize);
+    // At θ = 0 voxel (z, n/2, x) lands on column x − n/2 + center and row
+    // cos(tilt)·(z − depth/2) + rows/2.
+    let one = |z: usize, x: usize, tilt: f32, center: f32| {
+        let mut vol = Array3::zeros((depth, n, n));
+        vol[[z, n / 2, x]] = 1.0f32;
+        cuda::lamino_reproject(vol.view(), 0, depth, &[0.0], tilt, center, rows).unwrap()
+    };
+    let left = one(depth / 2, 0, 20.0, n as f32 / 2.0 - 0.5);
+    assert!(
+        left.iter().all(|&v| v == 0.0),
+        "column −0.5 scattered {:?}",
+        left.slice(s![0, rows / 2, ..2])
+    );
+    // cos(tilt) = 12.5/16 puts z = 0 on row −0.5.
+    let tilt = (12.5f32 / 16.0).acos().to_degrees();
+    let above = one(0, n / 2, tilt, n as f32 / 2.0);
+    assert!(
+        above.iter().all(|&v| v == 0.0),
+        "row −0.5 scattered {:?}",
+        above.slice(s![0, ..2, n / 2])
+    );
 }
 
 /// Every frame's centroid is where the blob's centroid projects: column

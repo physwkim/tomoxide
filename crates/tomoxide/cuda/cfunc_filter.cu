@@ -58,16 +58,20 @@ void cfunc_filter::free() {
   }
 }
 
-void cfunc_filter::filter(size_t g_, size_t w_, size_t stream_) {
+int cfunc_filter::filter(size_t g_, size_t w_, size_t stream_) {
     real* g = (real *)g_;    
     real2* w = (real2 *)w_;
     cudaStream_t stream = (cudaStream_t)stream_;    
-    cufftSetStream(plan_filter_fwd, stream);
-    cufftSetStream(plan_filter_inv, stream);    
+    if (cufftSetStream(plan_filter_fwd, stream) != CUFFT_SUCCESS ||
+        cufftSetStream(plan_filter_inv, stream) != CUFFT_SUCCESS)
+        return -2;
     dim3 dimBlock(32,32,1);
     dim3 GS3d2 = dim3(ceil((n/2+1)/32.0), ceil(nproj / 32.0), nz);
-    cufftXtExec(plan_filter_fwd, g, ge, CUFFT_FORWARD);
+    if (cufftXtExec(plan_filter_fwd, g, ge, CUFFT_FORWARD) != CUFFT_SUCCESS)
+        return -2;
     mulw <<<GS3d2, dimBlock, 0, stream>>> (ge, w, n/2+1, nproj, nz);
-    cufftXtExec(plan_filter_inv, ge, g, CUFFT_INVERSE);
+    if (cufftXtExec(plan_filter_inv, ge, g, CUFFT_INVERSE) != CUFFT_SUCCESS)
+        return -2;
     // 1/n normalization is folded into wfilter in fbp_filter.py::calc_filter()
+    return (int)cudaGetLastError();
 }

@@ -14,7 +14,7 @@
 // Radon transform (unit pixel spacing) — a converged solve of `A x = p` yields
 // the physical μ, matching ART/BART and tomopy `project.c`. Keeping the
 // geometry byte-identical to `backprojection_ker` — the (un-flipped) row `ty`,
-// the `n/2` centre, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
+// the centre `axis`, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
 // in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge.
 // The shared guard `vr < nz-1` drops slice 0 for the parallel beam (`v = tz` ⇒
 // `vr = tz-1`), the documented ≥2-slice rule, exactly as the back-projector
@@ -33,8 +33,8 @@
 // global z-offset of this volume block — both matching backprojection_ker so the
 // pair {A, Aᵀ} stays an exact transpose for a tilted axis (phi ≠ π/2) and an
 // output height that differs from the detector-row count. `axis` is the detector
-// column voxel column n/2 lands on: n/2 keeps the pair exact; any other value
-// reprojects as a reconstruction at that rotation centre reads the detector.
+// column voxel column n/2 lands on, the rotation centre; the pair stays exact
+// at any centre backprojection_ker is given too.
 static __global__ void forwardprojection_ker(float *g, const float *f, const float *theta,
                                              float phi, float axis, int sz, int ncz, int n, int nz,
                                              int rh, int nproj)
@@ -82,7 +82,10 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
         int vr = (int)(v - 1e-5f);
 
         // Same in-bounds guard as the gather; out-of-bounds taps contribute 0.
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz - 1))
+        // (int) truncates toward zero, so the lower bound tests u and v, with the
+        // 1e-5 margin the tap gives the upper one: u in (-1, 0) would otherwise
+        // land on column 0 with a weight above 1.
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
         {
             float fu = u - ur;
             float fv = v - vr;
@@ -97,6 +100,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 }
 
 // C-ABI host wrapper. `g` (output sinogram [nz][nproj][n]) must be pre-zeroed.
+// Returns cudaGetLastError(): 0 once the launch is queued.
 // Unweighted (gain 1): the geometry matches backprojection_ker with gain 1 (the
 // iterative back-projection call), so {forward, back} are a true adjoint pair
 // and the forward is the plain line-integral Radon transform — matching the CPU
@@ -107,8 +111,8 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 // height for laminography), `sz` = the volume block's global z-offset, `nz` =
 // detector rows, `rh` = FULL reconstruction height the global z is centred on
 // (== `nz` parallel beam, `lamino_recon_height` otherwise), `axis` = detector
-// column of voxel column n/2 (n/2 for the adjoint pair).
-extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
+// column of voxel column n/2 (the rotation centre).
+extern "C" int tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
                                         float axis, int sz, int ncz, int nz, int n, int rh,
                                         int nproj, void *stream)
 {
@@ -117,4 +121,5 @@ extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *the
     size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
     forwardprojection_ker<<<grid, dimBlock, shmem, (cudaStream_t)stream>>>(
         (float *)g, (const float *)f, theta, phi, axis, sz, ncz, n, nz, rh, nproj);
+    return (int)cudaGetLastError();
 }

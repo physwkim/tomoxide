@@ -36,10 +36,12 @@ public:
   // `lamino_recon_height` for laminography): the volume z is centred on rh/2
   // while the detector row stays centred on nz/2 (see kernels_linerec.cuh).
   // `backprojection_try_lamino` takes a device array of per-slot rh (one per
-  // tilt candidate, matching `phi_`).
-  void backprojection(size_t f_, size_t g_, size_t theta, float phi, float gain, int sz, int rh, size_t stream_);
-  void backprojection_try(size_t f_, size_t g_, size_t theta_,size_t sh_,  float phi, int sz, int rh, size_t stream_);
-  void backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz, size_t rh_, size_t stream_);
+  // tilt candidate, matching `phi_`). `axis` = detector column voxel column
+  // n/2 reads (n/2 once the sinogram is centred); the probes keep n/2.
+  // Each returns cudaGetLastError() after its launches: 0 once they are queued.
+  int backprojection(size_t f_, size_t g_, size_t theta, float phi, float axis, float gain, int sz, int rh, size_t stream_);
+  int backprojection_try(size_t f_, size_t g_, size_t theta_,size_t sh_,  float phi, int sz, int rh, size_t stream_);
+  int backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz, size_t rh_, size_t stream_);
   void free();
 };
 

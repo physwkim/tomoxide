@@ -28,7 +28,9 @@ public:
   // otherwise so an OOM surfaces as a clean error instead of a later SIGSEGV
   // when cufftXtExec runs on an unallocated work area.
   bool valid() const { return valid_; }
-  void filter(size_t g, size_t w, size_t stream);
+  // 0 once queued; -2 if cuFFT refused a transform (as fft.cu's exec_batched),
+  // else cudaGetLastError().
+  int filter(size_t g, size_t w, size_t stream);
   void free();
 };
 

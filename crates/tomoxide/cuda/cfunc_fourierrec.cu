@@ -79,19 +79,21 @@ void cfunc_fourierrec::free() {
   }
 }
 
-void cfunc_fourierrec::backprojection(size_t f_, size_t g_, size_t stream_) {
+int cfunc_fourierrec::backprojection(size_t f_, size_t g_, size_t stream_) {
     real2* g = (real2 *)g_;    
     real2* f = (real2 *)f_;
     cudaStream_t stream = (cudaStream_t)stream_;    
-    cufftSetStream(plan1d, stream);
-    cufftSetStream(plan2d, stream);    
+    if (cufftSetStream(plan1d, stream) != CUFFT_SUCCESS ||
+        cufftSetStream(plan2d, stream) != CUFFT_SUCCESS)
+        return -2;
 
     dim3 dimBlock(32, 32, 1);
 
     cudaMemsetAsync(fde, 0, (2 * n + 2 * m) * (2 * n + 2 * m) * nz * sizeof(real2), stream);
 
     ifftshiftc <<<GS3d3, dimBlock, 0, stream>>> (g, n, nproj, nz);
-    cufftXtExec(plan1d, g, g, CUFFT_FORWARD);
+    if (cufftXtExec(plan1d, g, g, CUFFT_FORWARD) != CUFFT_SUCCESS)
+        return -2;
     ifftshiftc <<<GS3d3, dimBlock, 0, stream>>> (g, n, nproj, nz);    
     
     gather <<<GS3d3, dimBlock, 0, stream>>> (g, fde, x, y, m, mu, n, nproj, nz);    
@@ -99,11 +101,12 @@ void cfunc_fourierrec::backprojection(size_t f_, size_t g_, size_t stream_) {
     wrap <<<GS3d2, dimBlock, 0, stream>>> (fde, n, nz, m);
     
     fftshiftc <<<GS3d2, dimBlock, 0, stream>>> (fde, 2 * n + 2 * m, nz);
-    cufftXtExec(plan2d, &fde[m + m * (2 * n + 2 * m)],
-               &fde[m + m * (2 * n + 2 * m)], CUFFT_INVERSE);
+    if (cufftXtExec(plan2d, &fde[m + m * (2 * n + 2 * m)],
+                    &fde[m + m * (2 * n + 2 * m)], CUFFT_INVERSE) != CUFFT_SUCCESS)
+        return -2;
     fftshiftc <<<GS3d2, dimBlock, 0, stream>>> (fde, 2 * n + 2 * m, nz);
     
     divphi <<<GS3d0, dimBlock, 0, stream>>> (fde, f, mu, n, nz, nproj, m);        
     circ <<<GS3d0, dimBlock, 0, stream>>> (f, 0, n, nz);  
-
+    return (int)cudaGetLastError();
 }

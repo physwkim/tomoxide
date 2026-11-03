@@ -41,7 +41,8 @@ public:
   // otherwise so an OOM surfaces as a clean error instead of a later SIGSEGV
   // when cufftXtExec runs on an unallocated work area.
   bool valid() const { return valid_; }
-  void backprojection(size_t f, size_t g, size_t stream);
+  // 0 once queued; -2 if cuFFT refused a transform, else cudaGetLastError().
+  int backprojection(size_t f, size_t g, size_t stream);
   void free();
 };
 

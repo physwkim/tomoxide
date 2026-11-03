@@ -245,10 +245,9 @@ pub fn center_probe(
 /// Column `center` is where voxel column `n/2` lands and volume z is centred
 /// on `depth/2`, as in every reconstruction here, so a band read off a
 /// reconstruction reprojects onto the frames it was reconstructed from:
-/// reprojection matching compares the two. Linear in `band`. The kernel's
-/// `int` indexing and its per-angle shared cache bound one call to 6144
-/// angles and fewer than 2^31 elements on either side; split `theta` to stay
-/// inside. CUDA-only.
+/// reprojection matching compares the two. Linear in `band`. One
+/// [`LaminoReprojector`] call; hold a reprojector to project the same band
+/// at several angle chunks. CUDA-only.
 pub fn lamino_reproject(
     band: ndarray::ArrayView3<'_, f32>,
     z0: usize,
@@ -258,14 +257,54 @@ pub fn lamino_reproject(
     center: f32,
     rows: usize,
 ) -> Result<ndarray::Array3<f32>> {
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (band, z0, depth, theta, tilt_deg, center, rows);
-        Err(Error::Backend("cuda feature not enabled".into()))
-    }
+    LaminoReprojector::new(band, z0, depth, tilt_deg, center, rows)?.project(theta)
+}
+
+/// A band held on the device for [`lamino_reproject`] at any number of angle
+/// chunks, uploaded once. The kernel's `int` indexing and its per-angle shared
+/// cache bound one [`project`](Self::project) to 6144 angles and fewer than
+/// 2^31 elements on either side; split `theta` to stay inside. CUDA-only.
+pub struct LaminoReprojector {
     #[cfg(feature = "cuda")]
-    {
-        cuda_impl::lamino_reproject(band, z0, depth, theta, tilt_deg, center, rows)
+    inner: cuda_impl::LaminoReprojector,
+}
+
+impl LaminoReprojector {
+    /// Upload `band` (`[nb, n, n]`, slices `z0 .. z0 + nb` of a volume `depth`
+    /// slices deep) for frames of `rows` rows at `tilt_deg` and `center`.
+    pub fn new(
+        band: ndarray::ArrayView3<'_, f32>,
+        z0: usize,
+        depth: usize,
+        tilt_deg: f32,
+        center: f32,
+        rows: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (band, z0, depth, tilt_deg, center, rows);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            Ok(Self {
+                inner: cuda_impl::LaminoReprojector::new(band, z0, depth, tilt_deg, center, rows)?,
+            })
+        }
+    }
+
+    /// The band's frames at each angle of `theta` (radians), `[theta.len(),
+    /// rows, n]`.
+    pub fn project(&self, theta: &[f32]) -> Result<ndarray::Array3<f32>> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = theta;
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.project(theta)
+        }
     }
 }
 
@@ -800,6 +839,33 @@ mod cuda_impl {
         }
     }
 
+    /// An owned `cfunc_*` handle, freed on drop so a launch error returned with
+    /// `?` between its creation and its last use does not leak it.
+    struct Handle {
+        ptr: *mut c_void,
+        free: unsafe extern "C" fn(*mut c_void),
+    }
+
+    impl Handle {
+        /// Take `ptr` from a `tomoxide_*_new`; null (allocation failed) is an error.
+        fn new(
+            ptr: *mut c_void,
+            free: unsafe extern "C" fn(*mut c_void),
+            what: &str,
+        ) -> Result<Self> {
+            if ptr.is_null() {
+                return Err(Error::Backend(format!("{what} allocation failed")));
+            }
+            Ok(Handle { ptr, free })
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { (self.free)(self.ptr) };
+        }
+    }
+
     /// A page-locked (pinned) host buffer of `f32`. Async H2D/D2H copies only
     /// overlap kernel execution when their host side is pinned — pageable memory
     /// forces the driver into a synchronous staged copy, defeating the pipeline.
@@ -998,9 +1064,9 @@ mod cuda_impl {
 
     impl FilteredBackproject for CudaBackend {
         /// Parallel-beam voxel-driven back-projection via the vendored
-        /// `cfunc_linerec` kernel (phi = π/2, gain 1). The sinogram must already be
-        /// filtered and centred on the detector midpoint (`recon` does this through
-        /// the shared FBP filter), so the kernel assumes centre `n/2`. Output is
+        /// `cfunc_linerec` kernel (phi = π/2, gain 1), about `geom.center` (the
+        /// analytic dispatcher hands a filtered sinogram centred at `ncols/2`,
+        /// the iterative solvers the caller's centre). Output is
         /// `[nz, n, n]` in the **CPU/tomopy convention**: the kernel's tomocupy
         /// y-flip has been unified to the CPU handedness (Phase 1/2 cross-backend
         /// unification), so CUDA back-projection matches the CPU back-projector
@@ -1015,15 +1081,7 @@ mod cuda_impl {
             geom: &Geometry,
             out: &mut Volume<f32>,
         ) -> Result<()> {
-            let phi_lam = match geom.beam {
-                Beam::Parallel => None,
-                Beam::Laminography { phi } => Some(phi),
-                _ => {
-                    return Err(Error::InvalidParam(
-                        "cuda back-projection supports parallel beam and laminography only".into(),
-                    ));
-                }
-            };
+            let pg = pair_geom(geom)?;
             let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let nz = s.n_rows();
             let nproj = s.n_angles();
@@ -1045,7 +1103,7 @@ mod cuda_impl {
             // `[rh, n, n]` volume (rh = output height) with the tilted geometry
             // (sz = 0, ncz = rh). Pure adjoint `Wᵀ` — the exact transpose of the
             // tilted forward projector, so {A, Aᵀ} is a true adjoint pair.
-            if let Some(phi) = phi_lam {
+            if matches!(geom.beam, Beam::Laminography { .. }) {
                 let rh = oz;
                 let sino_std = s.array.as_standard_layout();
                 let sino_slice = sino_std
@@ -1054,25 +1112,30 @@ mod cuda_impl {
                 let g = DevBuf::from_host_f32(sino_slice)?;
                 let theta_d = DevBuf::from_host_f32(theta)?;
                 let f = DevBuf::zeroed(rh * ncols * ncols * std::mem::size_of::<f32>())?;
-                let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, rh) };
-                if handle.is_null() {
-                    return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-                }
-                unsafe {
-                    ffi::tomoxide_linerec_backproject(
-                        handle,
-                        f.ptr,
-                        g.ptr,
-                        theta_d.ptr as *const f32,
-                        phi,
-                        1.0,       // pure adjoint Wᵀ
-                        0,         // sz
-                        rh as i32, // volume z centred on the full recon height
-                        std::ptr::null_mut(),
-                    );
-                }
+                let handle = Handle::new(
+                    unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, rh) },
+                    ffi::tomoxide_linerec_free,
+                    "cfunc_linerec",
+                )?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_linerec_backproject(
+                            handle.ptr,
+                            f.ptr,
+                            g.ptr,
+                            theta_d.ptr as *const f32,
+                            pg.phi,
+                            pg.axis,
+                            1.0,       // pure adjoint Wᵀ
+                            0,         // sz
+                            rh as i32, // volume z centred on the full recon height
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "linerec backproject",
+                )?;
                 let rc = unsafe { ffi::tomoxide_cuda_sync() };
-                unsafe { ffi::tomoxide_linerec_free(handle) };
+                drop(handle);
                 if rc != 0 {
                     return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
                 }
@@ -1116,26 +1179,30 @@ mod cuda_impl {
             let f = DevBuf::zeroed(nz_run * ncols * ncols * std::mem::size_of::<f32>())?;
 
             // cfunc_linerec(nproj, nz, n, ncproj=nproj, ncz=nz): whole stack at once.
-            let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz_run, ncols, nproj, nz_run) };
-            if handle.is_null() {
-                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-            }
-            let phi = std::f32::consts::FRAC_PI_2; // parallel beam
-            unsafe {
-                ffi::tomoxide_linerec_backproject(
-                    handle,
-                    f.ptr,
-                    g.ptr,
-                    theta_d.ptr as *const f32,
-                    phi,
-                    1.0, // pure adjoint Wᵀ — no angular-quadrature gain
-                    0,
-                    nz_run as i32, // parallel beam: rh == nz
-                    std::ptr::null_mut(),
-                );
-            }
+            let handle = Handle::new(
+                unsafe { ffi::tomoxide_linerec_new(nproj, nz_run, ncols, nproj, nz_run) },
+                ffi::tomoxide_linerec_free,
+                "cfunc_linerec",
+            )?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_linerec_backproject(
+                        handle.ptr,
+                        f.ptr,
+                        g.ptr,
+                        theta_d.ptr as *const f32,
+                        pg.phi, // π/2 (parallel beam)
+                        pg.axis,
+                        1.0, // pure adjoint Wᵀ — no angular-quadrature gain
+                        0,
+                        nz_run as i32, // parallel beam: rh == nz
+                        std::ptr::null_mut(),
+                    )
+                },
+                "linerec backproject",
+            )?;
             let rc = unsafe { ffi::tomoxide_cuda_sync() };
-            unsafe { ffi::tomoxide_linerec_free(handle) };
+            drop(handle);
             if rc != 0 {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
@@ -1152,26 +1219,17 @@ mod cuda_impl {
     impl ForwardProject for CudaBackend {
         /// Parallel-beam forward projection (`forwardprojection_ker`), the exact
         /// discrete transpose of [`FilteredBackproject::backproject`]
-        /// (`cfunc_linerec`, phi = π/2, gain 1): same handedness, centre `n/2`, and
+        /// (`cfunc_linerec`, phi = π/2, gain 1): same handedness, centre, and
         /// both unweighted, so the two form a true `{A, Aᵀ}` pair — matching the
         /// CPU projector pair — which is what the generic iterative solvers
         /// (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV) require. `A` is the plain
         /// line-integral Radon transform (unit pixel spacing), so a converged
-        /// solve of `A x = p` yields the physical μ. Like the back-projector, the
-        /// kernel hard-wires centre `n/2` (it ignores `geom.center`) and assumes
-        /// the detector width equals the grid `n`. Output is `[nz, nproj, n]` in
+        /// solve of `A x = p` yields the physical μ. Like the back-projector, it
+        /// projects about `geom.center` (`pair_geom`) and assumes the detector
+        /// width equals the grid `n`. Output is `[nz, nproj, n]` in
         /// `Sinogram` layout.
         fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
-            let phi = match geom.beam {
-                Beam::Parallel => std::f32::consts::FRAC_PI_2,
-                Beam::Laminography { phi } => phi,
-                _ => {
-                    return Err(Error::InvalidParam(
-                        "cuda forward projection supports parallel beam and laminography only"
-                            .into(),
-                    ));
-                }
-            };
+            let pg = pair_geom(geom)?;
             let (rh, ny, nx) = vol.dims(); // volume z-extent (== detector rows for parallel)
             if ny != nx {
                 return Err(Error::InvalidParam(format!(
@@ -1209,22 +1267,25 @@ mod cuda_impl {
                 let f = DevBuf::from_host_f32(vol_slice)?;
                 let theta_d = DevBuf::from_host_f32(theta)?;
                 let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
-                unsafe {
-                    ffi::tomoxide_forwardproject(
-                        g.ptr,
-                        f.ptr,
-                        theta_d.ptr as *const f32,
-                        phi,
-                        (n / 2) as f32,
-                        0,
-                        rh as i32,
-                        nz as i32,
-                        n as i32,
-                        rh as i32, // volume z centred on the full recon height
-                        nproj as i32,
-                        std::ptr::null_mut(),
-                    );
-                }
+                ck(
+                    unsafe {
+                        ffi::tomoxide_forwardproject(
+                            g.ptr,
+                            f.ptr,
+                            theta_d.ptr as *const f32,
+                            pg.phi,
+                            pg.axis,
+                            0,
+                            rh as i32,
+                            nz as i32,
+                            n as i32,
+                            rh as i32, // volume z centred on the full recon height
+                            nproj as i32,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    "forwardproject",
+                )?;
                 let rc = unsafe { ffi::tomoxide_cuda_sync() };
                 if rc != 0 {
                     return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
@@ -1265,22 +1326,25 @@ mod cuda_impl {
             let theta_d = DevBuf::from_host_f32(theta)?;
             let g = DevBuf::zeroed(nz_run * nproj * n * std::mem::size_of::<f32>())?;
 
-            unsafe {
-                ffi::tomoxide_forwardproject(
-                    g.ptr,
-                    f.ptr,
-                    theta_d.ptr as *const f32,
-                    phi, // π/2 (parallel beam)
-                    (n / 2) as f32,
-                    0,
-                    nz_run as i32,
-                    nz_run as i32,
-                    n as i32,
-                    nz_run as i32, // parallel beam: rh == nz
-                    nproj as i32,
-                    std::ptr::null_mut(),
-                );
-            }
+            ck(
+                unsafe {
+                    ffi::tomoxide_forwardproject(
+                        g.ptr,
+                        f.ptr,
+                        theta_d.ptr as *const f32,
+                        pg.phi, // π/2 (parallel beam)
+                        pg.axis,
+                        0,
+                        nz_run as i32,
+                        nz_run as i32,
+                        n as i32,
+                        nz_run as i32, // parallel beam: rh == nz
+                        nproj as i32,
+                        std::ptr::null_mut(),
+                    )
+                },
+                "forwardproject",
+            )?;
             let rc = unsafe { ffi::tomoxide_cuda_sync() };
             if rc != 0 {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
@@ -1306,22 +1370,49 @@ mod cuda_impl {
         }
     }
 
-    /// Projector tilt angle for the device-resident solvers: `π/2` for a
-    /// parallel beam, the laminography tilt otherwise. Threaded into
-    /// [`dev_forward`]/[`dev_backproject`] so the same `A`/`Aᵀ` kernels drive
-    /// both geometries; laminography reconstructs at recon-height = detector
-    /// rows (`rh == nz`), matching the generic host solvers' tilted projector
-    /// calls (which the device path replaces to keep the volume/sinogram
-    /// resident across iterations).
+    /// What the `{A, Aᵀ}` kernel pair reads of a geometry: the tilt `phi`
+    /// (`π/2` for a parallel beam) and `axis`, the detector column voxel column
+    /// `n/2` lands on — `geom.center`, as the CPU projector pair reads it.
+    /// Threaded into [`dev_forward`]/[`dev_backproject`] and the host
+    /// projectors so both directions always share it.
     #[cfg(feature = "cuda")]
-    fn beam_phi(beam: &Beam) -> f32 {
-        match beam {
-            Beam::Laminography { phi } => *phi,
-            // Parallel beam uses the untilted projector. Any other geometry
-            // (cone) is gated out of the device path in `solve` before a solver
-            // — and thus `beam_phi` — ever runs, so it never reaches here.
-            _ => std::f32::consts::FRAC_PI_2,
-        }
+    #[derive(Clone, Copy)]
+    struct PairGeom {
+        phi: f32,
+        axis: f32,
+    }
+
+    /// [`PairGeom`] of `geom`. The kernels take one centre for every row, so a
+    /// `Center::PerRow` with differing values is refused rather than read at
+    /// row 0.
+    #[cfg(feature = "cuda")]
+    fn pair_geom(geom: &Geometry) -> Result<PairGeom> {
+        let phi = match geom.beam {
+            Beam::Parallel => std::f32::consts::FRAC_PI_2,
+            Beam::Laminography { phi } => phi,
+            Beam::Cone { .. } => {
+                return Err(Error::InvalidParam(
+                    "the cuda projector pair supports parallel beam and laminography only".into(),
+                ));
+            }
+        };
+        let axis = match &geom.center {
+            Center::Scalar(c) => *c,
+            Center::PerRow(v) => {
+                let first = *v
+                    .first()
+                    .ok_or_else(|| Error::InvalidParam("empty PerRow centre".into()))?;
+                if v.iter().any(|c| *c != first) {
+                    return Err(Error::InvalidParam(
+                        "the cuda projector pair takes one rotation centre; \
+                         geom.center is Center::PerRow with differing values"
+                            .into(),
+                    ));
+                }
+                first
+            }
+        };
+        Ok(PairGeom { phi, axis })
     }
 
     /// On-device forward projection `g = A f`: zero `g` (the scatter-add kernel
@@ -1337,28 +1428,34 @@ mod cuda_impl {
         g: *mut c_void,
         f: *const c_void,
         theta: *const f32,
-        phi: f32,
+        pg: PairGeom,
         nz: usize,
         n: usize,
         nproj: usize,
-    ) {
+    ) -> Result<()> {
         let null = std::ptr::null_mut::<c_void>();
         let sbytes = nz * nproj * n * std::mem::size_of::<f32>();
-        ffi::tomoxide_cuda_memset_async(g, 0, sbytes, null);
-        ffi::tomoxide_forwardproject(
-            g,
-            f,
-            theta,
-            phi, // π/2 parallel beam, tilted for laminography
-            (n / 2) as f32,
-            0,         // sz: whole volume, no offset
-            nz as i32, // ncz: recon height == detector rows (rh == nz here)
-            nz as i32,
-            n as i32,
-            nz as i32, // rh == nz by the device-path design (see above)
-            nproj as i32,
-            null,
-        );
+        ck(
+            ffi::tomoxide_cuda_memset_async(g, 0, sbytes, null),
+            "memset",
+        )?;
+        ck(
+            ffi::tomoxide_forwardproject(
+                g,
+                f,
+                theta,
+                pg.phi,
+                pg.axis,
+                0,         // sz: whole volume, no offset
+                nz as i32, // ncz: recon height == detector rows (rh == nz here)
+                nz as i32,
+                n as i32,
+                nz as i32, // rh == nz by the device-path design (see above)
+                nproj as i32,
+                null,
+            ),
+            "forwardproject",
+        )
     }
 
     /// On-device back projection `f = Aᵀ g` (tilt `phi`) via a reused
@@ -1377,17 +1474,23 @@ mod cuda_impl {
         f: *mut c_void,
         g: *const c_void,
         theta: *const f32,
-        phi: f32,
+        pg: PairGeom,
         nz: usize,
         vbytes: usize,
-    ) {
+    ) -> Result<()> {
         let null = std::ptr::null_mut::<c_void>();
-        ffi::tomoxide_cuda_memset_async(f, 0, vbytes, null);
-        ffi::tomoxide_linerec_backproject(
-            handle, f, g, theta, phi, // π/2 parallel beam, tilted for laminography
-            1.0, 0, nz as i32, // rh == nz by the device-path design
-            null,
-        );
+        ck(
+            ffi::tomoxide_cuda_memset_async(f, 0, vbytes, null),
+            "memset",
+        )?;
+        ck(
+            ffi::tomoxide_linerec_backproject(
+                handle, f, g, theta, pg.phi, pg.axis, 1.0, 0,
+                nz as i32, // rh == nz by the device-path design
+                null,
+            ),
+            "linerec backproject",
+        )
     }
 
     /// Device-resident SIRT: upload `b`/θ/ones once, precompute the ray-length
@@ -1435,7 +1538,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
@@ -1445,29 +1548,42 @@ mod cuda_impl {
         let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1)
         let cw_d = DevBuf::zeroed(vbytes)?; // C = 1/Aᵀ(1)
 
-        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
-        if handle.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
+        let handle = Handle::new(
+            unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) },
+            ffi::tomoxide_linerec_free,
+            "cfunc_linerec",
+        )?;
 
         // All ops on the per-thread default stream (null) → FIFO-ordered, so one
         // sync before the download suffices.
         unsafe {
-            dev_forward(ax_d.ptr, ones_v.ptr, tp, phi, nz, n, nproj); // A(1)
-            ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null); // R
-            dev_backproject(handle, corr_d.ptr, ones_s.ptr, tp, phi, nz, vbytes); // Aᵀ(1)
-            ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null); // C
+            dev_forward(ax_d.ptr, ones_v.ptr, tp, pg, nz, n, nproj)?; // A(1)
+            ck(
+                ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null),
+                "iter_recip_thresh",
+            )?; // R
+            dev_backproject(handle.ptr, corr_d.ptr, ones_s.ptr, tp, pg, nz, vbytes)?; // Aᵀ(1)
+            ck(
+                ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null),
+                "iter_recip_thresh",
+            )?; // C
             for _ in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj); // ax = A x
-                ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null); // (b−Ax)∘R
-                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, phi, nz, vbytes); // corr = Aᵀ(…)
-                ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null);
+                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // ax = A x
+                ck(
+                    ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null),
+                    "iter_residual",
+                )?; // (b−Ax)∘R
+                dev_backproject(handle.ptr, corr_d.ptr, ax_d.ptr, tp, pg, nz, vbytes)?; // corr = Aᵀ(…)
+                ck(
+                    ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null),
+                    "iter_update",
+                )?;
                 // x += C∘corr
             }
         }
 
         let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        unsafe { ffi::tomoxide_linerec_free(handle) };
+        drop(handle);
         if rc != 0 {
             return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
@@ -1514,7 +1630,7 @@ mod cuda_impl {
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let theta = &geom.angles.0;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
@@ -1573,7 +1689,7 @@ mod cuda_impl {
                     let barrier = &barrier;
                     let result = &result;
                     scope.spawn(move || -> Result<()> {
-                        unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                        ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
                         let len = a1 - a0;
                         let nsub = nz * len * ncols;
                         let sbytes = nsub * std::mem::size_of::<f32>();
@@ -1618,19 +1734,23 @@ mod cuda_impl {
                         let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1) (local)
                         let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…) partial, then global
                         let cw_d = DevBuf::zeroed(vbytes)?; // C = 1/Aᵀ(1) (global)
-                        let handle = unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) };
-                        if handle.is_null() {
-                            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-                        }
+                        let handle = Handle::new(
+                            unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) },
+                            ffi::tomoxide_linerec_free,
+                            "cfunc_linerec",
+                        )?;
 
                         // Ray weights R = 1/A(1) — local (each ray is on one GPU).
                         {
                             let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
                             unsafe {
-                                dev_forward(ax_d.ptr, ones_v.ptr, tp, phi, nz, n, len);
-                                ffi::tomoxide_iter_recip_thresh(
-                                    rw_d.ptr, ax_d.ptr, 1e-6, nsub, null,
-                                );
+                                dev_forward(ax_d.ptr, ones_v.ptr, tp, pg, nz, n, len)?;
+                                ck(
+                                    ffi::tomoxide_iter_recip_thresh(
+                                        rw_d.ptr, ax_d.ptr, 1e-6, nsub, null,
+                                    ),
+                                    "iter_recip_thresh",
+                                )?;
                             }
                         }
                         // Partial sensitivity Aᵀₘ(1) → corr_d, then all-reduce → C.
@@ -1638,8 +1758,8 @@ mod cuda_impl {
                             let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsub])?;
                             unsafe {
                                 dev_backproject(
-                                    handle, corr_d.ptr, ones_s.ptr, tp, phi, nz, vbytes,
-                                );
+                                    handle.ptr, corr_d.ptr, ones_s.ptr, tp, pg, nz, vbytes,
+                                )?;
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
                                 }
@@ -1661,11 +1781,16 @@ mod cuda_impl {
                         // SIRT iterations, volume resident, correction all-reduced.
                         for _ in 0..num_iter.max(1) {
                             unsafe {
-                                dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, len); // A x
-                                ffi::tomoxide_iter_residual(
-                                    ax_d.ptr, b_d.ptr, rw_d.ptr, nsub, null,
-                                ); // (b−Ax)∘R
-                                dev_backproject(handle, corr_d.ptr, ax_d.ptr, tp, phi, nz, vbytes); // Aᵀₘ(…)
+                                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, len)?; // A x
+                                ck(
+                                    ffi::tomoxide_iter_residual(
+                                        ax_d.ptr, b_d.ptr, rw_d.ptr, nsub, null,
+                                    ),
+                                    "iter_residual",
+                                )?; // (b−Ax)∘R
+                                dev_backproject(
+                                    handle.ptr, corr_d.ptr, ax_d.ptr, tp, pg, nz, vbytes,
+                                )?; // Aᵀₘ(…)
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
                                 }
@@ -1677,9 +1802,12 @@ mod cuda_impl {
                             }
                             corr_d.copy_from_host_f32(&summed.read().unwrap())?; // global correction back on device
                             unsafe {
-                                ffi::tomoxide_iter_update(
-                                    vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null,
-                                ); // x += C∘corr
+                                ck(
+                                    ffi::tomoxide_iter_update(
+                                        vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null,
+                                    ),
+                                    "iter_update",
+                                )?; // x += C∘corr
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
                                 }
@@ -1692,7 +1820,7 @@ mod cuda_impl {
                             vol_d.to_host_f32(&mut host)?;
                             *result.lock().unwrap() = Some(host);
                         }
-                        unsafe { ffi::tomoxide_linerec_free(handle) };
+                        drop(handle);
                         Ok(())
                     })
                 })
@@ -1722,26 +1850,14 @@ mod cuda_impl {
         b_d: DevBuf,
         sens_d: DevBuf,
         ax_d: DevBuf,
-        handle: *mut c_void,
+        handle: Handle,
         len: usize,
-    }
-
-    // RAII for the cfunc_linerec handle so every path (early `?`, sync error,
-    // normal return) frees it — the single owner of the handle's lifetime. The
-    // solver syncs before dropping, so no kernel still references it at free.
-    #[cfg(feature = "cuda")]
-    impl Drop for DevSubset {
-        fn drop(&mut self) {
-            if !self.handle.is_null() {
-                unsafe { ffi::tomoxide_linerec_free(self.handle) };
-            }
-        }
     }
 
     /// Build every ordered subset device-resident: for each subset gather its θ
     /// and measured sinogram `bₛ` (uploaded once), precompute the sensitivity
     /// `Aₛᵀ(1)` on-device, and create a reused `cfunc_linerec` handle (freed by
-    /// [`DevSubset`]'s `Drop`). Shared by [`em_device`] and [`ospml_device`].
+    /// its [`Handle`]). Shared by [`em_device`] and [`ospml_device`].
     #[cfg(feature = "cuda")]
     fn build_dev_subsets(
         s: &Tomo<f32>,
@@ -1750,7 +1866,7 @@ mod cuda_impl {
         subsets_idx: Vec<Vec<usize>>,
     ) -> Result<Vec<DevSubset>> {
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let vbytes = nz * n * n * std::mem::size_of::<f32>();
         let mut subs: Vec<DevSubset> = Vec::with_capacity(subsets_idx.len());
         for idx in subsets_idx {
@@ -1764,22 +1880,23 @@ mod cuda_impl {
                     Error::InvalidParam("non-contiguous subset sinogram".into())
                 })?)?;
             let sbytes = nz * len * ncols * std::mem::size_of::<f32>();
-            let handle = unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) };
-            if handle.is_null() {
-                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-            }
+            let handle = Handle::new(
+                unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) },
+                ffi::tomoxide_linerec_free,
+                "cfunc_linerec",
+            )?;
             let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nz * len * ncols])?;
             let sens_d = DevBuf::zeroed(vbytes)?;
             unsafe {
                 dev_backproject(
-                    handle,
+                    handle.ptr,
                     sens_d.ptr,
                     ones_s.ptr,
                     theta_d.ptr as *const f32,
-                    phi,
+                    pg,
                     nz,
                     vbytes,
-                )
+                )?
             };
             subs.push(DevSubset {
                 theta_d,
@@ -1811,7 +1928,7 @@ mod cuda_impl {
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -1824,10 +1941,22 @@ mod cuda_impl {
                 for sub in &subs {
                     let tp = sub.theta_d.ptr as *const f32;
                     let nsub = nz * sub.len * ncols;
-                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, phi, nz, n, sub.len); // Aₛ x
-                    ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null); // bₛ ⊘ Aₛ x
-                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, phi, nz, vbytes); // Aₛᵀ(…)
-                    ffi::tomoxide_iter_em_update(vol_d.ptr, corr_d.ptr, sub.sens_d.ptr, nvol, null);
+                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, pg, nz, n, sub.len)?; // Aₛ x
+                    ck(
+                        ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null),
+                        "iter_em_ratio",
+                    )?; // bₛ ⊘ Aₛ x
+                    dev_backproject(sub.handle.ptr, corr_d.ptr, sub.ax_d.ptr, tp, pg, nz, vbytes)?; // Aₛᵀ(…)
+                    ck(
+                        ffi::tomoxide_iter_em_update(
+                            vol_d.ptr,
+                            corr_d.ptr,
+                            sub.sens_d.ptr,
+                            nvol,
+                            null,
+                        ),
+                        "iter_em_update",
+                    )?;
                     // x ∘ corr ⊘ sens
                 }
             }
@@ -1838,7 +1967,7 @@ mod cuda_impl {
             return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
         let mut host = vec![0.0f32; nvol];
-        vol_d.to_host_f32(&mut host)?; // handles freed by DevSubset::drop after this
+        vol_d.to_host_f32(&mut host)?; // subset handles freed when `subs` drops after this
         let array = Array3::from_shape_vec((nz, n, n), host)
             .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
         Ok(Volume::new(array))
@@ -1865,7 +1994,7 @@ mod cuda_impl {
         let (reg, delta) = prior;
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -1883,22 +2012,31 @@ mod cuda_impl {
                 for sub in &subs {
                     let tp = sub.theta_d.ptr as *const f32;
                     let nsub = nz * sub.len * ncols;
-                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, phi, nz, n, sub.len); // Aₛ x
-                    ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null); // bₛ ⊘ Aₛ x
-                    dev_backproject(sub.handle, corr_d.ptr, sub.ax_d.ptr, tp, phi, nz, vbytes); // Aₛᵀ(…)
-                    ffi::tomoxide_cuda_memcpy_d2d_async(old_d.ptr, vol_d.ptr, vbytes, null); // snapshot
-                    ffi::tomoxide_iter_pml_update(
-                        vol_d.ptr,
-                        old_d.ptr,
-                        corr_d.ptr,
-                        sub.sens_d.ptr,
-                        reg,
-                        delta_v,
-                        has_delta,
-                        n,
-                        nz,
-                        null,
-                    );
+                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, pg, nz, n, sub.len)?; // Aₛ x
+                    ck(
+                        ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null),
+                        "iter_em_ratio",
+                    )?; // bₛ ⊘ Aₛ x
+                    dev_backproject(sub.handle.ptr, corr_d.ptr, sub.ax_d.ptr, tp, pg, nz, vbytes)?; // Aₛᵀ(…)
+                    ck(
+                        ffi::tomoxide_cuda_memcpy_d2d_async(old_d.ptr, vol_d.ptr, vbytes, null),
+                        "memcpy_d2d_async",
+                    )?; // snapshot
+                    ck(
+                        ffi::tomoxide_iter_pml_update(
+                            vol_d.ptr,
+                            old_d.ptr,
+                            corr_d.ptr,
+                            sub.sens_d.ptr,
+                            reg,
+                            delta_v,
+                            has_delta,
+                            n,
+                            nz,
+                            null,
+                        ),
+                        "iter_pml_update",
+                    )?;
                 }
             }
         }
@@ -1956,7 +2094,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let vol_d = seed_buf(init, 0.0, nvol, 1.0 / r)?; // x, r-scaled (init 0 or warm-start/r)
         let recon0_d = DevBuf::zeroed(vbytes)?; // previous x (BB)
@@ -1972,59 +2110,87 @@ mod cuda_impl {
             None => None,
         };
 
-        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
-        if handle.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
+        let handle = Handle::new(
+            unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) },
+            ffi::tomoxide_linerec_free,
+            "cfunc_linerec",
+        )?;
 
         unsafe {
             for it in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj); // ax = R x
-                ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null); // r·R x − b
-                dev_backproject(handle, bpv_d.ptr, ax_d.ptr, tp, phi, nz, vbytes); // Rᵀ(…)
-                ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null); // 2r·Rᵀ
+                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // ax = R x
+                ck(
+                    ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null),
+                    "iter_grad_prox",
+                )?; // r·R x − b
+                dev_backproject(handle.ptr, bpv_d.ptr, ax_d.ptr, tp, pg, nz, vbytes)?; // Rᵀ(…)
+                ck(
+                    ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null),
+                    "iter_grad_assemble",
+                )?; // 2r·Rᵀ
                 if let Some(pd) = &prior_d {
-                    ffi::tomoxide_iter_grad_tikh(
-                        grad_d.ptr, vol_d.ptr, pd.ptr, two_reg1, nvol, null,
-                    );
+                    ck(
+                        ffi::tomoxide_iter_grad_tikh(
+                            grad_d.ptr, vol_d.ptr, pd.ptr, two_reg1, nvol, null,
+                        ),
+                        "iter_grad_tikh",
+                    )?;
                 }
                 // Step size from the previous iterate/gradient, then save them.
-                ffi::tomoxide_iter_bb_reduce(
-                    num_d.ptr,
-                    den_d.ptr,
-                    vol_d.ptr,
-                    recon0_d.ptr,
-                    grad_d.ptr,
-                    grad0_d.ptr,
-                    slice_len,
-                    nz,
-                    null,
-                );
-                ffi::tomoxide_iter_bb_lambda(
-                    lambda_d.ptr,
-                    num_d.ptr,
-                    den_d.ptr,
-                    fixed_step,
-                    i32::from(it == 0),
-                    nz,
-                    null,
-                );
-                ffi::tomoxide_cuda_memcpy_d2d_async(recon0_d.ptr, vol_d.ptr, vbytes, null);
-                ffi::tomoxide_cuda_memcpy_d2d_async(grad0_d.ptr, grad_d.ptr, vbytes, null);
-                ffi::tomoxide_iter_axpy_neg_slice(
-                    vol_d.ptr,
-                    grad_d.ptr,
-                    lambda_d.ptr,
-                    slice_len,
-                    nvol,
-                    null,
-                ); // x ← x − λ g
+                ck(
+                    ffi::tomoxide_iter_bb_reduce(
+                        num_d.ptr,
+                        den_d.ptr,
+                        vol_d.ptr,
+                        recon0_d.ptr,
+                        grad_d.ptr,
+                        grad0_d.ptr,
+                        slice_len,
+                        nz,
+                        null,
+                    ),
+                    "iter_bb_reduce",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_bb_lambda(
+                        lambda_d.ptr,
+                        num_d.ptr,
+                        den_d.ptr,
+                        fixed_step,
+                        i32::from(it == 0),
+                        nz,
+                        null,
+                    ),
+                    "iter_bb_lambda",
+                )?;
+                ck(
+                    ffi::tomoxide_cuda_memcpy_d2d_async(recon0_d.ptr, vol_d.ptr, vbytes, null),
+                    "memcpy_d2d_async",
+                )?;
+                ck(
+                    ffi::tomoxide_cuda_memcpy_d2d_async(grad0_d.ptr, grad_d.ptr, vbytes, null),
+                    "memcpy_d2d_async",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_axpy_neg_slice(
+                        vol_d.ptr,
+                        grad_d.ptr,
+                        lambda_d.ptr,
+                        slice_len,
+                        nvol,
+                        null,
+                    ),
+                    "iter_axpy_neg_slice",
+                )?; // x ← x − λ g
             }
-            ffi::tomoxide_iter_scale_inplace(vol_d.ptr, r, nvol, null); // back to physical domain
+            ck(
+                ffi::tomoxide_iter_scale_inplace(vol_d.ptr, r, nvol, null),
+                "iter_scale_inplace",
+            )?; // back to physical domain
         }
 
         let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        unsafe { ffi::tomoxide_linerec_free(handle) };
+        drop(handle);
         if rc != 0 {
             return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
@@ -2071,7 +2237,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?; // r = (b − A x0)·1
 
@@ -2087,57 +2253,88 @@ mod cuda_impl {
         let neg_alpha_d = DevBuf::zeroed(zbytes)?;
         let beta_d = DevBuf::zeroed(zbytes)?;
 
-        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
-        if handle.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
+        let handle = Handle::new(
+            unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) },
+            ffi::tomoxide_linerec_free,
+            "cfunc_linerec",
+        )?;
 
         unsafe {
             // Init: r = b − A x0 ; z = Aᵀ r ; p = z ; gamma = ⟨z,z⟩ per slice.
-            dev_forward(r_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj); // r = A x0
-            ffi::tomoxide_iter_residual(r_d.ptr, b_d.ptr, ones_s.ptr, nsino, null); // r = b − A x0
-            dev_backproject(handle, z_d.ptr, r_d.ptr, tp, phi, nz, vbytes); // z = Aᵀ r
-            ffi::tomoxide_cuda_memcpy_d2d_async(p_d.ptr, z_d.ptr, vbytes, null); // p = z
-            ffi::tomoxide_iter_slice_dot(gamma_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null);
+            dev_forward(r_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // r = A x0
+            ck(
+                ffi::tomoxide_iter_residual(r_d.ptr, b_d.ptr, ones_s.ptr, nsino, null),
+                "iter_residual",
+            )?; // r = b − A x0
+            dev_backproject(handle.ptr, z_d.ptr, r_d.ptr, tp, pg, nz, vbytes)?; // z = Aᵀ r
+            ck(
+                ffi::tomoxide_cuda_memcpy_d2d_async(p_d.ptr, z_d.ptr, vbytes, null),
+                "memcpy_d2d_async",
+            )?; // p = z
+            ck(
+                ffi::tomoxide_iter_slice_dot(gamma_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null),
+                "iter_slice_dot",
+            )?;
 
             for _ in 0..num_iter.max(1) {
-                dev_forward(w_d.ptr, p_d.ptr, tp, phi, nz, n, nproj); // w = A p
-                ffi::tomoxide_iter_slice_dot(wdot_d.ptr, w_d.ptr, w_d.ptr, sslice, nz, null);
-                ffi::tomoxide_iter_cgls_alpha(
-                    alpha_d.ptr,
-                    neg_alpha_d.ptr,
-                    gamma_d.ptr,
-                    wdot_d.ptr,
-                    nz,
-                    null,
-                );
+                dev_forward(w_d.ptr, p_d.ptr, tp, pg, nz, n, nproj)?; // w = A p
+                ck(
+                    ffi::tomoxide_iter_slice_dot(wdot_d.ptr, w_d.ptr, w_d.ptr, sslice, nz, null),
+                    "iter_slice_dot",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_cgls_alpha(
+                        alpha_d.ptr,
+                        neg_alpha_d.ptr,
+                        gamma_d.ptr,
+                        wdot_d.ptr,
+                        nz,
+                        null,
+                    ),
+                    "iter_cgls_alpha",
+                )?;
                 // x += alpha·p  (x −= (−alpha)·p) ;  r −= alpha·w.
-                ffi::tomoxide_iter_axpy_neg_slice(
-                    vol_d.ptr,
-                    p_d.ptr,
-                    neg_alpha_d.ptr,
-                    vslice,
-                    nvol,
-                    null,
-                );
-                ffi::tomoxide_iter_axpy_neg_slice(
-                    r_d.ptr,
-                    w_d.ptr,
-                    alpha_d.ptr,
-                    sslice,
-                    nsino,
-                    null,
-                );
-                dev_backproject(handle, z_d.ptr, r_d.ptr, tp, phi, nz, vbytes); // z = Aᵀ r
-                ffi::tomoxide_iter_slice_dot(gnew_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null);
-                ffi::tomoxide_iter_cgls_beta(beta_d.ptr, gamma_d.ptr, gnew_d.ptr, nz, null);
-                ffi::tomoxide_iter_xpby_slice(p_d.ptr, z_d.ptr, beta_d.ptr, vslice, nvol, null);
+                ck(
+                    ffi::tomoxide_iter_axpy_neg_slice(
+                        vol_d.ptr,
+                        p_d.ptr,
+                        neg_alpha_d.ptr,
+                        vslice,
+                        nvol,
+                        null,
+                    ),
+                    "iter_axpy_neg_slice",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_axpy_neg_slice(
+                        r_d.ptr,
+                        w_d.ptr,
+                        alpha_d.ptr,
+                        sslice,
+                        nsino,
+                        null,
+                    ),
+                    "iter_axpy_neg_slice",
+                )?;
+                dev_backproject(handle.ptr, z_d.ptr, r_d.ptr, tp, pg, nz, vbytes)?; // z = Aᵀ r
+                ck(
+                    ffi::tomoxide_iter_slice_dot(gnew_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null),
+                    "iter_slice_dot",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_cgls_beta(beta_d.ptr, gamma_d.ptr, gnew_d.ptr, nz, null),
+                    "iter_cgls_beta",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_xpby_slice(p_d.ptr, z_d.ptr, beta_d.ptr, vslice, nvol, null),
+                    "iter_xpby_slice",
+                )?;
                 // p = z + beta·p
             }
         }
 
         let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        unsafe { ffi::tomoxide_linerec_free(handle) };
+        drop(handle);
         if rc != 0 {
             return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
@@ -2183,7 +2380,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         // Both the extrapolated and the primal iterate start from the seed / r
         // (r-scaled domain); a `None` init is the plain zero start.
@@ -2195,28 +2392,41 @@ mod cuda_impl {
         let ax_d = DevBuf::zeroed(sbytes)?;
         let bpv_d = DevBuf::zeroed(vbytes)?;
 
-        let handle = unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) };
-        if handle.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
+        let handle = Handle::new(
+            unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) },
+            ffi::tomoxide_linerec_free,
+            "cfunc_linerec",
+        )?;
 
         unsafe {
             for _ in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, xbar_d.ptr, tp, phi, nz, n, nproj); // R x̄
-                ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null);
-                dev_backproject(handle, bpv_d.ptr, pd_d.ptr, tp, phi, nz, vbytes); // Rᵀ(pd)
-                ffi::tomoxide_iter_tv_dual(
-                    p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
-                );
-                ffi::tomoxide_iter_tv_primal(
-                    x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, n, nz, null,
-                );
+                dev_forward(ax_d.ptr, xbar_d.ptr, tp, pg, nz, n, nproj)?; // R x̄
+                ck(
+                    ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null),
+                    "iter_tv_datadual",
+                )?;
+                dev_backproject(handle.ptr, bpv_d.ptr, pd_d.ptr, tp, pg, nz, vbytes)?; // Rᵀ(pd)
+                ck(
+                    ffi::tomoxide_iter_tv_dual(
+                        p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
+                    ),
+                    "iter_tv_dual",
+                )?;
+                ck(
+                    ffi::tomoxide_iter_tv_primal(
+                        x_d.ptr, xbar_d.ptr, bpv_d.ptr, p0x_d.ptr, p0y_d.ptr, C, r, n, nz, null,
+                    ),
+                    "iter_tv_primal",
+                )?;
             }
-            ffi::tomoxide_iter_scale_inplace(xbar_d.ptr, r, nvol, null); // back to physical domain
+            ck(
+                ffi::tomoxide_iter_scale_inplace(xbar_d.ptr, r, nvol, null),
+                "iter_scale_inplace",
+            )?; // back to physical domain
         }
 
         let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        unsafe { ffi::tomoxide_linerec_free(handle) };
+        drop(handle);
         if rc != 0 {
             return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
         }
@@ -2234,7 +2444,7 @@ mod cuda_impl {
         /// OSPML/PML (`ospml_device`), GRAD/TIKH (`grad_device`), and TV
         /// (`tv_device`); every other algorithm returns `Ok(None)` → generic
         /// host fallback (ART/BART are dispatched earlier, by ray projector).
-        /// Serves parallel beam and laminography (`beam_phi` threads the tilt
+        /// Serves parallel beam and laminography (`pair_geom` threads the tilt
         /// into the projector pair; recon-height = detector rows); falls back for
         /// the tilt-invalid per-slice solvers (CGLS/GRAD/TIKH on laminography) or
         /// a non-square grid (the kernels assume detector width = grid `n`).
@@ -2253,7 +2463,7 @@ mod cuda_impl {
             use crate::params::Algorithm;
             // The device-resident path serves both parallel beam and
             // laminography (the tilt is threaded into dev_forward/dev_backproject
-            // via `beam_phi`; the recon-height equals the detector-row count, so
+            // via `pair_geom`; the recon-height equals the detector-row count, so
             // the volume/sinogram buffers are sized exactly as the parallel case
             // and stay resident across every iteration). For a tilted axis the
             // per-slice-step solvers (CGLS/GRAD/TIKH) are invalid — their scalar
@@ -2515,36 +2725,45 @@ mod cuda_impl {
             },
             "pad",
         )?;
-        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter allocation failed".into()));
-        }
-        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_free(fh) };
+        let fh = Handle::new(
+            unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) },
+            ffi::tomoxide_filter_free,
+            "cfunc_filter",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_filter_apply(fh.ptr, gpad.ptr, w_dev.ptr, null) },
+            "filter_apply",
+        )?;
+        drop(fh);
         let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
         ck(
             unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
             "crop",
         )?;
         let f = DevBuf::zeroed(nz * n * n * fsz)?;
-        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, nz) };
-        if h.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
+        let h = Handle::new(
+            unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, nz) },
+            ffi::tomoxide_linerec_free,
+            "cfunc_linerec",
+        )?;
         unsafe {
-            ffi::tomoxide_linerec_backproject(
-                h,
-                f.ptr,
-                gf.ptr,
-                theta_dev.ptr as *const f32,
-                std::f32::consts::FRAC_PI_2,
-                std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
-                0,
-                nz as i32, // parallel beam: rh == nz
-                null,
-            );
+            ck(
+                ffi::tomoxide_linerec_backproject(
+                    h.ptr,
+                    f.ptr,
+                    gf.ptr,
+                    theta_dev.ptr as *const f32,
+                    std::f32::consts::FRAC_PI_2,
+                    (n / 2) as f32, // centred sinogram: axis = n/2
+                    std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
+                    0,
+                    nz as i32, // parallel beam: rh == nz
+                    null,
+                ),
+                "linerec_backproject",
+            )?;
         }
-        unsafe { ffi::tomoxide_linerec_free(h) };
+        drop(h);
         ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         let mut host = vec![0.0f32; nz * n * n];
         f.to_host_f32(&mut host)?;
@@ -2612,12 +2831,16 @@ mod cuda_impl {
             },
             "pad",
         )?;
-        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter allocation failed".into()));
-        }
-        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_free(fh) };
+        let fh = Handle::new(
+            unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) },
+            ffi::tomoxide_filter_free,
+            "cfunc_filter",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_filter_apply(fh.ptr, gpad.ptr, w_dev.ptr, null) },
+            "filter_apply",
+        )?;
+        drop(fh);
         let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
         ck(
             unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
@@ -2625,24 +2848,29 @@ mod cuda_impl {
         )?;
         // Output is `rh` slices, not `nz`; ncz = rh, ncproj = nproj (whole stack).
         let f = DevBuf::zeroed(rh * n * n * fsz)?;
-        let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, rh) };
-        if h.is_null() {
-            return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-        }
+        let h = Handle::new(
+            unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, nproj, rh) },
+            ffi::tomoxide_linerec_free,
+            "cfunc_linerec",
+        )?;
         unsafe {
-            ffi::tomoxide_linerec_backproject(
-                h,
-                f.ptr,
-                gf.ptr,
-                theta_dev.ptr as *const f32,
-                phi,
-                std::f32::consts::PI / nproj as f32, // analytic angular quadrature dθ
-                sz,
-                rh as i32, // volume z centred on the full recon height
-                null,
-            );
+            ck(
+                ffi::tomoxide_linerec_backproject(
+                    h.ptr,
+                    f.ptr,
+                    gf.ptr,
+                    theta_dev.ptr as *const f32,
+                    phi,
+                    (n / 2) as f32, // centred sinogram: axis = n/2
+                    std::f32::consts::PI / nproj as f32, // analytic angular quadrature dθ
+                    sz,
+                    rh as i32, // volume z centred on the full recon height
+                    null,
+                ),
+                "linerec_backproject",
+            )?;
         }
-        unsafe { ffi::tomoxide_linerec_free(h) };
+        drop(h);
         ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         let mut host = vec![0.0f32; rh * n * n];
         f.to_host_f32(&mut host)?;
@@ -2743,41 +2971,48 @@ mod cuda_impl {
             let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
             // `nproj` global (fixes the π/nproj quadrature scale), `alen` local
             // (the kernel's angle loop bound and its `data` stride).
-            let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, ncand) };
-            if h.is_null() {
-                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-            }
+            let h = Handle::new(
+                unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, ncand) },
+                ffi::tomoxide_linerec_free,
+                "cfunc_linerec",
+            )?;
             match sweep {
                 TrySweep::Center { phi, rh, .. } => unsafe {
-                    ffi::tomoxide_linerec_backproject_try(
-                        h,
-                        f_dev.ptr,
-                        gf_dev.ptr,
-                        theta_ptr,
-                        cand_dev.ptr as *const f32,
-                        phi,
-                        sz,
-                        rh,
-                        null,
-                    );
+                    ck(
+                        ffi::tomoxide_linerec_backproject_try(
+                            h.ptr,
+                            f_dev.ptr,
+                            gf_dev.ptr,
+                            theta_ptr,
+                            cand_dev.ptr as *const f32,
+                            phi,
+                            sz,
+                            rh,
+                            null,
+                        ),
+                        "linerec_backproject_try",
+                    )?;
                 },
                 TrySweep::Tilt { .. } => unsafe {
-                    ffi::tomoxide_linerec_backproject_try_lamino(
-                        h,
-                        f_dev.ptr,
-                        gf_dev.ptr,
-                        theta_ptr,
-                        cand_dev.ptr as *const f32,
-                        sz,
-                        rh_dev
-                            .as_ref()
-                            .expect("Tilt sweep uploads its per-slot rh")
-                            .ptr as *const i32,
-                        null,
-                    );
+                    ck(
+                        ffi::tomoxide_linerec_backproject_try_lamino(
+                            h.ptr,
+                            f_dev.ptr,
+                            gf_dev.ptr,
+                            theta_ptr,
+                            cand_dev.ptr as *const f32,
+                            sz,
+                            rh_dev
+                                .as_ref()
+                                .expect("Tilt sweep uploads its per-slot rh")
+                                .ptr as *const i32,
+                            null,
+                        ),
+                        "linerec_backproject_try_lamino",
+                    )?;
                 },
             }
-            unsafe { ffi::tomoxide_linerec_free(h) };
+            drop(h);
         }
         ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         let mut host = vec![0.0f32; ncand * n * n];
@@ -2863,7 +3098,10 @@ mod cuda_impl {
         let sh: Vec<f32> = centers.iter().map(|c| nominal - c).collect();
 
         let devices = selected_devices();
-        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        ck(
+            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+            "set_device",
+        )?;
         let out = try_probe_chunk(
             raw,
             &w,
@@ -2879,77 +3117,120 @@ mod cuda_impl {
             .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
     }
 
-    /// See [`super::lamino_reproject`].
-    pub(super) fn lamino_reproject(
-        band: ArrayView3<'_, f32>,
+    /// See [`super::LaminoReprojector`].
+    pub(super) struct LaminoReprojector {
+        band: DevBuf,
+        dev: i32,
         z0: usize,
+        nb: usize,
+        n: usize,
         depth: usize,
-        theta: &[f32],
-        tilt_deg: f32,
+        phi: f32,
         center: f32,
         rows: usize,
-    ) -> Result<Array3<f32>> {
-        let (nb, ny, n) = band.dim();
-        let nproj = theta.len();
-        if nb == 0 || n == 0 || ny != n {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject needs a square band [nb, n, n]; got {nb}x{ny}x{n}"
-            )));
-        }
-        if z0 + nb > depth {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject: band {z0}..{} exceeds depth {depth}",
-                z0 + nb
-            )));
-        }
-        // The kernel's bilinear row taps need two detector rows.
-        if rows < 2 || nproj == 0 {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject needs ≥2 rows and ≥1 angle; got {rows} and {nproj}"
-            )));
-        }
-        // The launch caches cos/sin per angle in 48 KiB of shared memory, and a
-        // launch that asks for more fails without reaching the sync.
-        if nproj > 6144 || nb * n * n > i32::MAX as usize || rows * nproj * n > i32::MAX as usize {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject: {nproj} angles of {rows}x{n} from a {nb}-slice band \
-                 exceed one launch; split theta"
-            )));
-        }
-        let devices = selected_devices();
-        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
-        let band = band.as_standard_layout();
-        let f = DevBuf::from_host_f32(band.as_slice().expect("standard layout"))?;
-        let theta_d = DevBuf::from_host_f32(theta)?;
-        let g = DevBuf::zeroed(rows * nproj * n * std::mem::size_of::<f32>())?;
-        unsafe {
-            ffi::tomoxide_forwardproject(
-                g.ptr,
-                f.ptr,
-                theta_d.ptr as *const f32,
-                lamino_phi(tilt_deg),
+    }
+
+    // The band is device memory of the runtime's primary context, valid on any
+    // host thread; `project` only reads it and selects its device itself.
+    unsafe impl Send for LaminoReprojector {}
+    unsafe impl Sync for LaminoReprojector {}
+
+    impl LaminoReprojector {
+        pub(super) fn new(
+            band: ArrayView3<'_, f32>,
+            z0: usize,
+            depth: usize,
+            tilt_deg: f32,
+            center: f32,
+            rows: usize,
+        ) -> Result<Self> {
+            let (nb, ny, n) = band.dim();
+            if nb == 0 || n == 0 || ny != n {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection needs a square band [nb, n, n]; got {nb}x{ny}x{n}"
+                )));
+            }
+            if z0 + nb > depth {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection: band {z0}..{} exceeds depth {depth}",
+                    z0 + nb
+                )));
+            }
+            // The kernel's bilinear row taps need two detector rows.
+            if rows < 2 {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection needs ≥2 rows; got {rows}"
+                )));
+            }
+            if nb * n * n > i32::MAX as usize {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection: a {nb}x{n}x{n} band exceeds the kernel's int indexing"
+                )));
+            }
+            let dev = *selected_devices().first().unwrap_or(&0);
+            ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
+            let band = band.as_standard_layout();
+            Ok(Self {
+                band: DevBuf::from_host_f32(band.as_slice().expect("standard layout"))?,
+                dev,
+                z0,
+                nb,
+                n,
+                depth,
+                phi: lamino_phi(tilt_deg),
                 center,
-                z0 as i32,
-                nb as i32,
-                rows as i32,
-                n as i32,
-                depth as i32,
-                nproj as i32,
-                std::ptr::null_mut(),
-            );
+                rows,
+            })
         }
-        let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        if rc != 0 {
-            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+
+        pub(super) fn project(&self, theta: &[f32]) -> Result<Array3<f32>> {
+            let (n, rows, nproj) = (self.n, self.rows, theta.len());
+            // The launch caches cos/sin per angle in 48 KiB of shared memory, and
+            // a launch that asks for more fails without reaching the sync.
+            if nproj == 0 || nproj > 6144 || rows * nproj * n > i32::MAX as usize {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection takes 1..=6144 angles of {rows}x{n} under 2^31 \
+                     elements per call; got {nproj}, split theta"
+                )));
+            }
+            ck(
+                unsafe { ffi::tomoxide_cuda_set_device(self.dev) },
+                "set_device",
+            )?;
+            let theta_d = DevBuf::from_host_f32(theta)?;
+            let g = DevBuf::zeroed(rows * nproj * n * std::mem::size_of::<f32>())?;
+            unsafe {
+                ck(
+                    ffi::tomoxide_forwardproject(
+                        g.ptr,
+                        self.band.ptr,
+                        theta_d.ptr as *const f32,
+                        self.phi,
+                        self.center,
+                        self.z0 as i32,
+                        self.nb as i32,
+                        rows as i32,
+                        n as i32,
+                        self.depth as i32,
+                        nproj as i32,
+                        std::ptr::null_mut(),
+                    ),
+                    "forwardproject",
+                )?;
+            }
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+            }
+            let mut host = vec![0.0f32; rows * nproj * n];
+            g.to_host_f32(&mut host)?;
+            let sino = Array3::from_shape_vec((rows, nproj, n), host)
+                .map_err(|e| Error::InvalidParam(format!("cuda reprojection shape: {e}")))?;
+            Ok(sino
+                .permuted_axes([1, 0, 2])
+                .as_standard_layout()
+                .into_owned())
         }
-        let mut host = vec![0.0f32; rows * nproj * n];
-        g.to_host_f32(&mut host)?;
-        let sino = Array3::from_shape_vec((rows, nproj, n), host)
-            .map_err(|e| Error::InvalidParam(format!("cuda reprojection shape: {e}")))?;
-        Ok(sino
-            .permuted_axes([1, 0, 2])
-            .as_standard_layout()
-            .into_owned())
     }
 
     /// See [`super::center_probe_sweep`].
@@ -3068,7 +3349,10 @@ mod cuda_impl {
             .collect();
 
         let devices = selected_devices();
-        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        ck(
+            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+            "set_device",
+        )?;
         let out = try_probe_chunk(
             raw,
             &w,
@@ -3281,12 +3565,16 @@ mod cuda_impl {
                 // `w` is [nz, nfreq2], angle-independent (mulw indexes it by
                 // frequency and detector row only) → slice by z, reuse per chunk.
                 let w_dev = DevBuf::from_host_f32(&w[z0 * nfreq2..(z0 + zlen) * nfreq2])?;
-                let fh = unsafe { ffi::tomoxide_filter_new(alen, zlen, pad) };
-                if fh.is_null() {
-                    return Err(Error::Backend("cfunc_filter allocation failed".into()));
-                }
-                unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-                unsafe { ffi::tomoxide_filter_free(fh) };
+                let fh = Handle::new(
+                    unsafe { ffi::tomoxide_filter_new(alen, zlen, pad) },
+                    ffi::tomoxide_filter_free,
+                    "cfunc_filter",
+                )?;
+                ck(
+                    unsafe { ffi::tomoxide_filter_apply(fh.ptr, gpad.ptr, w_dev.ptr, null) },
+                    "filter_apply",
+                )?;
+                drop(fh);
                 let gf_dev = DevBuf::zeroed(zlen * alen * ncols * fsz)?;
                 ck(
                     unsafe {
@@ -3372,24 +3660,29 @@ mod cuda_impl {
             for (c, &(a0, alen)) in angle_chunks.iter().enumerate() {
                 gf_dev.copy_from_host_f32(&host_gf[c])?;
                 let theta_ptr = unsafe { (theta_dev.ptr as *const f32).add(a0) };
-                let h = unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, tlen) };
-                if h.is_null() {
-                    return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-                }
+                let h = Handle::new(
+                    unsafe { ffi::tomoxide_linerec_new(nproj, nz, n, alen, tlen) },
+                    ffi::tomoxide_linerec_free,
+                    "cfunc_linerec",
+                )?;
                 unsafe {
-                    ffi::tomoxide_linerec_backproject(
-                        h,
-                        f_dev.ptr,
-                        gf_dev.ptr,
-                        theta_ptr,
-                        phi,
-                        gain,
-                        sz,
-                        rh_total as i32, // global rows centred on the full height
-                        null,
-                    );
+                    ck(
+                        ffi::tomoxide_linerec_backproject(
+                            h.ptr,
+                            f_dev.ptr,
+                            gf_dev.ptr,
+                            theta_ptr,
+                            phi,
+                            (n / 2) as f32, // centred sinogram: axis = n/2
+                            gain,
+                            sz,
+                            rh_total as i32, // global rows centred on the full height
+                            null,
+                        ),
+                        "linerec_backproject",
+                    )?;
                 }
-                unsafe { ffi::tomoxide_linerec_free(h) };
+                drop(h);
             }
             ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
             f_dev.to_host_f32(&mut out[t_local * n * n..(t_local + tlen) * n * n])?;
@@ -3438,14 +3731,16 @@ mod cuda_impl {
             },
             "pad_fp16",
         )?;
-        let fh = unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend(
-                "cfunc_filter (f16) allocation failed".into(),
-            ));
-        }
-        unsafe { ffi::tomoxide_filter_fp16_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_fp16_free(fh) };
+        let fh = Handle::new(
+            unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) },
+            ffi::tomoxide_filter_fp16_free,
+            "cfunc_filter (f16)",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_filter_fp16_apply(fh.ptr, gpad.ptr, w_dev.ptr, null) },
+            "filter_fp16_apply",
+        )?;
+        drop(fh);
         let gf = DevBuf::zeroed(nz * nproj * ncols * hsz)?;
         ck(
             unsafe {
@@ -3454,26 +3749,29 @@ mod cuda_impl {
             "crop_fp16",
         )?;
         let f = DevBuf::zeroed(nz * n * n * hsz)?;
-        let h = unsafe { ffi::tomoxide_linerec_fp16_new(nproj, nz, n, nproj, nz) };
-        if h.is_null() {
-            return Err(Error::Backend(
-                "cfunc_linerec (f16) allocation failed".into(),
-            ));
-        }
+        let h = Handle::new(
+            unsafe { ffi::tomoxide_linerec_fp16_new(nproj, nz, n, nproj, nz) },
+            ffi::tomoxide_linerec_fp16_free,
+            "cfunc_linerec (f16)",
+        )?;
         unsafe {
-            ffi::tomoxide_linerec_fp16_backproject(
-                h,
-                f.ptr,
-                gf.ptr,
-                theta_dev.ptr as *const f32,
-                std::f32::consts::FRAC_PI_2,
-                std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
-                0,
-                nz as i32, // parallel beam: rh == nz
-                null,
-            );
+            ck(
+                ffi::tomoxide_linerec_fp16_backproject(
+                    h.ptr,
+                    f.ptr,
+                    gf.ptr,
+                    theta_dev.ptr as *const f32,
+                    std::f32::consts::FRAC_PI_2,
+                    (n / 2) as f32, // centred sinogram: axis = n/2
+                    std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
+                    0,
+                    nz as i32, // parallel beam: rh == nz
+                    null,
+                ),
+                "linerec_fp16_backproject",
+            )?;
         }
-        unsafe { ffi::tomoxide_linerec_fp16_free(h) };
+        drop(h);
         ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
         f.to_host_f16_as_f32(nz * n * n)
     }
@@ -4744,9 +5042,12 @@ mod cuda_impl {
                     },
                     "pad_fp16",
                 )?;
-                unsafe {
-                    ffi::tomoxide_filter_fp16_apply(self.filt, self.gpad.ptr, self.w.ptr, null)
-                };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_filter_fp16_apply(self.filt, self.gpad.ptr, self.w.ptr, null)
+                    },
+                    "filter_fp16_apply",
+                )?;
                 ck(
                     unsafe {
                         ffi::tomoxide_crop_fp16(
@@ -4781,9 +5082,14 @@ mod cuda_impl {
                         },
                         "pack_fp16",
                     )?;
-                    unsafe {
-                        ffi::tomoxide_fourierrec_fp16_backproject(self.frec, fc.ptr, gc.ptr, null)
-                    };
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_fourierrec_fp16_backproject(
+                                self.frec, fc.ptr, gc.ptr, null,
+                            )
+                        },
+                        "fourierrec_fp16_backproject",
+                    )?;
                     ck(
                         unsafe { ffi::tomoxide_unpack_pairs_fp16(fc.ptr, self.f.ptr, m, n, null) },
                         "unpack_fp16",
@@ -4794,17 +5100,21 @@ mod cuda_impl {
                         "memset f f16",
                     )?;
                     unsafe {
-                        ffi::tomoxide_linerec_fp16_backproject(
-                            self.lrec,
-                            self.f.ptr,
-                            self.gf.ptr,
-                            self.theta.ptr as *const f32,
-                            std::f32::consts::FRAC_PI_2,
-                            std::f32::consts::PI / nproj as f32, // FBP dθ weight
-                            0,
-                            self.max_nz as i32, // parallel: rh == the handle's nz
-                            null,
-                        );
+                        ck(
+                            ffi::tomoxide_linerec_fp16_backproject(
+                                self.lrec,
+                                self.f.ptr,
+                                self.gf.ptr,
+                                self.theta.ptr as *const f32,
+                                std::f32::consts::FRAC_PI_2,
+                                (self.n / 2) as f32, // centred sinogram: axis = n/2
+                                std::f32::consts::PI / nproj as f32, // FBP dθ weight
+                                0,
+                                self.max_nz as i32, // parallel: rh == the handle's nz
+                                null,
+                            ),
+                            "linerec_fp16_backproject",
+                        )?;
                     }
                 }
                 // Cast the f16 volume to f32 on the GPU, then D2H f32 (no host widen).
@@ -4837,7 +5147,12 @@ mod cuda_impl {
                     },
                     "pad",
                 )?;
-                unsafe { ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null)
+                    },
+                    "filter_apply",
+                )?;
                 ck(
                     unsafe {
                         ffi::tomoxide_crop(
@@ -4885,7 +5200,12 @@ mod cuda_impl {
                     },
                     "pad",
                 )?;
-                unsafe { ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null)
+                    },
+                    "filter_apply",
+                )?;
                 ck(
                     unsafe {
                         ffi::tomoxide_crop(
@@ -4905,7 +5225,12 @@ mod cuda_impl {
                     unsafe { ffi::tomoxide_pack_pairs(self.gf.ptr, gc.ptr, m, nproj, ncols, null) },
                     "pack",
                 )?;
-                unsafe { ffi::tomoxide_fourierrec_backproject(self.frec, fc.ptr, gc.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_fourierrec_backproject(self.frec, fc.ptr, gc.ptr, null)
+                    },
+                    "fourierrec_backproject",
+                )?;
                 ck(
                     unsafe { ffi::tomoxide_unpack_pairs(fc.ptr, self.f.ptr, m, n, null) },
                     "unpack",
@@ -4928,7 +5253,12 @@ mod cuda_impl {
                     },
                     "pad",
                 )?;
-                unsafe { ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null) };
+                ck(
+                    unsafe {
+                        ffi::tomoxide_filter_apply(self.filt, self.gpad.ptr, self.w.ptr, null)
+                    },
+                    "filter_apply",
+                )?;
                 ck(
                     unsafe {
                         ffi::tomoxide_crop(
@@ -4949,17 +5279,21 @@ mod cuda_impl {
                     "memset f",
                 )?;
                 unsafe {
-                    ffi::tomoxide_linerec_backproject(
-                        self.lrec,
-                        self.f.ptr,
-                        self.gf.ptr,
-                        self.theta.ptr as *const f32,
-                        std::f32::consts::FRAC_PI_2,
-                        std::f32::consts::PI / nproj as f32, // FBP dθ weight
-                        0,
-                        self.max_nz as i32, // parallel: rh == the handle's nz
-                        null,
-                    );
+                    ck(
+                        ffi::tomoxide_linerec_backproject(
+                            self.lrec,
+                            self.f.ptr,
+                            self.gf.ptr,
+                            self.theta.ptr as *const f32,
+                            std::f32::consts::FRAC_PI_2,
+                            (self.n / 2) as f32, // centred sinogram: axis = n/2
+                            std::f32::consts::PI / nproj as f32, // FBP dθ weight
+                            0,
+                            self.max_nz as i32, // parallel: rh == the handle's nz
+                            null,
+                        ),
+                        "linerec_backproject",
+                    )?;
                 }
                 ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
                 download_volume(&self.f, &mut self.out_pinned, &mut self.reuse_pool, nz, n)
@@ -4982,8 +5316,8 @@ mod cuda_impl {
         pin_w: PinnedBuf,
         pin_out: PinnedBuf,
         inflight: Option<usize>,
-        filt: *mut c_void,
-        lrec: *mut c_void,
+        filt: Option<Handle>,
+        lrec: Option<Handle>,
     }
 
     /// Asynchronous, double-buffered Fbp/Linerec back-projection over `chunks`
@@ -5030,8 +5364,8 @@ mod cuda_impl {
                 pin_w: PinnedBuf::new(maxlen * nfreq2)?,
                 pin_out: PinnedBuf::new(maxlen * n * n)?,
                 inflight: None,
-                filt: std::ptr::null_mut(),
-                lrec: std::ptr::null_mut(),
+                filt: None,
+                lrec: None,
             });
         }
 
@@ -5094,12 +5428,18 @@ mod cuda_impl {
                 },
                 "pad",
             )?;
-            let filt = unsafe { ffi::tomoxide_filter_new(nproj, len, pad) };
-            if filt.is_null() {
-                return Err(Error::Backend("cfunc_filter allocation failed".into()));
-            }
-            slots[s].filt = filt;
-            unsafe { ffi::tomoxide_filter_apply(filt, slots[s].gpad.ptr, slots[s].w.ptr, st) };
+            let filt = slots[s]
+                .filt
+                .insert(Handle::new(
+                    unsafe { ffi::tomoxide_filter_new(nproj, len, pad) },
+                    ffi::tomoxide_filter_free,
+                    "cfunc_filter",
+                )?)
+                .ptr;
+            ck(
+                unsafe { ffi::tomoxide_filter_apply(filt, slots[s].gpad.ptr, slots[s].w.ptr, st) },
+                "filter_apply",
+            )?;
             ck(
                 unsafe {
                     ffi::tomoxide_crop(
@@ -5122,23 +5462,30 @@ mod cuda_impl {
                 },
                 "memset f",
             )?;
-            let lrec = unsafe { ffi::tomoxide_linerec_new(nproj, len, n, nproj, len) };
-            if lrec.is_null() {
-                return Err(Error::Backend("cfunc_linerec allocation failed".into()));
-            }
-            slots[s].lrec = lrec;
+            let lrec = slots[s]
+                .lrec
+                .insert(Handle::new(
+                    unsafe { ffi::tomoxide_linerec_new(nproj, len, n, nproj, len) },
+                    ffi::tomoxide_linerec_free,
+                    "cfunc_linerec",
+                )?)
+                .ptr;
             unsafe {
-                ffi::tomoxide_linerec_backproject(
-                    lrec,
-                    slots[s].f.ptr,
-                    slots[s].gf.ptr,
-                    theta_dev.ptr as *const f32,
-                    std::f32::consts::FRAC_PI_2,
-                    std::f32::consts::PI / nproj as f32, // FBP dθ weight
-                    0,
-                    len as i32, // parallel: rh == the chunk's nz
-                    st,
-                );
+                ck(
+                    ffi::tomoxide_linerec_backproject(
+                        lrec,
+                        slots[s].f.ptr,
+                        slots[s].gf.ptr,
+                        theta_dev.ptr as *const f32,
+                        std::f32::consts::FRAC_PI_2,
+                        (n / 2) as f32, // centred sinogram: axis = n/2
+                        std::f32::consts::PI / nproj as f32, // FBP dθ weight
+                        0,
+                        len as i32, // parallel: rh == the chunk's nz
+                        st,
+                    ),
+                    "linerec_backproject",
+                )?;
             }
             ck(
                 unsafe {
@@ -5174,12 +5521,8 @@ mod cuda_impl {
         out: &mut [f32],
     ) -> Result<()> {
         slot.stream.sync()?;
-        unsafe {
-            ffi::tomoxide_filter_free(slot.filt);
-            ffi::tomoxide_linerec_free(slot.lrec);
-        }
-        slot.filt = std::ptr::null_mut();
-        slot.lrec = std::ptr::null_mut();
+        slot.filt = None;
+        slot.lrec = None;
         let (z0, len) = chunks[ci];
         out[z0 * n * n..(z0 + len) * n * n]
             .copy_from_slice(&slot.pin_out.as_slice()[..len * n * n]);
@@ -5237,8 +5580,8 @@ mod cuda_impl {
         pin_w: PinnedBuf<half::f16>,
         pin_out: PinnedBuf<half::f16>,
         inflight: Option<usize>,
-        filt: *mut c_void,
-        lrec: *mut c_void,
+        filt: Option<Handle>,
+        lrec: Option<Handle>,
     }
 
     /// Half-precision counterpart of [`analytic_fbp_pipeline`]. Same double-
@@ -5283,8 +5626,8 @@ mod cuda_impl {
                 pin_w: PinnedBuf::new(maxlen * nfreq2)?,
                 pin_out: PinnedBuf::new(maxlen * n * n)?,
                 inflight: None,
-                filt: std::ptr::null_mut(),
-                lrec: std::ptr::null_mut(),
+                filt: None,
+                lrec: None,
             });
         }
 
@@ -5350,14 +5693,20 @@ mod cuda_impl {
                 },
                 "pad_fp16",
             )?;
-            let filt = unsafe { ffi::tomoxide_filter_fp16_new(nproj, len, pad) };
-            if filt.is_null() {
-                return Err(Error::Backend(
-                    "cfunc_filter (f16) allocation failed".into(),
-                ));
-            }
-            slots[s].filt = filt;
-            unsafe { ffi::tomoxide_filter_fp16_apply(filt, slots[s].gpad.ptr, slots[s].w.ptr, st) };
+            let filt = slots[s]
+                .filt
+                .insert(Handle::new(
+                    unsafe { ffi::tomoxide_filter_fp16_new(nproj, len, pad) },
+                    ffi::tomoxide_filter_fp16_free,
+                    "cfunc_filter (f16)",
+                )?)
+                .ptr;
+            ck(
+                unsafe {
+                    ffi::tomoxide_filter_fp16_apply(filt, slots[s].gpad.ptr, slots[s].w.ptr, st)
+                },
+                "filter_fp16_apply",
+            )?;
             ck(
                 unsafe {
                     ffi::tomoxide_crop_fp16(
@@ -5379,25 +5728,30 @@ mod cuda_impl {
                 },
                 "memset f f16",
             )?;
-            let lrec = unsafe { ffi::tomoxide_linerec_fp16_new(nproj, len, n, nproj, len) };
-            if lrec.is_null() {
-                return Err(Error::Backend(
-                    "cfunc_linerec (f16) allocation failed".into(),
-                ));
-            }
-            slots[s].lrec = lrec;
+            let lrec = slots[s]
+                .lrec
+                .insert(Handle::new(
+                    unsafe { ffi::tomoxide_linerec_fp16_new(nproj, len, n, nproj, len) },
+                    ffi::tomoxide_linerec_fp16_free,
+                    "cfunc_linerec (f16)",
+                )?)
+                .ptr;
             unsafe {
-                ffi::tomoxide_linerec_fp16_backproject(
-                    lrec,
-                    slots[s].f.ptr,
-                    slots[s].gf.ptr,
-                    theta_dev.ptr as *const f32,
-                    std::f32::consts::FRAC_PI_2,
-                    std::f32::consts::PI / nproj as f32, // FBP dθ weight
-                    0,
-                    len as i32, // parallel: rh == the chunk's nz
-                    st,
-                );
+                ck(
+                    ffi::tomoxide_linerec_fp16_backproject(
+                        lrec,
+                        slots[s].f.ptr,
+                        slots[s].gf.ptr,
+                        theta_dev.ptr as *const f32,
+                        std::f32::consts::FRAC_PI_2,
+                        (n / 2) as f32, // centred sinogram: axis = n/2
+                        std::f32::consts::PI / nproj as f32, // FBP dθ weight
+                        0,
+                        len as i32, // parallel: rh == the chunk's nz
+                        st,
+                    ),
+                    "linerec_fp16_backproject",
+                )?;
             }
             ck(
                 unsafe {
@@ -5432,12 +5786,8 @@ mod cuda_impl {
         out: &mut [f32],
     ) -> Result<()> {
         slot.stream.sync()?;
-        unsafe {
-            ffi::tomoxide_filter_fp16_free(slot.filt);
-            ffi::tomoxide_linerec_fp16_free(slot.lrec);
-        }
-        slot.filt = std::ptr::null_mut();
-        slot.lrec = std::ptr::null_mut();
+        slot.filt = None;
+        slot.lrec = None;
         let (z0, len) = chunks[ci];
         out[z0 * n * n..(z0 + len) * n * n]
             .par_iter_mut()
@@ -5527,12 +5877,16 @@ mod cuda_impl {
             },
             "pad",
         )?;
-        let fh = unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend("cfunc_filter allocation failed".into()));
-        }
-        unsafe { ffi::tomoxide_filter_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_free(fh) };
+        let fh = Handle::new(
+            unsafe { ffi::tomoxide_filter_new(nproj, nz, pad) },
+            ffi::tomoxide_filter_free,
+            "cfunc_filter",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_filter_apply(fh.ptr, gpad.ptr, w_dev.ptr, null) },
+            "filter_apply",
+        )?;
+        drop(fh);
         let gf = DevBuf::zeroed(nz * nproj * ncols * fsz)?;
         ck(
             unsafe { ffi::tomoxide_crop(gpad.ptr, gf.ptr, nz, nproj, ncols, pad, pad_side, null) },
@@ -5544,13 +5898,16 @@ mod cuda_impl {
             "pack",
         )?;
         let fc = DevBuf::zeroed(nz * n * n * fsz)?; // complex [nz/2,n,n]
-        let h =
-            unsafe { ffi::tomoxide_fourierrec_new(nproj, nz / 2, n, theta_dev.ptr as *const f32) };
-        if h.is_null() {
-            return Err(Error::Backend("cfunc_fourierrec allocation failed".into()));
-        }
-        unsafe { ffi::tomoxide_fourierrec_backproject(h, fc.ptr, gc.ptr, null) };
-        unsafe { ffi::tomoxide_fourierrec_free(h) };
+        let h = Handle::new(
+            unsafe { ffi::tomoxide_fourierrec_new(nproj, nz / 2, n, theta_dev.ptr as *const f32) },
+            ffi::tomoxide_fourierrec_free,
+            "cfunc_fourierrec",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_fourierrec_backproject(h.ptr, fc.ptr, gc.ptr, null) },
+            "fourierrec_backproject",
+        )?;
+        drop(h);
         let vol_dev = DevBuf::zeroed(nz * n * n * fsz)?;
         ck(
             unsafe { ffi::tomoxide_unpack_pairs(fc.ptr, vol_dev.ptr, nz, n, null) },
@@ -6921,14 +7278,16 @@ mod cuda_impl {
             },
             "pad_fp16",
         )?;
-        let fh = unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) };
-        if fh.is_null() {
-            return Err(Error::Backend(
-                "cfunc_filter (f16) allocation failed".into(),
-            ));
-        }
-        unsafe { ffi::tomoxide_filter_fp16_apply(fh, gpad.ptr, w_dev.ptr, null) };
-        unsafe { ffi::tomoxide_filter_fp16_free(fh) };
+        let fh = Handle::new(
+            unsafe { ffi::tomoxide_filter_fp16_new(nproj, nz, pad) },
+            ffi::tomoxide_filter_fp16_free,
+            "cfunc_filter (f16)",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_filter_fp16_apply(fh.ptr, gpad.ptr, w_dev.ptr, null) },
+            "filter_fp16_apply",
+        )?;
+        drop(fh);
         let gf = DevBuf::zeroed(nz * nproj * ncols * hsz)?;
         ck(
             unsafe {
@@ -6942,16 +7301,18 @@ mod cuda_impl {
             "pack_fp16",
         )?;
         let fc = DevBuf::zeroed(nz * n * n * hsz)?; // complex [nz/2,n,n]
-        let h = unsafe {
-            ffi::tomoxide_fourierrec_fp16_new(nproj, nz / 2, n, theta_dev.ptr as *const f32)
-        };
-        if h.is_null() {
-            return Err(Error::Backend(
-                "cfunc_fourierrec (f16) allocation failed".into(),
-            ));
-        }
-        unsafe { ffi::tomoxide_fourierrec_fp16_backproject(h, fc.ptr, gc.ptr, null) };
-        unsafe { ffi::tomoxide_fourierrec_fp16_free(h) };
+        let h = Handle::new(
+            unsafe {
+                ffi::tomoxide_fourierrec_fp16_new(nproj, nz / 2, n, theta_dev.ptr as *const f32)
+            },
+            ffi::tomoxide_fourierrec_fp16_free,
+            "cfunc_fourierrec (f16)",
+        )?;
+        ck(
+            unsafe { ffi::tomoxide_fourierrec_fp16_backproject(h.ptr, fc.ptr, gc.ptr, null) },
+            "fourierrec_fp16_backproject",
+        )?;
+        drop(h);
         let vol_dev = DevBuf::zeroed(nz * n * n * hsz)?;
         ck(
             unsafe { ffi::tomoxide_unpack_pairs_fp16(fc.ptr, vol_dev.ptr, nz, n, null) },
@@ -7077,7 +7438,10 @@ mod cuda_impl {
                 .as_slice()
                 .ok_or_else(|| Error::InvalidParam("non-contiguous projection stack".into()))?;
             let devices = selected_devices();
-            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+            ck(
+                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                "set_device",
+            )?;
             analytic_lamino_fourierrec(
                 proj,
                 theta,
@@ -7116,7 +7480,10 @@ mod cuda_impl {
             .unwrap_or_else(|| super::lamino_recon_height(nz, lamino_angle_deg));
 
         let devices = selected_devices();
-        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+        ck(
+            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+            "set_device",
+        )?;
         let (host_gf, angle_chunks) =
             lamino_filter_to_host(raw, &w, pad, pad_side, device_free_bytes(), cancel)?;
         let host_gf: &[Vec<f32>] = &host_gf;
@@ -7138,7 +7505,7 @@ mod cuda_impl {
                     .zip(devices.iter().copied())
                     .map(|((tz0, tlen), dev)| {
                         scope.spawn(move || -> Result<Vec<f32>> {
-                            unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                            ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
                             lamino_backproject_shard(
                                 host_gf,
                                 angle_chunks,
@@ -7254,7 +7621,10 @@ mod cuda_impl {
                         Error::InvalidParam("non-contiguous projection stack".into())
                     })?;
                     let devices = selected_devices();
-                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                    ck(
+                        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                        "set_device",
+                    )?;
                     // In-memory AnalyticReconstruct receives an already-normalized
                     // sinogram, so no fused correction (norm = None).
                     let mut vol = Vec::with_capacity(rh * n * n);
@@ -7301,7 +7671,10 @@ mod cuda_impl {
                 // device so a tiny rh does not spawn idle threads.
                 let k = devices.len().min(rh / 2).max(1);
                 if k <= 1 {
-                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                    ck(
+                        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                        "set_device",
+                    )?;
                     let vol = analytic_lamino_stream(
                         raw, &w, theta, nz, nproj, ncols, n, pad, pad_side, phi, rh,
                     )?;
@@ -7310,7 +7683,10 @@ mod cuda_impl {
                             .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
                     ));
                 }
-                unsafe { ffi::tomoxide_cuda_set_device(devices[0]) };
+                ck(
+                    unsafe { ffi::tomoxide_cuda_set_device(devices[0]) },
+                    "set_device",
+                )?;
                 let (host_gf, angle_chunks) = lamino_filter_to_host(
                     s.array.view(),
                     &w,
@@ -7327,7 +7703,7 @@ mod cuda_impl {
                         .zip(devices.iter().copied())
                         .map(|((rh0, rh_len), dev)| {
                             scope.spawn(move || -> Result<Vec<f32>> {
-                                unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                                ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
                                 lamino_backproject_shard(
                                     host_gf,
                                     angle_chunks,
@@ -7402,7 +7778,10 @@ mod cuda_impl {
                     )));
                 }
                 let devices = selected_devices();
-                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                ck(
+                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                    "set_device",
+                )?;
                 let vol = match algorithm {
                     Algorithm::Fbp | Algorithm::Linerec => {
                         analytic_fbp_stream_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
@@ -7434,7 +7813,12 @@ mod cuda_impl {
                     // every GPU a single slice and reconstruct an all-zero volume.
                     let k = linerec_chunk_count(nz, devices.len());
                     if k <= 1 {
-                        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                        ck(
+                            unsafe {
+                                ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0))
+                            },
+                            "set_device",
+                        )?;
                         analytic_fbp_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     } else {
                         // Contiguous z-chunks (sizes differ by ≤1), one GPU each,
@@ -7460,7 +7844,10 @@ mod cuda_impl {
                                 .zip(devices.iter().copied())
                                 .map(|((a, len), dev)| {
                                     scope.spawn(move || -> Result<Vec<f32>> {
-                                        unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                                        ck(
+                                            unsafe { ffi::tomoxide_cuda_set_device(dev) },
+                                            "set_device",
+                                        )?;
                                         analytic_fbp_stream(
                                             &raw[a * nproj * ncols..(a + len) * nproj * ncols],
                                             &w[a * nfreq2..(a + len) * nfreq2],
@@ -7493,7 +7880,10 @@ mod cuda_impl {
                 Algorithm::Fourierrec => {
                     // nz is even here by the batch-domain pad above.
                     let devices = selected_devices();
-                    unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+                    ck(
+                        unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                        "set_device",
+                    )?;
                     analytic_fourierrec_stream(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                 }
                 other => {
@@ -7566,7 +7956,10 @@ mod cuda_impl {
             // construction (mirrors the assert in `reconstruct`).
             let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
             let devices = selected_devices();
-            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+            ck(
+                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                "set_device",
+            )?;
             // Build + upload the lprec grids once for the whole stream (the chunk
             // loop reuses them); other methods carry no grids.
             let lprec = if is_lprec {
@@ -7662,15 +8055,24 @@ mod cuda_impl {
 
                 let g_dev = DevBuf::from_host_f32(&g)?;
                 let w_dev = DevBuf::from_host_f32(&w[z0 * nfreq * 2..(z0 + tz) * nfreq * 2])?;
-                let handle = unsafe { ffi::tomoxide_filter_new(nproj, tz, pad) };
-                if handle.is_null() {
-                    return Err(Error::Backend("cfunc_filter allocation failed".into()));
-                }
+                let handle = Handle::new(
+                    unsafe { ffi::tomoxide_filter_new(nproj, tz, pad) },
+                    ffi::tomoxide_filter_free,
+                    "cfunc_filter",
+                )?;
                 unsafe {
-                    ffi::tomoxide_filter_apply(handle, g_dev.ptr, w_dev.ptr, std::ptr::null_mut());
+                    ck(
+                        ffi::tomoxide_filter_apply(
+                            handle.ptr,
+                            g_dev.ptr,
+                            w_dev.ptr,
+                            std::ptr::null_mut(),
+                        ),
+                        "filter_apply",
+                    )?;
                 }
                 let rc = unsafe { ffi::tomoxide_cuda_sync() };
-                unsafe { ffi::tomoxide_filter_free(handle) };
+                drop(handle);
                 if rc != 0 {
                     return Err(Error::Backend(format!("cuda filter sync failed ({rc})")));
                 }
@@ -7894,7 +8296,10 @@ mod cuda_impl {
                     ThreadPoolBuilder::new()
                         .num_threads(per)
                         .start_handler(move |_| {
-                            unsafe { ffi::tomoxide_cuda_set_device(dev) };
+                            // A start handler cannot return an error and `dev` is in
+                            // range (`selected_devices`); a refused bind leaves the
+                            // worker on device 0.
+                            let _ = unsafe { ffi::tomoxide_cuda_set_device(dev) };
                         })
                         .build()
                         .expect("build cuda device pool")
@@ -7929,7 +8334,9 @@ mod cuda_impl {
             ThreadPoolBuilder::new()
                 .num_threads(nthreads.max(1))
                 .start_handler(move |_| {
-                    unsafe { ffi::tomoxide_cuda_set_device(device) };
+                    // A start handler cannot return an error and `device` is in
+                    // range; a refused bind leaves the worker on device 0.
+                    let _ = unsafe { ffi::tomoxide_cuda_set_device(device) };
                 })
                 .build()
                 .expect("build cuda slice pool"),
@@ -8280,22 +8687,26 @@ mod cuda_impl {
             // Output: complex [nz/2, n, n] = nz*n*n floats.
             let f_dev = DevBuf::zeroed(nz * n * n * std::mem::size_of::<f32>())?;
 
-            let handle = unsafe {
-                ffi::tomoxide_fourierrec_new(nproj, half, n, theta_dev.ptr as *const f32)
-            };
-            if handle.is_null() {
-                return Err(Error::Backend("cfunc_fourierrec allocation failed".into()));
-            }
+            let handle = Handle::new(
+                unsafe {
+                    ffi::tomoxide_fourierrec_new(nproj, half, n, theta_dev.ptr as *const f32)
+                },
+                ffi::tomoxide_fourierrec_free,
+                "cfunc_fourierrec",
+            )?;
             unsafe {
-                ffi::tomoxide_fourierrec_backproject(
-                    handle,
-                    f_dev.ptr,
-                    g_dev.ptr,
-                    std::ptr::null_mut(),
-                );
+                ck(
+                    ffi::tomoxide_fourierrec_backproject(
+                        handle.ptr,
+                        f_dev.ptr,
+                        g_dev.ptr,
+                        std::ptr::null_mut(),
+                    ),
+                    "fourierrec_backproject",
+                )?;
             }
             let rc = unsafe { ffi::tomoxide_cuda_sync() };
-            unsafe { ffi::tomoxide_fourierrec_free(handle) };
+            drop(handle);
             if rc != 0 {
                 return Err(Error::Backend(format!(
                     "cuda fourierrec sync failed ({rc})"
@@ -8614,7 +9025,10 @@ mod cuda_impl {
                 .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
             let devices = selected_devices();
-            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) };
+            ck(
+                unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
+                "set_device",
+            )?;
 
             // Precompute + upload the geometry grids once (shared device runtime).
             let lp = LpRecDev::new(n, nproj)?;
