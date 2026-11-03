@@ -111,7 +111,8 @@ pub fn blur_edges(data: &mut Tomo<f32>, low: f64, high: f64) -> Result<()> {
 /// `(row, col)`, with `d = (dy[k], dx[k])`, `c = ((rows−1)/2, (cols−1)/2)` and
 /// `M = [[cos r, sin r], [−sin r, cos r]]` for `r = roll_deg`. What sat at
 /// `o + d` in the rolled frame lands at `o`, so a measured displacement `d` is
-/// removed. A position outside the frame reads the nearest edge.
+/// removed. Off the frame it reads the spline of the frame extended by its
+/// edges, as scipy does.
 ///
 /// This is scipy's `shift(rotate(p, roll_deg, reshape=False), (−dy, −dx))`
 /// with `order=3, mode='nearest'`, made as one resampling instead of two.
@@ -152,9 +153,8 @@ pub fn move_frames(data: &mut Tomo<f32>, dy: &[f32], dx: &[f32], roll_deg: f32) 
                     let a = i as f64 + dy as f64 - cy;
                     for (j, v) in out.iter_mut().enumerate() {
                         let b = j as f64 + dx as f64 - cx;
-                        let r = (cs * a + sn * b + cy).clamp(0.0, (rows - 1) as f64);
-                        let c = (cs * b - sn * a + cx).clamp(0.0, (cols - 1) as f64);
-                        *v = spline_at(coef, w, r, c);
+                        let (r, c) = (cs * a + sn * b + cy, cs * b - sn * a + cx);
+                        *v = spline_at(coef, h, w, r, c);
                     }
                 }
             },
@@ -188,18 +188,24 @@ fn spline_coeffs(frame: &[f32], rows: usize, cols: usize, coef: &mut [f32], line
     }
 }
 
-/// The spline of padded coefficients `coef` (row width `w`) at frame position
-/// `(r, c)`, which lies inside the frame.
-fn spline_at(coef: &[f32], w: usize, r: f64, c: f64) -> f32 {
+/// The spline of padded coefficients `coef` (`h × w`) at frame position
+/// `(r, c)`. scipy neither clamps the position nor stops at the padding: a
+/// tap past it reads the padding's edge coefficient.
+fn spline_at(coef: &[f32], h: usize, w: usize, r: f64, c: f64) -> f32 {
+    let (r, c) = (r + SPLINE_PAD as f64, c + SPLINE_PAD as f64);
     let (fr, fc) = (r.floor(), c.floor());
     let wr = bspline_weights((r - fr) as f32);
     let wc = bspline_weights((c - fc) as f32);
-    // Tap −1 of frame row `fr` is padded row `fr − 1 + SPLINE_PAD`.
-    let (r0, c0) = (fr as usize + SPLINE_PAD - 1, fc as usize + SPLINE_PAD - 1);
+    let tap = |f: f64, k: isize, n: usize| (f as isize - 1 + k).clamp(0, n as isize - 1) as usize;
+    let cols = [0, 1, 2, 3].map(|k| tap(fc, k, w));
     let mut sum = 0.0f32;
     for (k, &wk) in wr.iter().enumerate() {
-        let row = &coef[(r0 + k) * w + c0..][..4];
-        sum += wk * (wc[0] * row[0] + wc[1] * row[1] + wc[2] * row[2] + wc[3] * row[3]);
+        let row = &coef[tap(fr, k as isize, h) * w..][..w];
+        sum += wk
+            * (wc[0] * row[cols[0]]
+                + wc[1] * row[cols[1]]
+                + wc[2] * row[cols[2]]
+                + wc[3] * row[cols[3]]);
     }
     sum
 }
@@ -263,6 +269,27 @@ mod tests {
             let sj = (j as isize + dx[k] as isize).clamp(0, cols as isize - 1) as usize;
             let want = src[[k, si, sj]];
             assert!((v - want).abs() < 1e-4, "[{k},{i},{j}] {v} want {want}");
+        }
+    }
+
+    /// Past the edge it reads what scipy 1.13.1's
+    /// `shift(f, (−0.4, 2.7), order=3, mode='nearest')` reads.
+    #[test]
+    fn move_frames_reads_past_the_edge_as_scipy_shift() {
+        let src = Array3::from_shape_fn((1, 4, 6), |(_, r, c)| {
+            ((3 * r + 7 * c) % 5) as f32 + 0.25 * r as f32
+        });
+        let mut t = Tomo::new(src, Layout::Projection);
+        move_frames(&mut t, &[0.4], &[-2.7], 0.0).unwrap();
+        #[rustfmt::skip]
+        let want = [
+            1.472188, 1.445359, 1.545486, 1.159575, 1.725208, 3.519763,
+            2.657169, 2.63813, 2.709184, 2.411628, 1.016459, 2.02057,
+            2.455581, 2.480741, 2.386841, 2.758071, 2.931692, 1.194648,
+            5.197221, 5.093313, 5.481104, 3.933387, 2.036161, 3.506029,
+        ];
+        for (k, (&v, &w)) in t.array.iter().zip(&want).enumerate() {
+            assert!((v - w).abs() < 1e-5, "[{}][{}] {v} want {w}", k / 6, k % 6);
         }
     }
 
