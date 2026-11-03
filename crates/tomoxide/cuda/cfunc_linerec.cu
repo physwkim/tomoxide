@@ -50,7 +50,7 @@ void cfunc_linerec::ensure_texture() {
 }
 #endif
 
-void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float gain, int sz, int rh, size_t stream_) {
+int cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float gain, int sz, int rh, size_t stream_) {
     real* g = (real *)g_;
     real* f = (real *)f_;
     float* theta = (float *)theta_;
@@ -75,9 +75,10 @@ void cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float ph
 #else
     backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, gain, sz, ncz, n, nz, rh, ncproj);
 #endif
+    return (int)cudaGetLastError();
 }
 
-void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size_t sh_, float phi, int sz, int rh, size_t stream_) {
+int cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size_t sh_, float phi, int sz, int rh, size_t stream_) {
     real* g = (real *)g_;    
     real* f = (real *)f_;
     float* sh = (float *)sh_;
@@ -90,9 +91,10 @@ void cfunc_linerec::backprojection_try(size_t f_, size_t g_, size_t theta_, size
     GS3d0 = dim3(ceil(n / 32.0), ceil(n / 32.0), ncz);
     size_t shmem = 2 * ncproj * sizeof(float); // cos/sin(theta) cache
     backprojection_try_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, sh, ncz, n, nz, rh, ncproj);
+    return (int)cudaGetLastError();
 }                                            
 
-void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz, size_t rh_, size_t stream_) {
+int cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta_, size_t phi_, int sz, size_t rh_, size_t stream_) {
     real* g = (real *)g_;
     real* f = (real *)f_;
     float* phi = (float *)phi_;
@@ -108,4 +110,5 @@ void cfunc_linerec::backprojection_try_lamino(size_t f_, size_t g_, size_t theta
     // as the analytic call sites pass to `backprojection`. tomocupy's 4/nproj
     // predates the scale unification.
     backprojection_try_lamino_ker<<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, 3.14159265358979f/nproj, sz, rh, ncz, n, nz, ncproj);
+    return (int)cudaGetLastError();
 }

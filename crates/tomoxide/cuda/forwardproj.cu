@@ -97,6 +97,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 }
 
 // C-ABI host wrapper. `g` (output sinogram [nz][nproj][n]) must be pre-zeroed.
+// Returns cudaGetLastError(): 0 once the launch is queued.
 // Unweighted (gain 1): the geometry matches backprojection_ker with gain 1 (the
 // iterative back-projection call), so {forward, back} are a true adjoint pair
 // and the forward is the plain line-integral Radon transform — matching the CPU
@@ -108,7 +109,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 // detector rows, `rh` = FULL reconstruction height the global z is centred on
 // (== `nz` parallel beam, `lamino_recon_height` otherwise), `axis` = detector
 // column of voxel column n/2 (n/2 for the adjoint pair).
-extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
+extern "C" int tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
                                         float axis, int sz, int ncz, int nz, int n, int rh,
                                         int nproj, void *stream)
 {
@@ -117,4 +118,5 @@ extern "C" void tomoxide_forwardproject(void *g, const void *f, const float *the
     size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
     forwardprojection_ker<<<grid, dimBlock, shmem, (cudaStream_t)stream>>>(
         (float *)g, (const float *)f, theta, phi, axis, sz, ncz, n, nz, rh, nproj);
+    return (int)cudaGetLastError();
 }
