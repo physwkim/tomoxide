@@ -173,12 +173,15 @@ unsafe extern "C" {
     /// volume `[nz, n, n]`, `phi = π/2` for parallel beam. `rh` = full
     /// reconstruction height the volume z is centred on (see
     /// [`tomoxide_linerec_backproject`]); must match the back-projection's `rh`
-    /// so the pair stays an exact adjoint.
+    /// so the pair stays an exact adjoint. `axis` is the detector column voxel
+    /// column `n/2` lands on: `n/2` for the adjoint pair, a rotation centre to
+    /// reproject as a reconstruction at that centre reads the detector.
     pub fn tomoxide_forwardproject(
         g: *mut c_void,
         f: *const c_void,
         theta: *const f32,
         phi: f32,
+        axis: f32,
         sz: i32,
         ncz: i32,
         nz: i32,
