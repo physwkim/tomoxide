@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`cuda::lamino_reproject` reprojects a band of a lamino volume at a
+  rotation centre.** It gives the frames Fourierrec at that centre and tilt
+  reads slices `z0..z0+nb` from, so reprojection matching runs on the GPU
+  against the volume's own geometry. The CUDA forward kernel now takes the
+  detector column the volume's middle lands on; the existing projectors pass
+  the middle and are unchanged. On a 1001-frame scan, Lamino-Pal's
+  reprojection matching went from 498 to 45 ms a frame.
+- **`prep::alignment::move_frames` and `PreppedStack::moved` move frames by a
+  per-frame shift and a roll.** They give scipy's
+  `shift(rotate(p, roll, reshape=False), (-dy, -dx))` with order 3 and mode
+  nearest, edges included, in one cubic resampling instead of two; `moved`
+  applies it in transmission to a loaded stack, so a roll can be tried
+  without writing the scan again.
+
 ## [0.10.3] - 2026-11-02
 
 ### Fixed
