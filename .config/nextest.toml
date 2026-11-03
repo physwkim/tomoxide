@@ -1,0 +1,9 @@
+# Each CUDA test process holds a ~310 MiB context on GPU 0. One test per CPU
+# puts ~90 of them there at once, and a late cudaSetDevice then fails with
+# cudaErrorMemoryAllocation.
+[test-groups]
+cuda = { max-threads = 24 }
+
+[[profile.default.overrides]]
+filter = 'binary(/^cuda_/) | test(/cuda/)'
+test-group = 'cuda'
