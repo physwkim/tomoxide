@@ -1025,9 +1025,9 @@ mod cuda_impl {
 
     impl FilteredBackproject for CudaBackend {
         /// Parallel-beam voxel-driven back-projection via the vendored
-        /// `cfunc_linerec` kernel (phi = π/2, gain 1). The sinogram must already be
-        /// filtered and centred on the detector midpoint (`recon` does this through
-        /// the shared FBP filter), so the kernel assumes centre `n/2`. Output is
+        /// `cfunc_linerec` kernel (phi = π/2, gain 1), about `geom.center` (the
+        /// analytic dispatcher hands a filtered sinogram centred at `ncols/2`,
+        /// the iterative solvers the caller's centre). Output is
         /// `[nz, n, n]` in the **CPU/tomopy convention**: the kernel's tomocupy
         /// y-flip has been unified to the CPU handedness (Phase 1/2 cross-backend
         /// unification), so CUDA back-projection matches the CPU back-projector
@@ -1042,15 +1042,7 @@ mod cuda_impl {
             geom: &Geometry,
             out: &mut Volume<f32>,
         ) -> Result<()> {
-            let phi_lam = match geom.beam {
-                Beam::Parallel => None,
-                Beam::Laminography { phi } => Some(phi),
-                _ => {
-                    return Err(Error::InvalidParam(
-                        "cuda back-projection supports parallel beam and laminography only".into(),
-                    ));
-                }
-            };
+            let pg = pair_geom(geom)?;
             let s = sino.as_layout(Layout::Sinogram); // [nz, nproj, ncols], no copy if already
             let nz = s.n_rows();
             let nproj = s.n_angles();
@@ -1072,7 +1064,7 @@ mod cuda_impl {
             // `[rh, n, n]` volume (rh = output height) with the tilted geometry
             // (sz = 0, ncz = rh). Pure adjoint `Wᵀ` — the exact transpose of the
             // tilted forward projector, so {A, Aᵀ} is a true adjoint pair.
-            if let Some(phi) = phi_lam {
+            if matches!(geom.beam, Beam::Laminography { .. }) {
                 let rh = oz;
                 let sino_std = s.array.as_standard_layout();
                 let sino_slice = sino_std
@@ -1093,7 +1085,8 @@ mod cuda_impl {
                             f.ptr,
                             g.ptr,
                             theta_d.ptr as *const f32,
-                            phi,
+                            pg.phi,
+                            pg.axis,
                             1.0,       // pure adjoint Wᵀ
                             0,         // sz
                             rh as i32, // volume z centred on the full recon height
@@ -1152,7 +1145,6 @@ mod cuda_impl {
                 ffi::tomoxide_linerec_free,
                 "cfunc_linerec",
             )?;
-            let phi = std::f32::consts::FRAC_PI_2; // parallel beam
             ck(
                 unsafe {
                     ffi::tomoxide_linerec_backproject(
@@ -1160,7 +1152,8 @@ mod cuda_impl {
                         f.ptr,
                         g.ptr,
                         theta_d.ptr as *const f32,
-                        phi,
+                        pg.phi, // π/2 (parallel beam)
+                        pg.axis,
                         1.0, // pure adjoint Wᵀ — no angular-quadrature gain
                         0,
                         nz_run as i32, // parallel beam: rh == nz
@@ -1187,26 +1180,17 @@ mod cuda_impl {
     impl ForwardProject for CudaBackend {
         /// Parallel-beam forward projection (`forwardprojection_ker`), the exact
         /// discrete transpose of [`FilteredBackproject::backproject`]
-        /// (`cfunc_linerec`, phi = π/2, gain 1): same handedness, centre `n/2`, and
+        /// (`cfunc_linerec`, phi = π/2, gain 1): same handedness, centre, and
         /// both unweighted, so the two form a true `{A, Aᵀ}` pair — matching the
         /// CPU projector pair — which is what the generic iterative solvers
         /// (SIRT/MLEM/OSEM/OSPML/PML/GRAD/TIKH/TV) require. `A` is the plain
         /// line-integral Radon transform (unit pixel spacing), so a converged
-        /// solve of `A x = p` yields the physical μ. Like the back-projector, the
-        /// kernel hard-wires centre `n/2` (it ignores `geom.center`) and assumes
-        /// the detector width equals the grid `n`. Output is `[nz, nproj, n]` in
+        /// solve of `A x = p` yields the physical μ. Like the back-projector, it
+        /// projects about `geom.center` (`pair_geom`) and assumes the detector
+        /// width equals the grid `n`. Output is `[nz, nproj, n]` in
         /// `Sinogram` layout.
         fn project(&self, vol: &Volume<f32>, geom: &Geometry, out: &mut Tomo<f32>) -> Result<()> {
-            let phi = match geom.beam {
-                Beam::Parallel => std::f32::consts::FRAC_PI_2,
-                Beam::Laminography { phi } => phi,
-                _ => {
-                    return Err(Error::InvalidParam(
-                        "cuda forward projection supports parallel beam and laminography only"
-                            .into(),
-                    ));
-                }
-            };
+            let pg = pair_geom(geom)?;
             let (rh, ny, nx) = vol.dims(); // volume z-extent (== detector rows for parallel)
             if ny != nx {
                 return Err(Error::InvalidParam(format!(
@@ -1250,8 +1234,8 @@ mod cuda_impl {
                             g.ptr,
                             f.ptr,
                             theta_d.ptr as *const f32,
-                            phi,
-                            (n / 2) as f32,
+                            pg.phi,
+                            pg.axis,
                             0,
                             rh as i32,
                             nz as i32,
@@ -1309,8 +1293,8 @@ mod cuda_impl {
                         g.ptr,
                         f.ptr,
                         theta_d.ptr as *const f32,
-                        phi, // π/2 (parallel beam)
-                        (n / 2) as f32,
+                        pg.phi, // π/2 (parallel beam)
+                        pg.axis,
                         0,
                         nz_run as i32,
                         nz_run as i32,
@@ -1347,22 +1331,49 @@ mod cuda_impl {
         }
     }
 
-    /// Projector tilt angle for the device-resident solvers: `π/2` for a
-    /// parallel beam, the laminography tilt otherwise. Threaded into
-    /// [`dev_forward`]/[`dev_backproject`] so the same `A`/`Aᵀ` kernels drive
-    /// both geometries; laminography reconstructs at recon-height = detector
-    /// rows (`rh == nz`), matching the generic host solvers' tilted projector
-    /// calls (which the device path replaces to keep the volume/sinogram
-    /// resident across iterations).
+    /// What the `{A, Aᵀ}` kernel pair reads of a geometry: the tilt `phi`
+    /// (`π/2` for a parallel beam) and `axis`, the detector column voxel column
+    /// `n/2` lands on — `geom.center`, as the CPU projector pair reads it.
+    /// Threaded into [`dev_forward`]/[`dev_backproject`] and the host
+    /// projectors so both directions always share it.
     #[cfg(feature = "cuda")]
-    fn beam_phi(beam: &Beam) -> f32 {
-        match beam {
-            Beam::Laminography { phi } => *phi,
-            // Parallel beam uses the untilted projector. Any other geometry
-            // (cone) is gated out of the device path in `solve` before a solver
-            // — and thus `beam_phi` — ever runs, so it never reaches here.
-            _ => std::f32::consts::FRAC_PI_2,
-        }
+    #[derive(Clone, Copy)]
+    struct PairGeom {
+        phi: f32,
+        axis: f32,
+    }
+
+    /// [`PairGeom`] of `geom`. The kernels take one centre for every row, so a
+    /// `Center::PerRow` with differing values is refused rather than read at
+    /// row 0.
+    #[cfg(feature = "cuda")]
+    fn pair_geom(geom: &Geometry) -> Result<PairGeom> {
+        let phi = match geom.beam {
+            Beam::Parallel => std::f32::consts::FRAC_PI_2,
+            Beam::Laminography { phi } => phi,
+            Beam::Cone { .. } => {
+                return Err(Error::InvalidParam(
+                    "the cuda projector pair supports parallel beam and laminography only".into(),
+                ));
+            }
+        };
+        let axis = match &geom.center {
+            Center::Scalar(c) => *c,
+            Center::PerRow(v) => {
+                let first = *v
+                    .first()
+                    .ok_or_else(|| Error::InvalidParam("empty PerRow centre".into()))?;
+                if v.iter().any(|c| *c != first) {
+                    return Err(Error::InvalidParam(
+                        "the cuda projector pair takes one rotation centre; \
+                         geom.center is Center::PerRow with differing values"
+                            .into(),
+                    ));
+                }
+                first
+            }
+        };
+        Ok(PairGeom { phi, axis })
     }
 
     /// On-device forward projection `g = A f`: zero `g` (the scatter-add kernel
@@ -1378,7 +1389,7 @@ mod cuda_impl {
         g: *mut c_void,
         f: *const c_void,
         theta: *const f32,
-        phi: f32,
+        pg: PairGeom,
         nz: usize,
         n: usize,
         nproj: usize,
@@ -1394,8 +1405,8 @@ mod cuda_impl {
                 g,
                 f,
                 theta,
-                phi, // π/2 parallel beam, tilted for laminography
-                (n / 2) as f32,
+                pg.phi,
+                pg.axis,
                 0,         // sz: whole volume, no offset
                 nz as i32, // ncz: recon height == detector rows (rh == nz here)
                 nz as i32,
@@ -1424,7 +1435,7 @@ mod cuda_impl {
         f: *mut c_void,
         g: *const c_void,
         theta: *const f32,
-        phi: f32,
+        pg: PairGeom,
         nz: usize,
         vbytes: usize,
     ) -> Result<()> {
@@ -1435,8 +1446,8 @@ mod cuda_impl {
         )?;
         ck(
             ffi::tomoxide_linerec_backproject(
-                handle, f, g, theta, phi, // π/2 parallel beam, tilted for laminography
-                1.0, 0, nz as i32, // rh == nz by the device-path design
+                handle, f, g, theta, pg.phi, pg.axis, 1.0, 0,
+                nz as i32, // rh == nz by the device-path design
                 null,
             ),
             "linerec backproject",
@@ -1488,7 +1499,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
@@ -1507,23 +1518,23 @@ mod cuda_impl {
         // All ops on the per-thread default stream (null) → FIFO-ordered, so one
         // sync before the download suffices.
         unsafe {
-            dev_forward(ax_d.ptr, ones_v.ptr, tp, phi, nz, n, nproj)?; // A(1)
+            dev_forward(ax_d.ptr, ones_v.ptr, tp, pg, nz, n, nproj)?; // A(1)
             ck(
                 ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null),
                 "iter_recip_thresh",
             )?; // R
-            dev_backproject(handle.ptr, corr_d.ptr, ones_s.ptr, tp, phi, nz, vbytes)?; // Aᵀ(1)
+            dev_backproject(handle.ptr, corr_d.ptr, ones_s.ptr, tp, pg, nz, vbytes)?; // Aᵀ(1)
             ck(
                 ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null),
                 "iter_recip_thresh",
             )?; // C
             for _ in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj)?; // ax = A x
+                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // ax = A x
                 ck(
                     ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null),
                     "iter_residual",
                 )?; // (b−Ax)∘R
-                dev_backproject(handle.ptr, corr_d.ptr, ax_d.ptr, tp, phi, nz, vbytes)?; // corr = Aᵀ(…)
+                dev_backproject(handle.ptr, corr_d.ptr, ax_d.ptr, tp, pg, nz, vbytes)?; // corr = Aᵀ(…)
                 ck(
                     ffi::tomoxide_iter_update(vol_d.ptr, cw_d.ptr, corr_d.ptr, nvol, null),
                     "iter_update",
@@ -1580,7 +1591,7 @@ mod cuda_impl {
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, nproj, ncols) = (s.n_rows(), s.n_angles(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let theta = &geom.angles.0;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
@@ -1694,7 +1705,7 @@ mod cuda_impl {
                         {
                             let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
                             unsafe {
-                                dev_forward(ax_d.ptr, ones_v.ptr, tp, phi, nz, n, len)?;
+                                dev_forward(ax_d.ptr, ones_v.ptr, tp, pg, nz, n, len)?;
                                 ck(
                                     ffi::tomoxide_iter_recip_thresh(
                                         rw_d.ptr, ax_d.ptr, 1e-6, nsub, null,
@@ -1708,7 +1719,7 @@ mod cuda_impl {
                             let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsub])?;
                             unsafe {
                                 dev_backproject(
-                                    handle.ptr, corr_d.ptr, ones_s.ptr, tp, phi, nz, vbytes,
+                                    handle.ptr, corr_d.ptr, ones_s.ptr, tp, pg, nz, vbytes,
                                 )?;
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
@@ -1731,7 +1742,7 @@ mod cuda_impl {
                         // SIRT iterations, volume resident, correction all-reduced.
                         for _ in 0..num_iter.max(1) {
                             unsafe {
-                                dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, len)?; // A x
+                                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, len)?; // A x
                                 ck(
                                     ffi::tomoxide_iter_residual(
                                         ax_d.ptr, b_d.ptr, rw_d.ptr, nsub, null,
@@ -1739,7 +1750,7 @@ mod cuda_impl {
                                     "iter_residual",
                                 )?; // (b−Ax)∘R
                                 dev_backproject(
-                                    handle.ptr, corr_d.ptr, ax_d.ptr, tp, phi, nz, vbytes,
+                                    handle.ptr, corr_d.ptr, ax_d.ptr, tp, pg, nz, vbytes,
                                 )?; // Aᵀₘ(…)
                                 if ffi::tomoxide_cuda_sync() != 0 {
                                     return Err(Error::Backend("cuda sync failed".into()));
@@ -1816,7 +1827,7 @@ mod cuda_impl {
         subsets_idx: Vec<Vec<usize>>,
     ) -> Result<Vec<DevSubset>> {
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let vbytes = nz * n * n * std::mem::size_of::<f32>();
         let mut subs: Vec<DevSubset> = Vec::with_capacity(subsets_idx.len());
         for idx in subsets_idx {
@@ -1843,7 +1854,7 @@ mod cuda_impl {
                     sens_d.ptr,
                     ones_s.ptr,
                     theta_d.ptr as *const f32,
-                    phi,
+                    pg,
                     nz,
                     vbytes,
                 )?
@@ -1878,7 +1889,7 @@ mod cuda_impl {
     ) -> Result<Volume<f32>> {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -1891,20 +1902,12 @@ mod cuda_impl {
                 for sub in &subs {
                     let tp = sub.theta_d.ptr as *const f32;
                     let nsub = nz * sub.len * ncols;
-                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, phi, nz, n, sub.len)?; // Aₛ x
+                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, pg, nz, n, sub.len)?; // Aₛ x
                     ck(
                         ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null),
                         "iter_em_ratio",
                     )?; // bₛ ⊘ Aₛ x
-                    dev_backproject(
-                        sub.handle.ptr,
-                        corr_d.ptr,
-                        sub.ax_d.ptr,
-                        tp,
-                        phi,
-                        nz,
-                        vbytes,
-                    )?; // Aₛᵀ(…)
+                    dev_backproject(sub.handle.ptr, corr_d.ptr, sub.ax_d.ptr, tp, pg, nz, vbytes)?; // Aₛᵀ(…)
                     ck(
                         ffi::tomoxide_iter_em_update(
                             vol_d.ptr,
@@ -1952,7 +1955,7 @@ mod cuda_impl {
         let (reg, delta) = prior;
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -1970,20 +1973,12 @@ mod cuda_impl {
                 for sub in &subs {
                     let tp = sub.theta_d.ptr as *const f32;
                     let nsub = nz * sub.len * ncols;
-                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, phi, nz, n, sub.len)?; // Aₛ x
+                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, pg, nz, n, sub.len)?; // Aₛ x
                     ck(
                         ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null),
                         "iter_em_ratio",
                     )?; // bₛ ⊘ Aₛ x
-                    dev_backproject(
-                        sub.handle.ptr,
-                        corr_d.ptr,
-                        sub.ax_d.ptr,
-                        tp,
-                        phi,
-                        nz,
-                        vbytes,
-                    )?; // Aₛᵀ(…)
+                    dev_backproject(sub.handle.ptr, corr_d.ptr, sub.ax_d.ptr, tp, pg, nz, vbytes)?; // Aₛᵀ(…)
                     ck(
                         ffi::tomoxide_cuda_memcpy_d2d_async(old_d.ptr, vol_d.ptr, vbytes, null),
                         "memcpy_d2d_async",
@@ -2060,7 +2055,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let vol_d = seed_buf(init, 0.0, nvol, 1.0 / r)?; // x, r-scaled (init 0 or warm-start/r)
         let recon0_d = DevBuf::zeroed(vbytes)?; // previous x (BB)
@@ -2084,12 +2079,12 @@ mod cuda_impl {
 
         unsafe {
             for it in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj)?; // ax = R x
+                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // ax = R x
                 ck(
                     ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null),
                     "iter_grad_prox",
                 )?; // r·R x − b
-                dev_backproject(handle.ptr, bpv_d.ptr, ax_d.ptr, tp, phi, nz, vbytes)?; // Rᵀ(…)
+                dev_backproject(handle.ptr, bpv_d.ptr, ax_d.ptr, tp, pg, nz, vbytes)?; // Rᵀ(…)
                 ck(
                     ffi::tomoxide_iter_grad_assemble(grad_d.ptr, bpv_d.ptr, coef, nvol, null),
                     "iter_grad_assemble",
@@ -2203,7 +2198,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?; // r = (b − A x0)·1
 
@@ -2227,12 +2222,12 @@ mod cuda_impl {
 
         unsafe {
             // Init: r = b − A x0 ; z = Aᵀ r ; p = z ; gamma = ⟨z,z⟩ per slice.
-            dev_forward(r_d.ptr, vol_d.ptr, tp, phi, nz, n, nproj)?; // r = A x0
+            dev_forward(r_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // r = A x0
             ck(
                 ffi::tomoxide_iter_residual(r_d.ptr, b_d.ptr, ones_s.ptr, nsino, null),
                 "iter_residual",
             )?; // r = b − A x0
-            dev_backproject(handle.ptr, z_d.ptr, r_d.ptr, tp, phi, nz, vbytes)?; // z = Aᵀ r
+            dev_backproject(handle.ptr, z_d.ptr, r_d.ptr, tp, pg, nz, vbytes)?; // z = Aᵀ r
             ck(
                 ffi::tomoxide_cuda_memcpy_d2d_async(p_d.ptr, z_d.ptr, vbytes, null),
                 "memcpy_d2d_async",
@@ -2243,7 +2238,7 @@ mod cuda_impl {
             )?;
 
             for _ in 0..num_iter.max(1) {
-                dev_forward(w_d.ptr, p_d.ptr, tp, phi, nz, n, nproj)?; // w = A p
+                dev_forward(w_d.ptr, p_d.ptr, tp, pg, nz, n, nproj)?; // w = A p
                 ck(
                     ffi::tomoxide_iter_slice_dot(wdot_d.ptr, w_d.ptr, w_d.ptr, sslice, nz, null),
                     "iter_slice_dot",
@@ -2282,7 +2277,7 @@ mod cuda_impl {
                     ),
                     "iter_axpy_neg_slice",
                 )?;
-                dev_backproject(handle.ptr, z_d.ptr, r_d.ptr, tp, phi, nz, vbytes)?; // z = Aᵀ r
+                dev_backproject(handle.ptr, z_d.ptr, r_d.ptr, tp, pg, nz, vbytes)?; // z = Aᵀ r
                 ck(
                     ffi::tomoxide_iter_slice_dot(gnew_d.ptr, z_d.ptr, z_d.ptr, vslice, nz, null),
                     "iter_slice_dot",
@@ -2346,7 +2341,7 @@ mod cuda_impl {
 
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
-        let phi = beam_phi(&geom.beam);
+        let pg = pair_geom(geom)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         // Both the extrapolated and the primal iterate start from the seed / r
         // (r-scaled domain); a `None` init is the plain zero start.
@@ -2366,12 +2361,12 @@ mod cuda_impl {
 
         unsafe {
             for _ in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, xbar_d.ptr, tp, phi, nz, n, nproj)?; // R x̄
+                dev_forward(ax_d.ptr, xbar_d.ptr, tp, pg, nz, n, nproj)?; // R x̄
                 ck(
                     ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null),
                     "iter_tv_datadual",
                 )?;
-                dev_backproject(handle.ptr, bpv_d.ptr, pd_d.ptr, tp, phi, nz, vbytes)?; // Rᵀ(pd)
+                dev_backproject(handle.ptr, bpv_d.ptr, pd_d.ptr, tp, pg, nz, vbytes)?; // Rᵀ(pd)
                 ck(
                     ffi::tomoxide_iter_tv_dual(
                         p0x_d.ptr, p0y_d.ptr, xbar_d.ptr, C, lambda, n, nz, null,
@@ -2410,7 +2405,7 @@ mod cuda_impl {
         /// OSPML/PML (`ospml_device`), GRAD/TIKH (`grad_device`), and TV
         /// (`tv_device`); every other algorithm returns `Ok(None)` → generic
         /// host fallback (ART/BART are dispatched earlier, by ray projector).
-        /// Serves parallel beam and laminography (`beam_phi` threads the tilt
+        /// Serves parallel beam and laminography (`pair_geom` threads the tilt
         /// into the projector pair; recon-height = detector rows); falls back for
         /// the tilt-invalid per-slice solvers (CGLS/GRAD/TIKH on laminography) or
         /// a non-square grid (the kernels assume detector width = grid `n`).
@@ -2429,7 +2424,7 @@ mod cuda_impl {
             use crate::params::Algorithm;
             // The device-resident path serves both parallel beam and
             // laminography (the tilt is threaded into dev_forward/dev_backproject
-            // via `beam_phi`; the recon-height equals the detector-row count, so
+            // via `pair_geom`; the recon-height equals the detector-row count, so
             // the volume/sinogram buffers are sized exactly as the parallel case
             // and stay resident across every iteration). For a tilted axis the
             // per-slice-step solvers (CGLS/GRAD/TIKH) are invalid — their scalar
@@ -2720,6 +2715,7 @@ mod cuda_impl {
                     gf.ptr,
                     theta_dev.ptr as *const f32,
                     std::f32::consts::FRAC_PI_2,
+                    (n / 2) as f32, // centred sinogram: axis = n/2
                     std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                     0,
                     nz as i32, // parallel beam: rh == nz
@@ -2826,6 +2822,7 @@ mod cuda_impl {
                     gf.ptr,
                     theta_dev.ptr as *const f32,
                     phi,
+                    (n / 2) as f32, // centred sinogram: axis = n/2
                     std::f32::consts::PI / nproj as f32, // analytic angular quadrature dθ
                     sz,
                     rh as i32, // volume z centred on the full recon height
@@ -3600,6 +3597,7 @@ mod cuda_impl {
                             gf_dev.ptr,
                             theta_ptr,
                             phi,
+                            (n / 2) as f32, // centred sinogram: axis = n/2
                             gain,
                             sz,
                             rh_total as i32, // global rows centred on the full height
@@ -3688,6 +3686,7 @@ mod cuda_impl {
                     gf.ptr,
                     theta_dev.ptr as *const f32,
                     std::f32::consts::FRAC_PI_2,
+                    (n / 2) as f32, // centred sinogram: axis = n/2
                     std::f32::consts::PI / nproj as f32, // FBP angular quadrature dθ
                     0,
                     nz as i32, // parallel beam: rh == nz
@@ -5032,6 +5031,7 @@ mod cuda_impl {
                                 self.gf.ptr,
                                 self.theta.ptr as *const f32,
                                 std::f32::consts::FRAC_PI_2,
+                                (self.n / 2) as f32, // centred sinogram: axis = n/2
                                 std::f32::consts::PI / nproj as f32, // FBP dθ weight
                                 0,
                                 self.max_nz as i32, // parallel: rh == the handle's nz
@@ -5210,6 +5210,7 @@ mod cuda_impl {
                             self.gf.ptr,
                             self.theta.ptr as *const f32,
                             std::f32::consts::FRAC_PI_2,
+                            (self.n / 2) as f32, // centred sinogram: axis = n/2
                             std::f32::consts::PI / nproj as f32, // FBP dθ weight
                             0,
                             self.max_nz as i32, // parallel: rh == the handle's nz
@@ -5401,6 +5402,7 @@ mod cuda_impl {
                         slots[s].gf.ptr,
                         theta_dev.ptr as *const f32,
                         std::f32::consts::FRAC_PI_2,
+                        (n / 2) as f32, // centred sinogram: axis = n/2
                         std::f32::consts::PI / nproj as f32, // FBP dθ weight
                         0,
                         len as i32, // parallel: rh == the chunk's nz
@@ -5666,6 +5668,7 @@ mod cuda_impl {
                         slots[s].gf.ptr,
                         theta_dev.ptr as *const f32,
                         std::f32::consts::FRAC_PI_2,
+                        (n / 2) as f32, // centred sinogram: axis = n/2
                         std::f32::consts::PI / nproj as f32, // FBP dθ weight
                         0,
                         len as i32, // parallel: rh == the chunk's nz

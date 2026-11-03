@@ -119,9 +119,10 @@ void* tomoxide_linerec_fp16_new(size_t nproj, size_t nz, size_t n, size_t ncproj
   return new fp16::cfunc_linerec(nproj, nz, n, ncproj, ncz);
 }
 int tomoxide_linerec_fp16_backproject(void* h, void* f, const void* g, const float* theta,
-                                      float phi, float gain, int sz, int rh, void* stream) {
+                                      float phi, float axis, float gain, int sz, int rh,
+                                      void* stream) {
   return static_cast<fp16::cfunc_linerec*>(h)->backprojection(
-      as_size(f), as_size(g), as_size(theta), phi, gain, sz, rh, as_size(stream));
+      as_size(f), as_size(g), as_size(theta), phi, axis, gain, sz, rh, as_size(stream));
 }
 void tomoxide_linerec_fp16_free(void* h) { delete static_cast<fp16::cfunc_linerec*>(h); }
 

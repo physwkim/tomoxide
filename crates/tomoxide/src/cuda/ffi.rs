@@ -113,10 +113,12 @@ unsafe extern "C" {
         ncproj: usize,
         ncz: usize,
     ) -> *mut c_void;
-    /// `backprojection(f, g, theta, phi, gain, sz, rh, stream)` (phi = π/2 for
-    /// parallel beam). `gain` is the caller's angular quadrature weight:
-    /// π/nproj for the analytic FBP paths (the dθ weight), 1.0 for the
-    /// iterative solvers (pure adjoint of `tomoxide_forwardproject`).
+    /// `backprojection(f, g, theta, phi, axis, gain, sz, rh, stream)` (phi = π/2
+    /// for parallel beam). `axis` is the detector column voxel column `n/2`
+    /// reads, as in [`tomoxide_forwardproject`]. `gain` is the caller's
+    /// angular quadrature weight: π/nproj for the analytic FBP paths (the dθ
+    /// weight), 1.0 for the iterative solvers (pure adjoint of
+    /// `tomoxide_forwardproject`).
     /// `rh` is the FULL reconstruction height in slices (`nz` for parallel
     /// beam, [`super::lamino_recon_height`] for laminography): the volume z
     /// `tz + sz` is centred on `rh/2` — the volume's own midpoint — while the
@@ -130,6 +132,7 @@ unsafe extern "C" {
         g: *const c_void,
         theta: *const f32,
         phi: f32,
+        axis: f32,
         gain: f32,
         sz: i32,
         rh: i32,
@@ -195,9 +198,8 @@ unsafe extern "C" {
     /// volume `[nz, n, n]`, `phi = π/2` for parallel beam. `rh` = full
     /// reconstruction height the volume z is centred on (see
     /// [`tomoxide_linerec_backproject`]); must match the back-projection's `rh`
-    /// so the pair stays an exact adjoint. `axis` is the detector column voxel
-    /// column `n/2` lands on: `n/2` for the adjoint pair, a rotation centre to
-    /// reproject as a reconstruction at that centre reads the detector.
+    /// so the pair stays an exact adjoint, and so must `axis`, the detector
+    /// column voxel column `n/2` lands on (the rotation centre).
     #[must_use]
     pub fn tomoxide_forwardproject(
         g: *mut c_void,
@@ -935,6 +937,7 @@ unsafe extern "C" {
         g: *const c_void,
         theta: *const f32,
         phi: f32,
+        axis: f32,
         gain: f32,
         sz: i32,
         rh: i32,

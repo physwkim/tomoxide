@@ -1,6 +1,6 @@
 //! `cuda::lamino_reproject` gives the frames a laminography reconstruction at
 //! a given centre reads a band of its volume from: it is the existing
-//! projector at centre `n/2`, a band projects where it sits in the volume, the
+//! projector, a band projects where it sits in the volume, the
 //! centre moves the frames along the detector, and Fourierrec at that centre
 //! puts what was projected back in place, sharpest at that centre.
 //!
@@ -70,8 +70,8 @@ fn cuda_or_skip() -> Option<CudaBackend> {
     }
 }
 
-/// At centre `n/2` the whole volume reprojects as `sim::project` projects
-/// it, and two bands at their own `z0` add up to the whole.
+/// At a centre off `n/2` the whole volume reprojects as `sim::project`
+/// projects it, and two bands at their own `z0` add up to the whole.
 #[test]
 fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
     let Some(cudab) = cuda_or_skip() else { return };
@@ -85,10 +85,10 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
             (36.0, 40.0, 30.0, 2.0),
         ],
     );
-    let geom = geometry(nproj, tilt, n as f32 / 2.0, n, rows);
+    let center = n as f32 / 2.0 + 3.5;
+    let geom = geometry(nproj, tilt, center, n, rows);
     let theta = geom.angles.0.clone();
-    let whole =
-        cuda::lamino_reproject(vol.view(), 0, depth, &theta, tilt, n as f32 / 2.0, rows).unwrap();
+    let whole = cuda::lamino_reproject(vol.view(), 0, depth, &theta, tilt, center, rows).unwrap();
     assert_eq!(whole.dim(), (nproj, rows, n));
 
     let sino = sim::project(&Volume::new(vol.clone()), &geom, &cudab).unwrap();
@@ -106,7 +106,7 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
         depth,
         &theta,
         tilt,
-        32.0,
+        center,
         rows,
     );
     let high = cuda::lamino_reproject(
@@ -115,7 +115,7 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
         depth,
         &theta,
         tilt,
-        32.0,
+        center,
         rows,
     );
     let sum = low.unwrap() + high.unwrap();

@@ -50,7 +50,7 @@ void cfunc_linerec::ensure_texture() {
 }
 #endif
 
-int cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float gain, int sz, int rh, size_t stream_) {
+int cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi, float axis, float gain, int sz, int rh, size_t stream_) {
     real* g = (real *)g_;
     real* f = (real *)f_;
     float* theta = (float *)theta_;
@@ -71,9 +71,9 @@ int cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi
     // the CPU/tomopy scale), the iterative solvers pass 1 so this kernel is the
     // pure adjoint of forwardproj.cu's unweighted scatter and the pair {A, Aᵀ}
     // converges to the physical μ.
-    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, gain, sz, ncz, n, nz, rh, ncproj);
+    backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
 #else
-    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, gain, sz, ncz, n, nz, rh, ncproj);
+    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
 #endif
     return (int)cudaGetLastError();
 }

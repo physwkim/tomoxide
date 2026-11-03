@@ -14,7 +14,7 @@
 // Radon transform (unit pixel spacing) — a converged solve of `A x = p` yields
 // the physical μ, matching ART/BART and tomopy `project.c`. Keeping the
 // geometry byte-identical to `backprojection_ker` — the (un-flipped) row `ty`,
-// the `n/2` centre, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
+// the centre `axis`, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
 // in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge.
 // The shared guard `vr < nz-1` drops slice 0 for the parallel beam (`v = tz` ⇒
 // `vr = tz-1`), the documented ≥2-slice rule, exactly as the back-projector
@@ -33,8 +33,8 @@
 // global z-offset of this volume block — both matching backprojection_ker so the
 // pair {A, Aᵀ} stays an exact transpose for a tilted axis (phi ≠ π/2) and an
 // output height that differs from the detector-row count. `axis` is the detector
-// column voxel column n/2 lands on: n/2 keeps the pair exact; any other value
-// reprojects as a reconstruction at that rotation centre reads the detector.
+// column voxel column n/2 lands on, the rotation centre; the pair stays exact
+// at any centre backprojection_ker is given too.
 static __global__ void forwardprojection_ker(float *g, const float *f, const float *theta,
                                              float phi, float axis, int sz, int ncz, int n, int nz,
                                              int rh, int nproj)
@@ -111,7 +111,7 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 // height for laminography), `sz` = the volume block's global z-offset, `nz` =
 // detector rows, `rh` = FULL reconstruction height the global z is centred on
 // (== `nz` parallel beam, `lamino_recon_height` otherwise), `axis` = detector
-// column of voxel column n/2 (n/2 for the adjoint pair).
+// column of voxel column n/2 (the rotation centre).
 extern "C" int tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
                                         float axis, int sz, int ncz, int nz, int n, int rh,
                                         int nproj, void *stream)

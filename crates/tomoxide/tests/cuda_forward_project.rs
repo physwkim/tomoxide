@@ -23,7 +23,7 @@
 use ndarray::{Array3, Axis};
 use std::f32::consts::PI;
 use tomoxide::{
-    recon, sim, Algorithm, Angles, Backend, CpuBackend, CudaBackend, DeviceKind, Dtype,
+    recon, sim, Algorithm, Angles, Backend, Center, CpuBackend, CudaBackend, DeviceKind, Dtype,
     FilteredBackproject, ForwardProject, Geometry, IterativeReconstruct, Layout, ReconParams, Tomo,
     Volume,
 };
@@ -308,6 +308,66 @@ fn cuda_sirt_recovers_phantom() {
     assert!(
         r > 0.95,
         "CUDA SIRT did not recover the phantom: r = {r:.6} (expected > 0.95)"
+    );
+}
+
+/// Off the detector midpoint the CUDA pair projects, back-projects and
+/// solves about `geom.center` as the CPU pair does (even `n`, where both put
+/// the voxel origin at `n/2`).
+#[test]
+fn cuda_pair_follows_geom_center() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (64usize, 90usize, 4usize);
+    let mut geom = Geometry::parallel(Angles::uniform(nproj, 0.0, PI), n, nz, 1.0);
+    geom.center = Center::Scalar(n as f32 / 2.0 + 5.5);
+
+    let vol = Volume::new(stack(&sim::shepp2d(n).unwrap(), nz));
+    let cpu_sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let r_fwd = pearson(
+        &interior(&sim::project(&vol, &geom, &cuda).unwrap()),
+        &interior(&cpu_sino),
+    );
+
+    let y = Tomo::new(rand_arr((nz, nproj, n), 0x9abc_def0), Layout::Sinogram);
+    let bp = |b: &dyn Backend| {
+        let mut v = Volume::new(Array3::zeros((nz, n, n)));
+        b.backprojector()
+            .unwrap()
+            .backproject(&y, &geom, &mut v)
+            .unwrap();
+        v
+    };
+    let (rb, cb) = (bp(&cuda), bp(&cpu));
+    let (_, r_back, _) = compare_interior(&rb, &cb, nz);
+
+    let params = ReconParams {
+        num_iter: 120,
+        num_gridx: Some(n),
+        ..Default::default()
+    };
+    let rg = recon::recon(&cpu_sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
+    let rc = recon::recon(&cpu_sino, &geom, Algorithm::Sirt, &params, &cpu).unwrap();
+    let (_, r_sirt, _) = compare_interior(&rg, &rc, nz);
+
+    eprintln!("centre n/2+5.5: forward r = {r_fwd:.6}, back r = {r_back:.6}, SIRT r = {r_sirt:.6}");
+    assert!(
+        r_fwd > 0.999,
+        "forward off the CPU at centre n/2+5.5: r = {r_fwd:.6}"
+    );
+    assert!(
+        r_back > 0.999,
+        "back-projection off the CPU at centre n/2+5.5: r = {r_back:.6}"
+    );
+    assert!(
+        r_sirt > 0.99,
+        "device SIRT off the CPU at centre n/2+5.5: r = {r_sirt:.6}"
     );
 }
 
