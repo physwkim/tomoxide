@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-03
+
 ### Added
 
 - **`cuda::lamino_reproject` reprojects a band of a lamino volume at a
@@ -1090,7 +1092,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/physwkim/tomoxide/compare/v0.10.3...v0.11.0
 [0.10.3]: https://github.com/physwkim/tomoxide/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/physwkim/tomoxide/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/physwkim/tomoxide/compare/v0.10.0...v0.10.1
