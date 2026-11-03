@@ -82,7 +82,10 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
         int vr = (int)(v - 1e-5f);
 
         // Same in-bounds guard as the gather; out-of-bounds taps contribute 0.
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz - 1))
+        // (int) truncates toward zero, so the lower bound tests u and v, with the
+        // 1e-5 margin the tap gives the upper one: u in (-1, 0) would otherwise
+        // land on column 0 with a weight above 1.
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
         {
             float fu = u - ur;
             float fv = v - vr;

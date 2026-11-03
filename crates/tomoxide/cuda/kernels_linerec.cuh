@@ -80,7 +80,7 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
 
         // Keep the original in-bounds guard: out-of-bounds taps must add 0,
         // whereas the texture's clamp addressing would return edge texels.
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz-1))
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
         {
             // Texel i is sampled at coordinate i+0.5, so u+0.5 reproduces
             // (1-frac(u))*T[ur] + frac(u)*T[ur+1] (and likewise for v).
@@ -141,8 +141,8 @@ void __global__ backprojection_ker(real *f, real *data, float *theta, float phi,
         ur = (int)(u-1e-5f);
         vr = (int)(v-1e-5f);
 
-        // linear interp
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz-1))
+        // linear interp; the lower bound tests u and v, as in forwardprojection_ker
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
         {
             u = u-ur;
             v = v-vr;
@@ -204,7 +204,7 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
         vr = (int)(v-1e-5f);            
         
         // linear interp            
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz-1))
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
         {
             u = u-ur;
             v = v-vr;                
@@ -266,7 +266,7 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
         vr = (int)(v-1e-5f);                                    
         
         // linear interp            
-        if ((ur >= 0) & (ur < n - 1) & (vr >= 0) & (vr < nz - 1))
+        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
         {
             u = u-ur;
             v = v-vr;                

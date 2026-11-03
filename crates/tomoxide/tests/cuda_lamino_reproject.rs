@@ -150,6 +150,38 @@ fn cuda_lamino_reproject_centre_moves_the_frames_along_the_detector() {
     }
 }
 
+/// A voxel that projects left of column 0 or above row 0 adds nothing. `(int)`
+/// truncates toward zero, so such a sample once landed on column (row) 0 with
+/// weight 1.5 and on column (row) 1 with −0.5.
+#[test]
+fn cuda_lamino_reproject_drops_a_sample_left_of_column_0_or_above_row_0() {
+    if cuda_or_skip().is_none() {
+        return;
+    }
+    let (n, rows, depth) = (32usize, 24usize, 32usize);
+    // At θ = 0 voxel (z, n/2, x) lands on column x − n/2 + center and row
+    // cos(tilt)·(z − depth/2) + rows/2.
+    let one = |z: usize, x: usize, tilt: f32, center: f32| {
+        let mut vol = Array3::zeros((depth, n, n));
+        vol[[z, n / 2, x]] = 1.0f32;
+        cuda::lamino_reproject(vol.view(), 0, depth, &[0.0], tilt, center, rows).unwrap()
+    };
+    let left = one(depth / 2, 0, 20.0, n as f32 / 2.0 - 0.5);
+    assert!(
+        left.iter().all(|&v| v == 0.0),
+        "column −0.5 scattered {:?}",
+        left.slice(s![0, rows / 2, ..2])
+    );
+    // cos(tilt) = 12.5/16 puts z = 0 on row −0.5.
+    let tilt = (12.5f32 / 16.0).acos().to_degrees();
+    let above = one(0, n / 2, tilt, n as f32 / 2.0);
+    assert!(
+        above.iter().all(|&v| v == 0.0),
+        "row −0.5 scattered {:?}",
+        above.slice(s![0, ..2, n / 2])
+    );
+}
+
 /// Every frame's centroid is where the blob's centroid projects: column
 /// `cosθ·(x−n/2) + sinθ·(y−n/2) + center`, row
 /// `sinθ·cosφ·(x−n/2) − cosθ·cosφ·(y−n/2) + sinφ·(z−depth/2) + rows/2`.
