@@ -126,6 +126,32 @@ fn cuda_lamino_reproject_is_the_projector_and_bands_add_up() {
     );
 }
 
+/// One `LaminoReprojector` projecting angle chunks gives the frames one call
+/// over every angle gives, and refuses an empty chunk.
+#[test]
+fn cuda_lamino_reprojector_chunks_are_the_whole() {
+    if cuda_or_skip().is_none() {
+        return;
+    }
+    let (n, nproj, rows, depth, tilt, center) =
+        (64usize, 50usize, 40usize, 48usize, 20.0f32, 33.5f32);
+    let vol = blobs(
+        depth,
+        n,
+        &[(20.0, 26.0, 38.0, 2.5), (28.0, 36.0, 24.0, 3.0)],
+    );
+    let band = vol.slice(s![10..40, .., ..]);
+    let theta = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI).0;
+    let whole = cuda::lamino_reproject(band, 10, depth, &theta, tilt, center, rows).unwrap();
+    let rp = cuda::LaminoReprojector::new(band, 10, depth, tilt, center, rows).unwrap();
+    let parts: Vec<_> = theta.chunks(16).map(|t| rp.project(t).unwrap()).collect();
+    let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+    // The kernel scatters with atomicAdd, so two launches agree to rounding.
+    let d = max_rel_diff(&ndarray::concatenate(Axis(0), &views).unwrap(), &whole);
+    assert!(d < 1e-5, "chunks differ from the whole by {d:e} of peak");
+    assert!(rp.project(&[]).is_err());
+}
+
 /// A centre `k` columns right of `n/2` is the same frames moved `k` columns
 /// right.
 #[test]

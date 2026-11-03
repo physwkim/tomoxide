@@ -245,10 +245,9 @@ pub fn center_probe(
 /// Column `center` is where voxel column `n/2` lands and volume z is centred
 /// on `depth/2`, as in every reconstruction here, so a band read off a
 /// reconstruction reprojects onto the frames it was reconstructed from:
-/// reprojection matching compares the two. Linear in `band`. The kernel's
-/// `int` indexing and its per-angle shared cache bound one call to 6144
-/// angles and fewer than 2^31 elements on either side; split `theta` to stay
-/// inside. CUDA-only.
+/// reprojection matching compares the two. Linear in `band`. One
+/// [`LaminoReprojector`] call; hold a reprojector to project the same band
+/// at several angle chunks. CUDA-only.
 pub fn lamino_reproject(
     band: ndarray::ArrayView3<'_, f32>,
     z0: usize,
@@ -258,14 +257,54 @@ pub fn lamino_reproject(
     center: f32,
     rows: usize,
 ) -> Result<ndarray::Array3<f32>> {
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (band, z0, depth, theta, tilt_deg, center, rows);
-        Err(Error::Backend("cuda feature not enabled".into()))
-    }
+    LaminoReprojector::new(band, z0, depth, tilt_deg, center, rows)?.project(theta)
+}
+
+/// A band held on the device for [`lamino_reproject`] at any number of angle
+/// chunks, uploaded once. The kernel's `int` indexing and its per-angle shared
+/// cache bound one [`project`](Self::project) to 6144 angles and fewer than
+/// 2^31 elements on either side; split `theta` to stay inside. CUDA-only.
+pub struct LaminoReprojector {
     #[cfg(feature = "cuda")]
-    {
-        cuda_impl::lamino_reproject(band, z0, depth, theta, tilt_deg, center, rows)
+    inner: cuda_impl::LaminoReprojector,
+}
+
+impl LaminoReprojector {
+    /// Upload `band` (`[nb, n, n]`, slices `z0 .. z0 + nb` of a volume `depth`
+    /// slices deep) for frames of `rows` rows at `tilt_deg` and `center`.
+    pub fn new(
+        band: ndarray::ArrayView3<'_, f32>,
+        z0: usize,
+        depth: usize,
+        tilt_deg: f32,
+        center: f32,
+        rows: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (band, z0, depth, tilt_deg, center, rows);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            Ok(Self {
+                inner: cuda_impl::LaminoReprojector::new(band, z0, depth, tilt_deg, center, rows)?,
+            })
+        }
+    }
+
+    /// The band's frames at each angle of `theta` (radians), `[theta.len(),
+    /// rows, n]`.
+    pub fn project(&self, theta: &[f32]) -> Result<ndarray::Array3<f32>> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = theta;
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.project(theta)
+        }
     }
 }
 
@@ -3078,83 +3117,120 @@ mod cuda_impl {
             .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
     }
 
-    /// See [`super::lamino_reproject`].
-    pub(super) fn lamino_reproject(
-        band: ArrayView3<'_, f32>,
+    /// See [`super::LaminoReprojector`].
+    pub(super) struct LaminoReprojector {
+        band: DevBuf,
+        dev: i32,
         z0: usize,
+        nb: usize,
+        n: usize,
         depth: usize,
-        theta: &[f32],
-        tilt_deg: f32,
+        phi: f32,
         center: f32,
         rows: usize,
-    ) -> Result<Array3<f32>> {
-        let (nb, ny, n) = band.dim();
-        let nproj = theta.len();
-        if nb == 0 || n == 0 || ny != n {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject needs a square band [nb, n, n]; got {nb}x{ny}x{n}"
-            )));
+    }
+
+    // The band is device memory of the runtime's primary context, valid on any
+    // host thread; `project` only reads it and selects its device itself.
+    unsafe impl Send for LaminoReprojector {}
+    unsafe impl Sync for LaminoReprojector {}
+
+    impl LaminoReprojector {
+        pub(super) fn new(
+            band: ArrayView3<'_, f32>,
+            z0: usize,
+            depth: usize,
+            tilt_deg: f32,
+            center: f32,
+            rows: usize,
+        ) -> Result<Self> {
+            let (nb, ny, n) = band.dim();
+            if nb == 0 || n == 0 || ny != n {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection needs a square band [nb, n, n]; got {nb}x{ny}x{n}"
+                )));
+            }
+            if z0 + nb > depth {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection: band {z0}..{} exceeds depth {depth}",
+                    z0 + nb
+                )));
+            }
+            // The kernel's bilinear row taps need two detector rows.
+            if rows < 2 {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection needs ≥2 rows; got {rows}"
+                )));
+            }
+            if nb * n * n > i32::MAX as usize {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection: a {nb}x{n}x{n} band exceeds the kernel's int indexing"
+                )));
+            }
+            let dev = *selected_devices().first().unwrap_or(&0);
+            ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
+            let band = band.as_standard_layout();
+            Ok(Self {
+                band: DevBuf::from_host_f32(band.as_slice().expect("standard layout"))?,
+                dev,
+                z0,
+                nb,
+                n,
+                depth,
+                phi: lamino_phi(tilt_deg),
+                center,
+                rows,
+            })
         }
-        if z0 + nb > depth {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject: band {z0}..{} exceeds depth {depth}",
-                z0 + nb
-            )));
-        }
-        // The kernel's bilinear row taps need two detector rows.
-        if rows < 2 || nproj == 0 {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject needs ≥2 rows and ≥1 angle; got {rows} and {nproj}"
-            )));
-        }
-        // The launch caches cos/sin per angle in 48 KiB of shared memory, and a
-        // launch that asks for more fails without reaching the sync.
-        if nproj > 6144 || nb * n * n > i32::MAX as usize || rows * nproj * n > i32::MAX as usize {
-            return Err(Error::InvalidParam(format!(
-                "lamino_reproject: {nproj} angles of {rows}x{n} from a {nb}-slice band \
-                 exceed one launch; split theta"
-            )));
-        }
-        let devices = selected_devices();
-        ck(
-            unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
-            "set_device",
-        )?;
-        let band = band.as_standard_layout();
-        let f = DevBuf::from_host_f32(band.as_slice().expect("standard layout"))?;
-        let theta_d = DevBuf::from_host_f32(theta)?;
-        let g = DevBuf::zeroed(rows * nproj * n * std::mem::size_of::<f32>())?;
-        unsafe {
+
+        pub(super) fn project(&self, theta: &[f32]) -> Result<Array3<f32>> {
+            let (n, rows, nproj) = (self.n, self.rows, theta.len());
+            // The launch caches cos/sin per angle in 48 KiB of shared memory, and
+            // a launch that asks for more fails without reaching the sync.
+            if nproj == 0 || nproj > 6144 || rows * nproj * n > i32::MAX as usize {
+                return Err(Error::InvalidParam(format!(
+                    "lamino reprojection takes 1..=6144 angles of {rows}x{n} under 2^31 \
+                     elements per call; got {nproj}, split theta"
+                )));
+            }
             ck(
-                ffi::tomoxide_forwardproject(
-                    g.ptr,
-                    f.ptr,
-                    theta_d.ptr as *const f32,
-                    lamino_phi(tilt_deg),
-                    center,
-                    z0 as i32,
-                    nb as i32,
-                    rows as i32,
-                    n as i32,
-                    depth as i32,
-                    nproj as i32,
-                    std::ptr::null_mut(),
-                ),
-                "forwardproject",
+                unsafe { ffi::tomoxide_cuda_set_device(self.dev) },
+                "set_device",
             )?;
+            let theta_d = DevBuf::from_host_f32(theta)?;
+            let g = DevBuf::zeroed(rows * nproj * n * std::mem::size_of::<f32>())?;
+            unsafe {
+                ck(
+                    ffi::tomoxide_forwardproject(
+                        g.ptr,
+                        self.band.ptr,
+                        theta_d.ptr as *const f32,
+                        self.phi,
+                        self.center,
+                        self.z0 as i32,
+                        self.nb as i32,
+                        rows as i32,
+                        n as i32,
+                        self.depth as i32,
+                        nproj as i32,
+                        std::ptr::null_mut(),
+                    ),
+                    "forwardproject",
+                )?;
+            }
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+            }
+            let mut host = vec![0.0f32; rows * nproj * n];
+            g.to_host_f32(&mut host)?;
+            let sino = Array3::from_shape_vec((rows, nproj, n), host)
+                .map_err(|e| Error::InvalidParam(format!("cuda reprojection shape: {e}")))?;
+            Ok(sino
+                .permuted_axes([1, 0, 2])
+                .as_standard_layout()
+                .into_owned())
         }
-        let rc = unsafe { ffi::tomoxide_cuda_sync() };
-        if rc != 0 {
-            return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
-        }
-        let mut host = vec![0.0f32; rows * nproj * n];
-        g.to_host_f32(&mut host)?;
-        let sino = Array3::from_shape_vec((rows, nproj, n), host)
-            .map_err(|e| Error::InvalidParam(format!("cuda reprojection shape: {e}")))?;
-        Ok(sino
-            .permuted_axes([1, 0, 2])
-            .as_standard_layout()
-            .into_owned())
     }
 
     /// See [`super::center_probe_sweep`].
