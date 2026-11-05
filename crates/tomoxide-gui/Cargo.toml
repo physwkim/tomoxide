@@ -1,7 +1,7 @@
 # tomoxide-gui — desktop GUI for tomoxide, built on rsplot (egui + wgpu).
 #
 # NOT a member of the repo workspace (root Cargo.toml `exclude`): rsplot is
-# edition-2024 / rust 1.92 while the library workspace holds MSRV 1.82, and a
+# edition-2024 / rust 1.92 while the library workspace holds MSRV 1.89, and a
 # workspace member's manifest is parsed by every cargo invocation. Own
 # [workspace] + own Cargo.lock; build from this directory. See docs/GUI.md §3.1.
 [package]
@@ -21,7 +21,7 @@ description = "tomoxide desktop GUI (rsplot/egui)"
 # Turn on the CUDA backend explicitly with `--features cuda` on beamline
 # machines. sift-center stays on by default so the Center screen's SIFT method
 # is always there — pure-Rust lowe-sift, no system packages (it needs
-# rustc ≥ 1.92, above the library workspace's 1.82 MSRV; this crate pins 1.92).
+# rustc ≥ 1.92, above the library workspace's 1.89 MSRV; this crate pins 1.92).
 # gpu-wgpu stays off — tomoxide's wgpu backend duplicates a second wgpu stack
 # next to rsplot's egui-wgpu and buys the GUI nothing (docs/GUI.md §3.2).
 default = ["sift-center"]

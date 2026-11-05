@@ -43,7 +43,7 @@ const EPS: f64 = 1e-3;
 /// by this before and after an FFT centres the transform (DC at index `N/2`).
 #[inline]
 fn shift_sign(i: usize) -> f32 {
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         -1.0
     } else {
         1.0

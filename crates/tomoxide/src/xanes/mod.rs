@@ -188,14 +188,14 @@ pub fn fit_peak_energy(energy: &[f64], spectrum: &[f64], p: &FitParams) -> f64 {
         // rejects both up front, but this pub path must mask an invalid width as
         // NaN, not panic — the same way the SavGol arm surfaces its error.
         SmoothAlgo::Median => {
-            if p.smooth_width == 0 || p.smooth_width % 2 == 0 {
+            if p.smooth_width == 0 || p.smooth_width.is_multiple_of(2) {
                 return f64::NAN;
             }
             slice = medfilt(slice, p.smooth_width, "zeropadding");
         }
         SmoothAlgo::ThreePoint => slice = multi_3point_average(&slice, p.smooth_width),
         SmoothAlgo::Boxcar => {
-            if p.smooth_width == 0 || p.smooth_width % 2 == 0 {
+            if p.smooth_width == 0 || p.smooth_width.is_multiple_of(2) {
                 return f64::NAN;
             }
             slice = boxcar(&slice, p.smooth_width);
@@ -357,7 +357,7 @@ pub fn fit_map(
         // so reject even widths up front, like the SavGol branch above.
         // ThreePoint uses `smooth_width` as an iteration count (even is fine) and
         // None does not smooth.
-        SmoothAlgo::Median | SmoothAlgo::Boxcar if params.smooth_width % 2 == 0 => {
+        SmoothAlgo::Median | SmoothAlgo::Boxcar if params.smooth_width.is_multiple_of(2) => {
             let algo = if matches!(params.smooth, SmoothAlgo::Median) {
                 "median"
             } else {

@@ -631,7 +631,7 @@ impl WgpuBackend {
     /// Read an interleaved complex buffer back into `buf`, scaling by `norm`.
     fn download_complex(&self, data: &wgpu::Buffer, buf: &mut [Complex32], norm: f32) {
         let out = self.download_f32(data, buf.len() * 2);
-        for (c, chunk) in buf.iter_mut().zip(out.chunks_exact(2)) {
+        for (c, chunk) in buf.iter_mut().zip(out.as_chunks::<2>().0) {
             c.re = chunk[0] * norm;
             c.im = chunk[1] * norm;
         }

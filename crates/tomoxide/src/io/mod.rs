@@ -1559,7 +1559,9 @@ mod tests {
             let bytes = std::fs::read(data.join(format!("{z}.0.0"))).unwrap();
             assert_eq!(bytes.len(), 2 * 2 * 4, "chunk {z} byte length");
             let got: Vec<f32> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             let want: Vec<f32> = arr.index_axis(Axis(0), z).iter().copied().collect();

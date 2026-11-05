@@ -7943,7 +7943,7 @@ mod cuda_impl {
             // sino tail in `reconstruct_chunk*`, tail rows dropped in
             // `finish_recon`), which never reads the pad rows as data.
             let mut max_nz = max_nz.max(2);
-            if fourier && max_nz % 2 != 0 {
+            if fourier && !max_nz.is_multiple_of(2) {
                 max_nz += 1;
             }
             // lprec's gather/scatter + spline runtime is f32-only (no f16 port);

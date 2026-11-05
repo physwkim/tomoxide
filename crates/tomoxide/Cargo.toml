@@ -63,8 +63,9 @@ log.workspace = true
 # empty file — that truncate armed ext4 `auto_da_alloc`, whose implicit
 # writeback-on-close (~325 ms per 512^3 volume) silently defeated
 # `close_no_sync`. With both, h5 streaming output costs the same as tiff
-# (0.84 vs 0.83 s end-to-end at 512^3, 1 GPU).
-rust-hdf5 = { version = "0.3.2", features = ["parallel"] }
+# (0.84 vs 0.83 s end-to-end at 512^3, 1 GPU). >=0.7.10: one rust-hdf5
+# with a dependent that reads group attributes (`H5Group::attr`); needs rustc 1.89.
+rust-hdf5 = { version = "0.7.10", features = ["parallel"] }
 tiff = "0.11"
 # optional GPU (wgpu / Metal) — only with `gpu-wgpu`
 wgpu = { workspace = true, optional = true }

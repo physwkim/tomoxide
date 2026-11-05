@@ -411,7 +411,7 @@ enum Sym {
 /// `|fw[size1+i] + fw[size1−i]| ≤ DBL_EPSILON` ⇒ anti-symmetric.
 fn filter_symmetry(weights: &[f64], size1: usize) -> Sym {
     let fsize = weights.len();
-    if fsize % 2 == 0 {
+    if fsize.is_multiple_of(2) {
         return Sym::None;
     }
     let half = fsize / 2;

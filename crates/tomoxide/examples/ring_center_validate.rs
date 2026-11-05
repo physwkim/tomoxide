@@ -17,7 +17,7 @@ use tomoxide::{CpuBackend, Result};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         eprintln!("usage: ring_center_validate <h5> <truth> [<h5> <truth> ...]");
         std::process::exit(2);
     }

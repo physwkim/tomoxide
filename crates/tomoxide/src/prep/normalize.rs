@@ -156,7 +156,7 @@ fn median_frames(frames: &ndarray::Array3<f32>, start: usize, end: usize) -> Arr
                 *c = frames[[start + k, y, x]];
             }
             col.sort_by(|a, b| a.total_cmp(b));
-            out[[y, x]] = if g % 2 == 0 {
+            out[[y, x]] = if g.is_multiple_of(2) {
                 (col[mid - 1] + col[mid]) / 2.0
             } else {
                 col[mid]
@@ -170,7 +170,7 @@ fn median_frames(frames: &ndarray::Array3<f32>, start: usize, end: usize) -> Arr
 /// computed in integers so it is exact.
 fn round_half_even_div2(diff: usize) -> usize {
     let k = diff / 2;
-    if diff % 2 == 0 || k % 2 == 0 {
+    if diff.is_multiple_of(2) || k.is_multiple_of(2) {
         k
     } else {
         k + 1

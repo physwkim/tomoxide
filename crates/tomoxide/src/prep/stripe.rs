@@ -1079,7 +1079,7 @@ fn gaussian_window(len: usize, sigma: f64) -> Vec<f64> {
 /// turns the low-pass Fourier multiply into a band centred at the spectrum mid.
 #[inline]
 fn listsign(k: usize) -> f64 {
-    if k % 2 == 0 {
+    if k.is_multiple_of(2) {
         1.0
     } else {
         -1.0

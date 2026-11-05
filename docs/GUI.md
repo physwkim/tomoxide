@@ -320,7 +320,7 @@ white-line / edge-shift method is standard XANES analysis. No third-party IP.
 ### 3.1 In the repository, outside the workspace
 
 rsplot is `edition = "2024"`, `rust-version = "1.92"`; the tomoxide workspace
-is `edition = "2021"` with a declared MSRV of `1.82` (`rust-toolchain.toml`
+is `edition = "2021"` with a declared MSRV of `1.89` (`rust-toolchain.toml`
 pins `stable`, so day-to-day builds are on a current toolchain — the MSRV is
 a compatibility promise, not the dev toolchain).
 
@@ -337,7 +337,7 @@ workspace load regardless of build selection.
 - `crates/tomoxide-gui/Cargo.toml`: its own empty `[workspace]`,
   `edition = "2024"`, `rust-version = "1.92"`, its own committed
   `Cargo.lock`.
-- `cargo build --workspace` at the root still parses and builds on a 1.82
+- `cargo build --workspace` at the root still parses and builds on a 1.89
   toolchain (the MSRV guarantee stays CI-checkable). The GUI builds with
   `cargo build --manifest-path crates/tomoxide-gui/Cargo.toml` (alias in a
   justfile/Makefile; separate CI job on stable).

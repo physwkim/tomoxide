@@ -66,7 +66,7 @@ impl DatasetReader for DiskFileReader {
                 .map_err(|e| tomoxide::Error::Io(e.to_string()))?;
             let dst = data.index_axis_mut(Axis(0), p);
             let mut it = dst.into_iter();
-            for c in buf.chunks_exact(F) {
+            for c in buf.as_chunks::<F>().0 {
                 *it.next().unwrap() = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             }
         }

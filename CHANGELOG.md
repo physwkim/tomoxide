@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **rust-hdf5 0.3.2 → 0.7.10, and the MSRV 1.82 → 1.89**, which 0.7.10
+  needs. A crate that links tomoxide and reads HDF5 group attributes
+  (`H5Group::attr`, new in 0.7.10) now builds one rust-hdf5. The h5 output
+  is unchanged: a 512³ fbp streaming recon writes identical data in the
+  same 0.54 s.
+
 ## [0.12.0] - 2026-11-03
 
 ### Added

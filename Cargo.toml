@@ -16,7 +16,7 @@ members = [
 # The GUI lives in the repo but OUTSIDE this workspace (own [workspace], own
 # lock): it depends on rsplot (edition 2024, rust 1.92), and cargo parses every
 # member manifest on every command — as a member it would silently raise the
-# whole repo's effective MSRV from 1.82 to 1.92 (`default-members` does not
+# whole repo's effective MSRV from 1.89 to 1.92 (`default-members` does not
 # avoid the parse). Fold it in when the workspace MSRV reaches 1.92+.
 # See docs/GUI.md §3.1.
 exclude = ["crates/tomoxide-gui"]
@@ -24,7 +24,7 @@ exclude = ["crates/tomoxide-gui"]
 [workspace.package]
 version = "0.12.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 license = "BSD-3-Clause"
 repository = "https://github.com/physwkim/tomoxide"
 authors = ["tomoxide contributors"]
@@ -45,7 +45,7 @@ xraylib = "0.1"
 
 # --- computer vision (SIFT center finding; optional, `sift-center` feature).
 # Pure-Rust Lowe SIFT — no system OpenCV or clang. Its rust-version is 1.92,
-# above the workspace MSRV 1.82: the dep is optional and resolver = "2" does
+# above the workspace MSRV 1.89: the dep is optional and resolver = "2" does
 # not enforce rust-version, so only builds that ENABLE `sift-center` need the
 # newer toolchain. `default-features = false` drops its `image`-crate
 # conversion helpers (tomoxide builds `GrayImage` buffers directly). ---
