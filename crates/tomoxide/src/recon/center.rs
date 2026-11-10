@@ -229,7 +229,7 @@ fn ring_center_from_profile(prof: &[f32], nx: usize) -> RingCenter {
 
 /// Focus of one reconstructed slice: mean |∇|² inside a 0.92-FOV disk. This is
 /// the score `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 prescribes, and what
-/// [`lamino_tilt_scan`] maximises.
+/// [`lamino_tilt_scan`] averages over the scored slices.
 ///
 /// The disk is not cosmetic. Reconstruction geometry decides where the
 /// back-projection sampling leaves the detector, so the ring outside the
@@ -533,9 +533,9 @@ pub fn judge_sweep(cands: &[f32], score: &[f64]) -> Option<SweepVerdict> {
 /// The whole volume is not scorable on real data: [`slice_focus`] is mean |∇|²,
 /// and measurement on the aligned pouch scan says that ranks a pure-noise plane
 /// **1.7×** above the plane the sample is actually on (z=310 at 1.95e-5 against
-/// the eye-confirmed electrode at z=899, 1.15e-5). Max-over-z therefore scores
-/// the noise at every candidate, and the curve it produces is exactly the broken
-/// search `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 describes. Confining the score to
+/// the eye-confirmed electrode at z=899, 1.15e-5). A score over every slice is
+/// therefore mostly noise at every candidate, and the curve it produces is exactly
+/// the broken search `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 describes. Confining the score to
 /// the band the sample occupies is what the reference workflow validated (its
 /// centre curve peaks cleanly on the known axis); the band is read off one
 /// reconstruction — by eye, per §3, or from a [`TiltFocus::focus_by_z`] profile —
@@ -579,10 +579,15 @@ impl SampleBand {
 pub struct TiltFocus {
     /// The tilt, in degrees, that was reconstructed.
     pub tilt_deg: f32,
-    /// The best [`slice_focus`] any scored slice of that reconstruction reached —
-    /// every slice without a [`SampleBand`], the band's slices with one.
+    /// The mean [`slice_focus`] of that reconstruction's scored slices — every
+    /// slice without a [`SampleBand`], the band's slices with one. A mean, not the
+    /// best slice: each slice peaks at its own candidate by what it holds
+    /// (measured on a phantom rolled 2°: single slices peak from 1.1° to 2.6°,
+    /// the best one at 2.4°, their mean at 2.0°), and not a sum, because the
+    /// band's slice count changes with the tilt.
     pub focus: f64,
-    /// The slice that reached it — the in-focus layer. It moves with the tilt
+    /// The scored slice with the highest focus — the in-focus layer; it does not
+    /// set `focus`. It moves with the tilt
     /// (measured: 800 → 1120 as tilt went 40° → 58°), which is the whole reason
     /// this is a full reconstruction and not a probe.
     pub z_peak: usize,
@@ -594,8 +599,8 @@ pub struct TiltFocus {
     /// with the tilt (`ceil(nz / cos(tilt) / 2) * 2`), so `z_peak` values are only
     /// comparable across tilts as fractions of their own `depth`.
     pub depth: usize,
-    /// [`slice_focus`] of every slice, indexed by z — `focus` is its maximum and
-    /// `z_peak` its argmax. The scan computes all of it anyway, and keeping it is
+    /// [`slice_focus`] of every slice, indexed by z — `focus` is its mean over the
+    /// scored range and `z_peak` its argmax there. The scan computes all of it anyway, and keeping it is
     /// what separates the two things a bare `z_peak` cannot: a broad hump centred
     /// on the sample, versus a spike on a z-edge slice where few projections
     /// contribute and the streaks are the gradient. Believing an unexamined argmax
@@ -641,16 +646,14 @@ pub struct TiltCandidates<'a> {
 }
 
 /// Score each tilt in `cands.tilts_deg` by fully reconstructing at it and taking
-/// the maximum [`slice_focus`] over the scored z range — every slice when
+/// the mean [`slice_focus`] over the scored z range — every slice when
 /// `cands.band` is `None`, the sample's own slices when a [`SampleBand`] carries
 /// a prior.
 ///
-/// Pass the band whenever one can be read. Without it the score is the max over
+/// Pass the band whenever one can be read. Without it the score is the mean over
 /// a volume in which, on real data, mean |∇|² ranks noise planes above the
-/// sample (measured 1.7× — see [`SampleBand`]), so the whole-volume max answers
-/// for the noise: on the aligned pouch scan it pins `z_peak` to the same noise
-/// hump at every candidate and produces a centre curve with no peak at the known
-/// axis. The band is mapped into each candidate's own volume through the
+/// sample (measured 1.7× — see [`SampleBand`]), so the whole-volume score answers
+/// for the noise, and `z_peak` sits on the same noise hump at every candidate. The band is mapped into each candidate's own volume through the
 /// detector rows, so the moving in-focus layer stays inside it.
 ///
 /// It is expensive on purpose. The cheap alternative — score one fixed slice per
@@ -659,7 +662,7 @@ pub struct TiltCandidates<'a> {
 /// tilt, so a fixed row scores a plane whose error grows with the distance from
 /// its own optimum, while the tilt's own signal is only ~2 % per degree. On the
 /// pouch scans that sweep returns 48° or rails to the range edge depending only
-/// on which row was picked. Taking the max over z needs every (tilt, z) pair,
+/// on which row was picked. Scoring the band needs every (tilt, z) pair in it,
 /// which is exactly the work the probe skips, so the probe buys nothing here.
 /// The centre is the opposite case: an in-plane shift does not move the layer, so
 /// one probe launch can rank every candidate — but only within a few px of the
@@ -729,7 +732,6 @@ pub fn lamino_tilt_scan(
         // band, because the profile is how the *next* band gets read.
         let layer_z = middle_slice(scored, rh);
         let mut layer: Option<Array2<f32>> = None;
-        let mut best: Option<(f64, usize)> = None;
         let mut profile: Vec<f64> = Vec::new();
         let mut xz: Vec<f32> = Vec::new();
         let (depth, _, nx) = {
@@ -738,13 +740,8 @@ pub fn lamino_tilt_scan(
                 let ny = tile.array.dim().1;
                 xz.extend(tile.array.index_axis(Axis(1), ny / 2).iter());
                 for (k, f) in focus_by_z(tile.array.view()).into_iter().enumerate() {
-                    let z = z0 + k;
                     profile.push(f);
-                    let in_band = scored.is_none_or(|(lo, hi)| (lo..=hi).contains(&z));
-                    if in_band && best.is_none_or(|(b, _)| f > b) {
-                        best = Some((f, z));
-                    }
-                    if z == layer_z {
+                    if z0 + k == layer_z {
                         layer = Some(tile.array.index_axis(Axis(0), k).to_owned());
                     }
                 }
@@ -766,11 +763,6 @@ pub fn lamino_tilt_scan(
                  said {rh} — the sample band was mapped against the wrong depth"
             )));
         }
-        let (focus, z_peak) = best.ok_or_else(|| {
-            Error::Backend(format!(
-                "the reconstruction at tilt {tilt_deg}° produced no slices to score"
-            ))
-        })?;
         // The profile is only indexable by z if every row arrived exactly once.
         if profile.len() != depth {
             return Err(Error::Backend(format!(
@@ -778,6 +770,21 @@ pub fn lamino_tilt_scan(
                 profile.len()
             )));
         }
+        let (lo, hi) = scored.unwrap_or((0, depth.saturating_sub(1)));
+        let in_band = profile
+            .get(lo..=hi)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "the reconstruction at tilt {tilt_deg}° produced no slices to score"
+                ))
+            })?;
+        let focus = in_band.iter().sum::<f64>() / in_band.len() as f64;
+        let z_peak = lo
+            + in_band
+                .iter()
+                .enumerate()
+                .fold(0, |best, (k, &f)| if f > in_band[best] { k } else { best });
         let layer = layer.ok_or_else(|| {
             Error::Backend(format!(
                 "tilt {tilt_deg}°: slice {layer_z} never streamed past"

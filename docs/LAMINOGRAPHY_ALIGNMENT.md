@@ -120,9 +120,11 @@ scoring are load-bearing; both were learned by getting them wrong first.
   `recon::center::SampleBand` in the library). The mapping lands on the measured
   spikes to ~1 px: carrying the 44° band predicts 836 / — / 957.
 
-Focus score per slice: mean `|∇|²` inside a 0.92-FOV disk; take the max inside
-the band. Correct geometry concentrates a thin layer into one sharp slice, so
-the peak is high; wrong geometry spreads it. Read the band off one
+Focus score per slice: mean `|∇|²` inside a 0.92-FOV disk; take the mean over
+the band. Correct geometry sharpens every slice the sample is on; wrong
+geometry blurs them all. The best single slice is not the score: each slice
+peaks at its own candidate by what it holds (on a phantom rolled 2°, single
+slices peak from 1.1° to 2.6° and the best one at 2.4°; their mean, at 2.0°). Read the band off one
 reconstruction at your prior geometry — §3's eye check says which slices carry
 round particles — or off the focus-by-slice profile the tilt scan reports.
 

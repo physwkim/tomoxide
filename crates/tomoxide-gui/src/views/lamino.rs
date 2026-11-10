@@ -24,7 +24,7 @@
 //!    known-correct 396 by 0.34 %, with neither at an edge — so the picture, not
 //!    a rail check, is what shows you the sweep is lost. At ±8 px around the
 //!    rings' answer it is one lobe, 0.25 px from the truth.
-//! 3. **Tilt** — a FULL reconstruction per candidate, scored by the max focus
+//! 3. **Tilt** — a FULL reconstruction per candidate, scored by the mean focus
 //!    over its slices. The tilt drags the in-focus layer through z, so a fixed
 //!    slice cannot rank it. The optional sample z band (§2) confines the score
 //!    to the layer the sample is known to occupy — the reference workflow's
@@ -151,7 +151,7 @@ pub struct LaminoView {
     tilt_half: f32,
     tilt_step: f32,
     /// Sample z-band the tilt scan scores inside, read off a reconstruction at
-    /// the working tilt. Off ⇒ the max over the whole volume.
+    /// the working tilt. Off ⇒ the mean over the whole volume.
     sample_z: (usize, usize),
     sample_z_on: bool,
     tilt_run: Option<TiltRun>,
@@ -396,7 +396,7 @@ impl LaminoView {
             None => {
                 self.tilt_curve = Some(
                     self.tilt_plot
-                        .add_curve_data_with_legend(&curve, "max focus per tilt"),
+                        .add_curve_data_with_legend(&curve, "mean focus per tilt"),
                 );
             }
         }
@@ -645,7 +645,7 @@ impl LaminoView {
             "The tilt drags the in-focus layer through z (measured: slice 800 → 1120 as the \
              tilt went 40° → 58°) while its own response is only ~2 % per degree, so a fixed \
              slice scores a plane whose error swamps the signal. Ranking tilts takes the \
-             whole reconstruction, scored by the max focus over its slices; the optional \
+             whole reconstruction, scored by the mean focus over its slices; the optional \
              band confines that score to the layer the sample is known to occupy.",
         );
         let cands = grid(self.tilt, self.tilt_half, self.tilt_step);

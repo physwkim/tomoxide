@@ -764,7 +764,7 @@ fn run_align(
 
     // --- step 3: the tilt, if asked for. Centre first, tilt second (§4). ---
     // No probe here, and that is not an omission. The tilt moves the in-focus
-    // layer in z, so ranking tilts means taking the max over every z — which
+    // layer in z, so ranking tilts means scoring over every z — which
     // needs every (tilt, z) pair, i.e. exactly the full reconstruction the probe
     // exists to avoid. See `lamino_tilt_scan`.
     let tilt = match (lamino_angle, tilt_width) {
@@ -777,13 +777,13 @@ fn run_align(
             match focus_z {
                 Some((lo, hi)) => println!(
                     "  Each candidate is a FULL reconstruction ({nproj} projections, \
-                     {nx}×{nx}×~{depth}) scored\n  by the max focus inside the sample band \
+                     {nx}×{nx}×~{depth}) scored\n  by the mean focus inside the sample band \
                      {lo}..{hi} (read at {t0:.2}°, carried to each\n  tilt through the \
                      detector rows). Minutes per tilt, not seconds."
                 ),
                 None => println!(
                     "  Each candidate is a FULL reconstruction ({nproj} projections, \
-                     {nx}×{nx}×~{depth}) scored\n  by the max focus over every one of its \
+                     {nx}×{nx}×~{depth}) scored\n  by the mean focus over every one of its \
                      slices. Minutes per tilt, not seconds.\n  Optional: --focus_z LO:HI \
                      confines the score to the sample's own slices (read\n  the range off \
                      the focus-by-slice curve below) — useful where structured noise\n  \
@@ -846,7 +846,7 @@ fn run_align(
         _ => {}
     }
     println!(
-        "\nThe centre is scored on one output slice, the tilt on the best slice of a whole\n\
+        "\nThe centre is scored on one output slice, the tilt on the slices of a whole\n\
          reconstruction, and the asymmetry is the physics rather than an optimisation that\n\
          was skipped. The centre is an in-plane shift: it leaves the in-focus layer where\n\
          it is, so one slice ranks it and a probe sweeps every candidate in a single\n\
@@ -854,7 +854,7 @@ fn run_align(
          axis rather than searching for one. The tilt is the opposite on both\n\
          counts — ~2 % per 1°, and it drags the in-focus layer through z (measured: z_peak\n\
          800 -> 1120 as tilt went 40° -> 58°) — so a fixed slice scores a plane whose error\n\
-         swamps the signal; a full reconstruction ranks it, by the max focus over its\n\
+         swamps the signal; a full reconstruction ranks it, by the mean focus over its\n\
          slices or inside the sample's z band (--focus_z) where noise competes.\n\
          docs/LAMINOGRAPHY_ALIGNMENT.md §2 and §4. If the tilt moved far, the centre was\n\
          scored under the old one: re-run with the new --lamino_angle. Use -v for the focus\n\

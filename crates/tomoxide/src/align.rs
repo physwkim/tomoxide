@@ -291,7 +291,7 @@ impl PreppedStack {
         })
     }
 
-    /// Fully reconstruct at every tilt and score each by its best slice; see
+    /// Fully reconstruct at every tilt and score each by its mean slice focus; see
     /// [`lamino_tilt_scan`](crate::recon::center::lamino_tilt_scan), which this
     /// runs with Fourierrec and default parameters. CUDA-only.
     pub fn tilt_scan(
@@ -304,8 +304,8 @@ impl PreppedStack {
     ) -> Result<Vec<TiltFocus>> {
         // Default parameters are the tuned analytic path (parzen filter) the
         // laminography goldens reconstruct with. `lamino_rh` left `None` gives
-        // every tilt its own natural depth, which is the point of scoring the
-        // max over all of it.
+        // every tilt its own natural depth, so the scored range is its own
+        // volume's.
         crate::recon::center::lamino_tilt_scan(
             &self.data,
             &self.geometry(center, Some(0.0)), // beam ignored — `tilts_deg` supplies it

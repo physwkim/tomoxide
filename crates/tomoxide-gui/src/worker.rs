@@ -135,7 +135,7 @@ pub enum Job {
     ///
     /// `band` is the sample's z range, and passing it is what makes the score
     /// mean anything on real data: the focus metric ranks noise planes above the
-    /// sample (measured 1.7×), so without a band the max-over-z answers for the
+    /// sample (measured 1.7×), so without a band the whole-volume mean answers for the
     /// noise. It is carried into each candidate tilt's own volume through the
     /// detector rows by the scan itself.
     LaminoTiltScan {

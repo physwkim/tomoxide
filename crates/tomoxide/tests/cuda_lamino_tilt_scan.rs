@@ -1,7 +1,7 @@
 //! `recon::center::lamino_tilt_scan` — the laminography tilt search.
 //!
 //! The scan is expensive by construction: one full reconstruction per candidate,
-//! scored by the max focus over every slice. `cuda::lamino_tilt_probe` would make
+//! scored by the mean focus over its slices. `cuda::lamino_tilt_probe` would make
 //! a whole sweep one launch, and the tests next door prove the probe reproduces
 //! the reconstruction exactly — so the only thing that justifies not using it here
 //! is that a fixed slice cannot rank tilts at all. That claim is what these tests
@@ -37,7 +37,7 @@ fn geom_lamino(angles: &Angles, n: usize, nz: usize, tilt_deg: f32) -> Geometry 
 }
 
 /// A phantom that occupies a **slab**, deliberately off the middle of the volume.
-/// The whole point of scoring the max over z is that the in-focus layer is not
+/// The whole point of scoring over z is that the in-focus layer is not
 /// where you assume, so a phantom centred in z would hide a scan that only ever
 /// looked at the middle.
 fn slab_volume(n: usize, rh: usize, z_lo: usize, z_hi: usize) -> Volume<f32> {
@@ -162,12 +162,13 @@ fn cuda_lamino_tilt_scan_finds_the_layer_the_sample_is_on_not_the_middle() {
     assert!(r.focus > 0.0, "focus is not positive — the volume is empty");
 }
 
-/// The focus the scan reports is `slice_focus` of the slice it names, not a
-/// number the streaming tiles quietly changed. `on_tile` sees the volume in
-/// row-order tiles and only a running max survives; an off-by-one in the tile
-/// offset would name a neighbouring slice while still reporting a plausible peak.
+/// The profile the scan reports is `slice_focus` of the slices it indexes, not
+/// numbers the streaming tiles quietly moved: `on_tile` sees the volume in
+/// row-order tiles, and an off-by-one in the tile offset would name a
+/// neighbouring slice while still reporting a plausible peak. `focus` is that
+/// profile's mean over the scored slices and `z_peak` its argmax.
 #[test]
-fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
+fn cuda_lamino_tilt_scan_focus_belongs_to_the_slices_it_names() {
     let cuda = match CudaBackend::new() {
         Ok(b) => b,
         Err(e) => {
@@ -195,13 +196,25 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
     assert_eq!(vol.array.dim().0, r.depth, "scan and recon disagree on rh");
 
     let named = vol.array.index_axis(Axis(0), r.z_peak);
-    let want = slice_focus(&named);
-    eprintln!("scan focus {:.6e}, recon slice focus {want:.6e}", r.focus);
+    let want: Vec<f64> = (0..r.depth)
+        .map(|z| slice_focus(&vol.array.index_axis(Axis(0), z)))
+        .collect();
+    let top = want.iter().cloned().fold(0.0f64, f64::max);
+    for (z, (&got, &want)) in r.focus_by_z.iter().zip(&want).enumerate() {
+        assert!(
+            (got - want).abs() <= top * 1e-6,
+            "scan reported {got:.6e} for slice {z} but that slice scores {want:.6e}"
+        );
+    }
+    let mean = want.iter().sum::<f64>() / want.len() as f64;
+    eprintln!(
+        "scan focus {:.6e}, recon mean slice focus {mean:.6e}",
+        r.focus
+    );
     assert!(
-        (r.focus - want).abs() <= want.abs() * 1e-6,
-        "scan reported {:.6e} for slice {} but that slice scores {want:.6e}",
-        r.focus,
-        r.z_peak
+        (r.focus - mean).abs() <= mean * 1e-6,
+        "scan reported {:.6e} but the slices' mean focus is {mean:.6e}",
+        r.focus
     );
     // The xz plane is row n/2 of every tile, in z order: a tile offset off by
     // one would shift the slab's rows, a whole tile's worth of difference. Not
@@ -225,13 +238,13 @@ fn cuda_lamino_tilt_scan_focus_belongs_to_the_slice_it_names() {
         n / 2,
         d / peak
     );
-    // ...and it really is the best one, i.e. the running max kept the right tile.
-    for z in 0..r.depth {
-        let f = slice_focus(&vol.array.index_axis(Axis(0), z));
+    // ...and `z_peak` really is the sharpest slice.
+    for (z, &f) in want.iter().enumerate() {
         assert!(
-            f <= r.focus * (1.0 + 1e-6),
-            "slice {z} scores {f:.6e}, above the reported max {:.6e}",
-            r.focus
+            f <= want[r.z_peak] * (1.0 + 1e-6),
+            "slice {z} scores {f:.6e}, above slice {}'s {:.6e}",
+            r.z_peak,
+            want[r.z_peak]
         );
     }
 }
@@ -301,11 +314,11 @@ fn cuda_lamino_tilt_scan_hands_over_the_band_middle_at_every_tilt() {
     }
 }
 
-/// The band is what gets scored, and nothing else answers. A band enclosing the
-/// slab reproduces the whole-volume winner; a band on the empty far side of the
-/// volume forces the winner inside itself, away from the slab a whole-volume max
-/// would pick — which is the point: on real data the plane a whole-volume max
-/// picks is noise, and the band is how the caller keeps the score on the sample.
+/// The band is what gets scored, and nothing else answers. A band on the slab
+/// scores the mean of its own slices and names the whole-volume `z_peak`; a band
+/// on the empty far side of the volume keeps `z_peak` inside itself and scores
+/// its own emptiness — which is the point: on real data most of the volume is
+/// noise, and the band is how the caller keeps the score on the sample.
 #[test]
 fn cuda_lamino_tilt_scan_scores_only_the_sample_band() {
     if let Err(e) = CudaBackend::new() {
@@ -332,12 +345,21 @@ fn cuda_lamino_tilt_scan_scores_only_the_sample_band() {
     );
     // Two independent scans, so the FFT batching can differ — round-off, not
     // bit-equality, same as the whole-vs-streamed comparison above.
+    let slab = &unbanded[0].focus_by_z[z_lo..z_hi];
+    let want = slab.iter().sum::<f64>() / slab.len() as f64;
     assert!(
-        (r.focus - unbanded[0].focus).abs() <= unbanded[0].focus * 1e-6,
-        "banded {} vs unbanded {}",
+        (r.focus - want).abs() <= want * 1e-6,
+        "banded {} vs the unbanded profile's mean over the band {want}",
+        r.focus
+    );
+    assert!(
+        r.focus > unbanded[0].focus,
+        "the slab's band scored {} — no higher than the whole volume's {}, which \
+         averages the empty slices in",
         r.focus,
         unbanded[0].focus
     );
+    let on_slab_focus = r.focus;
 
     let far = (3 * r.depth / 4, 3 * r.depth / 4 + 4);
     let off_slab = SampleBand {
@@ -354,11 +376,10 @@ fn cuda_lamino_tilt_scan_scores_only_the_sample_band() {
         far.1
     );
     assert!(
-        r.focus < unbanded[0].focus,
-        "an empty band scored {} — at least as high as the slab's {} — so the band \
-         did not restrict anything",
-        r.focus,
-        unbanded[0].focus
+        r.focus < on_slab_focus,
+        "an empty band scored {} — at least as high as the slab's {on_slab_focus} — so \
+         the band did not restrict anything",
+        r.focus
     );
     // The profile is never truncated to the band: the next band is read off it.
     assert_eq!(r.focus_by_z.len(), r.depth);

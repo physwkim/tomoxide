@@ -142,11 +142,11 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
 /// the plane error swamps it: on the aligned pouch scan a fixed-slice focus
 /// sweep returned an interior wrong answer or railed depending only on which
 /// slice it was pointed at. `docs/LAMINOGRAPHY_ALIGNMENT.md` §2 is the reason:
-/// score the max over the *whole* z range, which needs every (tilt, z) pair —
+/// score over the *whole* z range, which needs every (tilt, z) pair —
 /// exactly the work this primitive skips, so it buys nothing there.
 ///
 /// Use it where the plane is known and fixed: refining a tilt after a
-/// full-volume z-max has located `z_peak`, or on a sample whose layer is known.
+/// full-volume scan has located `z_peak`, or on a sample whose layer is known.
 /// The rotation centre is an in-plane shift and does not move `z_peak`, so a
 /// fixed `sz` does rank centre candidates — but only **on the sample's own
 /// slice, near the answer**. On the aligned reference scan probed at the sample

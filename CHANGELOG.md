@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Breaking (behaviour): `recon::center::lamino_tilt_scan` scores a
+  candidate by the mean `slice_focus` over the scored slices, not the best
+  one.** `TiltFocus::focus` is that mean; `z_peak` is still the sharpest
+  scored slice and `focus_by_z` the whole profile. Each slice peaks at its
+  own candidate by what it holds, so the best slice answered for one
+  slice's content: on a phantom rolled 2° single slices peak from 1.1° to
+  2.6°, the best one at 2.4°, the band's mean at 2.0°. Without a
+  `SampleBand` the mean runs over every slice, noise planes included.
 - **rust-hdf5 0.3.2 → 0.7.10, and the MSRV 1.82 → 1.89**, which 0.7.10
   needs. A crate that links tomoxide and reads HDF5 group attributes
   (`H5Group::attr`, new in 0.7.10) now builds one rust-hdf5. The h5 output
