@@ -345,7 +345,7 @@ impl LaminoReprojector {
 /// roll); each band slice scores as
 /// [`slice_focus`](crate::recon::center::slice_focus). Only the shifts and the
 /// centre go to the device per call, and only the scores and derivatives come
-/// back. CUDA-only.
+/// back, or the band itself from [`band`](Self::band). CUDA-only.
 pub struct LaminoBandFocus {
     #[cfg(feature = "cuda")]
     inner: cuda_impl::LaminoBandFocus,
@@ -398,6 +398,20 @@ impl LaminoBandFocus {
         #[cfg(feature = "cuda")]
         {
             self.inner.profile(dy, dx, center)
+        }
+    }
+
+    /// The band [`profile`](Self::profile) scores, `[z.1 − z.0 + 1, n, n]`:
+    /// the reconstruction's slices `z.0 ..= z.1` of the frames so moved.
+    pub fn band(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<ndarray::Array3<f32>> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (dy, dx, center);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.band(dy, dx, center)
         }
     }
 
@@ -3677,6 +3691,15 @@ mod cuda_impl {
         pub(super) fn profile(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<Vec<f64>> {
             self.reconstruct(dy, dx, center)?;
             self.focus()
+        }
+
+        pub(super) fn band(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<Array3<f32>> {
+            self.reconstruct(dy, dx, center)?;
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+            let mut host = vec![0.0f32; self.nb * self.n * self.n];
+            self.vol.to_host_f32(&mut host)?;
+            Array3::from_shape_vec((self.nb, self.n, self.n), host)
+                .map_err(|e| Error::InvalidParam(format!("cuda band focus shape: {e}")))
         }
 
         pub(super) fn gradient(

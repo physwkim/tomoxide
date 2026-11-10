@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`cuda::LaminoBandFocus::band` returns the band it scores.** The
+  reconstruction's slices of the frames moved by a curve, back-projected
+  from the frames already on the device: a caller registering the frames
+  against that band's reprojection no longer writes the moved frames and
+  reconstructs the whole volume to read one band of it.
+
 ### Changed
 
 - **Breaking: `PreppedStack::center_sweep` takes the sample band and scores

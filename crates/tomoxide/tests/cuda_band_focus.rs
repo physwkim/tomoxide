@@ -1,7 +1,8 @@
 //! `cuda::LaminoBandFocus` scores a band of the linerec reconstruction of
 //! moved frames without leaving the device: its profile is `focus_by_z` of
-//! that band as `move_frames` and `recon::recon` make it, chunked or not, and
-//! its gradient is the profile mean's derivative by every shift and the centre.
+//! that band as `move_frames` and `recon::recon` make it, chunked or not, its
+//! gradient is the profile mean's derivative by every shift and the centre,
+//! and `band` is that band.
 //!
 //! Own test binary (touches CUDA device state and sets
 //! `TOMOXIDE_CUDA_MAX_FREE_BYTES`) per the suite convention.
@@ -122,6 +123,23 @@ fn band_focus_profile_is_the_moved_linerec_band() {
 
     let mut one = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z).unwrap();
     let got = one.profile(&dy, &dx, center).unwrap();
+    let band = one.band(&dy, &dx, center).unwrap();
+    assert_eq!(band.dim(), (z.1 - z.0 + 1, N, N));
+    let d = max_rel(&focus_by_z(band.view()), &got);
+    assert!(
+        d < 1e-6,
+        "the band's focus differs from the profile by {d:e}"
+    );
+    let peak = rec.array.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let d = (&band - &rec.array.slice(s![z.0..=z.1, .., ..]))
+        .iter()
+        .fold(0.0f32, |m, v| m.max(v.abs()))
+        / peak;
+    eprintln!("band vs recon band: {d:.3e} of peak");
+    assert!(
+        d < 1e-5,
+        "the band differs from the reconstruction's by {d:e} of peak"
+    );
     assert_eq!(got.len(), z.1 - z.0 + 1);
     let d = max_rel(&got, &want);
     eprintln!("single chunk vs recon band: {d:.3e} of peak");
@@ -213,4 +231,5 @@ fn band_focus_refuses_bad_shapes() {
     let (dy, dx) = shifts(&theta);
     assert!(bf.profile(&dy[1..], &dx, N as f32 / 2.0).is_err());
     assert!(bf.gradient(&dy, &dx[1..], N as f32 / 2.0).is_err());
+    assert!(bf.band(&dy[1..], &dx, N as f32 / 2.0).is_err());
 }
