@@ -338,6 +338,85 @@ impl LaminoReprojector {
     }
 }
 
+/// A projection stack held on the device to score one band of its linerec
+/// laminography reconstruction for per-frame shifts and a rotation centre, and
+/// to differentiate that score. A frame moves as
+/// [`PreppedStack::moved`](crate::align::PreppedStack::moved) moves it (no
+/// roll); each band slice scores as
+/// [`slice_focus`](crate::recon::center::slice_focus). Only the shifts and the
+/// centre go to the device per call, and only the scores and derivatives come
+/// back. CUDA-only.
+pub struct LaminoBandFocus {
+    #[cfg(feature = "cuda")]
+    inner: cuda_impl::LaminoBandFocus,
+}
+
+/// [`LaminoBandFocus::gradient`]'s result.
+#[derive(Debug, Clone)]
+pub struct BandFocusGradient {
+    /// Each band slice's focus, as [`LaminoBandFocus::profile`].
+    pub profile: Vec<f64>,
+    /// The profile's mean differentiated by each frame's shift, `[nproj, 2]`,
+    /// `dx` first.
+    pub shift: ndarray::Array2<f64>,
+    /// The profile's mean differentiated by the centre.
+    pub center: f64,
+}
+
+impl LaminoBandFocus {
+    /// Upload `proj` (`[nproj, rows, n]` `−log` frames at angles `theta`,
+    /// radians) to score slices `z.0 ..= z.1` of its reconstruction at
+    /// `tilt_deg`, filtered with `filter`.
+    pub fn new(
+        proj: ndarray::ArrayView3<'_, f32>,
+        theta: &[f32],
+        filter: crate::params::FilterName,
+        tilt_deg: f32,
+        z: (usize, usize),
+    ) -> Result<Self> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (proj, theta, filter, tilt_deg, z);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            Ok(Self {
+                inner: cuda_impl::LaminoBandFocus::new(proj, theta, filter, tilt_deg, z)?,
+            })
+        }
+    }
+
+    /// Each band slice's focus with frame `t` moved by `(dy[t], dx[t])` and the
+    /// rotation axis at detector column `center`.
+    pub fn profile(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<Vec<f64>> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (dy, dx, center);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.profile(dy, dx, center)
+        }
+    }
+
+    /// [`profile`](Self::profile) and its mean's derivatives by every shift
+    /// and the centre: the transpose of each step the score takes, so exact
+    /// for this discretisation rather than a difference quotient.
+    pub fn gradient(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<BandFocusGradient> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (dy, dx, center);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.gradient(dy, dx, center)
+        }
+    }
+}
+
 /// Reconstruct slice `sz` at every candidate in `centers` — each one **exactly**
 /// equal to the corresponding full reconstruction, at any candidate spacing.
 /// Returns `[centers.len(), n, n]` in the order given. `geom.center` is ignored
@@ -559,9 +638,10 @@ mod cuda_impl {
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
-    use crate::geometry::{lamino_phi, lamino_tilt_deg, Beam, Center, Geometry};
+    use crate::geometry::{lamino_phi, lamino_tilt_deg, Angles, Beam, Center, Geometry};
     use crate::params::{FilterName, StripeMethod};
     use crate::pipeline::{check_cancel, CancelToken};
+    use crate::prep::alignment::{spline_coeffs, SPLINE_PAD};
     use ndarray::{s, Array3, ArrayView3, ArrayViewMut2, Axis};
     use rayon::prelude::*;
     use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -3379,6 +3459,463 @@ mod cuda_impl {
             }
             ndarray::Array2::from_shape_vec((nproj, 2), out.to_host_f64(2 * nproj)?)
                 .map_err(|e| Error::InvalidParam(format!("cuda shift gradient shape: {e}")))
+        }
+    }
+
+    /// See [`super::LaminoBandFocus`].
+    pub(super) struct LaminoBandFocus {
+        dev: i32,
+        nproj: usize,
+        rows: usize,
+        n: usize,
+        z0: usize,
+        nb: usize,
+        depth: usize,
+        phi: f32,
+        filter: Vec<f32>,
+        pad: usize,
+        /// Pixels the focus disk keeps in a slice.
+        cnt: usize,
+        /// Each frame's `exp(−p)` spline coefficients, `[nproj, rows + 2·SPLINE_PAD,
+        /// n + 2·SPLINE_PAD]`.
+        coef: DevBuf,
+        theta: DevBuf,
+        mask: DevBuf,
+        /// This evaluation's `dy` then `dx`.
+        shift: DevBuf,
+        /// The filter at this evaluation's centre, and its derivative by it.
+        w: DevBuf,
+        wc: DevBuf,
+        vol: DevBuf,
+        /// The band score's derivative by `vol`.
+        resid: DevBuf,
+        prof: DevBuf,
+        dots: DevBuf,
+        /// One angle chunk's moved frames and their shift derivatives, `[rows,
+        /// len, n]`, and the padded frames the filter works in.
+        m: DevBuf,
+        dmx: DevBuf,
+        dmy: DevBuf,
+        gpad: DevBuf,
+        chunks: Vec<(usize, usize)>,
+        /// The filter and back-projection handles for each chunk length.
+        handles: Vec<(usize, Handle, Handle)>,
+    }
+
+    // Device memory and handles of the runtime's primary context, valid on any
+    // host thread; every evaluation selects its device and takes `&mut self`.
+    unsafe impl Send for LaminoBandFocus {}
+
+    impl LaminoBandFocus {
+        pub(super) fn new(
+            proj: ArrayView3<'_, f32>,
+            theta: &[f32],
+            filter: FilterName,
+            tilt_deg: f32,
+            z: (usize, usize),
+        ) -> Result<Self> {
+            let (nproj, rows, n) = proj.dim();
+            if nproj == 0 || theta.len() != nproj || rows < 2 || n < 3 {
+                return Err(Error::InvalidParam(format!(
+                    "band focus needs frames [nproj ≥ 1, rows ≥ 2, n ≥ 3] and an angle each; \
+                     got {nproj}x{rows}x{n} and {} angles",
+                    theta.len()
+                )));
+            }
+            let depth = super::lamino_recon_height(rows, tilt_deg);
+            let (z0, z1) = z;
+            if z0 > z1 || z1 >= depth {
+                return Err(Error::InvalidParam(format!(
+                    "band focus: slices {z0}..={z1} are not inside depth {depth}"
+                )));
+            }
+            let nb = z1 - z0 + 1;
+            if nb * n * n > I32_INDEX_LIMIT {
+                return Err(Error::InvalidParam(format!(
+                    "band focus: a {nb}x{n}x{n} band exceeds the kernels' int indexing"
+                )));
+            }
+            let dev = *selected_devices().first().unwrap_or(&0);
+            ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
+            let fsz = std::mem::size_of::<f32>();
+            let (h, w) = (rows + 2 * SPLINE_PAD, n + 2 * SPLINE_PAD);
+            let coef = DevBuf::new(nproj * h * w * fsz)?;
+            // A batch of frames at a time, so the host never holds the stack's
+            // coefficients.
+            const BATCH: usize = 64;
+            let mut host = vec![0.0f32; BATCH.min(nproj) * h * w];
+            for b0 in (0..nproj).step_by(BATCH) {
+                let host = &mut host[..BATCH.min(nproj - b0) * h * w];
+                host.par_chunks_mut(h * w).enumerate().for_each_init(
+                    || (vec![0.0f32; rows * n], vec![0.0f32; h]),
+                    |(frame, line), (k, out)| {
+                        let p = proj.index_axis(Axis(0), b0 + k);
+                        for (t, &v) in frame.iter_mut().zip(p.iter()) {
+                            *t = (-v).exp();
+                        }
+                        spline_coeffs(frame, rows, n, out, line);
+                    },
+                );
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_h2d(
+                            (coef.ptr as *mut f32).add(b0 * h * w) as *mut c_void,
+                            host.as_ptr() as *const c_void,
+                            std::mem::size_of_val(host),
+                        )
+                    },
+                    "coef upload",
+                )?;
+            }
+            // slice_focus's disk, in its own f32 arithmetic.
+            let c = n as f32 / 2.0;
+            let r2 = (0.46 * n as f32).powi(2);
+            let inner = 1..n - 1;
+            let mask: Vec<u8> = (0..n * n)
+                .map(|p| {
+                    let (y, x) = (p / n, p % n);
+                    u8::from(
+                        inner.contains(&y)
+                            && inner.contains(&x)
+                            && (x as f32 - c).powi(2) + (y as f32 - c).powi(2) < r2,
+                    )
+                })
+                .collect();
+            let cnt = mask.iter().filter(|&&k| k != 0).count();
+            let mask_dev = DevBuf::new(n * n)?;
+            ck(
+                unsafe {
+                    ffi::tomoxide_cuda_memcpy_h2d(
+                        mask_dev.ptr,
+                        mask.as_ptr() as *const c_void,
+                        n * n,
+                    )
+                },
+                "mask upload",
+            )?;
+            let filter = make_fbp_filter(filter, n, RampShape::Wint)?;
+            let pad = filter.len();
+            let nfreq = pad / 2 + 1;
+            let dsz = std::mem::size_of::<f64>();
+            let vol = DevBuf::new(nb * n * n * fsz)?;
+            let resid = DevBuf::new(nb * n * n * fsz)?;
+            let prof = DevBuf::new(nb * dsz)?;
+            let dots = DevBuf::new(3 * nproj * dsz)?;
+            let shift = DevBuf::new(2 * nproj * fsz)?;
+            let w_dev = DevBuf::new(rows * nfreq * 2 * fsz)?;
+            let wc = DevBuf::new(rows * nfreq * 2 * fsz)?;
+            let theta_dev = DevBuf::from_host_f32(theta)?;
+            // Per angle: a frame, its two shift derivatives and its padded copy,
+            // and for each of the (at most two) filter handles its spectrum and a
+            // cuFFT work area taken as large again.
+            let per = (3 * rows * n + rows * pad) * fsz + 2 * 2 * rows * nfreq * 2 * fsz;
+            let by_mem = device_free_bytes() / 10 * 8 / per;
+            let by_idx = I32_INDEX_LIMIT / 100 * 88 / (rows * pad);
+            // backprojection_ker caches every angle's cos/sin in 48 KiB of shared memory.
+            let alen = by_mem.min(by_idx).min(nproj).min(6144);
+            if alen == 0 {
+                return Err(Error::Backend(format!(
+                    "band focus: no room on the device for one {rows}x{n} frame"
+                )));
+            }
+            let chunks = even_z_chunks(nproj, nproj.div_ceil(alen));
+            let alen = chunks.iter().map(|&(_, len)| len).max().unwrap_or(1);
+            let m = DevBuf::new(rows * alen * n * fsz)?;
+            let dmx = DevBuf::new(rows * alen * n * fsz)?;
+            let dmy = DevBuf::new(rows * alen * n * fsz)?;
+            let gpad = DevBuf::new(rows * alen * pad * fsz)?;
+            let mut handles: Vec<(usize, Handle, Handle)> = Vec::new();
+            for &(_, len) in &chunks {
+                if handles.iter().any(|(l, ..)| *l == len) {
+                    continue;
+                }
+                handles.push((
+                    len,
+                    Handle::new(
+                        unsafe { ffi::tomoxide_filter_new(len, rows, pad) },
+                        ffi::tomoxide_filter_free,
+                        "cfunc_filter",
+                    )?,
+                    Handle::new(
+                        unsafe { ffi::tomoxide_linerec_new(nproj, rows, n, len, nb) },
+                        ffi::tomoxide_linerec_free,
+                        "cfunc_linerec",
+                    )?,
+                ));
+            }
+            Ok(Self {
+                dev,
+                nproj,
+                rows,
+                n,
+                z0,
+                nb,
+                depth,
+                phi: lamino_phi(tilt_deg),
+                filter,
+                pad,
+                cnt,
+                coef,
+                theta: theta_dev,
+                mask: mask_dev,
+                shift,
+                w: w_dev,
+                wc,
+                vol,
+                resid,
+                prof,
+                dots,
+                m,
+                dmx,
+                dmy,
+                gpad,
+                chunks,
+                handles,
+            })
+        }
+
+        pub(super) fn profile(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<Vec<f64>> {
+            self.reconstruct(dy, dx, center)?;
+            self.focus()
+        }
+
+        pub(super) fn gradient(
+            &mut self,
+            dy: &[f32],
+            dx: &[f32],
+            center: f32,
+        ) -> Result<super::BandFocusGradient> {
+            self.reconstruct(dy, dx, center)?;
+            let profile = self.focus()?;
+            let null = std::ptr::null_mut::<c_void>();
+            let (nb, n) = (self.nb as i32, self.n as i32);
+            // The score is the profile's mean, each slice's sum over `cnt` pixels.
+            let scale = 2.0 / (self.nb * self.cnt) as f32;
+            unsafe {
+                ck(
+                    ffi::tomoxide_bf_focus_grad(
+                        self.resid.ptr,
+                        self.vol.ptr,
+                        self.mask.ptr,
+                        scale,
+                        nb,
+                        n,
+                        null,
+                    ),
+                    "bf_focus_grad",
+                )?;
+                ck(
+                    ffi::tomoxide_cuda_memset(self.dots.ptr, 0, self.dots.bytes),
+                    "memset",
+                )?;
+            }
+            for &(a0, len) in &self.chunks {
+                let (fh, _) = self.handles(len);
+                self.move_chunk(a0, len, true)?;
+                self.filter_frames(self.dmx.ptr, self.w.ptr, len, fh)?;
+                self.filter_frames(self.dmy.ptr, self.w.ptr, len, fh)?;
+                self.filter_frames(self.m.ptr, self.wc.ptr, len, fh)?;
+                unsafe {
+                    ck(
+                        ffi::tomoxide_bf_framedot3(
+                            (self.dots.ptr as *mut f64).add(3 * a0) as *mut c_void,
+                            self.resid.ptr,
+                            self.dmx.ptr,
+                            self.dmy.ptr,
+                            self.m.ptr,
+                            (self.theta.ptr as *const f32).add(a0),
+                            self.phi,
+                            (self.n / 2) as f32,
+                            self.z0 as i32,
+                            nb,
+                            self.rows as i32,
+                            n,
+                            self.depth as i32,
+                            len as i32,
+                            null,
+                        ),
+                        "bf_framedot3",
+                    )?;
+                }
+            }
+            ck(unsafe { ffi::tomoxide_cuda_sync() }, "sync")?;
+            let dots = self.dots.to_host_f64(3 * self.nproj)?;
+            let gain = self.gain() as f64;
+            Ok(super::BandFocusGradient {
+                profile,
+                shift: ndarray::Array2::from_shape_fn((self.nproj, 2), |(t, k)| {
+                    gain * dots[3 * t + k]
+                }),
+                center: gain * dots.as_chunks::<3>().0.iter().map(|d| d[2]).sum::<f64>(),
+            })
+        }
+
+        /// The back-projection's angular quadrature weight.
+        fn gain(&self) -> f32 {
+            std::f32::consts::PI / self.nproj as f32
+        }
+
+        /// The filter and back-projection handles for a chunk of `len` angles.
+        fn handles(&self, len: usize) -> (&Handle, &Handle) {
+            let (_, fh, bh) = self
+                .handles
+                .iter()
+                .find(|(l, ..)| *l == len)
+                .expect("a handle per chunk length");
+            (fh, bh)
+        }
+
+        /// Upload this evaluation's shifts and filters and back-project the band
+        /// into `vol`.
+        fn reconstruct(&mut self, dy: &[f32], dx: &[f32], center: f32) -> Result<()> {
+            let nproj = self.nproj;
+            if dy.len() != nproj || dx.len() != nproj {
+                return Err(Error::InvalidParam(format!(
+                    "band focus takes {nproj} dy and dx; got {} and {}",
+                    dy.len(),
+                    dx.len()
+                )));
+            }
+            ck(
+                unsafe { ffi::tomoxide_cuda_set_device(self.dev) },
+                "set_device",
+            )?;
+            let geom = Geometry {
+                center: Center::Scalar(center),
+                ..Geometry::parallel(Angles(Vec::new()), self.n, self.rows, 1.0)
+            };
+            let w = build_filter_w(&self.filter, &geom, self.rows, self.n, self.pad);
+            // The centre enters only through the phase −2π·k·(n/2 − center)/pad.
+            let nfreq = self.pad / 2 + 1;
+            let mut wc = vec![0.0f32; w.len()];
+            let pairs = wc
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(w.as_chunks::<2>().0);
+            for (i, (d, s)) in pairs.enumerate() {
+                let sk = std::f32::consts::TAU * (i % nfreq) as f32 / self.pad as f32;
+                d[0] = -sk * s[1];
+                d[1] = sk * s[0];
+            }
+            self.w.copy_from_host_f32(&w)?;
+            self.wc.copy_from_host_f32(&wc)?;
+            self.shift.copy_from_host_f32(&[dy, dx].concat())?;
+            ck(
+                unsafe { ffi::tomoxide_cuda_memset(self.vol.ptr, 0, self.vol.bytes) },
+                "memset",
+            )?;
+            let null = std::ptr::null_mut::<c_void>();
+            for &(a0, len) in &self.chunks {
+                let (fh, bh) = self.handles(len);
+                self.move_chunk(a0, len, false)?;
+                self.filter_frames(self.m.ptr, self.w.ptr, len, fh)?;
+                unsafe {
+                    ck(
+                        ffi::tomoxide_linerec_backproject(
+                            bh.ptr,
+                            self.vol.ptr,
+                            self.m.ptr,
+                            (self.theta.ptr as *const f32).add(a0),
+                            self.phi,
+                            (self.n / 2) as f32,
+                            self.gain(),
+                            self.z0 as i32,
+                            self.depth as i32,
+                            null,
+                        ),
+                        "linerec_backproject",
+                    )?;
+                }
+            }
+            Ok(())
+        }
+
+        /// slice_focus of each slice of `vol`.
+        fn focus(&self) -> Result<Vec<f64>> {
+            unsafe {
+                ck(
+                    ffi::tomoxide_cuda_memset(self.prof.ptr, 0, self.prof.bytes),
+                    "memset",
+                )?;
+                ck(
+                    ffi::tomoxide_bf_focus(
+                        self.prof.ptr,
+                        self.vol.ptr,
+                        self.mask.ptr,
+                        self.nb as i32,
+                        self.n as i32,
+                        std::ptr::null_mut(),
+                    ),
+                    "bf_focus",
+                )?;
+                ck(ffi::tomoxide_cuda_sync(), "sync")?;
+            }
+            let cnt = self.cnt as f64;
+            Ok(self
+                .prof
+                .to_host_f64(self.nb)?
+                .into_iter()
+                .map(|a| a / cnt)
+                .collect())
+        }
+
+        /// Frames `a0 .. a0 + len` moved by this evaluation's shifts into `m`,
+        /// with their shift derivatives into `dmx`/`dmy` when `grad`.
+        fn move_chunk(&self, a0: usize, len: usize, grad: bool) -> Result<()> {
+            let null = std::ptr::null_mut::<c_void>();
+            let (dmx, dmy) = if grad {
+                (self.dmx.ptr, self.dmy.ptr)
+            } else {
+                (null, null)
+            };
+            let dy = self.shift.ptr as *const f32;
+            ck(
+                unsafe {
+                    ffi::tomoxide_bf_move(
+                        self.m.ptr,
+                        dmx,
+                        dmy,
+                        self.coef.ptr,
+                        dy,
+                        dy.add(self.nproj),
+                        a0 as i32,
+                        len as i32,
+                        self.rows as i32,
+                        self.n as i32,
+                        null,
+                    )
+                },
+                "bf_move",
+            )
+        }
+
+        /// `buf` (`[rows, len, n]`) filtered in place with `w` as the
+        /// reconstruction filters its frames.
+        fn filter_frames(
+            &self,
+            buf: *mut c_void,
+            w: *const c_void,
+            len: usize,
+            fh: &Handle,
+        ) -> Result<()> {
+            let null = std::ptr::null_mut::<c_void>();
+            let (rows, n, pad) = (self.rows, self.n, self.pad);
+            let pad_side = pad / 2 - n / 2;
+            unsafe {
+                ck(
+                    ffi::tomoxide_pad(buf, self.gpad.ptr, rows, len, n, pad, pad_side, null),
+                    "pad",
+                )?;
+                ck(
+                    ffi::tomoxide_filter_apply(fh.ptr, self.gpad.ptr, w, null),
+                    "filter_apply",
+                )?;
+                ck(
+                    ffi::tomoxide_crop(self.gpad.ptr, buf, rows, len, n, pad, pad_side, null),
+                    "crop",
+                )
+            }
         }
     }
 

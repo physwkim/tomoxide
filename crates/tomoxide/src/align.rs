@@ -11,11 +11,11 @@ use ndarray::{Array3, Axis};
 use rayon::prelude::*;
 
 use crate::backend::Backend;
-use crate::cuda::LaminoTileFn;
+use crate::cuda::{LaminoBandFocus, LaminoTileFn};
 use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
-use crate::params::{Algorithm, ReconParams};
+use crate::params::{Algorithm, FilterName, ReconParams};
 use crate::pipeline::{CancelToken, PrepOptions};
 use crate::recon::center::{RingCenter, SampleBand, TiltCandidates, TiltFocus, TiltViews};
 use crate::recon::tilt_flow::TiltFlow;
@@ -173,6 +173,19 @@ impl PreppedStack {
             nz,
             nx,
         })
+    }
+
+    /// This stack held on the device to score slices `z.0 ..= z.1` of its
+    /// linerec reconstruction at `tilt_deg`, filtered with `filter`, for
+    /// per-projection shifts and a centre. CUDA-only.
+    pub fn band_focus(
+        &self,
+        filter: FilterName,
+        tilt_deg: f32,
+        z: (usize, usize),
+    ) -> Result<LaminoBandFocus> {
+        let proj = self.data.as_layout(Layout::Projection);
+        LaminoBandFocus::new(proj.array.view(), &self.theta, filter, tilt_deg, z)
     }
 
     /// Laminography reconstruction of this stack at `geom` (from
