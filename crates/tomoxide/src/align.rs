@@ -11,7 +11,7 @@ use ndarray::{Array3, Axis};
 use rayon::prelude::*;
 
 use crate::backend::Backend;
-use crate::cuda::{LaminoBandFocus, LaminoTileFn};
+use crate::cuda::{BandFrames, LaminoBandFocus, LaminoTileFn};
 use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
@@ -178,7 +178,7 @@ impl PreppedStack {
         })
     }
 
-    /// This stack held on the device to score slices `z.0 ..= z.1` of its
+    /// This stack held in `frames` to score slices `z.0 ..= z.1` of its
     /// linerec reconstruction at `tilt_deg`, filtered with `filter`, for
     /// per-projection shifts and a centre. CUDA-only.
     pub fn band_focus(
@@ -186,9 +186,10 @@ impl PreppedStack {
         filter: FilterName,
         tilt_deg: f32,
         z: (usize, usize),
+        frames: BandFrames,
     ) -> Result<LaminoBandFocus> {
         let proj = self.data.as_layout(Layout::Projection);
-        LaminoBandFocus::new(proj.array.view(), &self.theta, filter, tilt_deg, z)
+        LaminoBandFocus::new(proj.array.view(), &self.theta, filter, tilt_deg, z, frames)
     }
 
     /// Laminography reconstruction of this stack at `geom` (from
@@ -295,7 +296,8 @@ impl PreppedStack {
         let focus = match (band, tilt_deg) {
             (None, _) => crate::recon::center::focus_by_z(frames.view()),
             (Some(z), Some(tilt)) => {
-                let mut scorer = self.band_focus(params.filter_name, tilt, z)?;
+                let mut scorer =
+                    self.band_focus(params.filter_name, tilt, z, BandFrames::Device)?;
                 let still = vec![0.0; self.nproj];
                 centers
                     .iter()

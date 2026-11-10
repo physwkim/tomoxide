@@ -264,6 +264,7 @@ unsafe extern "C" {
         dy: *const f32,
         dx: *const f32,
         a0: i32,
+        c0: i32,
         alen: i32,
         rows: i32,
         n: i32,

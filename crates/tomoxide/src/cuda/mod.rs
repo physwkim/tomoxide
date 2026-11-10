@@ -351,6 +351,15 @@ pub struct LaminoBandFocus {
     inner: cuda_impl::LaminoBandFocus,
 }
 
+/// Where a [`LaminoBandFocus`] keeps its frames between evaluations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandFrames {
+    /// On the device, which must hold the whole stack.
+    Device,
+    /// In host memory; an evaluation uploads them an angle chunk at a time.
+    Host,
+}
+
 /// [`LaminoBandFocus::gradient`]'s result.
 #[derive(Debug, Clone)]
 pub struct BandFocusGradient {
@@ -364,25 +373,26 @@ pub struct BandFocusGradient {
 }
 
 impl LaminoBandFocus {
-    /// Upload `proj` (`[nproj, rows, n]` `−log` frames at angles `theta`,
-    /// radians) to score slices `z.0 ..= z.1` of its reconstruction at
-    /// `tilt_deg`, filtered with `filter`.
+    /// Hold `proj` (`[nproj, rows, n]` `−log` frames at angles `theta`,
+    /// radians) in `frames` to score slices `z.0 ..= z.1` of its
+    /// reconstruction at `tilt_deg`, filtered with `filter`.
     pub fn new(
         proj: ndarray::ArrayView3<'_, f32>,
         theta: &[f32],
         filter: crate::params::FilterName,
         tilt_deg: f32,
         z: (usize, usize),
+        frames: BandFrames,
     ) -> Result<Self> {
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (proj, theta, filter, tilt_deg, z);
+            let _ = (proj, theta, filter, tilt_deg, z, frames);
             Err(Error::Backend("cuda feature not enabled".into()))
         }
         #[cfg(feature = "cuda")]
         {
             Ok(Self {
-                inner: cuda_impl::LaminoBandFocus::new(proj, theta, filter, tilt_deg, z)?,
+                inner: cuda_impl::LaminoBandFocus::new(proj, theta, filter, tilt_deg, z, frames)?,
             })
         }
     }
@@ -644,7 +654,7 @@ impl Backend for CudaBackend {
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-    use super::{ffi, CudaBackend};
+    use super::{ffi, BandFrames, CudaBackend};
     use crate::backend::{
         make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter, FilteredBackproject,
         ForwardProject, FourierReconstruct, IterativeReconstruct, LpRecReconstruct, RampShape,
@@ -3492,7 +3502,7 @@ mod cuda_impl {
         cnt: usize,
         /// Each frame's `exp(−p)` spline coefficients, `[nproj, rows + 2·SPLINE_PAD,
         /// n + 2·SPLINE_PAD]`.
-        coef: DevBuf,
+        coef: Coef,
         theta: DevBuf,
         mask: DevBuf,
         /// This evaluation's `dy` then `dx`.
@@ -3516,6 +3526,46 @@ mod cuda_impl {
         handles: Vec<(usize, Handle, Handle)>,
     }
 
+    /// Host memory for a stack's coefficients: page-locked where the driver
+    /// grants that much, pageable otherwise.
+    enum HostCoef {
+        Pinned(PinnedBuf<f32>),
+        Pageable(Vec<f32>),
+    }
+
+    impl HostCoef {
+        fn new(len: usize) -> Self {
+            match PinnedBuf::new(len) {
+                Ok(b) => HostCoef::Pinned(b),
+                Err(_) => HostCoef::Pageable(vec![0.0f32; len]),
+            }
+        }
+
+        fn as_slice(&self) -> &[f32] {
+            match self {
+                HostCoef::Pinned(b) => b.as_slice(),
+                HostCoef::Pageable(v) => v,
+            }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [f32] {
+            match self {
+                HostCoef::Pinned(b) => b.as_mut_slice(),
+                HostCoef::Pageable(v) => v,
+            }
+        }
+    }
+
+    /// A stack's coefficients where [`BandFrames`] keeps them.
+    enum Coef {
+        Device(DevBuf),
+        /// `chunk` holds the angle chunk being moved.
+        Host {
+            all: HostCoef,
+            chunk: DevBuf,
+        },
+    }
+
     // Device memory and handles of the runtime's primary context, valid on any
     // host thread; every evaluation selects its device and takes `&mut self`.
     unsafe impl Send for LaminoBandFocus {}
@@ -3527,6 +3577,7 @@ mod cuda_impl {
             filter: FilterName,
             tilt_deg: f32,
             z: (usize, usize),
+            frames: BandFrames,
         ) -> Result<Self> {
             let (nproj, rows, n) = proj.dim();
             if nproj == 0 || theta.len() != nproj || rows < 2 || n < 3 {
@@ -3553,14 +3604,9 @@ mod cuda_impl {
             ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
             let fsz = std::mem::size_of::<f32>();
             let (h, w) = (rows + 2 * SPLINE_PAD, n + 2 * SPLINE_PAD);
-            let coef = DevBuf::new(nproj * h * w * fsz)?;
-            // A batch of frames at a time, so the host never holds the stack's
-            // coefficients.
-            const BATCH: usize = 64;
-            let mut host = vec![0.0f32; BATCH.min(nproj) * h * w];
-            for b0 in (0..nproj).step_by(BATCH) {
-                let host = &mut host[..BATCH.min(nproj - b0) * h * w];
-                host.par_chunks_mut(h * w).enumerate().for_each_init(
+            // The coefficients of frames `b0 ..` into `out`.
+            let fill = |b0: usize, out: &mut [f32]| {
+                out.par_chunks_mut(h * w).enumerate().for_each_init(
                     || (vec![0.0f32; rows * n], vec![0.0f32; h]),
                     |(frame, line), (k, out)| {
                         let p = proj.index_axis(Axis(0), b0 + k);
@@ -3570,17 +3616,37 @@ mod cuda_impl {
                         spline_coeffs(frame, rows, n, out, line);
                     },
                 );
-                ck(
-                    unsafe {
-                        ffi::tomoxide_cuda_memcpy_h2d(
-                            (coef.ptr as *mut f32).add(b0 * h * w) as *mut c_void,
-                            host.as_ptr() as *const c_void,
-                            std::mem::size_of_val(host),
-                        )
-                    },
-                    "coef upload",
-                )?;
-            }
+            };
+            // The device's copy first: the angle chunks below take what it leaves.
+            let (on_device, on_host) = match frames {
+                BandFrames::Device => {
+                    let coef = DevBuf::new(nproj * h * w * fsz)?;
+                    // A batch of frames at a time, so the host never holds the
+                    // stack's coefficients.
+                    const BATCH: usize = 64;
+                    let mut host = vec![0.0f32; BATCH.min(nproj) * h * w];
+                    for b0 in (0..nproj).step_by(BATCH) {
+                        let host = &mut host[..BATCH.min(nproj - b0) * h * w];
+                        fill(b0, host);
+                        ck(
+                            unsafe {
+                                ffi::tomoxide_cuda_memcpy_h2d(
+                                    (coef.ptr as *mut f32).add(b0 * h * w) as *mut c_void,
+                                    host.as_ptr() as *const c_void,
+                                    std::mem::size_of_val(host),
+                                )
+                            },
+                            "coef upload",
+                        )?;
+                    }
+                    (Some(coef), None)
+                }
+                BandFrames::Host => {
+                    let mut all = HostCoef::new(nproj * h * w);
+                    fill(0, all.as_mut_slice());
+                    (None, Some(all))
+                }
+            };
             // slice_focus's disk, in its own f32 arithmetic.
             let c = n as f32 / 2.0;
             let r2 = (0.46 * n as f32).powi(2);
@@ -3620,9 +3686,12 @@ mod cuda_impl {
             let wc = DevBuf::new(rows * nfreq * 2 * fsz)?;
             let theta_dev = DevBuf::from_host_f32(theta)?;
             // Per angle: a frame, its two shift derivatives and its padded copy,
-            // and for each of the (at most two) filter handles its spectrum and a
-            // cuFFT work area taken as large again.
-            let per = (3 * rows * n + rows * pad) * fsz + 2 * 2 * rows * nfreq * 2 * fsz;
+            // for each of the (at most two) filter handles its spectrum and a
+            // cuFFT work area taken as large again, and the coefficients a host
+            // stack uploads.
+            let per = (3 * rows * n + rows * pad) * fsz
+                + 2 * 2 * rows * nfreq * 2 * fsz
+                + on_host.as_ref().map_or(0, |_| h * w * fsz);
             let by_mem = device_free_bytes() / 10 * 8 / per;
             let by_idx = I32_INDEX_LIMIT / 100 * 88 / (rows * pad);
             // backprojection_ker caches every angle's cos/sin in 48 KiB of shared memory.
@@ -3638,6 +3707,14 @@ mod cuda_impl {
             let dmx = DevBuf::new(rows * alen * n * fsz)?;
             let dmy = DevBuf::new(rows * alen * n * fsz)?;
             let gpad = DevBuf::new(rows * alen * pad * fsz)?;
+            let coef = match (on_device, on_host) {
+                (Some(all), _) => Coef::Device(all),
+                (None, Some(all)) => Coef::Host {
+                    all,
+                    chunk: DevBuf::new(alen * h * w * fsz)?,
+                },
+                (None, None) => unreachable!("frames are held on the device or the host"),
+            };
             let mut handles: Vec<(usize, Handle, Handle)> = Vec::new();
             for &(_, len) in &chunks {
                 if handles.iter().any(|(l, ..)| *l == len) {
@@ -3893,16 +3970,36 @@ mod cuda_impl {
                 (null, null)
             };
             let dy = self.shift.ptr as *const f32;
+            // The coefficients the kernel reads, and frame `a0`'s place in them.
+            let (coef, c0) = match &self.coef {
+                Coef::Device(all) => (all.ptr, a0),
+                Coef::Host { all, chunk } => {
+                    let hw = (self.rows + 2 * SPLINE_PAD) * (self.n + 2 * SPLINE_PAD);
+                    let src = &all.as_slice()[a0 * hw..(a0 + len) * hw];
+                    ck(
+                        unsafe {
+                            ffi::tomoxide_cuda_memcpy_h2d(
+                                chunk.ptr,
+                                src.as_ptr() as *const c_void,
+                                std::mem::size_of_val(src),
+                            )
+                        },
+                        "coef chunk upload",
+                    )?;
+                    (chunk.ptr, 0)
+                }
+            };
             ck(
                 unsafe {
                     ffi::tomoxide_bf_move(
                         self.m.ptr,
                         dmx,
                         dmy,
-                        self.coef.ptr,
+                        coef,
                         dy,
                         dy.add(self.nproj),
                         a0 as i32,
+                        c0 as i32,
                         len as i32,
                         self.rows as i32,
                         self.n as i32,

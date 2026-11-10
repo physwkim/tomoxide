@@ -171,7 +171,9 @@ fn center_sweep_scores_the_band_by_its_mean() {
         let want: Vec<f64> = match tilt {
             Some(t) => {
                 let filter = ReconParams::default().filter_name;
-                let mut scorer = stack.band_focus(filter, t, band).unwrap();
+                let mut scorer = stack
+                    .band_focus(filter, t, band, tomoxide::cuda::BandFrames::Device)
+                    .unwrap();
                 let still = vec![0.0; nproj];
                 centers
                     .iter()

@@ -13,6 +13,12 @@ All notable changes to this project are documented here. The format is based on
   from the frames already on the device: a caller registering the frames
   against that band's reprojection no longer writes the moved frames and
   reconstructs the whole volume to read one band of it.
+- **Breaking: `cuda::LaminoBandFocus::new` and `PreppedStack::band_focus`
+  take `cuda::BandFrames`, where the frames stay between evaluations.**
+  `Device` is the stack on the device as before; `Host` keeps it in host
+  memory and uploads an angle chunk per evaluation, for a device the stack
+  does not fit. On a 3601x1024x1024 stack a 201-slice band took 25 s
+  either way, in 7 GB of device memory under an 8 GB cap against 25 GB.
 
 ### Changed
 

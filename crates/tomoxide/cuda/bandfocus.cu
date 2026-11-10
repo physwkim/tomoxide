@@ -33,10 +33,11 @@ static __device__ __forceinline__ void bspline_dw(float f, float *d)
 }
 
 // m [rows][alen][n]: frames a0 .. a0 + alen moved by (dy, dx), as the sinogram
-// chunk the filter and back-projection read. With dmx/dmy non-null, also
+// chunk the filter and back-projection read; frame a0 is coef's frame c0. With dmx/dmy non-null, also
 // dm/d dx and dm/d dy there (0 where minus_log clamps).
 static __global__ void move_ker(float *m, float *dmx, float *dmy, const float *coef,
-                                const float *dy, const float *dx, int a0, int alen, int rows, int n)
+                                const float *dy, const float *dx, int a0, int c0, int alen, int rows,
+                                int n)
 {
     int j = blockDim.x * blockIdx.x + threadIdx.x;
     int i = blockDim.y * blockIdx.y + threadIdx.y;
@@ -56,7 +57,7 @@ static __global__ void move_ker(float *m, float *dmx, float *dmy, const float *c
 #pragma unroll
     for (int k = 0; k < 4; k++)
         cols[k] = min(max((int)fc - 1 + k, 0), w - 1);
-    const float *cf = coef + (size_t)(a0 + t) * h * w;
+    const float *cf = coef + (size_t)(c0 + t) * h * w;
     bool grad = dmx != nullptr;
     if (grad)
     {
@@ -243,12 +244,13 @@ static __global__ void framedot3_ker(double *out, const float *r, const float *h
 
 // See move_ker; dmx/dmy both null for the frames alone. Returns cudaGetLastError().
 extern "C" int tomoxide_bf_move(void *m, void *dmx, void *dmy, const void *coef, const float *dy,
-                                const float *dx, int a0, int alen, int rows, int n, void *stream)
+                                const float *dx, int a0, int c0, int alen, int rows, int n,
+                                void *stream)
 {
     dim3 block(32, 8, 1);
     dim3 grid((unsigned)((n + 31) / 32), (unsigned)((rows + 7) / 8), (unsigned)alen);
     move_ker<<<grid, block, 0, (cudaStream_t)stream>>>((float *)m, (float *)dmx, (float *)dmy,
-                                                        (const float *)coef, dy, dx, a0, alen,
+                                                        (const float *)coef, dy, dx, a0, c0, alen,
                                                         rows, n);
     return (int)cudaGetLastError();
 }

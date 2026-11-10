@@ -21,6 +21,7 @@ const NPROJ: usize = 61;
 const ROWS: usize = 40;
 const TILT: f32 = 20.0;
 const FILTER: FilterName = FilterName::Shepp;
+const DEVICE: cuda::BandFrames = cuda::BandFrames::Device;
 
 fn cuda_or_skip() -> Option<CudaBackend> {
     match CudaBackend::new() {
@@ -121,7 +122,7 @@ fn band_focus_profile_is_the_moved_linerec_band() {
     .unwrap();
     let want = focus_by_z(rec.array.slice(s![z.0..=z.1, .., ..]));
 
-    let mut one = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z).unwrap();
+    let mut one = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z, DEVICE).unwrap();
     let got = one.profile(&dy, &dx, center).unwrap();
     let band = one.band(&dy, &dx, center).unwrap();
     assert_eq!(band.dim(), (z.1 - z.0 + 1, N, N));
@@ -147,7 +148,7 @@ fn band_focus_profile_is_the_moved_linerec_band() {
 
     // 61 angles in chunks of at most two: 30 of two and one of one.
     std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
-    let many = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z);
+    let many = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z, DEVICE);
     std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
     let mut many = many.unwrap();
     let got = many.profile(&dy, &dx, center).unwrap();
@@ -166,6 +167,50 @@ fn band_focus_profile_is_the_moved_linerec_band() {
     assert!(d < 1e-4, "chunked centre gradient differs by {d:e}");
 }
 
+/// Frames held on the host score and differentiate as frames held on the
+/// device do, with the angles in one chunk or in many.
+#[test]
+fn band_focus_host_frames_score_as_device_frames() {
+    let Some(cudab) = cuda_or_skip() else { return };
+    let (proj, theta, depth) = frames(&cudab);
+    let (dy, dx) = shifts(&theta);
+    let center = N as f32 / 2.0 + 3.8;
+    let z = (depth / 4, 3 * depth / 4);
+    let host = cuda::BandFrames::Host;
+
+    let mut device =
+        cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z, DEVICE).unwrap();
+    let want = device.gradient(&dy, &dx, center).unwrap();
+    let want_band = device.band(&dy, &dx, center).unwrap();
+
+    let one = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z, host).unwrap();
+    std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "500000");
+    let many = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, z, host);
+    std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+    for (name, mut bf) in [("one chunk", one), ("chunked", many.unwrap())] {
+        let got = bf.gradient(&dy, &dx, center).unwrap();
+        let d = max_rel(&got.profile, &want.profile);
+        assert!(d < 1e-4, "{name}: host profile differs by {d:e} of peak");
+        let d = max_rel(
+            got.shift.as_slice().unwrap(),
+            want.shift.as_slice().unwrap(),
+        );
+        assert!(
+            d < 1e-4,
+            "{name}: host shift gradient differs by {d:e} of peak"
+        );
+        let d = (got.center - want.center).abs() / want.center.abs();
+        assert!(d < 1e-4, "{name}: host centre gradient differs by {d:e}");
+        let band = bf.band(&dy, &dx, center).unwrap();
+        let peak = want_band.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = (&band - &want_band)
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()))
+            / peak;
+        assert!(d < 1e-5, "{name}: host band differs by {d:e} of peak");
+    }
+}
+
 /// The gradient is the profile mean's central difference in a few frames'
 /// shifts and in the centre.
 #[test]
@@ -180,6 +225,7 @@ fn band_focus_gradient_matches_finite_differences() {
         FILTER,
         TILT,
         (depth / 4, 3 * depth / 4),
+        DEVICE,
     )
     .unwrap();
     let g = bf.gradient(&dy, &dx, center).unwrap();
@@ -225,9 +271,14 @@ fn band_focus_gradient_matches_finite_differences() {
 fn band_focus_refuses_bad_shapes() {
     let Some(cudab) = cuda_or_skip() else { return };
     let (proj, theta, depth) = frames(&cudab);
-    assert!(cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, (0, depth)).is_err());
-    assert!(cuda::LaminoBandFocus::new(proj.view(), &theta[1..], FILTER, TILT, (0, 4)).is_err());
-    let mut bf = cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, (0, 4)).unwrap();
+    assert!(
+        cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, (0, depth), DEVICE).is_err()
+    );
+    assert!(
+        cuda::LaminoBandFocus::new(proj.view(), &theta[1..], FILTER, TILT, (0, 4), DEVICE).is_err()
+    );
+    let mut bf =
+        cuda::LaminoBandFocus::new(proj.view(), &theta, FILTER, TILT, (0, 4), DEVICE).unwrap();
     let (dy, dx) = shifts(&theta);
     assert!(bf.profile(&dy[1..], &dx, N as f32 / 2.0).is_err());
     assert!(bf.gradient(&dy, &dx[1..], N as f32 / 2.0).is_err());
