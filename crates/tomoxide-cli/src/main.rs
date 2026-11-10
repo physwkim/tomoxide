@@ -54,7 +54,7 @@ enum Command {
     /// order: read the centre off the raw data first (the 360° mean projection is
     /// a bullseye on the axis — one pass, and it also says whether the scan was
     /// aligned at acquisition at all), then refine against reconstructions of a
-    /// single slice. The refinement uses the CUDA probes, so a whole sweep is one
+    /// slice, or of the sample band `--focus_z` states. The refinement uses the CUDA probes, so a whole sweep is one
     /// launch per axis instead of one full volume per grid point.
     Align {
         /// Input DXchange HDF5 file.
@@ -98,8 +98,8 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         tilt_step: f32,
         /// The sample's z-band, `LO:HI` inclusive, read off a reconstruction at
-        /// `--lamino_angle`. Its midpoint becomes the centre sweep's slice
-        /// (unless `--slice` overrides), and a tilt scan (`--tilt_width`) scores
+        /// `--lamino_angle`. The centre sweep scores each candidate by its mean
+        /// focus over it, and a tilt scan (`--tilt_width`) scores
         /// only inside it — the band follows the tilt into each candidate's
         /// volume by itself, since the sample's detector rows do not move.
         /// Useful wherever structured noise competes with the sample for the
@@ -714,7 +714,7 @@ fn run_align(
         return Ok(());
     }
 
-    // --- step 2: refine against single-slice reconstructions, via the probes. ---
+    // --- step 2: refine against reconstructions of a slice or the band. ---
     // The ring estimate above runs on any backend. The probes do not: a whole
     // sweep being one kernel launch is what makes this subcommand cheap, and
     // that kernel exists only in CUDA. Say so rather than sweeping on something
@@ -736,8 +736,12 @@ fn run_align(
     // --focus_z or --slice).
     let sz = slice.unwrap_or_else(|| st.default_slice(lamino_angle, focus_z));
     let depth = st.depth(lamino_angle);
+    let scored = match focus_z {
+        Some((lo, hi)) => format!("the mean of output slices {lo}..={hi}"),
+        None => format!("output slice {sz}"),
+    };
     println!(
-        "\nrefining on output slice {sz} of {depth} ({} centre candidates)",
+        "\nrefining on {scored} of {depth} ({} centre candidates)",
         grid(0.0, center_width, center_step).len()
     );
 
@@ -753,7 +757,9 @@ fn run_align(
     };
 
     let cands = grid(ring.center, center_width, center_step);
-    let f = st.center_sweep(lamino_angle, sz, &cands, None)?.focus;
+    let f = st
+        .center_sweep(lamino_angle, sz, focus_z, &cands, None)?
+        .focus;
     curve(&cands, &f, "");
     let center = pick("centre", &cands, &f, "--center_width")?;
     println!(
@@ -846,10 +852,12 @@ fn run_align(
         _ => {}
     }
     println!(
-        "\nThe centre is scored on one output slice, the tilt on the slices of a whole\n\
+        "\nThe centre is scored on one output slice, or with --focus_z by the mean focus\n\
+         over the sample's z band (each slice peaks at its own centre by what it holds);\n\
+         the tilt on the slices of a whole\n\
          reconstruction, and the asymmetry is the physics rather than an optimisation that\n\
          was skipped. The centre is an in-plane shift: it leaves the in-focus layer where\n\
-         it is, so one slice ranks it and a probe sweeps every candidate in a single\n\
+         it is, so a fixed slice or band ranks it and a probe sweeps every candidate in a single\n\
          launch — but only near the answer, which is why --center_width refines the rings'\n\
          axis rather than searching for one. The tilt is the opposite on both\n\
          counts — ~2 % per 1°, and it drags the in-focus layer through z (measured: z_peak\n\

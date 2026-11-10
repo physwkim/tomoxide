@@ -38,11 +38,14 @@ pub struct PreppedStack {
 
 /// A finished centre probe sweep.
 pub struct CenterSweep {
-    /// The output slice every candidate was scored on.
+    /// The output slice `frames` shows.
     pub slice: usize,
-    /// `[candidate, ny, nx]`: the slice as each candidate centre reconstructs it.
+    /// The slices scored, inclusive: the band, else `slice` alone.
+    pub scored: (usize, usize),
+    /// `[candidate, ny, nx]`: `slice` as each candidate centre reconstructs it.
     pub frames: Array3<f32>,
-    /// Each candidate's [`slice_focus`](crate::recon::center::slice_focus).
+    /// Each candidate's mean [`slice_focus`](crate::recon::center::slice_focus)
+    /// over `scored`.
     pub focus: Vec<f64>,
 }
 
@@ -240,7 +243,7 @@ impl PreppedStack {
         }
     }
 
-    /// The output slice a centre sweep scores by default. The centre response
+    /// The output slice a centre sweep shows by default, and scores without a band. The centre response
     /// lives where the sample is, and which plane holds the sample is a property
     /// of the scan, not of the geometry — so a stated sample band (`band`, read
     /// off a reconstruction at `tilt_deg`) supplies its midpoint. Without one the
@@ -264,28 +267,62 @@ impl PreppedStack {
     }
 
     /// Reconstruct output slice `slice` at every candidate centre in one probe
-    /// sweep and score each; a fired `cancel` stops it at the next probe
-    /// boundary with [`Error::Cancelled`]. CUDA-only.
+    /// sweep, and score each candidate by its mean slice focus over `band`
+    /// (inclusive slices of the volume at `tilt_deg`), else on `slice` alone.
+    /// Each slice peaks at its own centre by what it holds (on a quartz scan,
+    /// eleven slices of one band from 1045 to 1063 px, their mean at 1055), so
+    /// one slice answers for its own content. Under a tilt the band is scored
+    /// by [`band_focus`](Self::band_focus), a linerec back-projection of it
+    /// per candidate; in parallel beam by a probe sweep per slice. A fired
+    /// `cancel` stops it at the next probe or candidate with
+    /// [`Error::Cancelled`]. CUDA-only.
     pub fn center_sweep(
         &self,
         tilt_deg: Option<f32>,
         slice: usize,
+        band: Option<(usize, usize)>,
         centers: &[f32],
         cancel: Option<&CancelToken>,
     ) -> Result<CenterSweep> {
         // The probe anchors each candidate on its own nominal, so the
         // geometry's centre is not read.
-        let frames = crate::cuda::center_probe_sweep(
-            &self.data,
-            &self.geometry(self.nx as f32 / 2.0, tilt_deg),
-            &ReconParams::default(),
-            centers,
-            slice as i32,
-            cancel,
-        )?;
-        let focus = crate::recon::center::focus_by_z(frames.view());
+        let geom = self.geometry(self.nx as f32 / 2.0, tilt_deg);
+        let params = ReconParams::default();
+        let probe = |z: usize| {
+            crate::cuda::center_probe_sweep(&self.data, &geom, &params, centers, z as i32, cancel)
+        };
+        let frames = probe(slice)?;
+        let focus = match (band, tilt_deg) {
+            (None, _) => crate::recon::center::focus_by_z(frames.view()),
+            (Some(z), Some(tilt)) => {
+                let mut scorer = self.band_focus(params.filter_name, tilt, z)?;
+                let still = vec![0.0; self.nproj];
+                centers
+                    .iter()
+                    .map(|&c| {
+                        crate::pipeline::check_cancel(cancel)?;
+                        let profile = scorer.profile(&still, &still, c)?;
+                        Ok(profile.iter().sum::<f64>() / profile.len() as f64)
+                    })
+                    .collect::<Result<_>>()?
+            }
+            (Some((lo, hi)), None) => {
+                if lo > hi {
+                    return Err(Error::Backend(format!(
+                        "centre sweep: band {lo}..={hi} holds no slices"
+                    )));
+                }
+                let mut sum = vec![0.0; centers.len()];
+                for z in lo..=hi {
+                    let scored = crate::recon::center::focus_by_z(probe(z)?.view());
+                    sum.iter_mut().zip(scored).for_each(|(s, f)| *s += f);
+                }
+                sum.iter().map(|s| s / (hi - lo + 1) as f64).collect()
+            }
+        };
         Ok(CenterSweep {
             slice,
+            scored: band.unwrap_or((slice, slice)),
             frames,
             focus,
         })

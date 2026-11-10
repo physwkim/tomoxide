@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Breaking: `PreppedStack::center_sweep` takes the sample band and scores
+  a candidate by its mean `slice_focus` over it.** `CenterSweep::scored`
+  names the slices; without a band it is the one slice, as before. On a
+  quartz scan eleven slices of one band peaked from 1045 to 1063 px, the
+  three sharpest within 1.2 px of their mean at 1055. Under a tilt the
+  band is a linerec back-projection per candidate (`band_focus`; 200
+  slices and 41 candidates in 4 minutes where one slice's probes take 1),
+  in parallel beam a probe sweep per slice. `tomoxide align --focus_z` and
+  the GUI's sample z band pass it.
 - **Breaking (behaviour): `recon::center::lamino_tilt_scan` scores a
   candidate by the mean `slice_focus` over the scored slices, not the best
   one.** `TiltFocus::focus` is that mean; `z_peak` is still the sharpest

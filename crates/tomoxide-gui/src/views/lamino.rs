@@ -150,8 +150,9 @@ pub struct LaminoView {
 
     tilt_half: f32,
     tilt_step: f32,
-    /// Sample z-band the tilt scan scores inside, read off a reconstruction at
-    /// the working tilt. Off ⇒ the mean over the whole volume.
+    /// Sample z-band the tilt scan and the centre sweep score inside, read off
+    /// a reconstruction at the working tilt. Off ⇒ the tilt scan's mean runs
+    /// over the whole volume and the centre sweep scores its one slice.
     sample_z: (usize, usize),
     sample_z_on: bool,
     tilt_run: Option<TiltRun>,
@@ -559,7 +560,9 @@ impl LaminoView {
             if ui
                 .checkbox(&mut fixed, "slice")
                 .on_hover_text(
-                    "The output slice the sweep scores. Default: the middle of the volume, \
+                    "The output slice the sweep shows, and scores unless the sample z band \
+                     below is on (then each candidate scores by its mean focus over the \
+                     band). Default: the middle of the band, else of the volume, \
                      which under a tilt is rh/2 and NOT the detector's middle row — the tilt \
                      stretches the reconstruction deeper than the detector is tall. Set it by \
                      hand when the sample is not on the default plane; a flat focus curve is \
@@ -578,7 +581,8 @@ impl LaminoView {
             if ui
                 .add_enabled(idle, egui::Button::new("Sweep the centre"))
                 .on_hover_text(if idle {
-                    "One probe launch for every candidate."
+                    "One probe launch for every candidate; with the sample z band on, a \
+                     back-projection of the band per candidate as well."
                 } else if self.rings.is_none() {
                     "Read the rings first — they are the prior this sweep refines, and they \
                      load the stack it runs on."
@@ -595,6 +599,7 @@ impl LaminoView {
                     .send(Job::LaminoCenterSweep {
                         tilt_deg: Some(self.tilt),
                         slice: self.slice,
+                        band: self.sample_z_on.then_some(self.sample_z),
                         centers: cands,
                         cancel: cancel.clone(),
                     })

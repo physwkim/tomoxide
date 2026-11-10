@@ -108,10 +108,11 @@ pub enum Job {
     /// bullseye is read by eye, and the number is the second opinion.
     LaminoRings { step: usize },
     /// Probe-sweep the rotation axis over `centers` on output slice `slice`
-    /// (`None` ⇒ the middle of the volume) at `tilt_deg` → the montage +
-    /// focus curve of [`Event::LaminoCenterSweep`]. One launch for the whole
-    /// sweep: the centre is an in-plane shift, so it does not move the in-focus
-    /// layer and one slice can rank it.
+    /// (`None` ⇒ the middle of `band`, else of the volume) at `tilt_deg` → the
+    /// montage + focus curve of [`Event::LaminoCenterSweep`]. The centre is an
+    /// in-plane shift, so it does not move the in-focus layer, but each slice
+    /// peaks at its own centre by what it holds: with `band` (the sample's
+    /// slices at `tilt_deg`) a candidate scores by its mean focus over it.
     ///
     /// Ranking is all it does. Over a wide `centers` the focus curve grows
     /// competing lobes and its highest one is measurably not the axis (on the
@@ -125,6 +126,7 @@ pub enum Job {
     LaminoCenterSweep {
         tilt_deg: Option<f32>,
         slice: Option<usize>,
+        band: Option<(usize, usize)>,
         centers: Vec<f32>,
         cancel: CancelToken,
     },
@@ -208,7 +210,8 @@ pub enum Event {
         millis: u128,
     },
     /// A finished laminography centre sweep: one `[ny, nx]` probe reconstruction
-    /// per candidate (row-major in `frames`) and its `slice_focus`.
+    /// per candidate (row-major in `frames`) and its mean `slice_focus` over
+    /// slices `scored`, inclusive.
     LaminoCenterSweep {
         centers: Vec<f32>,
         ny: usize,
@@ -216,6 +219,7 @@ pub enum Event {
         frames: Vec<f32>,
         focus: Vec<f64>,
         slice: usize,
+        scored: (usize, usize),
         millis: u128,
     },
     /// The centre sweep stopped on its token.
@@ -416,6 +420,7 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
             Job::LaminoCenterSweep {
                 tilt_deg,
                 slice,
+                band,
                 centers,
                 cancel,
             } => {
@@ -424,8 +429,8 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                 };
                 let t0 = std::time::Instant::now();
                 match ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
-                    let slice = slice.unwrap_or_else(|| st.default_slice(tilt_deg, None));
-                    st.center_sweep(tilt_deg, slice, &centers, Some(&cancel))
+                    let slice = slice.unwrap_or_else(|| st.default_slice(tilt_deg, band));
+                    st.center_sweep(tilt_deg, slice, band, &centers, Some(&cancel))
                 }) {
                     Ok(sweep) => {
                         let (_n, ny, nx) = sweep.frames.dim();
@@ -436,6 +441,7 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                             frames: sweep.frames.iter().copied().collect(),
                             focus: sweep.focus,
                             slice: sweep.slice,
+                            scored: sweep.scored,
                             millis: t0.elapsed().as_millis(),
                         })
                     }

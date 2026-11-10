@@ -245,10 +245,11 @@ impl App {
                     frames,
                     focus,
                     slice,
+                    scored: (lo, hi),
                     millis,
                 } => {
                     self.log.push(format!(
-                        "lamino centre sweep: {} candidates on slice {slice} — {millis} ms",
+                        "lamino centre sweep: {} candidates scored on slices {lo}..={hi} — {millis} ms",
                         centers.len()
                     ));
                     self.lamino
