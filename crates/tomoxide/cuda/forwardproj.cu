@@ -123,3 +123,144 @@ extern "C" int tomoxide_forwardproject(void *g, const void *f, const float *thet
         (float *)g, (const float *)f, theta, phi, axis, sz, ncz, n, nz, rh, nproj);
     return (int)cudaGetLastError();
 }
+
+// Each frame's derivative along its columns and along its rows, as numpy's
+// `gradient`: central differences inside, one-sided at the edges. `m` is
+// [nframes][rows][n]; `d` is [2][nframes][rows][n], columns first.
+static __global__ void frame_derivatives_ker(const float *m, float *d, long long nframes, int rows,
+                                             int n)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = nframes * rows * n;
+    if (i >= total)
+        return;
+    int x = (int)(i % n);
+    int y = (int)(i / n % rows);
+    long long l = x == 0 ? i : i - 1, r = x == n - 1 ? i : i + 1;
+    d[i] = (m[r] - m[l]) / (float)(r - l);
+    long long u = y == 0 ? i : i - n, w = y == rows - 1 ? i : i + n;
+    d[total + i] = (m[w] - m[u]) / (float)((w - u) / n);
+}
+
+// Per-angle inner product of forwardprojection_ker's frame with the given
+// frames, without forming the frame: for angle t and c = 0 (hx), 1 (hy),
+//   out[2t + c] = Σ_p (A_t f)(p) · h_c[t](p).
+// A voxel gathers h at the very taps, with the very weights, it would scatter
+// into, so this is that sum up to its order, with no atomics on frames. Each
+// thread sums its voxel column over z for FD_ANG angles at once, so the band is
+// read once per FD_ANG angles; a block adds its partials in double, one
+// atomicAdd per value. `hx`/`hy` are [nproj][nz][n], `out` [nproj][2] pre-zeroed.
+#define FD_ANG 8
+static __global__ void framedot_ker(double *out, const float *f, const float *hx, const float *hy,
+                                    const float *theta, float phi, float axis, int sz, int ncz,
+                                    int n, int nz, int rh, int nproj)
+{
+    int tx = blockDim.x * blockIdx.x + threadIdx.x;
+    int ty = blockDim.y * blockIdx.y + threadIdx.y;
+    int t0 = FD_ANG * blockIdx.z;
+    int tid = threadIdx.x + blockDim.x * threadIdx.y;
+    __shared__ float sc[FD_ANG], ss[FD_ANG];
+    __shared__ double red[2 * FD_ANG][32];
+    if (tid < FD_ANG && t0 + tid < nproj)
+    {
+        sc[tid] = __cosf(theta[t0 + tid]);
+        ss[tid] = __sinf(theta[t0 + tid]);
+    }
+    __syncthreads();
+
+    float ax[FD_ANG], ay[FD_ANG];
+#pragma unroll
+    for (int a = 0; a < FD_ANG; a++)
+        ax[a] = ay[a] = 0.0f;
+    if (tx < n && ty < n)
+    {
+        float cphi = __cosf(phi);
+        float sphi = __sinf(phi);
+        for (int tz = 0; tz < ncz; tz++)
+        {
+            float val = f[tx + ty * n + tz * n * n];
+            if (val == 0.0f)
+                continue;
+#pragma unroll
+            for (int a = 0; a < FD_ANG; a++)
+            {
+                if (t0 + a >= nproj)
+                    continue;
+                // forwardprojection_ker's u, v, tap and guard, term for term.
+                float ctheta = sc[a];
+                float stheta = ss[a];
+                float R0 = ctheta, R1 = stheta;
+                float R3 = stheta * cphi, R4 = -ctheta * cphi, R5 = sphi;
+                float u = R0 * (tx - n / 2) + R1 * (ty - n / 2) + axis;
+                float v = R3 * (tx - n / 2) + R4 * (ty - n / 2) + R5 * (tz + sz - rh / 2) + nz / 2;
+                int ur = (int)(u - 1e-5f);
+                int vr = (int)(v - 1e-5f);
+                if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
+                {
+                    float fu = u - ur;
+                    float fv = v - vr;
+                    size_t o = ((size_t)(t0 + a) * nz + vr) * n + ur;
+                    float w00 = (1 - fu) * (1 - fv), w10 = fu * (1 - fv);
+                    float w01 = (1 - fu) * fv, w11 = fu * fv;
+                    ax[a] += val * (w00 * __ldg(hx + o) + w10 * __ldg(hx + o + 1) +
+                                    w01 * __ldg(hx + o + n) + w11 * __ldg(hx + o + n + 1));
+                    ay[a] += val * (w00 * __ldg(hy + o) + w10 * __ldg(hy + o + 1) +
+                                    w01 * __ldg(hy + o + n) + w11 * __ldg(hy + o + n + 1));
+                }
+            }
+        }
+    }
+
+    int lane = tid & 31, warp = tid >> 5;
+#pragma unroll
+    for (int a = 0; a < FD_ANG; a++)
+    {
+        double x = ax[a], y = ay[a];
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            x += __shfl_down_sync(0xffffffffu, x, o);
+            y += __shfl_down_sync(0xffffffffu, y, o);
+        }
+        if (lane == 0)
+        {
+            red[2 * a][warp] = x;
+            red[2 * a + 1][warp] = y;
+        }
+    }
+    __syncthreads();
+    int nwarps = (blockDim.x * blockDim.y) / 32;
+    if (tid < 2 * FD_ANG && t0 + tid / 2 < nproj)
+    {
+        double s = 0.0;
+        for (int w = 0; w < nwarps; w++)
+            s += red[tid][w];
+        atomicAdd(&out[2 * (size_t)t0 + tid], s);
+    }
+}
+
+// `d` [2][nframes][rows][n] from `m` [nframes][rows][n]; see
+// frame_derivatives_ker. Returns cudaGetLastError().
+extern "C" int tomoxide_frame_derivatives(const void *m, void *d, long long nframes, int rows,
+                                          int n, void *stream)
+{
+    int block = 256;
+    long long total = nframes * rows * n;
+    frame_derivatives_ker<<<(unsigned)((total + block - 1) / block), block, 0,
+                            (cudaStream_t)stream>>>((const float *)m, (float *)d, nframes, rows, n);
+    return (int)cudaGetLastError();
+}
+
+// `out` [nproj][2] (pre-zeroed doubles) += framedot_ker's sums; the geometry
+// arguments are tomoxide_forwardproject's. Returns cudaGetLastError().
+extern "C" int tomoxide_framedot(void *out, const void *f, const void *hx, const void *hy,
+                                 const float *theta, float phi, float axis, int sz, int ncz,
+                                 int nz, int n, int rh, int nproj, void *stream)
+{
+    dim3 block(32, 8, 1); // whole warps: framedot_ker's shuffles take every lane
+    dim3 grid((unsigned)((n + 31) / 32), (unsigned)((n + 7) / 8),
+              (unsigned)((nproj + FD_ANG - 1) / FD_ANG));
+    framedot_ker<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (double *)out, (const float *)f, (const float *)hx, (const float *)hy, theta, phi, axis,
+        sz, ncz, n, nz, rh, nproj);
+    return (int)cudaGetLastError();
+}

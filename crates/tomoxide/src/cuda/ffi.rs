@@ -215,6 +215,39 @@ unsafe extern "C" {
         nproj: i32,
         stream: *mut c_void,
     ) -> i32;
+    /// `d` `[2, nframes, rows, n]`: each frame of `m` `[nframes, rows, n]`
+    /// differentiated along its columns, then along its rows, as numpy's
+    /// `gradient`.
+    #[must_use]
+    pub fn tomoxide_frame_derivatives(
+        m: *const c_void,
+        d: *mut c_void,
+        nframes: i64,
+        rows: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `out` `[nproj, 2]` (pre-zeroed f64) += the inner product of
+    /// [`tomoxide_forwardproject`]'s frame of `f` at each angle with that
+    /// angle's frame of `hx`, and of `hy` (`[nproj, nz, n]` each), without
+    /// forming the projection. Geometry arguments as `tomoxide_forwardproject`.
+    #[must_use]
+    pub fn tomoxide_framedot(
+        out: *mut c_void,
+        f: *const c_void,
+        hx: *const c_void,
+        hy: *const c_void,
+        theta: *const f32,
+        phi: f32,
+        axis: f32,
+        sz: i32,
+        ncz: i32,
+        nz: i32,
+        n: i32,
+        rh: i32,
+        nproj: i32,
+        stream: *mut c_void,
+    ) -> i32;
 
     // --- device-resident iterative solver elementwise ops (iterative.cu) ---
     /// `ax[i] = (b[i] - ax[i]) * rw[i]` over `n` elements (in-place into `ax`).

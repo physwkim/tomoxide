@@ -306,6 +306,36 @@ impl LaminoReprojector {
             self.inner.project(theta)
         }
     }
+
+    /// For each frame `t` of `frames` (`[theta.len(), rows, n]`, at angle
+    /// `theta[t]`): the band's frame at that angle ([`project`](Self::project))
+    /// dotted with frame `t`'s derivative along the detector columns, and along
+    /// the rows, each filtered with `filter` as a lamino reconstruction filters
+    /// its frames. `[theta.len(), 2]`, columns first; derivatives as numpy's
+    /// `gradient`.
+    ///
+    /// With the band a score's derivative over a reconstruction's band, this is
+    /// the score's derivative over each frame's shift through a
+    /// back-projection reconstruction (unit gain): that reconstruction moves
+    /// by the back-projected filtered frame derivative, and back-projection at
+    /// one angle is the transpose of `project`'s. Nothing per angle is
+    /// projected or returned, so this costs far less than `project`.
+    pub fn shift_gradient(
+        &self,
+        theta: &[f32],
+        frames: ndarray::ArrayView3<'_, f32>,
+        filter: crate::params::FilterName,
+    ) -> Result<ndarray::Array2<f64>> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (theta, frames, filter);
+            Err(Error::Backend("cuda feature not enabled".into()))
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.shift_gradient(theta, frames, filter)
+        }
+    }
 }
 
 /// Reconstruct slice `sz` at every candidate in `centers` — each one **exactly**
@@ -641,8 +671,7 @@ mod cuda_impl {
             Ok(buf)
         }
 
-        /// Download `count` f64 elements into a fresh Vec (FW test helper).
-        #[cfg(test)]
+        /// Download `count` f64 elements into a fresh Vec.
         fn to_host_f64(&self, count: usize) -> Result<Vec<f64>> {
             let mut out = vec![0.0f64; count];
             let bytes = std::mem::size_of_val(out.as_slice());
@@ -3230,6 +3259,126 @@ mod cuda_impl {
                 .permuted_axes([1, 0, 2])
                 .as_standard_layout()
                 .into_owned())
+        }
+
+        pub(super) fn shift_gradient(
+            &self,
+            theta: &[f32],
+            frames: ArrayView3<'_, f32>,
+            filter: FilterName,
+        ) -> Result<ndarray::Array2<f64>> {
+            let (n, rows, nproj) = (self.n, self.rows, theta.len());
+            if frames.dim() != (nproj, rows, n) || nproj == 0 || n < 2 {
+                return Err(Error::InvalidParam(format!(
+                    "lamino shift gradient needs frames [{nproj} angles, {rows}, {n}] (n ≥ 2, \
+                     angles ≥ 1); got {:?}",
+                    frames.dim()
+                )));
+            }
+            ck(
+                unsafe { ffi::tomoxide_cuda_set_device(self.dev) },
+                "set_device",
+            )?;
+            let null = std::ptr::null_mut::<c_void>();
+            let (fsz, csz) = (std::mem::size_of::<f32>(), 2 * std::mem::size_of::<f32>());
+            let (filt, pad) = crate::recon::lamino::projection_filter(filter, n)?;
+            let ne = filt.len();
+            let filt_dev = DevBuf::from_host_f32(&filt)?;
+            let theta_dev = DevBuf::from_host_f32(theta)?;
+            let out = DevBuf::zeroed(2 * nproj * std::mem::size_of::<f64>())?;
+            // A frame, its two derivatives, and their padded spectra, per angle.
+            let per = rows * n * fsz + 2 * rows * n * fsz + 2 * rows * ne * csz;
+            let tc_max = (device_free_bytes() / 100 * 30 / per).clamp(1, nproj);
+            let m = DevBuf::new(tc_max * rows * n * fsz)?;
+            let d = DevBuf::new(2 * tc_max * rows * n * fsz)?;
+            let buf = DevBuf::new(2 * tc_max * rows * ne * csz)?;
+            for (t0, tc) in chunk_ranges(nproj, tc_max) {
+                let chunk = frames.slice(s![t0..t0 + tc, .., ..]);
+                let chunk = chunk.as_standard_layout();
+                let host = chunk.as_slice().expect("standard layout");
+                let rc = unsafe {
+                    ffi::tomoxide_cuda_memcpy_h2d(
+                        m.ptr,
+                        host.as_ptr() as *const c_void,
+                        std::mem::size_of_val(host),
+                    )
+                };
+                if rc != 0 {
+                    return Err(Error::Backend(format!("cudaMemcpy H2D failed ({rc})")));
+                }
+                let nlines = (2 * tc * rows) as i64;
+                unsafe {
+                    ck(
+                        ffi::tomoxide_frame_derivatives(
+                            m.ptr,
+                            d.ptr,
+                            tc as i64,
+                            rows as i32,
+                            n as i32,
+                            null,
+                        ),
+                        "frame_derivatives",
+                    )?;
+                    // The reconstruction's own filter, unshifted: the dot
+                    // below puts column `center` where the band's axis is.
+                    ck(
+                        ffi::tomoxide_lam_ramp_pad(
+                            d.ptr, buf.ptr, nlines, n as i32, ne as i32, pad as i32, null,
+                        ),
+                        "lam_ramp_pad",
+                    )?;
+                    ck(
+                        ffi::tomoxide_fft_1d_async(buf.ptr, ne, nlines as usize, 0),
+                        "lam_ramp_fft",
+                    )?;
+                    ck(
+                        ffi::tomoxide_lam_ramp_mul(
+                            buf.ptr,
+                            filt_dev.ptr as *const f32,
+                            nlines,
+                            ne as i32,
+                            0.0,
+                            null,
+                        ),
+                        "lam_ramp_mul",
+                    )?;
+                    ck(
+                        ffi::tomoxide_fft_1d_async(buf.ptr, ne, nlines as usize, 1),
+                        "lam_ramp_ifft",
+                    )?;
+                    ck(
+                        ffi::tomoxide_lam_ramp_crop(
+                            buf.ptr, d.ptr, nlines, n as i32, ne as i32, pad as i32, null,
+                        ),
+                        "lam_ramp_crop",
+                    )?;
+                    ck(
+                        ffi::tomoxide_framedot(
+                            (out.ptr as *mut f64).add(2 * t0) as *mut c_void,
+                            self.band.ptr,
+                            d.ptr,
+                            (d.ptr as *const f32).add(tc * rows * n) as *const c_void,
+                            (theta_dev.ptr as *const f32).add(t0),
+                            self.phi,
+                            self.center,
+                            self.z0 as i32,
+                            self.nb as i32,
+                            rows as i32,
+                            n as i32,
+                            self.depth as i32,
+                            tc as i32,
+                            null,
+                        ),
+                        "framedot",
+                    )?;
+                }
+            }
+            let rc = unsafe { ffi::tomoxide_cuda_sync() };
+            if rc != 0 {
+                return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
+            }
+            ndarray::Array2::from_shape_vec((nproj, 2), out.to_host_f64(2 * nproj)?)
+                .map_err(|e| Error::InvalidParam(format!("cuda shift gradient shape: {e}")))
         }
     }
 

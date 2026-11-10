@@ -7,10 +7,11 @@
 //! Own test binary (touches CUDA device state) per the suite convention.
 #![cfg(feature = "cuda")]
 
-use ndarray::{s, Array3, Axis};
+use ndarray::{s, Array2, Array3, Axis};
+use tomoxide::backend::{make_fbp_filter, RampShape};
 use tomoxide::{
-    cuda, recon, sim, Algorithm, Angles, Beam, Center, CudaBackend, Detector, Geometry, Layout,
-    ReconParams, Tomo, Volume,
+    cuda, recon, sim, Algorithm, Angles, Beam, Center, Complex32, CpuBackend, CudaBackend,
+    Detector, Fft, FilterName, Geometry, Layout, ReconParams, Tomo, Volume,
 };
 
 /// Gaussian blobs `(z, y, x, sigma)` in a `[depth, n, n]` volume.
@@ -150,6 +151,93 @@ fn cuda_lamino_reprojector_chunks_are_the_whole() {
     let d = max_rel_diff(&ndarray::concatenate(Axis(0), &views).unwrap(), &whole);
     assert!(d < 1e-5, "chunks differ from the whole by {d:e} of peak");
     assert!(rp.project(&[]).is_err());
+}
+
+/// Each frame's derivative along its columns and along its rows (numpy's
+/// `gradient`), each line filtered as `recon::lamino` filters a frame: edge
+/// padded to the filter's length, centred, unshifted.
+fn filtered_derivatives(frames: &Array3<f32>, filter: FilterName) -> [Array3<f32>; 2] {
+    let (nproj, rows, n) = frames.dim();
+    let w = make_fbp_filter(filter, n, RampShape::Wint).unwrap();
+    let (ne, pad) = (w.len(), w.len() / 2 - n / 2);
+    let dcol = Array3::from_shape_fn((nproj, rows, n), |(t, r, c)| {
+        let (l, h) = (c.saturating_sub(1), (c + 1).min(n - 1));
+        (frames[[t, r, h]] - frames[[t, r, l]]) / (h - l) as f32
+    });
+    let drow = Array3::from_shape_fn((nproj, rows, n), |(t, r, c)| {
+        let (l, h) = (r.saturating_sub(1), (r + 1).min(rows - 1));
+        (frames[[t, h, c]] - frames[[t, l, c]]) / (h - l) as f32
+    });
+    [dcol, drow].map(|mut d| {
+        let mut line = vec![Complex32::new(0.0, 0.0); ne];
+        for mut row in d.rows_mut() {
+            for (k, z) in line.iter_mut().enumerate() {
+                *z = Complex32::new(row[k.saturating_sub(pad).min(n - 1)], 0.0);
+            }
+            CpuBackend.fft_1d(&mut line, ne, 1, false).unwrap();
+            for (z, &wk) in line.iter_mut().zip(&w) {
+                *z *= wk;
+            }
+            CpuBackend.fft_1d(&mut line, ne, 1, true).unwrap();
+            for (k, v) in row.iter_mut().enumerate() {
+                *v = line[pad + k].re;
+            }
+        }
+        d
+    })
+}
+
+/// `shift_gradient` is, per angle, the band's frame from `project` dotted
+/// with the given frame's filtered derivatives, in one chunk or in several
+/// (61 angles: chunks of 4 and a partial angle block), and it refuses frames
+/// that are not one per angle.
+#[test]
+fn cuda_lamino_shift_gradient_is_the_frame_dotted_with_filtered_derivatives() {
+    if cuda_or_skip().is_none() {
+        return;
+    }
+    let (n, nproj, rows, depth, tilt, center) =
+        (64usize, 61usize, 40usize, 48usize, 20.0f32, 33.5f32);
+    let vol = blobs(
+        depth,
+        n,
+        &[(20.0, 26.0, 38.0, 2.5), (28.0, 36.0, 24.0, 3.0)],
+    );
+    let band = vol.slice(s![10..40, .., ..]);
+    let rp = cuda::LaminoReprojector::new(band, 10, depth, tilt, center, rows).unwrap();
+    let theta = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI).0;
+    let frames = Array3::from_shape_fn((nproj, rows, n), |(t, r, c)| {
+        (0.37 * c as f32 + 0.21 * r as f32 + 0.5 * t as f32).sin() + 0.002 * (c * r) as f32
+    });
+    let q = rp.project(&theta).unwrap();
+    for filter in [FilterName::Parzen, FilterName::Ramp] {
+        let h = filtered_derivatives(&frames, filter);
+        let want = Array2::from_shape_fn((nproj, 2), |(t, k)| {
+            q.index_axis(Axis(0), t)
+                .iter()
+                .zip(h[k].index_axis(Axis(0), t))
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum::<f64>()
+        });
+        let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(peak > 0.0);
+        let whole = rp.shift_gradient(&theta, frames.view(), filter).unwrap();
+        // ~194 kB per angle on the device: 3 MB of "free" memory is 4 angles.
+        std::env::set_var("TOMOXIDE_CUDA_MAX_FREE_BYTES", "3000000");
+        let chunked = rp.shift_gradient(&theta, frames.view(), filter);
+        std::env::remove_var("TOMOXIDE_CUDA_MAX_FREE_BYTES");
+        for (name, got) in [("whole", whole), ("chunked", chunked.unwrap())] {
+            for ((t, k), &g) in got.indexed_iter() {
+                let w = want[[t, k]];
+                assert!(
+                    (g - w).abs() < 1e-4 * peak,
+                    "{name} {filter:?} [{t},{k}] {g} want {w} (peak {peak})"
+                );
+            }
+        }
+    }
+    let short = rp.shift_gradient(&theta[..nproj - 1], frames.view(), FilterName::Parzen);
+    assert!(short.is_err());
 }
 
 /// A centre `k` columns right of `n/2` is the same frames moved `k` columns
