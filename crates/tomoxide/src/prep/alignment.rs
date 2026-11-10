@@ -14,7 +14,7 @@ use crate::recon::lprec::{bspline_weights, convert_to_coeffs};
 /// Edge-replicated margin the spline prefilter runs over around a frame
 /// (scipy's `npad` for mode `nearest`): its boundary term has decayed by
 /// `|pole|^12 ≈ 1.4e-7` where the frame starts.
-const SPLINE_PAD: usize = 12;
+pub(crate) const SPLINE_PAD: usize = 12;
 
 /// Linearly scale a projection stack into `[−1, 1]` by its peak magnitude
 /// (tomopy `prep/alignment.py:460` `scale`). Divides every pixel by
@@ -168,7 +168,13 @@ pub fn move_frames(data: &mut Tomo<f32>, dy: &[f32], dx: &[f32], roll_deg: f32) 
 /// The cubic-B-spline coefficients of `frame` (`rows × cols`) padded by
 /// [`SPLINE_PAD`] edge-replicated samples on every side, into `coef`
 /// (`(rows + 2·pad) × (cols + 2·pad)`); `line` holds one padded column.
-fn spline_coeffs(frame: &[f32], rows: usize, cols: usize, coef: &mut [f32], line: &mut [f32]) {
+pub(crate) fn spline_coeffs(
+    frame: &[f32],
+    rows: usize,
+    cols: usize,
+    coef: &mut [f32],
+    line: &mut [f32],
+) {
     let w = cols + 2 * SPLINE_PAD;
     for (r, out) in coef.chunks_exact_mut(w).enumerate() {
         let src = &frame[r.saturating_sub(SPLINE_PAD).min(rows - 1) * cols..][..cols];

@@ -11,11 +11,11 @@ use ndarray::{Array3, Axis};
 use rayon::prelude::*;
 
 use crate::backend::Backend;
-use crate::cuda::LaminoTileFn;
+use crate::cuda::{LaminoBandFocus, LaminoTileFn};
 use crate::data::{Layout, Tomo};
 use crate::error::{Error, Result};
 use crate::geometry::{Angles, Beam, Center, Detector, Geometry};
-use crate::params::{Algorithm, ReconParams};
+use crate::params::{Algorithm, FilterName, ReconParams};
 use crate::pipeline::{CancelToken, PrepOptions};
 use crate::recon::center::{RingCenter, SampleBand, TiltCandidates, TiltFocus, TiltViews};
 use crate::recon::tilt_flow::TiltFlow;
@@ -134,6 +134,60 @@ impl PreppedStack {
         })
     }
 
+    /// This stack binned `f`×`f` on the detector and cropped to whole blocks,
+    /// so column `c` of the result is columns `c·f .. c·f + f`. The block
+    /// mean is taken of the transmission `exp(−p)` and logged again, as
+    /// binning the normalized frames would.
+    pub fn binned(&self, backend: &dyn Backend, f: usize) -> Result<PreppedStack> {
+        if f == 0 || f > self.nz || f > self.nx {
+            return Err(Error::InvalidParam(format!(
+                "bin {f} for {}×{} frames",
+                self.nz, self.nx
+            )));
+        }
+        let (nz, nx) = (self.nz / f, self.nx / f);
+        let proj = self.data.as_layout(Layout::Projection);
+        let src = proj.array.as_standard_layout();
+        let src = src.as_slice().expect("as_standard_layout is standard");
+        let mut out = vec![0.0f32; self.nproj * nz * nx];
+        let inv = 1.0 / (f * f) as f32;
+        out.par_chunks_mut(nz * nx)
+            .zip(src.par_chunks(self.nz * self.nx))
+            .for_each(|(o, p)| {
+                for (r, row) in o.chunks_mut(nx).enumerate() {
+                    for (c, v) in row.iter_mut().enumerate() {
+                        let block = (r * f..(r + 1) * f)
+                            .flat_map(|y| &p[y * self.nx + c * f..y * self.nx + (c + 1) * f]);
+                        *v = block.map(|q| (-q).exp()).sum::<f32>() * inv;
+                    }
+                }
+            });
+        let array = Array3::from_shape_vec((self.nproj, nz, nx), out).expect("sized above");
+        let mut data = Tomo::new(array, Layout::Projection);
+        crate::prep::minus_log(&mut data, backend)?;
+        Ok(PreppedStack {
+            path: self.path.clone(),
+            data,
+            theta: self.theta.clone(),
+            nproj: self.nproj,
+            nz,
+            nx,
+        })
+    }
+
+    /// This stack held on the device to score slices `z.0 ..= z.1` of its
+    /// linerec reconstruction at `tilt_deg`, filtered with `filter`, for
+    /// per-projection shifts and a centre. CUDA-only.
+    pub fn band_focus(
+        &self,
+        filter: FilterName,
+        tilt_deg: f32,
+        z: (usize, usize),
+    ) -> Result<LaminoBandFocus> {
+        let proj = self.data.as_layout(Layout::Projection);
+        LaminoBandFocus::new(proj.array.view(), &self.theta, filter, tilt_deg, z)
+    }
+
     /// Laminography reconstruction of this stack at `geom` (from
     /// [`geometry`](Self::geometry)), streaming its rh-tiles to `on_tile` as
     /// [`reconstruct_lamino_streaming`](crate::reconstruct_lamino_streaming)
@@ -237,7 +291,7 @@ impl PreppedStack {
         })
     }
 
-    /// Fully reconstruct at every tilt and score each by its best slice; see
+    /// Fully reconstruct at every tilt and score each by its mean slice focus; see
     /// [`lamino_tilt_scan`](crate::recon::center::lamino_tilt_scan), which this
     /// runs with Fourierrec and default parameters. CUDA-only.
     pub fn tilt_scan(
@@ -250,8 +304,8 @@ impl PreppedStack {
     ) -> Result<Vec<TiltFocus>> {
         // Default parameters are the tuned analytic path (parzen filter) the
         // laminography goldens reconstruct with. `lamino_rh` left `None` gives
-        // every tilt its own natural depth, which is the point of scoring the
-        // max over all of it.
+        // every tilt its own natural depth, so the scored range is its own
+        // volume's.
         crate::recon::center::lamino_tilt_scan(
             &self.data,
             &self.geometry(center, Some(0.0)), // beam ignored — `tilts_deg` supplies it
@@ -335,5 +389,39 @@ mod tests {
         for (x, y) in a.array.iter().zip(b.array.iter()) {
             assert!((x - y).abs() <= 1e-4 * peak.max(1.0), "{x} vs {y}");
         }
+    }
+
+    /// Each binned pixel is −log of its block's mean transmission, and the
+    /// rows and columns past the last whole block are dropped.
+    #[test]
+    fn binned_is_the_logged_block_mean_of_the_transmission() {
+        let cpu = crate::CpuBackend::new();
+        let st = PreppedStack::load(&cpu, &fixture()).unwrap();
+        let (nproj, nz, nx) = st.shape();
+        let f = 3;
+        let b = st.binned(&cpu, f).unwrap();
+        assert_eq!(b.shape(), (nproj, nz / f, nx / f));
+        assert_eq!(b.theta, st.theta);
+        let a = st.data.as_layout(Layout::Projection);
+        let out = b.data.as_layout(Layout::Projection);
+        for &(i, r, c) in &[
+            (0, 0, 0),
+            (nproj - 1, nz / f - 1, nx / f - 1),
+            (nproj / 2, 1, 2),
+        ] {
+            let mut s = 0.0f64;
+            for y in r * f..(r + 1) * f {
+                for x in c * f..(c + 1) * f {
+                    s += f64::from(-a.array[[i, y, x]]).exp();
+                }
+            }
+            let want = -(s / (f * f) as f64).ln();
+            let got = f64::from(out.array[[i, r, c]]);
+            assert!(
+                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "{got} vs {want}"
+            );
+        }
+        assert!(st.binned(&cpu, 0).is_err());
     }
 }

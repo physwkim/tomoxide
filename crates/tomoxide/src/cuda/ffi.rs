@@ -215,6 +215,104 @@ unsafe extern "C" {
         nproj: i32,
         stream: *mut c_void,
     ) -> i32;
+    /// `d` `[2, nframes, rows, n]`: each frame of `m` `[nframes, rows, n]`
+    /// differentiated along its columns, then along its rows, as numpy's
+    /// `gradient`.
+    #[must_use]
+    pub fn tomoxide_frame_derivatives(
+        m: *const c_void,
+        d: *mut c_void,
+        nframes: i64,
+        rows: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `out` `[nproj, 2]` (pre-zeroed f64) += the inner product of
+    /// [`tomoxide_forwardproject`]'s frame of `f` at each angle with that
+    /// angle's frame of `hx`, and of `hy` (`[nproj, nz, n]` each), without
+    /// forming the projection. Geometry arguments as `tomoxide_forwardproject`.
+    #[must_use]
+    pub fn tomoxide_framedot(
+        out: *mut c_void,
+        f: *const c_void,
+        hx: *const c_void,
+        hy: *const c_void,
+        theta: *const f32,
+        phi: f32,
+        axis: f32,
+        sz: i32,
+        ncz: i32,
+        nz: i32,
+        n: i32,
+        rh: i32,
+        nproj: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // --- band focus (bandfocus.cu) ---
+    /// `m` `[rows, alen, n]`: frames `a0 .. a0 + alen` of the stack whose
+    /// spline coefficients `coef` holds (`[nproj, rows + 24, n + 24]`), moved
+    /// by `dy`/`dx` (device, `[nproj]`) as `PreppedStack::moved` moves them at
+    /// roll 0. With `dmx`/`dmy` non-null, also `m`'s derivative over `dx` and
+    /// over `dy`.
+    #[must_use]
+    pub fn tomoxide_bf_move(
+        m: *mut c_void,
+        dmx: *mut c_void,
+        dmy: *mut c_void,
+        coef: *const c_void,
+        dy: *const f32,
+        dx: *const f32,
+        a0: i32,
+        alen: i32,
+        rows: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `prof` `[nb]` (pre-zeroed f64) += each slice of `v` `[nb, n, n]`'s
+    /// `slice_focus` sum over the pixels `mask` `[n, n]` (u8) keeps.
+    #[must_use]
+    pub fn tomoxide_bf_focus(
+        prof: *mut c_void,
+        v: *const c_void,
+        mask: *const c_void,
+        nb: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `r` `[nb, n, n]` = `scale` × the derivative of those sums over `v`.
+    #[must_use]
+    pub fn tomoxide_bf_focus_grad(
+        r: *mut c_void,
+        v: *const c_void,
+        mask: *const c_void,
+        scale: f32,
+        nb: i32,
+        n: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// `out` `[nproj, 3]` (pre-zeroed f64) += `r` `[ncz, n, n]` dotted with
+    /// the back-projection of each angle of `hx`, `hy` and `hc` (`[nz, nproj,
+    /// n]` each) at unit gain. Geometry arguments as
+    /// [`tomoxide_linerec_backproject`].
+    #[must_use]
+    pub fn tomoxide_bf_framedot3(
+        out: *mut c_void,
+        r: *const c_void,
+        hx: *const c_void,
+        hy: *const c_void,
+        hc: *const c_void,
+        theta: *const f32,
+        phi: f32,
+        axis: f32,
+        sz: i32,
+        ncz: i32,
+        nz: i32,
+        n: i32,
+        rh: i32,
+        nproj: i32,
+        stream: *mut c_void,
+    ) -> i32;
 
     // --- device-resident iterative solver elementwise ops (iterative.cu) ---
     /// `ax[i] = (b[i] - ax[i]) * rw[i]` over `n` elements (in-place into `ax`).
