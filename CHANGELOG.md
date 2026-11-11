@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`prep::alignment::warp_frames` resamples each frame by its own affine
+  map.** A `FrameAffine { a, t }` reads output pixel o at `a·o + t` (row,
+  column), as scipy's `affine_transform` with order 3 and mode nearest. A
+  zone-plate XANES series images each energy at its own scale, which a
+  shift and a roll cannot undo; `move_frames` now builds its map as a
+  `FrameAffine` and resamples through `warp_frames`.
+
 ## [0.13.0] - 2026-11-10
 
 ### Added

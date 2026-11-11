@@ -2,8 +2,9 @@
 //!
 //! `scale` and `blur_edges` are real (bit-exact, Δ=0); the rest of the alignment
 //! family (`shift_images`, `add_jitter`, `align_seq`/`align_joint`) is unported —
-//! see `docs/PORTING.md` §D. [`move_frames`] is not a tomopy port: it applies a
-//! measured per-frame shift and a detector roll in one resampling.
+//! see `docs/PORTING.md` §D. [`warp_frames`] and [`move_frames`] are not tomopy
+//! ports: the first resamples each frame by its own affine map, the second by a
+//! measured per-frame shift and a detector roll, both in one resampling.
 
 use rayon::prelude::*;
 
@@ -106,6 +107,66 @@ pub fn blur_edges(data: &mut Tomo<f32>, low: f64, high: f64) -> Result<()> {
     Ok(())
 }
 
+/// One frame's resampling map on `(row, col)`: the output at `o` reads the
+/// input at `a·o + t`, as `scipy.ndimage.affine_transform(matrix=a, offset=t)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameAffine {
+    pub a: [[f64; 2]; 2],
+    pub t: [f64; 2],
+}
+
+/// Resample every projection by its own map, one cubic-B-spline resampling per
+/// frame: `out[o] = in[a·o + t]` on `(row, col)` with `maps[k]`'s `a` and `t`.
+/// Off the frame it reads the spline of the frame extended by its edges.
+///
+/// This is scipy's `affine_transform(p, a, t, order=3, mode='nearest')`.
+pub fn warp_frames(data: &mut Tomo<f32>, maps: &[FrameAffine]) -> Result<()> {
+    let nproj = data.n_angles();
+    if maps.len() != nproj {
+        return Err(Error::InvalidParam(format!(
+            "warp_frames: {} maps for {nproj} projections",
+            maps.len()
+        )));
+    }
+    if maps
+        .iter()
+        .any(|m| m.a.iter().flatten().chain(&m.t).any(|v| !v.is_finite()))
+    {
+        return Err(Error::InvalidParam("warp_frames: non-finite map".into()));
+    }
+    let (rows, cols) = (data.n_rows(), data.n_cols());
+    if nproj == 0 || rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    let target = data.layout;
+    if target != Layout::Projection || !data.array.is_standard_layout() {
+        *data = data.to_layout(Layout::Projection);
+    }
+    let (h, w) = (rows + 2 * SPLINE_PAD, cols + 2 * SPLINE_PAD);
+    let frames = data.array.as_slice_mut().expect("standard layout");
+    frames
+        .par_chunks_mut(rows * cols)
+        .zip(maps.par_iter())
+        .for_each_init(
+            || (vec![0.0f32; h * w], vec![0.0f32; h]),
+            |(coef, line), (frame, m)| {
+                spline_coeffs(frame, rows, cols, coef, line);
+                let [[a00, a01], [a10, a11]] = m.a;
+                for (i, out) in frame.chunks_exact_mut(cols).enumerate() {
+                    let (r0, c0) = (a00 * i as f64 + m.t[0], a10 * i as f64 + m.t[1]);
+                    for (j, v) in out.iter_mut().enumerate() {
+                        let j = j as f64;
+                        *v = spline_at(coef, h, w, r0 + a01 * j, c0 + a11 * j);
+                    }
+                }
+            },
+        );
+    if target != Layout::Projection {
+        *data = data.to_layout(target);
+    }
+    Ok(())
+}
+
 /// Move every projection by its own shift and one common roll, in a single
 /// cubic-B-spline resampling per frame: `out[o] = in[M·(o + d − c) + c]` on
 /// `(row, col)`, with `d = (dy[k], dx[k])`, `c = ((rows−1)/2, (cols−1)/2)` and
@@ -115,7 +176,8 @@ pub fn blur_edges(data: &mut Tomo<f32>, low: f64, high: f64) -> Result<()> {
 /// edges, as scipy does.
 ///
 /// This is scipy's `shift(rotate(p, roll_deg, reshape=False), (−dy, −dx))`
-/// with `order=3, mode='nearest'`, made as one resampling instead of two.
+/// with `order=3, mode='nearest'`, made as one resampling instead of two: the
+/// [`warp_frames`] map `a = M`, `t = M·(d − c) + c`.
 pub fn move_frames(data: &mut Tomo<f32>, dy: &[f32], dx: &[f32], roll_deg: f32) -> Result<()> {
     let nproj = data.n_angles();
     if dy.len() != nproj || dx.len() != nproj {
@@ -130,39 +192,24 @@ pub fn move_frames(data: &mut Tomo<f32>, dy: &[f32], dx: &[f32], roll_deg: f32) 
             "move_frames: non-finite shift or roll".into(),
         ));
     }
-    let (rows, cols) = (data.n_rows(), data.n_cols());
-    if nproj == 0 || rows == 0 || cols == 0 {
-        return Ok(());
-    }
-    let target = data.layout;
-    if target != Layout::Projection || !data.array.is_standard_layout() {
-        *data = data.to_layout(Layout::Projection);
-    }
     let (sn, cs) = (roll_deg as f64).to_radians().sin_cos();
-    let (cy, cx) = ((rows - 1) as f64 / 2.0, (cols - 1) as f64 / 2.0);
-    let (h, w) = (rows + 2 * SPLINE_PAD, cols + 2 * SPLINE_PAD);
-    let frames = data.array.as_slice_mut().expect("standard layout");
-    frames
-        .par_chunks_mut(rows * cols)
-        .zip(dy.par_iter().zip(dx))
-        .for_each_init(
-            || (vec![0.0f32; h * w], vec![0.0f32; h]),
-            |(coef, line), (frame, (&dy, &dx))| {
-                spline_coeffs(frame, rows, cols, coef, line);
-                for (i, out) in frame.chunks_exact_mut(cols).enumerate() {
-                    let a = i as f64 + dy as f64 - cy;
-                    for (j, v) in out.iter_mut().enumerate() {
-                        let b = j as f64 + dx as f64 - cx;
-                        let (r, c) = (cs * a + sn * b + cy, cs * b - sn * a + cx);
-                        *v = spline_at(coef, h, w, r, c);
-                    }
-                }
-            },
-        );
-    if target != Layout::Projection {
-        *data = data.to_layout(target);
-    }
-    Ok(())
+    let (rows, cols) = (data.n_rows(), data.n_cols());
+    let (cy, cx) = (
+        rows.saturating_sub(1) as f64 / 2.0,
+        cols.saturating_sub(1) as f64 / 2.0,
+    );
+    let maps: Vec<FrameAffine> = dy
+        .iter()
+        .zip(dx)
+        .map(|(&dy, &dx)| {
+            let (a, b) = (dy as f64 - cy, dx as f64 - cx);
+            FrameAffine {
+                a: [[cs, sn], [-sn, cs]],
+                t: [cs * a + sn * b + cy, cs * b - sn * a + cx],
+            }
+        })
+        .collect();
+    warp_frames(data, &maps)
 }
 
 /// The cubic-B-spline coefficients of `frame` (`rows × cols`) padded by
@@ -340,6 +387,49 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 200, "only {checked} interior samples");
+    }
+
+    /// Under a map with scale, shear and a sub-pixel offset it reads what
+    /// scipy 1.13.1's `affine_transform(f, [[0.9, 0.1], [−0.2, 1.1]],
+    /// (0.3, −0.7), order=3, mode='nearest')` reads, past the edge too.
+    #[test]
+    fn warp_frames_reads_as_scipy_affine_transform() {
+        let src = Array3::from_shape_fn((1, 4, 6), |(_, r, c)| {
+            ((3 * r + 7 * c) % 5) as f32 + 0.25 * r as f32
+        });
+        let mut t = Tomo::new(src, Layout::Projection);
+        let map = FrameAffine {
+            a: [[0.9, 0.1], [-0.2, 1.1]],
+            t: [0.3, -0.7],
+        };
+        warp_frames(&mut t, &[map]).unwrap();
+        #[rustfmt::skip]
+        let want = [
+            1.080359, 1.050139, 1.991373, 3.632939, 1.759985, 2.545119,
+            3.153204, 2.626173, 1.016459, 2.002381, 3.929068, 2.499835,
+            1.64036, 1.808876, 3.331622, 1.304466, 2.108485, 3.86987,
+            4.644784, 5.325908, 1.588449, 4.123327, 0.4809509, 3.176043,
+        ];
+        for (k, (&v, &w)) in t.array.iter().zip(&want).enumerate() {
+            assert!((v - w).abs() < 1e-5, "[{}][{}] {v} want {w}", k / 6, k % 6);
+        }
+    }
+
+    #[test]
+    fn warp_frames_rejects_a_map_count_mismatch_or_a_non_finite_map() {
+        let mut t = Tomo::new(rough(2, 4, 4), Layout::Projection);
+        let id = FrameAffine {
+            a: [[1.0, 0.0], [0.0, 1.0]],
+            t: [0.0, 0.0],
+        };
+        let r = warp_frames(&mut t, &[id]);
+        assert!(matches!(r, Err(Error::InvalidParam(_))));
+        let nan = FrameAffine {
+            t: [f64::NAN, 0.0],
+            ..id
+        };
+        let r = warp_frames(&mut t, &[id, nan]);
+        assert!(matches!(r, Err(Error::InvalidParam(_))));
     }
 
     #[test]
