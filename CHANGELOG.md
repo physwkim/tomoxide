@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Breaking: `PreppedStack::center_sweep` takes `on_scored(done, of)`.** A
+  band sweep back-projects the band once per candidate, minutes on a full
+  scan, and said nothing until it returned; the callback runs after each
+  candidate of a tilted band, or each slice of a parallel one.
+
+- **`prep::alignment::warp_frames` resamples each frame by its own affine
+  map.** A `FrameAffine { a, t }` reads output pixel o at `a·o + t` (row,
+  column), as scipy's `affine_transform` with order 3 and mode nearest. A
+  zone-plate XANES series images each energy at its own scale, which a
+  shift and a roll cannot undo; `move_frames` now builds its map as a
+  `FrameAffine` and resamples through `warp_frames`.
+
 ## [0.13.0] - 2026-11-10
 
 ### Added
