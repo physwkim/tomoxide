@@ -276,7 +276,9 @@ impl PreppedStack {
     /// by [`band_focus`](Self::band_focus), a linerec back-projection of it
     /// per candidate; in parallel beam by a probe sweep per slice. A fired
     /// `cancel` stops it at the next probe or candidate with
-    /// [`Error::Cancelled`]. CUDA-only.
+    /// [`Error::Cancelled`]. `on_scored(done, of)` runs after each candidate
+    /// of a tilted band, or each slice of a parallel one, is scored; a sweep
+    /// without a band is one probe and never calls it. CUDA-only.
     pub fn center_sweep(
         &self,
         tilt_deg: Option<f32>,
@@ -284,6 +286,7 @@ impl PreppedStack {
         band: Option<(usize, usize)>,
         centers: &[f32],
         cancel: Option<&CancelToken>,
+        on_scored: &mut dyn FnMut(usize, usize),
     ) -> Result<CenterSweep> {
         // The probe anchors each candidate on its own nominal, so the
         // geometry's centre is not read.
@@ -301,9 +304,11 @@ impl PreppedStack {
                 let still = vec![0.0; self.nproj];
                 centers
                     .iter()
-                    .map(|&c| {
+                    .enumerate()
+                    .map(|(i, &c)| {
                         crate::pipeline::check_cancel(cancel)?;
                         let profile = scorer.profile(&still, &still, c)?;
+                        on_scored(i + 1, centers.len());
                         Ok(profile.iter().sum::<f64>() / profile.len() as f64)
                     })
                     .collect::<Result<_>>()?
@@ -318,6 +323,7 @@ impl PreppedStack {
                 for z in lo..=hi {
                     let scored = crate::recon::center::focus_by_z(probe(z)?.view());
                     sum.iter_mut().zip(scored).for_each(|(s, f)| *s += f);
+                    on_scored(z - lo + 1, hi - lo + 1);
                 }
                 sum.iter().map(|s| s / (hi - lo + 1) as f64).collect()
             }

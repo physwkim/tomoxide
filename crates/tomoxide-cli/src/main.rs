@@ -758,7 +758,7 @@ fn run_align(
 
     let cands = grid(ring.center, center_width, center_step);
     let f = st
-        .center_sweep(lamino_angle, sz, focus_z, &cands, None)?
+        .center_sweep(lamino_angle, sz, focus_z, &cands, None, &mut |_, _| {})?
         .focus;
     curve(&cands, &f, "");
     let center = pick("centre", &cands, &f, "--center_width")?;

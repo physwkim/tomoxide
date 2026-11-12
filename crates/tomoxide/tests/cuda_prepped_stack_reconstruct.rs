@@ -154,15 +154,24 @@ fn center_sweep_scores_the_band_by_its_mean() {
     for tilt in [Some(20.0), None] {
         let depth = stack.depth(tilt);
         let (slice, band) = (depth / 2, (1, depth - 2));
+        let mut said = Vec::new();
         let one = stack
-            .center_sweep(tilt, slice, None, &centers, None)
+            .center_sweep(tilt, slice, None, &centers, None, &mut |i, n| {
+                said.push((i, n))
+            })
             .unwrap();
         assert_eq!(one.scored, (slice, slice));
         assert_eq!(one.focus, focus_by_z(one.frames.view()));
+        assert_eq!(said, []);
         let banded = stack
-            .center_sweep(tilt, slice, Some(band), &centers, None)
+            .center_sweep(tilt, slice, Some(band), &centers, None, &mut |i, n| {
+                said.push((i, n))
+            })
             .unwrap();
         assert_eq!(banded.scored, band);
+        // A tilted band is scored per candidate, a parallel one per slice.
+        let of = tilt.map_or(band.1 - band.0 + 1, |_| centers.len());
+        assert_eq!(said, (1..=of).map(|i| (i, of)).collect::<Vec<_>>());
         let err = nrmse(
             banded.frames.as_slice().unwrap(),
             one.frames.as_slice().unwrap(),
@@ -184,7 +193,7 @@ fn center_sweep_scores_the_band_by_its_mean() {
                 let by_slice: Vec<Vec<f64>> = (band.0..=band.1)
                     .map(|z| {
                         stack
-                            .center_sweep(None, z, None, &centers, None)
+                            .center_sweep(None, z, None, &centers, None, &mut |_, _| {})
                             .unwrap()
                             .focus
                     })
@@ -204,10 +213,17 @@ fn center_sweep_scores_the_band_by_its_mean() {
         assert_ne!(banded.focus, one.focus);
         let fired = tomoxide::CancelToken::new();
         fired.cancel();
-        let stopped = stack.center_sweep(tilt, slice, Some(band), &centers, Some(&fired));
+        let stopped = stack.center_sweep(
+            tilt,
+            slice,
+            Some(band),
+            &centers,
+            Some(&fired),
+            &mut |_, _| {},
+        );
         assert!(matches!(stopped, Err(tomoxide::Error::Cancelled)));
     }
-    let Err(e) = stack.center_sweep(None, 0, Some((3, 2)), &centers, None) else {
+    let Err(e) = stack.center_sweep(None, 0, Some((3, 2)), &centers, None, &mut |_, _| {}) else {
         panic!("an empty band scored");
     };
     assert!(e.to_string().contains("holds no slices"));

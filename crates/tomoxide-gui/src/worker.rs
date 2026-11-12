@@ -430,7 +430,7 @@ fn worker_main(jobs: Receiver<Job>, events: Sender<Event>, ctx: egui::Context) {
                 let t0 = std::time::Instant::now();
                 match ensure_prepped(&engine, &mut prepped, &path).and_then(|st| {
                     let slice = slice.unwrap_or_else(|| st.default_slice(tilt_deg, band));
-                    st.center_sweep(tilt_deg, slice, band, &centers, Some(&cancel))
+                    st.center_sweep(tilt_deg, slice, band, &centers, Some(&cancel), &mut |_, _| {})
                 }) {
                     Ok(sweep) => {
                         let (_n, ny, nx) = sweep.frames.dim();
