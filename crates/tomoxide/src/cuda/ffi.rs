@@ -1383,4 +1383,18 @@ unsafe extern "C" {
         n2: i32,
         stream: *mut c_void,
     ) -> i32;
+    /// `out [nz, ny, nx]` = the median of `v` over the `(2h+1)³` cube about
+    /// each voxel, the volume folded at its ends; with `mask` (u8, null for
+    /// none) among its non-zero voxels alone, NaN off it. `h <= 4`.
+    #[must_use]
+    pub fn tomoxide_median3d(
+        v: *const c_void,
+        mask: *const c_void,
+        out: *mut c_void,
+        nz: i32,
+        ny: i32,
+        nx: i32,
+        h: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }

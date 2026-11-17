@@ -260,6 +260,28 @@ pub fn lamino_reproject(
     LaminoReprojector::new(band, z0, depth, tilt_deg, center, rows)?.project(theta)
 }
 
+/// The median of `v` `[z, y, x]` over the `size³` cube about each voxel, the
+/// volume folded at its ends as scipy's `reflect`: scipy's
+/// `median_filter(v, size)`. With `mask` (same shape) only its non-zero voxels
+/// are counted, an even count giving the mean of the two middles, and a voxel
+/// off the mask comes out NaN. `size` is odd, 1 to 9; `v` is finite where it
+/// is counted. On the first of [`selected_devices`]. CUDA-only.
+pub fn median3d(
+    v: ndarray::ArrayView3<'_, f32>,
+    mask: Option<ndarray::ArrayView3<'_, u8>>,
+    size: usize,
+) -> Result<ndarray::Array3<f32>> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (v, mask, size);
+        Err(Error::Backend("cuda feature not enabled".into()))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        cuda_impl::median3d(v, mask, size)
+    }
+}
+
 /// A band held on the device for [`lamino_reproject`] at any number of angle
 /// chunks, uploaded once. The kernel's `int` indexing and its per-angle shared
 /// cache bound one [`project`](Self::project) to 6144 angles and fewer than
@@ -3248,6 +3270,72 @@ mod cuda_impl {
         )?;
         Array3::from_shape_vec((centers.len(), n, n), out)
             .map_err(|e| Error::InvalidParam(format!("cuda center-probe shape: {e}")))
+    }
+
+    /// See [`super::median3d`].
+    pub(super) fn median3d(
+        v: ndarray::ArrayView3<'_, f32>,
+        mask: Option<ndarray::ArrayView3<'_, u8>>,
+        size: usize,
+    ) -> Result<Array3<f32>> {
+        let (nz, ny, nx) = v.dim();
+        if size.is_multiple_of(2) || size > 9 {
+            return Err(Error::InvalidParam(format!(
+                "median3d size {size}, not odd and at most 9"
+            )));
+        }
+        if mask.is_some_and(|m| m.dim() != v.dim()) {
+            return Err(Error::InvalidParam(
+                "median3d mask and volume differ in shape".into(),
+            ));
+        }
+        let count = nz * ny * nx;
+        if count == 0 || count > i32::MAX as usize {
+            return Err(Error::InvalidParam(format!(
+                "median3d volume of {count} voxels"
+            )));
+        }
+        let dev = *selected_devices().first().unwrap_or(&0);
+        ck(unsafe { ffi::tomoxide_cuda_set_device(dev) }, "set_device")?;
+        let v = v.as_standard_layout();
+        let v_dev = DevBuf::from_host_f32(v.as_slice().expect("standard layout"))?;
+        let m_dev = match mask {
+            None => None,
+            Some(m) => {
+                let m = m.as_standard_layout();
+                let buf = DevBuf::new(count)?;
+                ck(
+                    unsafe {
+                        ffi::tomoxide_cuda_memcpy_h2d(buf.ptr, m.as_ptr() as *const c_void, count)
+                    },
+                    "median3d mask upload",
+                )?;
+                Some(buf)
+            }
+        };
+        let out_dev = DevBuf::new(count * std::mem::size_of::<f32>())?;
+        ck(
+            unsafe {
+                ffi::tomoxide_median3d(
+                    v_dev.ptr,
+                    m_dev
+                        .as_ref()
+                        .map_or(std::ptr::null(), |b| b.ptr as *const c_void),
+                    out_dev.ptr,
+                    nz as i32,
+                    ny as i32,
+                    nx as i32,
+                    (size / 2) as i32,
+                    std::ptr::null_mut(),
+                )
+            },
+            "median3d",
+        )?;
+        ck(unsafe { ffi::tomoxide_cuda_sync() }, "median3d sync")?;
+        let mut out = vec![0.0f32; count];
+        out_dev.to_host_f32(&mut out)?;
+        Array3::from_shape_vec((nz, ny, nx), out)
+            .map_err(|e| Error::InvalidParam(format!("median3d shape: {e}")))
     }
 
     /// See [`super::LaminoReprojector`].
