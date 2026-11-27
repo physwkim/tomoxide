@@ -58,8 +58,7 @@ fn pearson(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
     sxy / (sxx.sqrt() * syy.sqrt())
 }
 
-/// Stack a 2-D phantom into `nz` identical slices (CUDA drops slice 0 by the
-/// `vr < nz-1` boundary guard, so a parity check needs an interior slice).
+/// Stack a 2-D phantom into `nz` identical slices.
 fn stack(slice2d: &Array2<f32>, nz: usize) -> ndarray::Array3<f32> {
     let (h, w) = slice2d.dim();
     let mut v = ndarray::Array3::<f32>::zeros((nz, h, w));
@@ -92,11 +91,10 @@ fn cgls_device_matches_per_iteration_cuda() {
         ..Default::default()
     };
 
-    // Interior slice 1 (slice 0 is dropped by the CUDA ≥2-slice boundary rule).
     let dev = recon::recon(&sino, &geom, Algorithm::Cgls, &p, &cuda).unwrap();
     let host = recon::recon(&sino, &geom, Algorithm::Cgls, &p, &periter).unwrap();
-    let dev2d = dev.array.index_axis(Axis(0), 1).to_owned();
-    let host2d = host.array.index_axis(Axis(0), 1).to_owned();
+    let dev2d = dev.array.index_axis(Axis(0), 0).to_owned();
+    let host2d = host.array.index_axis(Axis(0), 0).to_owned();
 
     let r = rel_l2(&dev2d, &host2d);
     let corr = pearson(&dev2d, &host2d);

@@ -14,12 +14,9 @@
 // Radon transform (unit pixel spacing) — a converged solve of `A x = p` yields
 // the physical μ, matching ART/BART and tomopy `project.c`. Keeping the
 // geometry byte-identical to the back-projector — the (un-flipped) row `ty`,
-// the centre `axis`, the (u, v) formulas, the `(int)(·-1e-5)` tap, and the
-// in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge;
-// both pairs compute their taps through projgeom.cuh.
-// The shared guard `vr < nz-1` drops slice 0 for the parallel beam (`v = tz` ⇒
-// `vr = tz-1`), the documented ≥2-slice rule, exactly as the back-projector
-// does.
+// the centre `axis`, the (u, v) formulas, and the zero-padded tap (`proj_tap`)
+// — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge; both pairs
+// compute their taps through projgeom.cuh.
 // The parallel beam is a gather (forwardprojection_par_ker), the transpose of
 // backprojection_par_ker; a tilted axis is the atomic scatter
 // (forwardprojection_ker), the transpose of backprojection_ker.
@@ -28,6 +25,7 @@
 // by build.rs's `.cu` glob.
 
 #include <cuda_runtime.h>
+#include <limits.h>
 #include <math.h>
 #include <stddef.h>
 
@@ -108,44 +106,50 @@ static __global__ void __launch_bounds__(FWD_X *FWD_Y)
                                    fminf(proj_u(c, s, x0, ye, h, axis), proj_u(c, s, xe, ye, h, axis)));
             const float vm = fminf(fminf(lam_vxy(c, s, cphi, x0, y0, h), lam_vxy(c, s, cphi, xe, y0, h)),
                                    fminf(lam_vxy(c, s, cphi, x0, ye, h), lam_vxy(c, s, cphi, xe, ye, h)));
-            const int u0 = proj_tap(um);
-            const int v0 = proj_tap(fminf(lam_v(vm, sphi, zb, nz), lam_v(vm, sphi, zb + cnt - 1, nz)));
-            const float u = proj_u(c, s, tx, ty, h, axis);
-            const int ur = proj_tap(u);
-            // Same in-bounds guard as the gather; out-of-bounds taps contribute 0.
-            // (int) truncates toward zero, so the lower bound tests u and v, with
-            // the 1e-5 margin the tap gives the upper one: u in (-1, 0) would
-            // otherwise land on column 0 with a weight above 1.
-            if (any & (u > -1e-5f) & (ur < n - 1))
+            const int u0 = proj_tap(um, n).i;
+            const int v0 = proj_tap(fminf(lam_v(vm, sphi, zb, nz), lam_v(vm, sphi, zb + cnt - 1, nz)), nz).i;
+            const Tap cu = proj_tap(proj_u(c, s, tx, ty, h, axis), n);
+            if (any & tap_any(cu))
             {
-                const float fu = u - ur, vxy = lam_vxy(c, s, cphi, tx, ty, h);
-                const int pu = ur - u0;
-                // Adds detector cells (ur, r) and (ur+1, r).
+                const float fu = cu.f, vxy = lam_vxy(c, s, cphi, tx, ty, h);
+                const int ur = cu.i, pu = ur - u0;
+                // Adds detector cells (ur, r) and (ur+1, r), the ones that exist:
+                // a tap off the detector is zero padding and is never written,
+                // so every cell of the patch lies on the detector.
                 auto emit = [&](int r, float wa, float wb) {
+                    if (!tap_in(r, nz))
+                        return;
                     const int pv = r - v0;
                     if ((pu >= 0) & (pu < FWD_P - 1) & (pv >= 0) & (pv < FWD_P))
                     {
                         float *q = patch + pu + pv * FWD_P;
-                        atomicAdd(q, wa);
-                        atomicAdd(q + 1, wb);
+                        if (cu.lo)
+                            atomicAdd(q, wa);
+                        if (cu.hi)
+                            atomicAdd(q + 1, wb);
                     }
                     else
                     {
                         float *q = g + ur + (size_t)t * n + (size_t)r * zs;
-                        atomicAdd(q, wa);
-                        atomicAdd(q + 1, wb);
+                        if (cu.lo)
+                            atomicAdd(q, wa);
+                        if (cu.hi)
+                            atomicAdd(q + 1, wb);
                     }
                 };
                 // (r0a, r0b) hold row `row`, (r1a, r1b) row `row`+1. v is
                 // monotone in z, so a row the taps have moved past is complete.
-                int row = -2;
+                // Row -1 is a real pair (its row 0 exists), so "no row yet" is
+                // a value no tap reaches.
+                const int NO_ROW = INT_MIN / 2;
+                int row = NO_ROW;
                 float r0a = 0.f, r0b = 0.f, r1a = 0.f, r1b = 0.f;
 #pragma unroll
                 for (int z = 0; z < FWD_G; z++)
                 {
-                    const float v = lam_v(vxy, sphi, zb + z, nz);
-                    const int vr = proj_tap(v);
-                    if ((val[z] != 0.f) & (v > -1e-5f) & (vr < nz - 1))
+                    const Tap rv = proj_tap(lam_v(vxy, sphi, zb + z, nz), nz);
+                    const int vr = rv.i;
+                    if ((val[z] != 0.f) & tap_any(rv))
                     {
                         if (vr == row + 1)
                         {
@@ -159,7 +163,7 @@ static __global__ void __launch_bounds__(FWD_X *FWD_Y)
                         }
                         else if (vr != row)
                         {
-                            if (row >= 0)
+                            if (row != NO_ROW)
                             {
                                 emit(row, r0a, r0b);
                                 emit(row + 1, r1a, r1b);
@@ -169,14 +173,14 @@ static __global__ void __launch_bounds__(FWD_X *FWD_Y)
                         row = vr;
                         // Transpose of the 4-tap bilinear gather: val into the
                         // same taps with the same weights.
-                        const float fv = v - vr, a = val[z];
+                        const float fv = rv.f, a = val[z];
                         r0a += a * (1 - fu) * (1 - fv);
                         r0b += a * (0 + fu) * (1 - fv);
                         r1a += a * (1 - fu) * (0 + fv);
                         r1b += a * (0 + fu) * (0 + fv);
                     }
                 }
-                if (row >= 0)
+                if (row != NO_ROW)
                 {
                     emit(row, r0a, r0b);
                     emit(row + 1, r1a, r1b);
@@ -210,9 +214,10 @@ static __device__ __forceinline__ void par_gather(float *acc, const float *src, 
     const size_t nn = (size_t)n * n;
     const bool xdom = fabsf(c) >= fabsf(s);
     const float a = xdom ? c : s, b = xdom ? s : c; // u = a*(i-h) + b*(j-h) + axis
-    // ub is tapped by voxels with ur == ub or ur+1 == ub, i.e. u in [ub-1, ub+1];
-    // for ub < 2 the range starts at -1, which covers the guard's u > -1e-5.
-    const float lo = ub >= 2 ? ub - 1 : -1, hi = ub + 1;
+    // ub is tapped by voxels with ⌊u⌋ == ub or ⌊u⌋ + 1 == ub, i.e. u in
+    // (ub - 1, ub + 1). Column ub exists, so the tap that lands on it is never
+    // zero padding.
+    const float lo = ub - 1, hi = ub + 1;
     for (int j = 0; j < n; j++)
     {
         float base = b * (j - h) + axis;
@@ -223,16 +228,12 @@ static __device__ __forceinline__ void par_gather(float *acc, const float *src, 
         int i1 = min(n - 1, (int)ceilf(fmaxf(ia, ib)) + 1);
         for (int i = i0; i <= i1; i++)
         {
-            float u = xdom ? proj_u(c, s, i, j, h, axis) : proj_u(c, s, j, i, h, axis);
-            int ur = proj_tap(u);
-            if (!((u > -1e-5f) & (ur < n - 1)))
-                continue;
-            float fu = u - ur;
+            Tap cu = proj_tap(xdom ? proj_u(c, s, i, j, h, axis) : proj_u(c, s, j, i, h, axis), n);
             float w;
-            if (ur == ub)
-                w = 1 - fu;
-            else if (ur + 1 == ub)
-                w = fu;
+            if (cu.i == ub)
+                w = 1 - cu.f;
+            else if (cu.i + 1 == ub)
+                w = cu.f;
             else
                 continue;
             const float *p = src + i + (size_t)j * n;
@@ -259,7 +260,7 @@ static __global__ void forwardprojection_par_ker(float *g, const float *f, const
         return;
     unsigned ok = 0;
     for (int z = 0; z < PAR_G && zl + z < zn; z++)
-        if (par_row_ok(z0 + zl + z + off, nz))
+        if (tap_in(z0 + zl + z + off, nz))
             ok |= 1u << z;
     if (ok == 0)
         return;
@@ -412,8 +413,8 @@ static __global__ void framedot_ker(double *out, const float *f, const float *hx
         ax[a] = ay[a] = 0.0f;
     if (tx < n && ty < n)
     {
-        float cphi = __cosf(phi);
-        float sphi = __sinf(phi);
+        const int h = n / 2, zb = sz - rh / 2; // zz of slice tz is zb + tz
+        const float cphi = __cosf(phi), sphi = __sinf(phi);
         for (int tz = 0; tz < ncz; tz++)
         {
             float val = f[tx + ty * n + tz * n * n];
@@ -424,26 +425,15 @@ static __global__ void framedot_ker(double *out, const float *f, const float *hx
             {
                 if (t0 + a >= nproj)
                     continue;
-                // forwardprojection_ker's u, v, tap and guard, term for term.
-                float ctheta = sc[a];
-                float stheta = ss[a];
-                float R0 = ctheta, R1 = stheta;
-                float R3 = stheta * cphi, R4 = -ctheta * cphi, R5 = sphi;
-                float u = R0 * (tx - n / 2) + R1 * (ty - n / 2) + axis;
-                float v = R3 * (tx - n / 2) + R4 * (ty - n / 2) + R5 * (tz + sz - rh / 2) + nz / 2;
-                int ur = (int)(u - 1e-5f);
-                int vr = (int)(v - 1e-5f);
-                if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
+                // forwardprojection_ker's taps: the cells it scatters into.
+                const float c = sc[a], s = ss[a];
+                const Tap cu = proj_tap(proj_u(c, s, tx, ty, h, axis), n);
+                const Tap rv = proj_tap(lam_v(lam_vxy(c, s, cphi, tx, ty, h), sphi, zb + tz, nz), nz);
+                if (tap_any(cu) & tap_any(rv))
                 {
-                    float fu = u - ur;
-                    float fv = v - vr;
-                    size_t o = ((size_t)(t0 + a) * nz + vr) * n + ur;
-                    float w00 = (1 - fu) * (1 - fv), w10 = fu * (1 - fv);
-                    float w01 = (1 - fu) * fv, w11 = fu * fv;
-                    ax[a] += val * (w00 * __ldg(hx + o) + w10 * __ldg(hx + o + 1) +
-                                    w01 * __ldg(hx + o + n) + w11 * __ldg(hx + o + n + 1));
-                    ay[a] += val * (w00 * __ldg(hy + o) + w10 * __ldg(hy + o + 1) +
-                                    w01 * __ldg(hy + o + n) + w11 * __ldg(hy + o + n + 1));
+                    const ptrdiff_t o = ((ptrdiff_t)(t0 + a) * nz + rv.i) * n + cu.i;
+                    ax[a] += val * lam_bilerp(hx + o, n, cu, rv);
+                    ay[a] += val * lam_bilerp(hy + o, n, cu, rv);
                 }
             }
         }

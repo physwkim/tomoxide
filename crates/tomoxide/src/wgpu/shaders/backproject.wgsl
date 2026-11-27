@@ -55,11 +55,15 @@ fn backproject(@builtin(global_invocation_id) gid : vec3<u32>,
         let t = gx * c + gy * sn + ctr;
         let t0 = floor(t);
         let i0 = i32(t0);
-        // && short-circuits, so u32(i0) is only evaluated when i0 >= 0.
-        if (i0 >= 0 && u32(i0) + 1u < params.ncols) {
-            let frac = t - t0;
-            let off = base + ia * params.ncols + u32(i0);
-            acc = acc + sino[off] * (1.0 - frac) + sino[off + 1u] * frac;
+        let frac = t - t0;
+        // `linear_taps` (backend.rs): taps ⌊t⌋ and ⌊t⌋ + 1, zero off the
+        // detector. u32(i32) keeps the bits, so a negative tap fails `< ncols`.
+        let row = base + ia * params.ncols;
+        if (u32(i0) < params.ncols) {
+            acc = acc + sino[row + u32(i0)] * (1.0 - frac);
+        }
+        if (u32(i0 + 1) < params.ncols) {
+            acc = acc + sino[row + u32(i0 + 1)] * frac;
         }
     }
     vol[flat] = acc * params.scale;

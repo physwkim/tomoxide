@@ -674,6 +674,22 @@ pub trait RayProject {
     fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>>;
 }
 
+/// The linear taps of detector coordinate `t` over samples `0..n`: sample `⌊t⌋`
+/// with weight `1 − frac` and `⌊t⌋ + 1` with weight `frac`, a sample off the
+/// detector being zero and so left out. Every pixel-driven parallel projector —
+/// CPU, wgpu (`backproject.wgsl`, `project.wgsl`) and CUDA (`proj_tap` in
+/// `cuda/projgeom.cuh`) — uses this one rule, so they agree at the detector
+/// edges too.
+#[inline(always)]
+pub(crate) fn linear_taps(t: f32, n: usize) -> impl Iterator<Item = (usize, f32)> {
+    let t0 = t.floor();
+    let i0 = t0 as isize;
+    let frac = t - t0;
+    [(i0, 1.0 - frac), (i0 + 1, frac)]
+        .into_iter()
+        .filter_map(move |(i, w)| usize::try_from(i).ok().filter(|&i| i < n).map(|i| (i, w)))
+}
+
 /// Parallel-beam row-action rows for an `n × n` grid — the shared,
 /// backend-independent geometry behind every [`RayProject`] implementation.
 ///
@@ -681,7 +697,8 @@ pub trait RayProject {
 /// rows: each pixel `(iy, ix)` projects to
 /// `t = (ix − n/2)·cosθ + (iy − n/2)·sinθ + center` and splits linearly between
 /// detector columns `⌊t⌋` and `⌊t⌋+1`, so `rows[p][⌊t⌋]` gains weight `1 − frac`
-/// and `rows[p][⌊t⌋+1]` gains `frac`. These are exactly the rows of the same
+/// and `rows[p][⌊t⌋+1]` gains `frac` ([`linear_taps`]: a column off the
+/// detector gains nothing). These are exactly the rows of the same
 /// operator `R` the simultaneous methods use. A single `center` (row 0) is used
 /// for all slices, matching tomopy `art`.
 ///
@@ -711,17 +728,10 @@ pub(crate) fn parallel_ray_rows(geom: &Geometry, n: usize) -> Result<Vec<Vec<Ray
             let gy = iy as f32 - c0;
             for ix in 0..n {
                 let gx = ix as f32 - c0;
-                let t = gx * cs + gy * sn + center;
-                let t0 = t.floor();
-                let i0 = t0 as isize;
-                if i0 >= 0 && (i0 as usize) + 1 < ncols {
-                    let frac = t - t0;
-                    let pix = (iy * n + ix) as u32;
-                    let d0 = i0 as usize;
-                    arows[d0].pixels.push(pix);
-                    arows[d0].weights.push(1.0 - frac);
-                    arows[d0 + 1].pixels.push(pix);
-                    arows[d0 + 1].weights.push(frac);
+                let pix = (iy * n + ix) as u32;
+                for (d, w) in linear_taps(gx * cs + gy * sn + center, ncols) {
+                    arows[d].pixels.push(pix);
+                    arows[d].weights.push(w);
                 }
             }
         }

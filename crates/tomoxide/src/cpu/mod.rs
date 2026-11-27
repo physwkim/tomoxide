@@ -10,8 +10,8 @@
 #![forbid(unsafe_code)]
 
 use crate::backend::{
-    Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft, FilteredBackproject,
-    ForwardProject, RampShape, RankFilter, RayProject, RayRow,
+    linear_taps, Backend, DeviceBuffer, DeviceKind, Elementwise, FbpFilter, Fft,
+    FilteredBackproject, ForwardProject, RampShape, RankFilter, RayProject, RayRow,
 };
 use crate::data::{Frames, Layout, Tomo, Volume};
 use crate::dtype::{Complex32, Dtype, Element};
@@ -419,9 +419,10 @@ impl FilteredBackproject for CpuBackend {
     ///
     /// For each output pixel `(iy, ix)` and angle θ the detector coordinate is
     /// `t = (ix − cx)·cosθ + (iy − cy)·sinθ + center`; the (already filtered, for
-    /// FBP) sinogram is sampled there by linear interpolation and summed over
-    /// angles — no gain. The FBP angular-quadrature weight `π / n_angles` (the
-    /// dθ of the back-projection integral) is applied by the analytic dispatcher
+    /// FBP) sinogram is sampled there by linear interpolation ([`linear_taps`],
+    /// zero off the detector) and summed over angles — no gain. The FBP
+    /// angular-quadrature weight `π / n_angles` (the dθ of the back-projection
+    /// integral) is applied by the analytic dispatcher
     /// (`recon::analytic`), NOT here, so the iterative solvers get the exact
     /// unweighted adjoint of [`ForwardProject::project`]. Slices (`z` rows) are
     /// independent and run in parallel via rayon; `center` is taken per row. The
@@ -485,14 +486,10 @@ impl FilteredBackproject for CpuBackend {
                         let gx = ix as f32 - cx;
                         let mut acc = 0.0f32;
                         for (ia, &(c, sn)) in trig.iter().enumerate() {
-                            let t = gx * c + gy * sn + center;
-                            let t0 = t.floor();
-                            let i0 = t0 as isize;
-                            if i0 >= 0 && (i0 as usize) + 1 < ncols {
-                                let frac = t - t0;
-                                let off = base + ia * ncols + i0 as usize;
-                                acc += sino_slice[off] * (1.0 - frac) + sino_slice[off + 1] * frac;
-                            }
+                            let row = &sino_slice[base + ia * ncols..][..ncols];
+                            acc += linear_taps(gx * c + gy * sn + center, ncols)
+                                .map(|(i, w)| row[i] * w)
+                                .sum::<f32>();
                         }
                         slab[iy * nx + ix] = acc;
                     }
@@ -563,14 +560,8 @@ impl ForwardProject for CpuBackend {
                         }
                         let gx = ix as f32 - cx;
                         for (ia, &(c, sn)) in trig.iter().enumerate() {
-                            let t = gx * c + gy * sn + center;
-                            let t0 = t.floor();
-                            let i0 = t0 as isize;
-                            if i0 >= 0 && (i0 as usize) + 1 < ncols {
-                                let frac = t - t0;
-                                let off = ia * ncols + i0 as usize;
-                                slab[off] += f * (1.0 - frac);
-                                slab[off + 1] += f * frac;
+                            for (i, w) in linear_taps(gx * c + gy * sn + center, ncols) {
+                                slab[ia * ncols + i] += f * w;
                             }
                         }
                     }

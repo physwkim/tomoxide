@@ -38,9 +38,12 @@ void cfunc_linerec::ensure_texture() {
     resDesc.resType = cudaResourceTypeArray;
     resDesc.res.array.array = tex_array;
 
+    // Border (borderColor zeroed by `= {}`) reads 0 off the detector: the
+    // zero-padded tap of projgeom.cuh. Every fp16 caller builds ncz == nz, so
+    // the texture's rows are the detector rows.
     cudaTextureDesc texDesc = {};
-    texDesc.addressMode[0] = cudaAddressModeClamp;
-    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.addressMode[0] = cudaAddressModeBorder;
+    texDesc.addressMode[1] = cudaAddressModeBorder;
     texDesc.filterMode = cudaFilterModeLinear;
     texDesc.readMode = cudaReadModeElementType;
     texDesc.normalizedCoords = 0;

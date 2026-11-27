@@ -1315,28 +1315,15 @@ mod cuda_impl {
             let sino_slice = sino_std
                 .as_slice()
                 .expect("as_standard_layout is C-contiguous");
-            // Batch-domain minimum (same family as `IterativeReconstruct::
-            // solve`): the kernel's z-bilinear sampling needs ≥2 slices — a
-            // 1-slice batch back-projects to zero. Duplicate the row (the
-            // interpolation weights sum to 1 on identical rows, so the result
-            // is exact) and drop the duplicate after download.
-            let nz_run = nz.max(2);
-            let dup;
-            let sino_slice = if nz_run != nz {
-                dup = [sino_slice, sino_slice].concat();
-                &dup[..]
-            } else {
-                sino_slice
-            };
 
             // Device buffers: filtered sinogram, theta, output volume.
             let g = DevBuf::from_host_f32(sino_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
-            let f = DevBuf::zeroed(nz_run * ncols * ncols * std::mem::size_of::<f32>())?;
+            let f = DevBuf::zeroed(nz * ncols * ncols * std::mem::size_of::<f32>())?;
 
             // cfunc_linerec(nproj, nz, n, ncproj=nproj, ncz=nz): whole stack at once.
             let handle = Handle::new(
-                unsafe { ffi::tomoxide_linerec_new(nproj, nz_run, ncols, nproj, nz_run) },
+                unsafe { ffi::tomoxide_linerec_new(nproj, nz, ncols, nproj, nz) },
                 ffi::tomoxide_linerec_free,
                 "cfunc_linerec",
             )?;
@@ -1351,7 +1338,7 @@ mod cuda_impl {
                         pg.axis,
                         1.0, // pure adjoint Wᵀ — no angular-quadrature gain
                         0,
-                        nz_run as i32, // parallel beam: rh == nz
+                        nz as i32, // parallel beam: rh == nz
                         std::ptr::null_mut(),
                     )
                 },
@@ -1363,9 +1350,8 @@ mod cuda_impl {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
 
-            let mut host = vec![0.0f32; nz_run * ncols * ncols];
+            let mut host = vec![0.0f32; nz * ncols * ncols];
             f.to_host_f32(&mut host)?;
-            host.truncate(nz * ncols * ncols);
             out.array = Array3::from_shape_vec((nz, ncols, ncols), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?;
             Ok(())
@@ -1466,26 +1452,13 @@ mod cuda_impl {
             let vol_slice = vol_std
                 .as_slice()
                 .expect("as_standard_layout is C-contiguous");
-            // Batch-domain minimum (same family as `IterativeReconstruct::
-            // solve`): the kernel's z-bilinear scatter needs ≥2 slices — a
-            // 1-slice volume forward-projects to zero. Duplicate the slice
-            // (exact: the interpolation weights sum to 1 on identical rows)
-            // and drop the duplicate after download.
-            let nz_run = nz.max(2);
-            let dup;
-            let vol_slice = if nz_run != nz {
-                dup = [vol_slice, vol_slice].concat();
-                &dup[..]
-            } else {
-                vol_slice
-            };
 
             // Device buffers: input volume, theta, zeroed output sinogram (the
             // kernel accumulates into it), the gather's scratch.
             let f = DevBuf::from_host_f32(vol_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
-            let g = DevBuf::zeroed(nz_run * nproj * n * std::mem::size_of::<f32>())?;
-            let scratch = fwd_scratch(pg.phi, n, nz_run)?;
+            let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
+            let scratch = fwd_scratch(pg.phi, n, nz)?;
             let (sp, sb) = scratch_raw(&scratch);
 
             ck(
@@ -1497,10 +1470,10 @@ mod cuda_impl {
                         pg.phi, // π/2 (parallel beam)
                         pg.axis,
                         0,
-                        nz_run as i32,
-                        nz_run as i32,
+                        nz as i32,
+                        nz as i32,
                         n as i32,
-                        nz_run as i32, // parallel beam: rh == nz
+                        nz as i32, // parallel beam: rh == nz
                         nproj as i32,
                         sp,
                         sb,
@@ -1514,9 +1487,8 @@ mod cuda_impl {
                 return Err(Error::Backend(format!("cuda kernel sync failed ({rc})")));
             }
 
-            let mut host = vec![0.0f32; nz_run * nproj * n];
+            let mut host = vec![0.0f32; nz * nproj * n];
             g.to_host_f32(&mut host)?;
-            host.truncate(nz * nproj * n);
             let array = Array3::from_shape_vec((nz, nproj, n), host)
                 .map_err(|e| Error::InvalidParam(format!("cuda sinogram shape: {e}")))?;
             *out = Tomo::new(array, Layout::Sinogram);
@@ -2743,34 +2715,8 @@ mod cuda_impl {
                         .map(Some);
                 }
             }
-            // Batch-domain minimum, same family as the analytic paths: the
-            // z-bilinear forward/back-projection kernel pair samples slice
-            // pairs (vr, vr+1), so a 1-slice problem forward-projects to zero
-            // and never converges. Duplicate the slice into a 2-slice problem
-            // — identical neighbouring rows make the z-interpolation exact
-            // (the weights sum to 1) and the duplicated blocks are independent
-            // copies of the same problem, so every solver's iterates (incl.
-            // the global dot products of GRAD/TIKH/CGLS: numerator and
-            // denominator both double) match the single-slice solve — and
-            // drop the duplicate row from the output.
-            let padded = nz == 1;
-            let sino2: Tomo<f32>;
-            let sino: &Tomo<f32> = if padded {
-                let a = ndarray::concatenate(ndarray::Axis(0), &[s.array.view(), s.array.view()])
-                    .map_err(|e| Error::InvalidParam(format!("pad 1-slice sinogram: {e}")))?;
-                sino2 = Tomo::new(a, Layout::Sinogram);
-                &sino2
-            } else {
-                sino
-            };
-            let init_host = init_host.map(|mut v| {
-                if padded {
-                    v.extend_from_within(..);
-                }
-                v
-            });
             let init = init_host.as_deref();
-            let solved = match algorithm {
+            match algorithm {
                 Algorithm::Sirt => sirt_device(sino, geom, n, it, init).map(Some),
                 Algorithm::Mlem => {
                     em_device(sino, geom, n, it, vec![(0..nproj).collect()], init).map(Some)
@@ -2808,16 +2754,13 @@ mod cuda_impl {
                     // Tikhonov prior: reg_data ([nz,n,n] flat) or zeros. Wrong-sized
                     // reg_data ⇒ fall back so the host raises the shape error.
                     let reg1 = params.reg_par.get(1).copied().unwrap_or(0.0);
-                    let mut prior = if params.reg_data.is_empty() {
+                    let prior = if params.reg_data.is_empty() {
                         vec![0.0f32; nz * n * n]
                     } else if params.reg_data.len() == nz * n * n {
                         params.reg_data.clone()
                     } else {
                         return Ok(None);
                     };
-                    if padded {
-                        prior.extend_from_within(..);
-                    }
                     grad_device(
                         sino,
                         geom,
@@ -2835,14 +2778,6 @@ mod cuda_impl {
                 }
                 Algorithm::Cgls => cgls_device(sino, geom, n, it, init).map(Some),
                 _ => Ok(None),
-            };
-            match solved {
-                Ok(Some(v)) if padded => Ok(Some(Volume::new(v.array.slice_move(ndarray::s![
-                    0..1,
-                    ..,
-                    ..
-                ])))),
-                other => other,
             }
         }
     }
@@ -3437,12 +3372,6 @@ mod cuda_impl {
                 return Err(Error::InvalidParam(format!(
                     "lamino reprojection: band {z0}..{} exceeds depth {depth}",
                     z0 + nb
-                )));
-            }
-            // The kernel's bilinear row taps need two detector rows.
-            if rows < 2 {
-                return Err(Error::InvalidParam(format!(
-                    "lamino reprojection needs ≥2 rows; got {rows}"
                 )));
             }
             if nb * n * n > i32::MAX as usize {
@@ -6520,12 +6449,9 @@ mod cuda_impl {
             return analytic_fbp_chunk(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
         }
         // Tiling is needed. Size chunks so TWO are resident (half the memory
-        // budget) and run them through the async H2D∥compute∥D2H pipeline. Chunks
-        // are an even split that stays ≥2 slices (the cfunc_linerec invariant) —
-        // a greedy `[tile, …, 1]` tail would silently zero its last slice.
+        // budget) and run them through the async H2D∥compute∥D2H pipeline.
         let tile = fbp_tile_z(nproj, ncols, n, pad, device_free_bytes() / 2, false).min(nz.max(1));
-        let k = linerec_chunk_count(nz, nz.div_ceil(tile));
-        let chunks = even_z_chunks(nz, k);
+        let chunks = even_z_chunks(nz, nz.div_ceil(tile));
         analytic_fbp_pipeline(raw, w, theta, &chunks, nz, nproj, ncols, n, pad, pad_side)
     }
 
@@ -6787,8 +6713,7 @@ mod cuda_impl {
             return analytic_fbp_chunk_f16(raw, w, theta, nz, nproj, ncols, n, pad, pad_side);
         }
         let tile = fbp_tile_z(nproj, ncols, n, pad, budget / 2, true).min(nz.max(1));
-        let k = linerec_chunk_count(nz, nz.div_ceil(tile));
-        let chunks = even_z_chunks(nz, k);
+        let chunks = even_z_chunks(nz, nz.div_ceil(tile));
         analytic_fbp_pipeline_f16(raw, w, theta, &chunks, nz, nproj, ncols, n, pad, pad_side)
     }
 
@@ -8701,18 +8626,15 @@ mod cuda_impl {
                 ));
             }
 
-            // Kernel batch-domain minimums, same rule as `streaming()`: the
-            // z-bilinear back-projection samples slice pairs (vr, vr+1), so a
-            // 1-slice stack back-projects to zero (kernels_linerec.cuh
-            // `vr < nz-1`), and Fourierrec packs slice pairs (s, s+nz/2) for
-            // the real-FFT path, so it needs an even count. Pad the sinogram
-            // (and its per-row filter weights) with zero rows and drop the pad
-            // rows from the output volume.
+            // Fourierrec packs slice pairs (s, s+nz/2) for the real-FFT path,
+            // so it needs an even count, same rule as `streaming()`: pad an odd
+            // stack (and its per-row filter weights) with a zero row and drop
+            // it from the output volume.
             let nz_out = nz;
-            let mut nz = nz.max(2);
-            if matches!(algorithm, Algorithm::Fourierrec) && nz % 2 != 0 {
-                nz += 1;
-            }
+            let nz = match algorithm {
+                Algorithm::Fourierrec => nz + nz % 2,
+                _ => nz,
+            };
             let padded: Vec<f32>;
             let raw = if nz != nz_out {
                 let mut v = Vec::with_capacity(nz * nproj * ncols);
@@ -8749,7 +8671,7 @@ mod cuda_impl {
                         analytic_fbp_stream_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     Algorithm::Fourierrec => {
-                        // nz is even here by the batch-domain pad above.
+                        // nz is even here by the pad above.
                         analytic_fourierrec_f16(raw, &w, theta, nz, nproj, ncols, n, pad, pad_side)?
                     }
                     other => {
@@ -8769,11 +8691,7 @@ mod cuda_impl {
             let vol = match algorithm {
                 Algorithm::Fbp | Algorithm::Linerec => {
                     let devices = selected_devices();
-                    // cfunc_linerec interpolates across z, so each device's chunk
-                    // must hold ≥2 slices or it back-projects to zeros. Cap the
-                    // split at nz/2 GPUs: a 4-GPU nz=4 job would otherwise hand
-                    // every GPU a single slice and reconstruct an all-zero volume.
-                    let k = linerec_chunk_count(nz, devices.len());
+                    let k = devices.len().min(nz);
                     if k <= 1 {
                         ck(
                             unsafe {
@@ -8840,7 +8758,7 @@ mod cuda_impl {
                     }
                 }
                 Algorithm::Fourierrec => {
-                    // nz is even here by the batch-domain pad above.
+                    // nz is even here by the pad above.
                     let devices = selected_devices();
                     ck(
                         unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
@@ -8895,19 +8813,13 @@ mod cuda_impl {
             let f16 = params.dtype == crate::dtype::Dtype::F16;
             let fourier = matches!(algorithm, Algorithm::Fourierrec);
             let is_lprec = matches!(algorithm, Algorithm::Lprec);
-            // The device kernels have batch-domain minimums the stream capacity
-            // must respect: the z-bilinear back-projection samples slice pairs
-            // (vr, vr+1), so a 1-slice batch back-projects to zero
-            // (kernels_linerec.cuh `vr < nz-1`), and Fourierrec packs slice
-            // pairs (s, s+max_nz/2) for the real-FFT path, so it needs an even
-            // count. Allocate the stream at the padded capacity; chunks smaller
-            // than capacity go through the existing partial-chunk path (zeroed
-            // sino tail in `reconstruct_chunk*`, tail rows dropped in
-            // `finish_recon`), which never reads the pad rows as data.
-            let mut max_nz = max_nz.max(2);
-            if fourier && !max_nz.is_multiple_of(2) {
-                max_nz += 1;
-            }
+            // Fourierrec packs slice pairs (s, s+max_nz/2) for the real-FFT
+            // path, so it needs an even count. Allocate the stream at the
+            // padded capacity; chunks smaller than capacity go through the
+            // existing partial-chunk path (zeroed sino tail in
+            // `reconstruct_chunk*`, tail rows dropped in `finish_recon`),
+            // which never reads the pad rows as data.
+            let max_nz = if fourier { max_nz + max_nz % 2 } else { max_nz };
             // lprec's gather/scatter + spline runtime is f32-only (no f16 port);
             // f16 lprec falls back to the per-chunk host-interp path.
             if is_lprec && f16 {
@@ -9161,24 +9073,9 @@ mod cuda_impl {
         by_mem.min(by_idx).max(1)
     }
 
-    /// Single owner of cfunc_linerec's "chunk needs ≥2 z-slices" invariant: the
-    /// kernel interpolates the back-projection vertically across slices, so a
-    /// chunk holding a single slice reconstructs to **all zeros**. Given a desired
-    /// number of contiguous z-chunks `want` (device count for the multi-GPU split,
-    /// or the memory/index tile count for single-GPU streaming), returns a count
-    /// that keeps an even split at ≥2 slices per chunk — capped at `nz/2`, floored
-    /// at 1. `nz < 4` collapses to a single whole-stack chunk (two ≥2 chunks don't
-    /// fit); `nz < 2` is the kernel's own single-slice degenerate case, closed by
-    /// the batch-domain zero-pad in `reconstruct`/`streaming` (both hand the
-    /// kernels ≥2 slices).
-    fn linerec_chunk_count(nz: usize, want: usize) -> usize {
-        want.min(nz / 2).max(1)
-    }
-
     /// Split `nz` into `k` contiguous chunks whose lengths differ by at most one
     /// (the first `nz % k` chunks get one extra slice), as `(start, len)` pairs
-    /// summing to `nz`. With `k` from [`linerec_chunk_count`] every chunk holds
-    /// ≥2 slices, so no chunk back-projects to zeros.
+    /// summing to `nz`.
     fn even_z_chunks(nz: usize, k: usize) -> Vec<(usize, usize)> {
         let base = nz / k;
         let rem = nz % k;

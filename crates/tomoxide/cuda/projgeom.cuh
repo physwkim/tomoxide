@@ -7,8 +7,9 @@
 #define PROJGEOM_CUH
 
 // The tilt every parallel-beam caller passes (Rust `FRAC_PI_2`). At this tilt
-// the detector row of slice tz is the integer tz + sz - rh/2 + nz/2, so the
-// parallel kernels read that one row instead of interpolating between two.
+// the detector row of slice tz is the integer r = tz + sz - rh/2 + nz/2, so its
+// row taps are r with weight 1 and r + 1 with weight 0: the parallel kernels
+// read row r alone, and a slice contributes iff tap_in(r, nz).
 static inline __host__ __device__ bool is_parallel_tilt(float phi)
 {
     return phi == 1.57079632679489661923f;
@@ -25,10 +26,47 @@ static __device__ __forceinline__ float proj_u(float c, float s, int x, int y, i
     return __fmaf_rn(c, (float)(x - h), __fmaf_rn(s, (float)(y - h), axis));
 }
 
-// tomocupy's tap: truncation toward zero, so u in (-1, 0] also taps column 0.
-static __device__ __forceinline__ int proj_tap(float u)
+// Whether sample i of n exists.
+static __device__ __forceinline__ bool tap_in(int i, int n)
 {
-    return (int)(u - 1e-5f);
+    return (unsigned)i < (unsigned)n;
+}
+
+// The linear taps of detector coordinate t over samples [0, n): sample i = ⌊t⌋
+// with weight 1 - f and sample i + 1 with weight f. A sample off the detector is
+// zero, so lo/hi say which of the two exist and an absent one is never read or
+// written. The CPU and wgpu projectors (`backend::linear_taps`) use the same rule.
+struct Tap
+{
+    int i;
+    float f;
+    bool lo, hi;
+};
+static __device__ __forceinline__ Tap proj_tap(float t, int n)
+{
+    int i = __float2int_rd(t);
+    return {i, __fsub_rn(t, (float)i), tap_in(i, n), tap_in(i + 1, n)};
+}
+static __device__ __forceinline__ bool tap_any(Tap k)
+{
+    return k.lo | k.hi;
+}
+
+// Bilinear sample at column taps cu and row taps rv, q = &stack[rv.i][..][cu.i]
+// with row stride zs; a tap off the detector reads 0 and is not loaded. The
+// reconstruction, both probes and the frame-dot kernels sample through this one
+// helper with the roundings spelled out, so a probed slice is bit-identical to
+// the same slice of the reconstruction.
+template <typename T>
+static __device__ __forceinline__ float lam_bilerp(const T *q, size_t zs, Tap cu, Tap rv)
+{
+    float q00 = cu.lo & rv.lo ? (float)q[0] : 0.f;
+    float q01 = cu.hi & rv.lo ? (float)q[1] : 0.f;
+    float q10 = cu.lo & rv.hi ? (float)q[zs] : 0.f;
+    float q11 = cu.hi & rv.hi ? (float)q[zs + 1] : 0.f;
+    float a = __fmaf_rn(q01, cu.f, __fmul_rn(q00, 1.f - cu.f));
+    float b = __fmaf_rn(q11, cu.f, __fmul_rn(q10, 1.f - cu.f));
+    return __fmaf_rn(b, rv.f, __fmul_rn(a, 1.f - rv.f));
 }
 
 // Tilted detector row v of voxel (x, y) in slice zz = tz + sz - rh/2, split so
@@ -42,15 +80,6 @@ static __device__ __forceinline__ float lam_vxy(float c, float s, float cphi, in
 static __device__ __forceinline__ float lam_v(float vxy, float sphi, int zz, int nz)
 {
     return __fadd_rn(__fmaf_rn(sphi, (float)zz, vxy), (float)(nz / 2));
-}
-
-// Whether a parallel-beam slice landing on detector row r contributes. This is
-// the tilted kernel's row guard evaluated at v = r (`vr = (int)(v-1e-5f)`,
-// `v > -1e-5f`, `vr < nz-1`), so the parallel kernels are the same operator.
-static __device__ __forceinline__ bool par_row_ok(int r, int nz)
-{
-    int vr = (int)((float)r - 1e-5f);
-    return ((float)r > -1e-5f) & (vr < nz - 1);
 }
 
 #endif

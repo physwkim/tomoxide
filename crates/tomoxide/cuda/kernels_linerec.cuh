@@ -1,18 +1,6 @@
 #include "defs.cuh"
 #include "projgeom.cuh"
 
-// Bilinear sample at (ur + fu, vr + fv) of the filtered stack, q = &data[vr][t][ur],
-// row stride zs. The reconstruction and both probes sample through this one helper
-// with the roundings spelled out, so a probed slice is bit-identical to the same
-// slice of the reconstruction.
-template <typename T>
-static __device__ __forceinline__ float lam_bilerp(const T *q, size_t zs, float fu, float fv)
-{
-    float a = __fmaf_rn((float)q[1], fu, __fmul_rn((float)q[0], 1.f - fu));
-    float b = __fmaf_rn((float)q[zs + 1], fu, __fmul_rn((float)q[zs], 1.f - fu));
-    return __fmaf_rn(b, fv, __fmul_rn(a, 1.f - fv));
-}
-
 #ifdef HALF
 // The f16 back-projection path uses a hardware-interpolated layered texture
 // (below). The f32 path keeps the direct-gather kernel (in the #else branch):
@@ -88,17 +76,12 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
         float u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+axis;
         float v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-rh/2) + nz/2;
 
-        int ur = (int)(u-1e-5f);
-        int vr = (int)(v-1e-5f);
-
-        // Keep the original in-bounds guard: out-of-bounds taps must add 0,
-        // whereas the texture's clamp addressing would return edge texels.
-        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
-        {
-            // Texel i is sampled at coordinate i+0.5, so u+0.5 reproduces
-            // (1-frac(u))*T[ur] + frac(u)*T[ur+1] (and likewise for v).
+        // Texel i is sampled at coordinate i+0.5, so u+0.5 reproduces
+        // (1-frac(u))*T[⌊u⌋] + frac(u)*T[⌊u⌋+1] (and likewise for v), and the
+        // border addressing reads 0 off the detector: proj_tap's rule. The test
+        // only skips the fetches of pairs wholly off the detector.
+        if (tap_any(proj_tap(u, n)) & tap_any(proj_tap(v, nz)))
             f0 += tex2DLayered<float>(tex, u + 0.5f, v + 0.5f, t);
-        }
     }
     f[tx + ty * n + tz * n * n] += static_cast<real>(f0*c);
 }
@@ -144,23 +127,17 @@ void __global__ backprojection_ker(float *f, const float *data, const float *the
     for (int t = 0; t < nproj; t++)
     {
         float ct = ssc[t], st = ssc[nproj + t];
-        float u = proj_u(ct, st, tx, ty, h, axis);
-        int ur = proj_tap(u);
-        // the lower bound tests u and v, as in forwardprojection_ker
-        if (!((u > -1e-5f) & (ur < n - 1)))
+        Tap cu = proj_tap(proj_u(ct, st, tx, ty, h, axis), n);
+        if (!tap_any(cu))
             continue;
-        float fu = u - ur;
         float vxy = lam_vxy(ct, st, cphi, tx, ty, h);
-        const float *p = data + ur + (size_t)t * n;
+        const float *p = data + cu.i + (size_t)t * n;
 #pragma unroll
         for (int z = 0; z < LAM_G; z++)
         {
-            float v = lam_v(vxy, sphi, zb + z, nz);
-            int vr = proj_tap(v);
-            if ((z < cnt) & (v > -1e-5f) & (vr < nz - 1))
-            {
-                acc[z] += lam_bilerp(p + (size_t)vr * zs, zs, fu, v - vr);
-            }
+            Tap rv = proj_tap(lam_v(vxy, sphi, zb + z, nz), nz);
+            if ((z < cnt) & tap_any(rv))
+                acc[z] += lam_bilerp(p + (ptrdiff_t)rv.i * (ptrdiff_t)zs, zs, cu, rv);
         }
     }
 #pragma unroll
@@ -179,16 +156,18 @@ static __device__ __forceinline__ void par_accumulate(float *acc, const float *s
     const size_t zs = (size_t)n * nproj;
     for (int t = 0; t < nproj; t++)
     {
-        float u = proj_u(ssc[t], ssc[nproj + t], tx, ty, h, axis);
-        int ur = proj_tap(u);
-        if (!((u > -1e-5f) & (ur < n - 1)))
+        Tap cu = proj_tap(proj_u(ssc[t], ssc[nproj + t], tx, ty, h, axis), n);
+        if (!tap_any(cu))
             continue;
-        float fu = u - ur;
-        const float *p = d0 + ur + (size_t)t * n;
+        // A tap off the detector weighs 0 on the column of the tap that
+        // exists: unpredicated loads, ~5% faster than reading it as 0.
+        const int ca = cu.lo ? cu.i : cu.i + 1, cb = cu.hi ? cu.i + 1 : cu.i;
+        const float wa = cu.lo ? 1 - cu.f : 0.f, wb = cu.hi ? cu.f : 0.f;
+        const float *p = d0 + (size_t)t * n;
 #pragma unroll
         for (int z = 0; z < PAR_G; z++)
             if (!MASKED || ((ok >> z) & 1u))
-                acc[z] += p[z * zs] * (1 - fu) + p[z * zs + 1] * fu;
+                acc[z] += p[z * zs + ca] * wa + p[z * zs + cb] * wb;
     }
 }
 
@@ -215,7 +194,7 @@ void __global__ backprojection_par_ker(float *f, const float *data, const float 
     const int off = sz - rh / 2 + nz / 2; // detector row of slice tz is tz + off
     unsigned ok = 0;
     for (int z = 0; z < PAR_G && z0 + z < ncz; z++)
-        if (par_row_ok(z0 + z + off, nz))
+        if (tap_in(z0 + z + off, nz))
             ok |= 1u << z;
     float acc[PAR_G];
 #pragma unroll
@@ -269,12 +248,10 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
     {
         float ctheta = ssc[t];
         float stheta = ssc[nproj + t];
-        float u = __fsub_rn(proj_u(ctheta, stheta, tx, ty, h, (float)h), sh[tz]);
-        float v = lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, sz - rh / 2, nz);
-        int ur = proj_tap(u);
-        int vr = proj_tap(v);
-        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
-            f0 += lam_bilerp(data + ur + (size_t)t * n + (size_t)vr * zs, zs, u - ur, v - vr);
+        Tap cu = proj_tap(__fsub_rn(proj_u(ctheta, stheta, tx, ty, h, (float)h), sh[tz]), n);
+        Tap rv = proj_tap(lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, sz - rh / 2, nz), nz);
+        if (tap_any(cu) & tap_any(rv))
+            f0 += lam_bilerp(data + cu.i + (size_t)t * n + (ptrdiff_t)rv.i * (ptrdiff_t)zs, zs, cu, rv);
     }
     f[tx + ty * n + tz * n * n] += static_cast<real>(f0*c);
 }
@@ -314,12 +291,10 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
     {
         float ctheta = ssc[t];
         float stheta = ssc[nproj + t];
-        float u = proj_u(ctheta, stheta, tx, ty, h, (float)h);
-        float v = lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, sz - rh[tz] / 2, nz);
-        int ur = proj_tap(u);
-        int vr = proj_tap(v);
-        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
-            f0 += lam_bilerp(data + ur + (size_t)t * n + (size_t)vr * zs, zs, u - ur, v - vr);
+        Tap cu = proj_tap(proj_u(ctheta, stheta, tx, ty, h, (float)h), n);
+        Tap rv = proj_tap(lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, sz - rh[tz] / 2, nz), nz);
+        if (tap_any(cu) & tap_any(rv))
+            f0 += lam_bilerp(data + cu.i + (size_t)t * n + (ptrdiff_t)rv.i * (ptrdiff_t)zs, zs, cu, rv);
     }
     // No y-flip and the caller's dθ gain, like every other kernel here: tomocupy
     // writes `(n-ty-1)` and scales by 4/nproj, and this file's ports were moved
