@@ -135,9 +135,11 @@ void __global__ backprojection_ker(float *f, const float *data, const float *the
 #pragma unroll
         for (int z = 0; z < LAM_G; z++)
         {
+            // Branch-free (a per-slice branch cost 3%): lam_bilerp loads only
+            // the taps that exist, so a pair off the detector adds 0, and the
+            // slices z >= cnt are summed but never stored.
             Tap rv = proj_tap(lam_v(vxy, sphi, zb + z, nz), nz);
-            if ((z < cnt) & tap_any(rv))
-                acc[z] += lam_bilerp(p + (ptrdiff_t)rv.i * (ptrdiff_t)zs, zs, cu, rv);
+            acc[z] += lam_bilerp(p + (ptrdiff_t)rv.i * (ptrdiff_t)zs, zs, cu, rv);
         }
     }
 #pragma unroll
