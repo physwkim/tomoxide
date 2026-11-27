@@ -1,4 +1,5 @@
 #include "defs.cuh"
+#include "projgeom.cuh"
 
 #ifdef HALF
 // The f16 back-projection path uses a hardware-interpolated layered texture
@@ -154,6 +155,70 @@ void __global__ backprojection_ker(real *f, real *data, float *theta, float phi,
         }
     }
     f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
+}
+
+// Accumulates the PAR_G slices whose detector rows start at d0 (stride zs);
+// MASKED skips the slices not set in ok, so a group lying wholly inside the
+// detector runs the branch-free instantiation.
+template <bool MASKED>
+static __device__ __forceinline__ void par_accumulate(float *acc, const float *ssc, const float *d0, unsigned ok, int tx, int ty, float axis, int n, int nproj)
+{
+    const int h = n / 2;
+    const size_t zs = (size_t)n * nproj;
+    for (int t = 0; t < nproj; t++)
+    {
+        float u = proj_u(ssc[t], ssc[nproj + t], tx, ty, h, axis);
+        int ur = proj_tap(u);
+        if (!((u > -1e-5f) & (ur < n - 1)))
+            continue;
+        float fu = u - ur;
+        const float *p = d0 + ur + (size_t)t * n;
+#pragma unroll
+        for (int z = 0; z < PAR_G; z++)
+            if (!MASKED || ((ok >> z) & 1u))
+                acc[z] += p[z * zs] * (1 - fu) + p[z * zs + 1] * fu;
+    }
+}
+
+// Parallel-beam back-projection (is_parallel_tilt(phi)). The tilted kernel's
+// v-interpolation weighs row r = tz + sz - rh/2 + nz/2 by exactly 1 and its
+// neighbour by 0 at this tilt, so this kernel reads row r alone and each thread
+// reuses one column tap for PAR_G slices: backprojection_ker's operator up to
+// summation order, at a quarter of its loads.
+void __global__ backprojection_par_ker(float *f, const float *data, const float *theta, float axis, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
+{
+    int tx = blockDim.x * blockIdx.x + threadIdx.x;
+    int ty = blockDim.y * blockIdx.y + threadIdx.y;
+    int z0 = blockIdx.z * PAR_G;
+    extern __shared__ float ssc[]; // [0,nproj)=cos, [nproj,2*nproj)=sin
+    for (int t = threadIdx.x + blockDim.x * threadIdx.y; t < nproj; t += blockDim.x * blockDim.y)
+    {
+        ssc[t] = __cosf(theta[t]);
+        ssc[nproj + t] = __sinf(theta[t]);
+    }
+    __syncthreads();
+    if (tx >= n || ty >= n)
+        return;
+
+    const int off = sz - rh / 2 + nz / 2; // detector row of slice tz is tz + off
+    unsigned ok = 0;
+    for (int z = 0; z < PAR_G && z0 + z < ncz; z++)
+        if (par_row_ok(z0 + z + off, nz))
+            ok |= 1u << z;
+    float acc[PAR_G];
+#pragma unroll
+    for (int z = 0; z < PAR_G; z++)
+        acc[z] = 0.f;
+    // Row z0+off may lie outside the stack; only rows with their ok bit set are read.
+    const float *d0 = data + (ptrdiff_t)(z0 + off) * n * nproj;
+    if (ok == (1u << PAR_G) - 1)
+        par_accumulate<false>(acc, ssc, d0, ok, tx, ty, axis, n, nproj);
+    else
+        par_accumulate<true>(acc, ssc, d0, ok, tx, ty, axis, n, nproj);
+#pragma unroll
+    for (int z = 0; z < PAR_G; z++)
+        if (z0 + z < ncz)
+            f[tx + (size_t)ty * n + (size_t)(z0 + z) * n * n] += acc[z] * c;
 }
 
 #endif // HALF

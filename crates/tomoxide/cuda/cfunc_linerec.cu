@@ -73,7 +73,13 @@ int cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi
     // converges to the physical μ.
     backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
 #else
-    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
+    if (is_parallel_tilt(phi)) {
+        dim3 parBlock(32, 16, 1);
+        dim3 parGrid(ceil(n / 32.0), ceil(n / 16.0), (ncz + PAR_G - 1) / PAR_G);
+        backprojection_par_ker<<<parGrid, parBlock, shmem, stream>>>(f, g, theta, axis, gain, sz, ncz, n, nz, rh, ncproj);
+    } else {
+        backprojection_ker<<<GS3d0, dimBlock, shmem, stream>>>(f, g, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
+    }
 #endif
     return (int)cudaGetLastError();
 }
