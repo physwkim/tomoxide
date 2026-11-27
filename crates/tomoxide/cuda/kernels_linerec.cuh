@@ -161,10 +161,13 @@ static __device__ __forceinline__ void par_accumulate(float *acc, const float *s
         Tap cu = proj_tap(proj_u(ssc[t], ssc[nproj + t], tx, ty, h, axis), n);
         if (!tap_any(cu))
             continue;
-        // A tap off the detector weighs 0 on the column of the tap that
-        // exists: unpredicated loads, ~5% faster than reading it as 0.
+        // With one tap off the detector both loads read the existing column at
+        // half its weight: unpredicated loads (~5% faster than reading the
+        // absent tap as 0), no 0 · sample term (NaN for an Inf sample), and
+        // halving is exact, so the pair sums to the one-tap product.
         const int ca = cu.lo ? cu.i : cu.i + 1, cb = cu.hi ? cu.i + 1 : cu.i;
-        const float wa = cu.lo ? 1 - cu.f : 0.f, wb = cu.hi ? cu.f : 0.f;
+        const float w = cu.lo ? 1 - cu.f : cu.f;
+        const float wa = cu.lo & cu.hi ? w : 0.5f * w, wb = cu.lo & cu.hi ? cu.f : 0.5f * w;
         const float *p = d0 + (size_t)t * n;
 #pragma unroll
         for (int z = 0; z < PAR_G; z++)

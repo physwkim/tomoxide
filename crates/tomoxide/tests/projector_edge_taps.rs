@@ -130,10 +130,39 @@ fn check_parallel(label: &str, fwd: &dyn ForwardProject, bp: &dyn FilteredBackpr
     }
 }
 
+/// Infinite samples on both edge columns: a tap that exists multiplies its
+/// sample even at weight 0 (∞·0 = NaN), a tap off the detector adds nothing.
+/// θ = 0 puts every voxel on an integer column, so the weights are exactly 1
+/// and 0 on every backend and the NaN/∞ pattern is the rule's, not rounding's.
+fn check_infinite_edges(label: &str, bp: &dyn FilteredBackproject) {
+    let ang = vec![0.0f32];
+    for nz in [1usize, 3] {
+        let geom = Geometry::parallel(Angles(ang.clone()), N, nz, 1.0);
+        let mut sino = Array3::from_shape_vec((nz, 1, N), fill(11 + nz as u64, nz * N)).unwrap();
+        for z in 0..nz {
+            sino[[z, 0, 0]] = f32::INFINITY;
+            sino[[z, 0, N - 1]] = f32::NEG_INFINITY;
+        }
+        let mut f = Volume::new(Array3::zeros((nz, N, N)));
+        bp.backproject(&Tomo::new(sino.clone(), Layout::Sinogram), &geom, &mut f)
+            .unwrap();
+        for (i, &want) in ref_backproject(&sino, &ang).indexed_iter() {
+            let got = f.array[i];
+            let same = if want.is_finite() {
+                (got - want).abs() <= 1e-4
+            } else {
+                got.is_nan() == want.is_nan() && (want.is_nan() || got == want)
+            };
+            assert!(same, "{label} nz={nz} voxel {i:?}: got {got}, want {want}");
+        }
+    }
+}
+
 #[test]
 fn cpu_projectors_follow_the_edge_rule() {
     let cpu = CpuBackend::new();
     check_parallel("cpu", &cpu, &cpu);
+    check_infinite_edges("cpu", &cpu);
 }
 
 /// The ART/BART rows are the forward projector's rows.
@@ -177,6 +206,7 @@ fn cuda_projectors_follow_the_edge_rule() {
         }
     };
     check_parallel("cuda", &cuda, &cuda);
+    check_infinite_edges("cuda", &cuda);
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -190,4 +220,5 @@ fn wgpu_projectors_follow_the_edge_rule() {
         }
     };
     check_parallel("wgpu", &gpu, &gpu);
+    check_infinite_edges("wgpu", &gpu);
 }
