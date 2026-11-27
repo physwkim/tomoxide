@@ -31,6 +31,19 @@ static __device__ __forceinline__ int proj_tap(float u)
     return (int)(u - 1e-5f);
 }
 
+// Tilted detector row v of voxel (x, y) in slice zz = tz + sz - rh/2, split so
+// the (x, y) part lam_vxy is computed once for every slice of a column. cphi and
+// sphi are __cosf/__sinf(phi); at the parallel tilt __cosf gives exactly 0, so
+// v is the integer zz + nz/2.
+static __device__ __forceinline__ float lam_vxy(float c, float s, float cphi, int x, int y, int h)
+{
+    return __fmaf_rn(__fmul_rn(s, cphi), (float)(x - h), __fmul_rn(__fmul_rn(-c, cphi), (float)(y - h)));
+}
+static __device__ __forceinline__ float lam_v(float vxy, float sphi, int zz, int nz)
+{
+    return __fadd_rn(__fmaf_rn(sphi, (float)zz, vxy), (float)(nz / 2));
+}
+
 // Whether a parallel-beam slice landing on detector row r contributes. This is
 // the tilted kernel's row guard evaluated at v = r (`vr = (int)(v-1e-5f)`,
 // `v > -1e-5f`, `vr < nz-1`), so the parallel kernels are the same operator.

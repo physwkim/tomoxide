@@ -13,10 +13,10 @@
 // {A, Aᵀ} = {Wᵀ, W} is a true adjoint pair AND `A` is the plain line-integral
 // Radon transform (unit pixel spacing) — a converged solve of `A x = p` yields
 // the physical μ, matching ART/BART and tomopy `project.c`. Keeping the
-// geometry byte-identical to `backprojection_ker` — the (un-flipped) row `ty`,
-// the centre `axis`, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
+// geometry byte-identical to the back-projector — the (un-flipped) row `ty`,
+// the centre `axis`, the (u, v) formulas, the `(int)(·-1e-5)` tap, and the
 // in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge;
-// the parallel-beam pair shares its taps through projgeom.cuh.
+// both pairs compute their taps through projgeom.cuh.
 // The shared guard `vr < nz-1` drops slice 0 for the parallel beam (`v = tz` ⇒
 // `vr = tz-1`), the documented ≥2-slice rule, exactly as the back-projector
 // does.
@@ -73,20 +73,18 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 
     float cphi = __cosf(phi);
     float sphi = __sinf(phi);
-    float R[6] = {};
+    const int h = n / 2;
     for (int t = 0; t < nproj; t++)
     {
         float ctheta = ssc[t];
         float stheta = ssc[nproj + t];
-        R[0] = ctheta;       R[1] = stheta;        R[2] = 0;
-        R[3] = stheta * cphi; R[4] = -ctheta * cphi; R[5] = sphi;
-        float u = R[0] * (tx - n / 2) + R[1] * (ty - n / 2) + axis;
+        float u = proj_u(ctheta, stheta, tx, ty, h, axis);
         // Volume z centred on rh/2 (the volume's own midpoint), detector row on
-        // nz/2 — mirrors backprojection_ker so {A, Aᵀ} stays an exact transpose.
-        float v = R[3] * (tx - n / 2) + R[4] * (ty - n / 2) + R[5] * (tz + sz - rh / 2) + nz / 2;
+        // nz/2 — the taps of backprojection_ker, through the same helpers.
+        float v = lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, tz + sz - rh / 2, nz);
 
-        int ur = (int)(u - 1e-5f);
-        int vr = (int)(v - 1e-5f);
+        int ur = proj_tap(u);
+        int vr = proj_tap(v);
 
         // Same in-bounds guard as the gather; out-of-bounds taps contribute 0.
         // (int) truncates toward zero, so the lower bound tests u and v, with the

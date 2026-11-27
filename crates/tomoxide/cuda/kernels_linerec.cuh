@@ -1,6 +1,18 @@
 #include "defs.cuh"
 #include "projgeom.cuh"
 
+// Bilinear sample at (ur + fu, vr + fv) of the filtered stack, q = &data[vr][t][ur],
+// row stride zs. The reconstruction and both probes sample through this one helper
+// with the roundings spelled out, so a probed slice is bit-identical to the same
+// slice of the reconstruction.
+template <typename T>
+static __device__ __forceinline__ float lam_bilerp(const T *q, size_t zs, float fu, float fv)
+{
+    float a = __fmaf_rn((float)q[1], fu, __fmul_rn((float)q[0], 1.f - fu));
+    float b = __fmaf_rn((float)q[zs + 1], fu, __fmul_rn((float)q[zs], 1.f - fu));
+    return __fmaf_rn(b, fv, __fmul_rn(a, 1.f - fv));
+}
+
 #ifdef HALF
 // The f16 back-projection path uses a hardware-interpolated layered texture
 // (below). The f32 path keeps the direct-gather kernel (in the #else branch):
@@ -93,68 +105,68 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
 
 #else // !HALF: f32 direct-gather back-projection (see note above)
 
-// `rh` = full reconstruction height; volume z centres on rh/2, detector row on
-// nz/2 (see the note on `backprojection_tex_ker`). `axis` = detector column
-// voxel column n/2 reads, as in forwardprojection_ker.
-void __global__ backprojection_ker(real *f, real *data, float *theta, float phi, float axis, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
+// Slices one thread of backprojection_ker covers: the column tap and the (x, y)
+// part of the row depend on (x, y, θ) only, so they are computed once per group.
+#define LAM_G 8
+
+// Tilted-axis back-projection, bilinear in (u, v). `rh` = full reconstruction
+// height; volume z centres on rh/2, detector row on nz/2 (see the note on
+// `backprojection_tex_ker`). `axis` = detector column voxel column n/2 reads, as
+// in forwardprojection_ker. Each thread accumulates LAM_G slices of one (x, y).
+// cos/sin(theta) is cached per block in 2*nproj floats of dynamic shared memory
+// (the 48 KB default holds nproj up to 6144), filled before the bounds guard so
+// every thread reaches __syncthreads.
+void __global__ backprojection_ker(float *f, const float *data, const float *theta, float phi, float axis, float c, int sz, int ncz, int n, int nz, int rh, int nproj)
 {
     int tx = blockDim.x * blockIdx.x + threadIdx.x;
     int ty = blockDim.y * blockIdx.y + threadIdx.y;
-    int tz = blockDim.z * blockIdx.z + threadIdx.z;
-    // cos/sin(theta[t]) is identical for every (tx,ty,tz); compute it once per
-    // block into shared memory instead of nproj transcendentals per thread.
-    // Done before the bounds guard so all threads reach __syncthreads (threads
-    // that would early-return must not skip the barrier).
-    // ssc holds 2*nproj floats = 8*nproj bytes of dynamic shared memory; the
-    // launch passes that size, bounded by the 48 KB/block default (nproj up to
-    // 6144, far beyond any real scan).
+    int z0 = blockIdx.z * LAM_G;
     extern __shared__ float ssc[]; // [0,nproj)=cos, [nproj,2*nproj)=sin
+    for (int t = threadIdx.x + blockDim.x * threadIdx.y; t < nproj; t += blockDim.x * blockDim.y)
     {
-        int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
-        int nthreads = blockDim.x * blockDim.y * blockDim.z;
-        for (int t = tid; t < nproj; t += nthreads)
-        {
-            ssc[t] = __cosf(theta[t]);
-            ssc[nproj + t] = __sinf(theta[t]);
-        }
+        ssc[t] = __cosf(theta[t]);
+        ssc[nproj + t] = __sinf(theta[t]);
     }
     __syncthreads();
-    if (tx >= n || ty >= n || tz >= ncz)
+    if (tx >= n || ty >= n)
         return;
-    float u = 0;
-    float v = 0;
-    int ur = 0;
-    int vr = 0;
 
-    real f0 = 0;
-    float cphi = __cosf(phi);
-    float sphi = __sinf(phi);
-    float R[6] = {};
-
-    for (int t = 0; t<nproj; t++)
+    const int h = n / 2;
+    const int cnt = min(LAM_G, ncz - z0);
+    const int zb = z0 + sz - rh / 2; // zz of the group's first slice
+    const float cphi = __cosf(phi);
+    const float sphi = __sinf(phi);
+    const size_t zs = (size_t)n * nproj;
+    float acc[LAM_G];
+#pragma unroll
+    for (int z = 0; z < LAM_G; z++)
+        acc[z] = 0.f;
+    for (int t = 0; t < nproj; t++)
     {
-        float ctheta = ssc[t];
-        float stheta = ssc[nproj + t];
-        R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
-        R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
-        u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+axis;
-        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(tz+sz-rh/2) + nz/2;
-
-        ur = (int)(u-1e-5f);
-        vr = (int)(v-1e-5f);
-
-        // linear interp; the lower bound tests u and v, as in forwardprojection_ker
-        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
+        float ct = ssc[t], st = ssc[nproj + t];
+        float u = proj_u(ct, st, tx, ty, h, axis);
+        int ur = proj_tap(u);
+        // the lower bound tests u and v, as in forwardprojection_ker
+        if (!((u > -1e-5f) & (ur < n - 1)))
+            continue;
+        float fu = u - ur;
+        float vxy = lam_vxy(ct, st, cphi, tx, ty, h);
+        const float *p = data + ur + (size_t)t * n;
+#pragma unroll
+        for (int z = 0; z < LAM_G; z++)
         {
-            u = u-ur;
-            v = v-vr;
-            f0 +=   data[ur+0+t*n+(vr+0)*n*nproj]*static_cast<real>((1-u)*(1-v))+
-                    data[ur+1+t*n+(vr+0)*n*nproj]*static_cast<real>((0+u)*(1-v))+
-                    data[ur+0+t*n+(vr+1)*n*nproj]*static_cast<real>((1-u)*(0+v))+
-                    data[ur+1+t*n+(vr+1)*n*nproj]*static_cast<real>((0+u)*(0+v));
+            float v = lam_v(vxy, sphi, zb + z, nz);
+            int vr = proj_tap(v);
+            if ((z < cnt) & (v > -1e-5f) & (vr < nz - 1))
+            {
+                acc[z] += lam_bilerp(p + (size_t)vr * zs, zs, fu, v - vr);
+            }
         }
     }
-    f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
+#pragma unroll
+    for (int z = 0; z < LAM_G; z++)
+        if (z < cnt)
+            f[tx + (size_t)ty * n + (size_t)(z0 + z) * n * n] += acc[z] * c;
 }
 
 // Accumulates the PAR_G slices whose detector rows start at d0 (stride zs);
@@ -247,41 +259,24 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
     __syncthreads();
     if (tx >= n || ty >= n || tz >= ncz)
         return;
-    float u = 0;
-    float v = 0;
-    int ur = 0;
-    int vr = 0;
-
-    real f0 = 0;
+    const int h = n / 2;
+    const size_t zs = (size_t)n * nproj;
+    float f0 = 0;
     float cphi = __cosf(phi);
     float sphi = __sinf(phi);
-    float R[6] = {};
 
     for (int t = 0; t<nproj; t++)
     {
         float ctheta = ssc[t];
         float stheta = ssc[nproj + t];
-        R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
-        R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
-        u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2-sh[tz];
-        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(sz-rh/2) + nz/2;
-        
-        ur = (int)(u-1e-5f);
-        vr = (int)(v-1e-5f);            
-        
-        // linear interp            
+        float u = __fsub_rn(proj_u(ctheta, stheta, tx, ty, h, (float)h), sh[tz]);
+        float v = lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, sz - rh / 2, nz);
+        int ur = proj_tap(u);
+        int vr = proj_tap(v);
         if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz-1))
-        {
-            u = u-ur;
-            v = v-vr;                
-            f0 +=   data[ur+0+t*n+(vr+0)*n*nproj]*static_cast<real>((1-u)*(1-v))+
-                    data[ur+1+t*n+(vr+0)*n*nproj]*static_cast<real>((0+u)*(1-v))+
-                    data[ur+0+t*n+(vr+1)*n*nproj]*static_cast<real>((1-u)*(0+v))+
-                    data[ur+1+t*n+(vr+1)*n*nproj]*static_cast<real>((0+u)*(0+v));
-                    
-        }
+            f0 += lam_bilerp(data + ur + (size_t)t * n + (size_t)vr * zs, zs, u - ur, v - vr);
     }
-    f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
+    f[tx + ty * n + tz * n * n] += static_cast<real>(f0*c);
 }
 // `phi` and `rh` are per-tz: each tz slot probes one tilt candidate, and the
 // full reconstruction height depends on the tilt (`lamino_recon_height`), so
@@ -309,39 +304,22 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
     __syncthreads();
     if (tx >= n || ty >= n || tz >= ncz)
         return;
-    float u = 0;
-    float v = 0;
-    int ur = 0;
-    int vr = 0;
-
-    real f0 = 0;
+    const int h = n / 2;
+    const size_t zs = (size_t)n * nproj;
+    float f0 = 0;
     float cphi = __cosf(phi[tz]);
     float sphi = __sinf(phi[tz]);
-    float R[6] = {};
 
     for (int t = 0; t<nproj; t++)
     {
         float ctheta = ssc[t];
         float stheta = ssc[nproj + t];
-        R[0] =  ctheta;       R[1] =  stheta;        R[2] = 0;
-        R[3] =  stheta*cphi;  R[4] = -ctheta*cphi;   R[5] = sphi;
-        u = R[0]*(tx-n/2)+R[1]*(ty-n/2)+n/2;
-        v = R[3]*(tx-n/2)+R[4]*(ty-n/2)+R[5]*(sz-rh[tz]/2) + nz/2;
-        
-        ur = (int)(u-1e-5f);
-        vr = (int)(v-1e-5f);                                    
-        
-        // linear interp            
+        float u = proj_u(ctheta, stheta, tx, ty, h, (float)h);
+        float v = lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, sz - rh[tz] / 2, nz);
+        int ur = proj_tap(u);
+        int vr = proj_tap(v);
         if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
-        {
-            u = u-ur;
-            v = v-vr;                
-            f0 +=   data[ur+0+t*n+(vr+0)*n*nproj]*static_cast<real>((1-u)*(1-v))+
-                    data[ur+1+t*n+(vr+0)*n*nproj]*static_cast<real>((0+u)*(1-v))+
-                    data[ur+0+t*n+(vr+1)*n*nproj]*static_cast<real>((1-u)*(0+v))+
-                    data[ur+1+t*n+(vr+1)*n*nproj]*static_cast<real>((0+u)*(0+v));
-                    
-        }
+            f0 += lam_bilerp(data + ur + (size_t)t * n + (size_t)vr * zs, zs, u - ur, v - vr);
     }
     // No y-flip and the caller's dθ gain, like every other kernel here: tomocupy
     // writes `(n-ty-1)` and scales by 4/nproj, and this file's ports were moved
@@ -356,5 +334,5 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
     // migrated — so the two lamino kernels simply disagreed). A tilt probe whose
     // slice is flipped and 4/π off against every volume tomoxide reconstructs
     // would be comparing against an image the user never sees.
-    f[tx + ty * n + tz * n * n] += static_cast<real>((float)f0*c);
+    f[tx + ty * n + tz * n * n] += static_cast<real>(f0*c);
 }

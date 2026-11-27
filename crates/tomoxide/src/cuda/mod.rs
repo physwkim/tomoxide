@@ -4338,11 +4338,11 @@ mod cuda_impl {
     /// "note ncproj,nz!"): filter with `(ncproj, nz)`, loop angle chunks inside the
     /// output-tile loop.
     ///
-    /// Bounded by (a) the 32-bit index ceiling in `backprojection_ker`, which
-    /// addresses the filtered stack as `ur + t·n + vr·n·ncproj` with `vr < nz`, so
-    /// `nz·n·ncproj` must stay under 2³¹; and (b) memory — the resident filtered
-    /// angle chunk `nz·ncproj·ncols`, kept to ≲40 % of the budget so the output
-    /// tile and the per-chunk filter scratch also fit. Always ≥ 1, ≤ `nproj`.
+    /// Bounded by (a) `nz·n·ncproj < 2³¹`, the 32-bit range `backprojection_ker`
+    /// indexed the filtered stack in before it moved to 64-bit indices (now
+    /// conservative); and (b) memory — the resident filtered angle chunk
+    /// `nz·ncproj·ncols`, kept to ≲40 % of the budget so the output tile and the
+    /// per-chunk filter scratch also fit. Always ≥ 1, ≤ `nproj`.
     fn lamino_ncproj(
         nz: usize,
         ncols: usize,
@@ -4366,8 +4366,9 @@ mod cuda_impl {
 
     /// Largest output rh-tile (`ncz`) for streamed laminography, given the resident
     /// filtered angle chunk already claims `nz·ncproj·ncols·4` bytes. Bounded by
-    /// (a) the 32-bit index ceiling on the output buffer `tz·n·n` (`tz < ncz`) and
-    /// (b) the memory left after the angle chunk. Always ≥ 1, ≤ `rh`.
+    /// (a) `ncz·n·n < 2³¹`, the 32-bit range `backprojection_ker` indexed the output
+    /// tile in before it moved to 64-bit indices (now conservative), and (b) the
+    /// memory left after the angle chunk. Always ≥ 1, ≤ `rh`.
     fn lamino_ncz(n: usize, nz: usize, ncols: usize, ncproj: usize, free_bytes: usize) -> usize {
         let fsz = std::mem::size_of::<f32>();
         let by_idx = (I32_INDEX_LIMIT / 100 * 88) / (n * n).max(1);
@@ -4408,8 +4409,9 @@ mod cuda_impl {
         let fsz = std::mem::size_of::<f32>();
         let free = device_free_bytes();
 
-        // Fast path: whole stack indexes < 2³¹ on every kernel (filter pad stride,
-        // filtered stack, output) AND fits one chunk in memory → single shot,
+        // Fast path: whole stack indexes < 2³¹ (filter pad stride; the filtered
+        // stack and output bounds are conservative since `backprojection_ker`
+        // indexes 64-bit) AND fits one chunk in memory → single shot,
         // byte-identical to the un-streamed reconstruction.
         let idx_cap = I32_INDEX_LIMIT / 100 * 88;
         let stride = n.max(ncols);
