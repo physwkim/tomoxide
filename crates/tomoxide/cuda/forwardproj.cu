@@ -15,16 +15,23 @@
 // the physical μ, matching ART/BART and tomopy `project.c`. Keeping the
 // geometry byte-identical to `backprojection_ker` — the (un-flipped) row `ty`,
 // the centre `axis`, the rotation matrix `R`, the `(int)(·-1e-5)` tap, and the
-// in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge.
+// in-bounds guard — is what makes the pair exact, so SIRT/MLEM/OSEM/… converge;
+// the parallel-beam pair shares its taps through projgeom.cuh.
 // The shared guard `vr < nz-1` drops slice 0 for the parallel beam (`v = tz` ⇒
 // `vr = tz-1`), the documented ≥2-slice rule, exactly as the back-projector
 // does.
+// The parallel beam is a gather (forwardprojection_par_ker), the transpose of
+// backprojection_par_ker; a tilted axis is the atomic scatter
+// (forwardprojection_ker), the transpose of backprojection_ker.
 //
 // f32 only (the iterative suite is f32); built into libtomoxide_cuda_kernels.a
 // by build.rs's `.cu` glob.
 
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stddef.h>
+
+#include "projgeom.cuh"
 
 // Scatter transpose of backprojection_ker (see file header). `g` is the output
 // sinogram [nz][nproj][n] (must be pre-zeroed; the kernel only atomic-adds),
@@ -99,7 +106,127 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
     }
 }
 
-// C-ABI host wrapper. `g` (output sinogram [nz][nproj][n]) must be pre-zeroed.
+// Accumulates into acc the PAR_G slices of src (stride n*n) whose voxels tap
+// detector column ub at angle (c, s): the column taps of backprojection_par_ker
+// read the other way round. src is the volume when |c| >= |s| and its x<->y
+// transpose otherwise, so the voxels a ray meets lie along the contiguous index
+// i and consecutive ub read consecutive addresses. MASKED skips the slices not
+// set in ok.
+template <bool MASKED>
+static __device__ __forceinline__ void par_gather(float *acc, const float *src, unsigned ok, float c, float s, float axis, int ub, int n)
+{
+    const int h = n / 2;
+    const size_t nn = (size_t)n * n;
+    const bool xdom = fabsf(c) >= fabsf(s);
+    const float a = xdom ? c : s, b = xdom ? s : c; // u = a*(i-h) + b*(j-h) + axis
+    // ub is tapped by voxels with ur == ub or ur+1 == ub, i.e. u in [ub-1, ub+1];
+    // for ub < 2 the range starts at -1, which covers the guard's u > -1e-5.
+    const float lo = ub >= 2 ? ub - 1 : -1, hi = ub + 1;
+    for (int j = 0; j < n; j++)
+    {
+        float base = b * (j - h) + axis;
+        float ia = (lo - base) / a + h, ib = (hi - base) / a + h;
+        // One voxel of margin each side absorbs the rounding of ia/ib; proj_tap
+        // then decides each candidate exactly as the back-projector does.
+        int i0 = max(0, (int)floorf(fminf(ia, ib)) - 1);
+        int i1 = min(n - 1, (int)ceilf(fmaxf(ia, ib)) + 1);
+        for (int i = i0; i <= i1; i++)
+        {
+            float u = xdom ? proj_u(c, s, i, j, h, axis) : proj_u(c, s, j, i, h, axis);
+            int ur = proj_tap(u);
+            if (!((u > -1e-5f) & (ur < n - 1)))
+                continue;
+            float fu = u - ur;
+            float w;
+            if (ur == ub)
+                w = 1 - fu;
+            else if (ur + 1 == ub)
+                w = fu;
+            else
+                continue;
+            const float *p = src + i + (size_t)j * n;
+#pragma unroll
+            for (int z = 0; z < PAR_G; z++)
+                if (!MASKED || ((ok >> z) & 1u))
+                    acc[z] += p[z * nn] * w;
+        }
+    }
+}
+
+// Parallel-beam forward projection: the transpose of backprojection_par_ker as a
+// gather, so no atomics. One thread owns detector column ub at angle t for PAR_G
+// slices of the zn-slice chunk starting at global slice z0 (f, fT point at that
+// chunk); slice tz lands on detector row tz + off. Every (ub, t, row) has one
+// owner, so g is accumulated with a plain +=.
+static __global__ void forwardprojection_par_ker(float *g, const float *f, const float *fT, const float *theta,
+                                                 float axis, int z0, int zn, int off, int n, int nz, int nproj, int nub)
+{
+    int ub = (blockIdx.x % nub) * blockDim.x + threadIdx.x;
+    int t = blockIdx.x / nub;
+    int zl = blockIdx.z * PAR_G;
+    if (ub >= n)
+        return;
+    unsigned ok = 0;
+    for (int z = 0; z < PAR_G && zl + z < zn; z++)
+        if (par_row_ok(z0 + zl + z + off, nz))
+            ok |= 1u << z;
+    if (ok == 0)
+        return;
+    float c = __cosf(theta[t]), s = __sinf(theta[t]);
+    const float *src = (fabsf(c) >= fabsf(s) ? f : fT) + (size_t)zl * n * n;
+    float acc[PAR_G];
+#pragma unroll
+    for (int z = 0; z < PAR_G; z++)
+        acc[z] = 0.f;
+    if (ok == (1u << PAR_G) - 1)
+        par_gather<false>(acc, src, ok, c, s, axis, ub, n);
+    else
+        par_gather<true>(acc, src, ok, c, s, axis, ub, n);
+    float *gt = g + ub + (size_t)t * n;
+#pragma unroll
+    for (int z = 0; z < PAR_G; z++)
+        if ((ok >> z) & 1u)
+            gt[(size_t)(z0 + zl + z + off) * n * nproj] += acc[z];
+}
+
+// dst[z][x][y] = src[z][y][x] for each n x n slice.
+static __global__ void transpose_xy_ker(float *dst, const float *src, int n)
+{
+    __shared__ float tile[32][33];
+    size_t o = (size_t)blockIdx.z * n * n;
+    int x = blockIdx.x * 32 + threadIdx.x, y = blockIdx.y * 32 + threadIdx.y;
+    for (int k = 0; k < 32; k += 8)
+        if (x < n && y + k < n)
+            tile[threadIdx.y + k][threadIdx.x] = src[o + x + (size_t)(y + k) * n];
+    __syncthreads();
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+    for (int k = 0; k < 32; k += 8)
+        if (x < n && y + k < n)
+            dst[o + x + (size_t)(y + k) * n] = tile[threadIdx.x][threadIdx.y + k];
+}
+
+// Scratch budget of the parallel-beam gather: the transposed copy of one chunk
+// of slices, the chunk a multiple of PAR_G.
+static const size_t FWD_SCRATCH_BUDGET = (size_t)256 << 20;
+
+// Bytes of scratch tomoxide_forwardproject uses for this geometry when given at
+// least that much; 0 for a tilted axis (the scatter needs none).
+extern "C" size_t tomoxide_forwardproject_scratch_bytes(float phi, int n, int ncz)
+{
+    if (!is_parallel_tilt(phi) || n <= 0 || ncz <= 0)
+        return 0;
+    size_t slice = (size_t)n * n * sizeof(float);
+    size_t cap = FWD_SCRATCH_BUDGET / slice / PAR_G * PAR_G;
+    if (cap < PAR_G)
+        cap = PAR_G;
+    if (cap > (size_t)ncz)
+        cap = (size_t)ncz;
+    return cap * slice;
+}
+
+// C-ABI host wrapper. `g` (output sinogram [nz][nproj][n]) is accumulated
+// into, so callers pre-zero it.
 // Returns cudaGetLastError(): 0 once the launch is queued.
 // Unweighted (gain 1): the geometry matches backprojection_ker with gain 1 (the
 // iterative back-projection call), so {forward, back} are a true adjoint pair
@@ -112,14 +239,36 @@ static __global__ void forwardprojection_ker(float *g, const float *f, const flo
 // detector rows, `rh` = FULL reconstruction height the global z is centred on
 // (== `nz` parallel beam, `lamino_recon_height` otherwise), `axis` = detector
 // column of voxel column n/2 (the rotation centre).
+// The parallel beam runs the gather over chunks of as many slices as `scratch`
+// (`scratch_bytes`, stream-ordered on `stream`) holds; a tilted axis, or
+// scratch smaller than one slice, runs the atomic scatter.
 extern "C" int tomoxide_forwardproject(void *g, const void *f, const float *theta, float phi,
                                         float axis, int sz, int ncz, int nz, int n, int rh,
-                                        int nproj, void *stream)
+                                        int nproj, void *scratch, size_t scratch_bytes,
+                                        void *stream)
 {
+    cudaStream_t st = (cudaStream_t)stream;
+    size_t nn = (size_t)n * n;
+    size_t zc = scratch_bytes / (nn * sizeof(float));
+    if (is_parallel_tilt(phi) && zc > 0)
+    {
+        int off = sz - rh / 2 + nz / 2;
+        int nub = (n + 127) / 128;
+        float *fT = (float *)scratch;
+        for (int z0 = 0; z0 < ncz; z0 += (int)zc)
+        {
+            int zn = ncz - z0 < (int)zc ? ncz - z0 : (int)zc;
+            const float *fz = (const float *)f + (size_t)z0 * nn;
+            transpose_xy_ker<<<dim3((n + 31) / 32, (n + 31) / 32, zn), dim3(32, 8), 0, st>>>(fT, fz, n);
+            forwardprojection_par_ker<<<dim3((unsigned)nub * nproj, 1, (zn + PAR_G - 1) / PAR_G), 128, 0, st>>>(
+                (float *)g, fz, fT, theta, axis, z0, zn, off, n, nz, nproj, nub);
+        }
+        return (int)cudaGetLastError();
+    }
     dim3 dimBlock(32, 32, 1);
     dim3 grid((unsigned)ceil(n / 32.0), (unsigned)ceil(n / 32.0), (unsigned)ncz);
     size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
-    forwardprojection_ker<<<grid, dimBlock, shmem, (cudaStream_t)stream>>>(
+    forwardprojection_ker<<<grid, dimBlock, shmem, st>>>(
         (float *)g, (const float *)f, theta, phi, axis, sz, ncz, n, nz, rh, nproj);
     return (int)cudaGetLastError();
 }

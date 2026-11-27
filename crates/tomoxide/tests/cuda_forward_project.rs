@@ -189,8 +189,10 @@ fn cuda_forward_is_adjoint_of_backproject() {
         .sum();
     let rel = (lhs - rhs).abs() / lhs.abs().max(rhs.abs()).max(1e-12);
     eprintln!("adjoint: <Ax,y> = {lhs:.6}, <x,Aᵀy> = {rhs:.6}, rel = {rel:.2e}");
+    // The pair computes its taps through the same helpers (projgeom.cuh), so
+    // only f32 accumulation rounding separates the two sides.
     assert!(
-        rel < 2e-3,
+        rel < 1e-6,
         "forward projector is not the transpose of the back-projector: \
          <Ax,y>={lhs:.6}, <x,Aᵀy>={rhs:.6}, rel={rel:.2e}"
     );

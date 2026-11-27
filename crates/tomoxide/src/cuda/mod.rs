@@ -1422,6 +1422,8 @@ mod cuda_impl {
                 let f = DevBuf::from_host_f32(vol_slice)?;
                 let theta_d = DevBuf::from_host_f32(theta)?;
                 let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>())?;
+                let scratch = fwd_scratch(pg.phi, n, rh)?;
+                let (sp, sb) = scratch_raw(&scratch);
                 ck(
                     unsafe {
                         ffi::tomoxide_forwardproject(
@@ -1436,6 +1438,8 @@ mod cuda_impl {
                             n as i32,
                             rh as i32, // volume z centred on the full recon height
                             nproj as i32,
+                            sp,
+                            sb,
                             std::ptr::null_mut(),
                         )
                     },
@@ -1476,10 +1480,12 @@ mod cuda_impl {
             };
 
             // Device buffers: input volume, theta, zeroed output sinogram (the
-            // kernel only atomic-adds into it).
+            // kernel accumulates into it), the gather's scratch.
             let f = DevBuf::from_host_f32(vol_slice)?;
             let theta_d = DevBuf::from_host_f32(theta)?;
             let g = DevBuf::zeroed(nz_run * nproj * n * std::mem::size_of::<f32>())?;
+            let scratch = fwd_scratch(pg.phi, n, nz_run)?;
+            let (sp, sb) = scratch_raw(&scratch);
 
             ck(
                 unsafe {
@@ -1495,6 +1501,8 @@ mod cuda_impl {
                         n as i32,
                         nz_run as i32, // parallel beam: rh == nz
                         nproj as i32,
+                        sp,
+                        sb,
                         std::ptr::null_mut(),
                     )
                 },
@@ -1528,7 +1536,7 @@ mod cuda_impl {
     /// What the `{A, Aᵀ}` kernel pair reads of a geometry: the tilt `phi`
     /// (`π/2` for a parallel beam) and `axis`, the detector column voxel column
     /// `n/2` lands on — `geom.center`, as the CPU projector pair reads it.
-    /// Threaded into [`dev_forward`]/[`dev_backproject`] and the host
+    /// Threaded into [`DevForward`]/[`dev_backproject`] and the host
     /// projectors so both directions always share it.
     #[cfg(feature = "cuda")]
     #[derive(Clone, Copy)]
@@ -1570,55 +1578,101 @@ mod cuda_impl {
         Ok(PairGeom { phi, axis })
     }
 
-    /// On-device forward projection `g = A f`: zero `g` (the scatter-add kernel
-    /// accumulates) then launch with tilt `phi`. The projector requires a square
-    /// grid = detector width, so `g` is `[nz,nproj,n]` and its byte size is
-    /// derived (`nz*nproj*n*4`) rather than passed — the caller cannot desync it.
-    ///
-    /// # Safety
-    /// `g`/`f`/`theta` must be valid device pointers sized for `[nz,nproj,n]` /
-    /// `[nz,n,n]` / `[nproj]`.
+    /// Device scratch `tomoxide_forwardproject` uses for this geometry (the
+    /// parallel-beam gather's transposed volume chunk), sized by the kernel's
+    /// own `tomoxide_forwardproject_scratch_bytes`; `None` when it needs none.
     #[cfg(feature = "cuda")]
-    unsafe fn dev_forward(
-        g: *mut c_void,
-        f: *const c_void,
-        theta: *const f32,
+    fn fwd_scratch(phi: f32, n: usize, ncz: usize) -> Result<Option<DevBuf>> {
+        let bytes =
+            unsafe { ffi::tomoxide_forwardproject_scratch_bytes(phi, n as i32, ncz as i32) };
+        if bytes == 0 {
+            return Ok(None);
+        }
+        DevBuf::new(bytes).map(Some)
+    }
+
+    /// `(ptr, bytes)` of a [`fwd_scratch`] buffer for the FFI call.
+    #[cfg(feature = "cuda")]
+    fn scratch_raw(scratch: &Option<DevBuf>) -> (*mut c_void, usize) {
+        scratch
+            .as_ref()
+            .map_or((std::ptr::null_mut(), 0), |b| (b.ptr, b.bytes))
+    }
+
+    /// The device-resident solvers' forward projector `A` for one geometry:
+    /// [`PairGeom`] `pg`, volume `[nz,n,n]` with recon height == detector rows.
+    /// It owns the gather's scratch, allocated with the solver's other buffers
+    /// so nothing is allocated inside the iterations.
+    #[cfg(feature = "cuda")]
+    struct DevForward {
         pg: PairGeom,
         nz: usize,
         n: usize,
-        nproj: usize,
-    ) -> Result<()> {
-        let null = std::ptr::null_mut::<c_void>();
-        let sbytes = nz * nproj * n * std::mem::size_of::<f32>();
-        ck(
-            ffi::tomoxide_cuda_memset_async(g, 0, sbytes, null),
-            "memset",
-        )?;
-        ck(
-            ffi::tomoxide_forwardproject(
-                g,
-                f,
-                theta,
-                pg.phi,
-                pg.axis,
-                0,         // sz: whole volume, no offset
-                nz as i32, // ncz: recon height == detector rows (rh == nz here)
-                nz as i32,
-                n as i32,
-                nz as i32, // rh == nz by the device-path design (see above)
-                nproj as i32,
-                null,
-            ),
-            "forwardproject",
-        )
+        scratch: Option<DevBuf>,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl DevForward {
+        fn new(pg: PairGeom, nz: usize, n: usize) -> Result<Self> {
+            Ok(DevForward {
+                pg,
+                nz,
+                n,
+                scratch: fwd_scratch(pg.phi, n, nz)?,
+            })
+        }
+
+        /// On-device `g = A f`: zero `g` (the kernel accumulates) then launch.
+        /// The projector requires a square grid = detector width, so `g` is
+        /// `[nz,nproj,n]` and its byte size is derived (`nz*nproj*n*4`) rather
+        /// than passed — the caller cannot desync it.
+        ///
+        /// # Safety
+        /// `g`/`f`/`theta` must be valid device pointers sized for
+        /// `[nz,nproj,n]` / `[nz,n,n]` / `[nproj]`.
+        unsafe fn apply(
+            &self,
+            g: *mut c_void,
+            f: *const c_void,
+            theta: *const f32,
+            nproj: usize,
+        ) -> Result<()> {
+            let (nz, n, pg) = (self.nz, self.n, self.pg);
+            let null = std::ptr::null_mut::<c_void>();
+            let sbytes = nz * nproj * n * std::mem::size_of::<f32>();
+            let (sp, sb) = scratch_raw(&self.scratch);
+            ck(
+                ffi::tomoxide_cuda_memset_async(g, 0, sbytes, null),
+                "memset",
+            )?;
+            ck(
+                ffi::tomoxide_forwardproject(
+                    g,
+                    f,
+                    theta,
+                    pg.phi,
+                    pg.axis,
+                    0,         // sz: whole volume, no offset
+                    nz as i32, // ncz: recon height == detector rows (rh == nz here)
+                    nz as i32,
+                    n as i32,
+                    nz as i32, // rh == nz by the device-path design (see above)
+                    nproj as i32,
+                    sp,
+                    sb,
+                    null,
+                ),
+                "forwardproject",
+            )
+        }
     }
 
     /// On-device back projection `f = Aᵀ g` (tilt `phi`) via a reused
     /// `cfunc_linerec` handle: zero `f` (the kernel accumulates) then launch.
-    /// Gain 1 — the pure adjoint of [`dev_forward`], no angular-quadrature
+    /// Gain 1 — the pure adjoint of [`DevForward`], no angular-quadrature
     /// weight (that π/nproj belongs to the analytic FBP paths only). `vbytes` =
     /// byte size of `f`; `nz` = the volume height (== detector rows in the
-    /// device path — rh == nz by design, mirroring [`dev_forward`]'s centring).
+    /// device path — rh == nz by design, mirroring [`DevForward`]'s centring).
     ///
     /// # Safety
     /// `handle` from [`ffi::tomoxide_linerec_new`]; `f`/`g`/`theta` valid device
@@ -1694,6 +1748,7 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let pg = pair_geom(geom)?;
+        let fwd = DevForward::new(pg, nz, n)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
@@ -1712,7 +1767,7 @@ mod cuda_impl {
         // All ops on the per-thread default stream (null) → FIFO-ordered, so one
         // sync before the download suffices.
         unsafe {
-            dev_forward(ax_d.ptr, ones_v.ptr, tp, pg, nz, n, nproj)?; // A(1)
+            fwd.apply(ax_d.ptr, ones_v.ptr, tp, nproj)?; // A(1)
             ck(
                 ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null),
                 "iter_recip_thresh",
@@ -1723,7 +1778,7 @@ mod cuda_impl {
                 "iter_recip_thresh",
             )?; // C
             for _ in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // ax = A x
+                fwd.apply(ax_d.ptr, vol_d.ptr, tp, nproj)?; // ax = A x
                 ck(
                     ffi::tomoxide_iter_residual(ax_d.ptr, b_d.ptr, rw_d.ptr, nsino, null),
                     "iter_residual",
@@ -1889,6 +1944,7 @@ mod cuda_impl {
                         let rw_d = DevBuf::zeroed(sbytes)?; // R = 1/A(1) (local)
                         let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…) partial, then global
                         let cw_d = DevBuf::zeroed(vbytes)?; // C = 1/Aᵀ(1) (global)
+                        let fwd = DevForward::new(pg, nz, n)?;
                         let handle = Handle::new(
                             unsafe { ffi::tomoxide_linerec_new(len, nz, ncols, len, nz) },
                             ffi::tomoxide_linerec_free,
@@ -1899,7 +1955,7 @@ mod cuda_impl {
                         {
                             let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
                             unsafe {
-                                dev_forward(ax_d.ptr, ones_v.ptr, tp, pg, nz, n, len)?;
+                                fwd.apply(ax_d.ptr, ones_v.ptr, tp, len)?;
                                 ck(
                                     ffi::tomoxide_iter_recip_thresh(
                                         rw_d.ptr, ax_d.ptr, 1e-6, nsub, null,
@@ -1936,7 +1992,7 @@ mod cuda_impl {
                         // SIRT iterations, volume resident, correction all-reduced.
                         for _ in 0..num_iter.max(1) {
                             unsafe {
-                                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, len)?; // A x
+                                fwd.apply(ax_d.ptr, vol_d.ptr, tp, len)?; // A x
                                 ck(
                                     ffi::tomoxide_iter_residual(
                                         ax_d.ptr, b_d.ptr, rw_d.ptr, nsub, null,
@@ -2084,6 +2140,7 @@ mod cuda_impl {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
         let pg = pair_geom(geom)?;
+        let fwd = DevForward::new(pg, nz, n)?;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -2096,7 +2153,7 @@ mod cuda_impl {
                 for sub in &subs {
                     let tp = sub.theta_d.ptr as *const f32;
                     let nsub = nz * sub.len * ncols;
-                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, pg, nz, n, sub.len)?; // Aₛ x
+                    fwd.apply(sub.ax_d.ptr, vol_d.ptr, tp, sub.len)?; // Aₛ x
                     ck(
                         ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null),
                         "iter_em_ratio",
@@ -2150,6 +2207,7 @@ mod cuda_impl {
         let s = sino.as_layout(Layout::Sinogram);
         let (nz, ncols) = (s.n_rows(), s.n_cols());
         let pg = pair_geom(geom)?;
+        let fwd = DevForward::new(pg, nz, n)?;
         let nvol = nz * n * n;
         let vbytes = nvol * std::mem::size_of::<f32>();
         let null = std::ptr::null_mut::<c_void>();
@@ -2167,7 +2225,7 @@ mod cuda_impl {
                 for sub in &subs {
                     let tp = sub.theta_d.ptr as *const f32;
                     let nsub = nz * sub.len * ncols;
-                    dev_forward(sub.ax_d.ptr, vol_d.ptr, tp, pg, nz, n, sub.len)?; // Aₛ x
+                    fwd.apply(sub.ax_d.ptr, vol_d.ptr, tp, sub.len)?; // Aₛ x
                     ck(
                         ffi::tomoxide_iter_em_ratio(sub.ax_d.ptr, sub.b_d.ptr, nsub, null),
                         "iter_em_ratio",
@@ -2250,6 +2308,7 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let pg = pair_geom(geom)?;
+        let fwd = DevForward::new(pg, nz, n)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let vol_d = seed_buf(init, 0.0, nvol, 1.0 / r)?; // x, r-scaled (init 0 or warm-start/r)
         let recon0_d = DevBuf::zeroed(vbytes)?; // previous x (BB)
@@ -2273,7 +2332,7 @@ mod cuda_impl {
 
         unsafe {
             for it in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // ax = R x
+                fwd.apply(ax_d.ptr, vol_d.ptr, tp, nproj)?; // ax = R x
                 ck(
                     ffi::tomoxide_iter_grad_prox(ax_d.ptr, b_d.ptr, r, nsino, null),
                     "iter_grad_prox",
@@ -2393,6 +2452,7 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let pg = pair_geom(geom)?;
+        let fwd = DevForward::new(pg, nz, n)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?; // r = (b − A x0)·1
 
@@ -2416,7 +2476,7 @@ mod cuda_impl {
 
         unsafe {
             // Init: r = b − A x0 ; z = Aᵀ r ; p = z ; gamma = ⟨z,z⟩ per slice.
-            dev_forward(r_d.ptr, vol_d.ptr, tp, pg, nz, n, nproj)?; // r = A x0
+            fwd.apply(r_d.ptr, vol_d.ptr, tp, nproj)?; // r = A x0
             ck(
                 ffi::tomoxide_iter_residual(r_d.ptr, b_d.ptr, ones_s.ptr, nsino, null),
                 "iter_residual",
@@ -2432,7 +2492,7 @@ mod cuda_impl {
             )?;
 
             for _ in 0..num_iter.max(1) {
-                dev_forward(w_d.ptr, p_d.ptr, tp, pg, nz, n, nproj)?; // w = A p
+                fwd.apply(w_d.ptr, p_d.ptr, tp, nproj)?; // w = A p
                 ck(
                     ffi::tomoxide_iter_slice_dot(wdot_d.ptr, w_d.ptr, w_d.ptr, sslice, nz, null),
                     "iter_slice_dot",
@@ -2536,6 +2596,7 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let pg = pair_geom(geom)?;
+        let fwd = DevForward::new(pg, nz, n)?;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
         // Both the extrapolated and the primal iterate start from the seed / r
         // (r-scaled domain); a `None` init is the plain zero start.
@@ -2555,7 +2616,7 @@ mod cuda_impl {
 
         unsafe {
             for _ in 0..num_iter.max(1) {
-                dev_forward(ax_d.ptr, xbar_d.ptr, tp, pg, nz, n, nproj)?; // R x̄
+                fwd.apply(ax_d.ptr, xbar_d.ptr, tp, nproj)?; // R x̄
                 ck(
                     ffi::tomoxide_iter_tv_datadual(pd_d.ptr, ax_d.ptr, b_d.ptr, C, r, nsino, null),
                     "iter_tv_datadual",
@@ -2617,7 +2678,7 @@ mod cuda_impl {
         ) -> Result<Option<Volume<f32>>> {
             use crate::params::Algorithm;
             // The device-resident path serves both parallel beam and
-            // laminography (the tilt is threaded into dev_forward/dev_backproject
+            // laminography (the tilt is threaded into DevForward/dev_backproject
             // via `pair_geom`; the recon-height equals the detector-row count, so
             // the volume/sinogram buffers are sized exactly as the parallel case
             // and stay resident across every iteration). For a tilted axis the
@@ -3420,6 +3481,8 @@ mod cuda_impl {
             )?;
             let theta_d = DevBuf::from_host_f32(theta)?;
             let g = DevBuf::zeroed(rows * nproj * n * std::mem::size_of::<f32>())?;
+            let scratch = fwd_scratch(self.phi, n, self.nb)?;
+            let (sp, sb) = scratch_raw(&scratch);
             unsafe {
                 ck(
                     ffi::tomoxide_forwardproject(
@@ -3434,6 +3497,8 @@ mod cuda_impl {
                         n as i32,
                         self.depth as i32,
                         nproj as i32,
+                        sp,
+                        sb,
                         std::ptr::null_mut(),
                     ),
                     "forwardproject",
@@ -10110,6 +10175,94 @@ mod cuda_impl {
                 max_abs <= 1e-3 * peak.max(1e-6),
                 "multi-GPU SIRT max abs diff too large: {max_abs:.3e} (peak {peak:.3e})"
             );
+        }
+
+        // The parallel-beam gather must be the scatter's operator at every chunk
+        // size: one sequential sum per detector bin (so every scratch size gives
+        // the same bits), equal to the atomic scatter up to summation order.
+        // One- and three-slice scratch makes chunks end inside a PAR_G group;
+        // the second case puts the volume off the detector's centre rows and the
+        // rotation axis off voxel column n/2.
+        #[test]
+        fn parallel_forward_gather_matches_scatter_at_every_chunk_size() {
+            let _b = CudaBackend::new().expect("cuda backend");
+            ck(unsafe { ffi::tomoxide_cuda_set_device(0) }, "set_device").unwrap();
+            let phi = std::f32::consts::FRAC_PI_2;
+            let null = std::ptr::null_mut::<c_void>();
+            // (n, nproj, detector rows nz, volume slices ncz, sz, rh, axis)
+            let cases = [
+                (63usize, 37usize, 9usize, 9usize, 0i32, 9usize, 31.0f32),
+                (96, 50, 12, 5, 2, 12, 49.37),
+            ];
+            for (n, nproj, nz, ncz, sz, rh, axis) in cases {
+                assert!(fwd_scratch(phi + 0.3, n, ncz).unwrap().is_none());
+                let mut s = 0x2468_ace1u64 ^ n as u64;
+                let vol: Vec<f32> = (0..ncz * n * n)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s >> 40) as f32 / (1u64 << 24) as f32
+                    })
+                    .collect();
+                let theta: Vec<f32> = (0..nproj)
+                    .map(|i| i as f32 * std::f32::consts::PI / nproj as f32)
+                    .collect();
+                let f = DevBuf::from_host_f32(&vol).unwrap();
+                let theta_d = DevBuf::from_host_f32(&theta).unwrap();
+                let slice = n * n * std::mem::size_of::<f32>();
+                let project = |scratch: Option<DevBuf>| -> Vec<f32> {
+                    let g = DevBuf::zeroed(nz * nproj * n * std::mem::size_of::<f32>()).unwrap();
+                    let (sp, sb) = scratch_raw(&scratch);
+                    unsafe {
+                        ck(
+                            ffi::tomoxide_forwardproject(
+                                g.ptr,
+                                f.ptr,
+                                theta_d.ptr as *const f32,
+                                phi,
+                                axis,
+                                sz,
+                                ncz as i32,
+                                nz as i32,
+                                n as i32,
+                                rh as i32,
+                                nproj as i32,
+                                sp,
+                                sb,
+                                null,
+                            ),
+                            "forwardproject",
+                        )
+                        .unwrap();
+                        ck(ffi::tomoxide_cuda_sync(), "sync").unwrap();
+                    }
+                    let mut out = vec![0.0f32; nz * nproj * n];
+                    g.to_host_f32(&mut out).unwrap();
+                    out
+                };
+                let scatter = project(None);
+                let full = project(fwd_scratch(phi, n, ncz).unwrap());
+                for k in [1usize, 3] {
+                    let chunked = project(Some(DevBuf::new(k * slice).unwrap()));
+                    assert!(
+                        chunked == full,
+                        "n={n}: {k}-slice chunks changed the gather's bits"
+                    );
+                }
+                let (mut d2, mut s2) = (0.0f64, 0.0f64);
+                for (&a, &b) in full.iter().zip(&scatter) {
+                    d2 += (a as f64 - b as f64).powi(2);
+                    s2 += (b as f64).powi(2);
+                }
+                let rel = (d2 / s2).sqrt();
+                println!("n={n}: gather vs scatter relL2 {rel:.2e}");
+                assert!(s2 > 0.0, "n={n}: scatter projected nothing");
+                assert!(
+                    rel < 1e-4,
+                    "n={n}: gather diverged from scatter, relL2 {rel:.2e}"
+                );
+            }
         }
 
         // Validate the db5 DWT/IDWT kernels against the pywt oracle (the same
