@@ -218,19 +218,20 @@ __global__ void iter_axpy_neg_slice_ker(float *vol, const float *grad, const flo
 
 // Per-slice Barzilai–Borwein reductions: num[z] = Σ(x−x0)(g−g0), den[z] = Σ(g−g0)².
 // One block per slice; blockDim must be a power of two (shared-mem tree reduce).
+// Accumulated in double, as the host solvers do, so both round the same sum once.
 __global__ void iter_bb_reduce_ker(float *num, float *den, const float *x, const float *x0,
                                    const float *g, const float *g0, long long slice_len, int nz) {
     int z = blockIdx.x;
     if (z >= nz)
         return;
-    extern __shared__ float sh[];
-    float *snum = sh;
-    float *sden = sh + blockDim.x;
+    extern __shared__ double shd[];
+    double *snum = shd;
+    double *sden = shd + blockDim.x;
     long long base = (long long)z * slice_len;
-    float ln = 0.0f, ld = 0.0f;
+    double ln = 0.0, ld = 0.0;
     for (long long i = threadIdx.x; i < slice_len; i += blockDim.x) {
-        float dx = x[base + i] - x0[base + i];
-        float dg = g[base + i] - g0[base + i];
+        double dx = x[base + i] - x0[base + i];
+        double dg = g[base + i] - g0[base + i];
         ln += dx * dg;
         ld += dg * dg;
     }
@@ -245,8 +246,8 @@ __global__ void iter_bb_reduce_ker(float *num, float *den, const float *x, const
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        num[z] = snum[0];
-        den[z] = sden[0];
+        num[z] = (float)snum[0];
+        den[z] = (float)sden[0];
     }
 }
 
@@ -274,27 +275,28 @@ __global__ void iter_bb_lambda_ker(float *lambda, const float *num, const float 
 // `iter_axpy_neg_slice_ker` (x uses -alpha, r uses +alpha); only the per-slice
 // dot, the p = z + beta*p recurrence, and the alpha/beta scalars are new here.
 
-// out[z] = Σ_i a[z,i]*b[z,i] over slice z. One block per slice; blockDim a power
-// of two (shared-mem tree reduce), mirroring iter_bb_reduce_ker.
+// out[z] = Σ_i a[z,i]*b[z,i] over slice z, accumulated in double. One block per
+// slice; blockDim a power of two (shared-mem tree reduce), mirroring
+// iter_bb_reduce_ker.
 __global__ void iter_slice_dot_ker(float *out, const float *a, const float *b,
                                    long long slice_len, int nslices) {
     int z = blockIdx.x;
     if (z >= nslices)
         return;
-    extern __shared__ float sh[];
+    extern __shared__ double shd[];
     long long base = (long long)z * slice_len;
-    float acc = 0.0f;
+    double acc = 0.0;
     for (long long i = threadIdx.x; i < slice_len; i += blockDim.x)
-        acc += a[base + i] * b[base + i];
-    sh[threadIdx.x] = acc;
+        acc += (double)a[base + i] * b[base + i];
+    shd[threadIdx.x] = acc;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s)
-            sh[threadIdx.x] += sh[threadIdx.x + s];
+            shd[threadIdx.x] += shd[threadIdx.x + s];
         __syncthreads();
     }
     if (threadIdx.x == 0)
-        out[z] = sh[0];
+        out[z] = (float)shd[0];
 }
 
 // p[i] = z[i] + beta[s]*p[i], s = i/slice_len  — the CGLS direction recurrence.
@@ -335,7 +337,7 @@ int tomoxide_iter_slice_dot(void *out, const void *a, const void *b, size_t slic
                             void *stream) {
     int block = 256;
     int grid = (int)nz;
-    size_t shmem = (size_t)block * sizeof(float);
+    size_t shmem = (size_t)block * sizeof(double);
     iter_slice_dot_ker<<<grid, block, shmem, (cudaStream_t)stream>>>(
         (float *)out, (const float *)a, (const float *)b, (long long)slice_len, (int)nz);
     return (int)cudaGetLastError();
@@ -457,7 +459,7 @@ int tomoxide_iter_bb_reduce(void *num, void *den, const void *x, const void *x0,
                             const void *g0, size_t slice_len, size_t nz, void *stream) {
     int block = 256;
     int grid = (int)nz;
-    size_t shmem = 2 * (size_t)block * sizeof(float);
+    size_t shmem = 2 * (size_t)block * sizeof(double);
     iter_bb_reduce_ker<<<grid, block, shmem, (cudaStream_t)stream>>>(
         (float *)num, (float *)den, (const float *)x, (const float *)x0, (const float *)g,
         (const float *)g0, (long long)slice_len, (int)nz);

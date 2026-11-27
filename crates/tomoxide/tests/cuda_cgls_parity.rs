@@ -1,11 +1,11 @@
 //! CUDA CGLS parity: the device-resident CGLS solver must match the same CGLS
-//! math run through the generic host solver on the *same* CUDA kernels. Only the
-//! per-slice dot products differ (device shared-mem tree reduce vs host ndarray
-//! sequential sum), and because CGLS is a Krylov method those tiny
-//! summation-order differences propagate through the conjugate recurrence — so
-//! the two agree to ~1e-2 relative (not the ~1e-8 of contractive SIRT/grad)
-//! while staying visually identical (Pearson ≈ 1). Device-residency changes the
-//! transfer schedule, not the algorithm.
+//! math run through the generic host solver on the *same* CUDA kernels. Both
+//! accumulate the per-slice dot products in f64; the elementwise updates still
+//! round differently (device fma, host mul + add), and because CGLS is a Krylov
+//! method those last-bit differences propagate through the conjugate
+//! recurrence — so the two agree to ~1e-3 relative (not the ~1e-8 of
+//! contractive SIRT/grad) while staying visually identical (Pearson ≈ 1).
+//! Device-residency changes the transfer schedule, not the algorithm.
 //!
 //! Only built under `cuda`; needs a real CUDA device (skipped otherwise).
 #![cfg(feature = "cuda")]

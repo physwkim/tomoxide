@@ -821,16 +821,18 @@ fn gradient_descent(
             } else if it == 0 {
                 1e-3
             } else {
-                let (mut num, mut den) = (0.0f32, 0.0f32);
+                // f64 like every per-slice solver scalar (see `slice_dot`).
+                let (mut num, mut den) = (0.0f64, 0.0f64);
                 ndarray::Zip::from(vol.array.index_axis(Axis(0), z))
                     .and(recon0.index_axis(Axis(0), z))
                     .and(grad.index_axis(Axis(0), z))
                     .and(grad0.index_axis(Axis(0), z))
                     .for_each(|&x, &x0, &g, &g0| {
-                        let dg = g - g0;
-                        num += (x - x0) * dg;
+                        let dg = f64::from(g - g0);
+                        num += f64::from(x - x0) * dg;
                         den += dg * dg;
                     });
+                let (num, den) = (num as f32, den as f32);
                 if den != 0.0 {
                     num / den
                 } else {
@@ -936,11 +938,15 @@ fn cgls(
     let ncols = b.n_cols();
 
     // Per-slice sum over a 2-D view (an [nz]-length accumulator lives one entry
-    // per independent slice problem).
+    // per independent slice problem). Accumulated in f64 on every backend: a
+    // running f32 sum over an 800² slice drifts ~1e-3, which becomes the step
+    // size alpha and, through the recurrence, the whole solve.
     fn slice_dot(a: &ndarray::ArrayView2<f32>, c: &ndarray::ArrayView2<f32>) -> f32 {
-        let mut acc = 0.0f32;
-        ndarray::Zip::from(a).and(c).for_each(|&x, &y| acc += x * y);
-        acc
+        let mut acc = 0.0f64;
+        ndarray::Zip::from(a)
+            .and(c)
+            .for_each(|&x, &y| acc += f64::from(x) * f64::from(y));
+        acc as f32
     }
 
     let mut vol = init_volume(params, nz, n, 0.0)?; // x = x0 (0, or warm-start)
