@@ -172,10 +172,7 @@ static __global__ void framedot3_ker(double *out, const float *r, const float *h
     __shared__ float sc[FD_ANG], ss[FD_ANG];
     __shared__ double red[3 * FD_ANG][32];
     if (tid < FD_ANG && t0 + tid < nproj)
-    {
-        sc[tid] = __cosf(theta[t0 + tid]);
-        ss[tid] = __sinf(theta[t0 + tid]);
-    }
+        theta_cs(theta[t0 + tid], &sc[tid], &ss[tid]);
     __syncthreads();
 
     float acc[3 * FD_ANG];

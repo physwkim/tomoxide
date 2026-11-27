@@ -257,6 +257,40 @@ fn cuda_forward_matches_cpu() {
     );
 }
 
+/// SIRT divides by the ray sums A·1, and an edge bin sees only a corner of the
+/// grid, so its sum is small and a tap shift there is amplified. Over a full
+/// turn (θ up to 2π, where a fast sin/cos drifts most) the CUDA ray sums must
+/// match the CPU's bin for bin, corners included.
+#[test]
+fn cuda_ray_sums_match_cpu_over_a_full_turn() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (256usize, 720usize, 2usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, 2.0 * PI), n, nz, 1.0);
+    let ones = Volume::new(Array3::from_elem((nz, n, n), 1.0f32));
+    let g = sim::project(&ones, &geom, &cuda).unwrap();
+    let c = sim::project(&ones, &geom, &cpu).unwrap();
+    let peak = c.array.iter().fold(0.0f32, |m, &v| m.max(v));
+    let worst = g
+        .array
+        .iter()
+        .zip(c.array.iter())
+        .filter(|&(_, &b)| b > 1e-3 * peak)
+        .map(|(&a, &b)| ((a - b) / b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("ray sums cuda vs cpu: worst relative difference {worst:.3e}");
+    assert!(
+        worst < 2e-5,
+        "CUDA ray sums leave the CPU's: worst relative difference {worst:.3e}"
+    );
+}
+
 #[test]
 fn cuda_sirt_recovers_phantom() {
     let cuda = match CudaBackend::new() {

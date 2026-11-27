@@ -19,6 +19,14 @@ static inline __host__ __device__ bool is_parallel_tilt(float phi)
 // (x, y, θ) only, so it is computed once and reused for every slice.
 #define PAR_G 8
 
+// cos θ and sin θ of a projection angle from the accurate sincosf, as the CPU
+// projectors' sin_cos: __cosf/__sinf are ~1e-6 off (more past ±π), a ~2e-4 px
+// tap shift at a 1024² corner that SIRT's 1/A(1) amplifies in sparse edge bins.
+static __device__ __forceinline__ void theta_cs(float t, float *c, float *s)
+{
+    sincosf(t, s, c);
+}
+
 // Detector column of voxel (x, y) at angle (c, s) = (cos θ, sin θ), h = n/2;
 // axis is the column voxel column h lands on (the rotation centre).
 static __device__ __forceinline__ float proj_u(float c, float s, int x, int y, int h, float axis)

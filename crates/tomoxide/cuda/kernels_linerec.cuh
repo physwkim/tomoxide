@@ -53,10 +53,7 @@ void __global__ backprojection_tex_ker(real *f, cudaTextureObject_t tex, float *
         int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
         int nthreads = blockDim.x * blockDim.y * blockDim.z;
         for (int t = tid; t < nproj; t += nthreads)
-        {
-            ssc[t] = __cosf(theta[t]);
-            ssc[nproj + t] = __sinf(theta[t]);
-        }
+            theta_cs(theta[t], &ssc[t], &ssc[nproj + t]);
     }
     __syncthreads();
     if (tx >= n || ty >= n || tz >= ncz)
@@ -106,10 +103,7 @@ void __global__ backprojection_ker(float *f, const float *data, const float *the
     int z0 = blockIdx.z * LAM_G;
     extern __shared__ float ssc[]; // [0,nproj)=cos, [nproj,2*nproj)=sin
     for (int t = threadIdx.x + blockDim.x * threadIdx.y; t < nproj; t += blockDim.x * blockDim.y)
-    {
-        ssc[t] = __cosf(theta[t]);
-        ssc[nproj + t] = __sinf(theta[t]);
-    }
+        theta_cs(theta[t], &ssc[t], &ssc[nproj + t]);
     __syncthreads();
     if (tx >= n || ty >= n)
         return;
@@ -188,10 +182,7 @@ void __global__ backprojection_par_ker(float *f, const float *data, const float 
     int z0 = blockIdx.z * PAR_G;
     extern __shared__ float ssc[]; // [0,nproj)=cos, [nproj,2*nproj)=sin
     for (int t = threadIdx.x + blockDim.x * threadIdx.y; t < nproj; t += blockDim.x * blockDim.y)
-    {
-        ssc[t] = __cosf(theta[t]);
-        ssc[nproj + t] = __sinf(theta[t]);
-    }
+        theta_cs(theta[t], &ssc[t], &ssc[nproj + t]);
     __syncthreads();
     if (tx >= n || ty >= n)
         return;
@@ -235,10 +226,7 @@ void __global__ backprojection_try_ker(real *f, real *data, float *theta, float 
         int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
         int nthreads = blockDim.x * blockDim.y * blockDim.z;
         for (int t = tid; t < nproj; t += nthreads)
-        {
-            ssc[t] = __cosf(theta[t]);
-            ssc[nproj + t] = __sinf(theta[t]);
-        }
+            theta_cs(theta[t], &ssc[t], &ssc[nproj + t]);
     }
     __syncthreads();
     if (tx >= n || ty >= n || tz >= ncz)
@@ -278,10 +266,7 @@ void __global__ backprojection_try_lamino_ker(real *f, real *data, float *theta,
         int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
         int nthreads = blockDim.x * blockDim.y * blockDim.z;
         for (int t = tid; t < nproj; t += nthreads)
-        {
-            ssc[t] = __cosf(theta[t]);
-            ssc[nproj + t] = __sinf(theta[t]);
-        }
+            theta_cs(theta[t], &ssc[t], &ssc[nproj + t]);
     }
     __syncthreads();
     if (tx >= n || ty >= n || tz >= ncz)

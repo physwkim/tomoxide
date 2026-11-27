@@ -91,10 +91,7 @@ static __global__ void __launch_bounds__(FWD_X *FWD_Y)
         // The previous angle's closing __syncthreads ordered its reads of ssc.
         const int tn = min(FWD_TC, nproj - t0);
         for (int i = tid; i < tn; i += FWD_X * FWD_Y)
-        {
-            ssc[i] = __cosf(theta[t0 + i]);
-            ssc[FWD_TC + i] = __sinf(theta[t0 + i]);
-        }
+            theta_cs(theta[t0 + i], &ssc[i], &ssc[FWD_TC + i]);
         __syncthreads();
         for (int k = 0; k < tn; k++)
         {
@@ -264,7 +261,8 @@ static __global__ void forwardprojection_par_ker(float *g, const float *f, const
             ok |= 1u << z;
     if (ok == 0)
         return;
-    float c = __cosf(theta[t]), s = __sinf(theta[t]);
+    float c, s;
+    theta_cs(theta[t], &c, &s);
     const float *src = (fabsf(c) >= fabsf(s) ? f : fT) + (size_t)zl * n * n;
     float acc[PAR_G];
 #pragma unroll
@@ -401,10 +399,7 @@ static __global__ void framedot_ker(double *out, const float *f, const float *hx
     __shared__ float sc[FD_ANG], ss[FD_ANG];
     __shared__ double red[2 * FD_ANG][32];
     if (tid < FD_ANG && t0 + tid < nproj)
-    {
-        sc[tid] = __cosf(theta[t0 + tid]);
-        ss[tid] = __sinf(theta[t0 + tid]);
-    }
+        theta_cs(theta[t0 + tid], &sc[tid], &ss[tid]);
     __syncthreads();
 
     float ax[FD_ANG], ay[FD_ANG];
