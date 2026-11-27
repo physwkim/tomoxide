@@ -33,6 +33,17 @@
 
 #include "projgeom.cuh"
 
+// The voxel tile one block of forwardprojection_ker owns: FWD_X×FWD_Y columns
+// of FWD_G slices. At one angle its taps span at most |(FWD_X, FWD_Y)| + 2
+// detector columns and that plus FWD_G rows, so they fit the FWD_P² shared
+// patch; a tap outside it goes straight to g. cos/sin are cached FWD_TC angles
+// at a time, so shared memory does not grow with nproj.
+#define FWD_X 32
+#define FWD_Y 8
+#define FWD_G 16
+#define FWD_P 40
+#define FWD_TC 512
+
 // Scatter transpose of backprojection_ker (see file header). `g` is the output
 // sinogram [nz][nproj][n] (must be pre-zeroed; the kernel only atomic-adds),
 // `f` the input volume [ncz][n][n]. `ncz` is the volume z-extent (== nz for the
@@ -42,64 +53,146 @@
 // output height that differs from the detector-row count. `axis` is the detector
 // column voxel column n/2 lands on, the rotation centre; the pair stays exact
 // at any centre backprojection_ker is given too.
-static __global__ void forwardprojection_ker(float *g, const float *f, const float *theta,
-                                             float phi, float axis, int sz, int ncz, int n, int nz,
-                                             int rh, int nproj)
+// Per angle a thread sums its column's taps row by row in registers, adds each
+// row into the block's shared detector patch, and the block flushes the patch
+// to g: one global atomic per touched detector cell instead of four per voxel.
+// Taps and weights are the per-voxel scatter's; only the summation order
+// differs, which the atomics never fixed.
+static __global__ void __launch_bounds__(FWD_X *FWD_Y)
+    forwardprojection_ker(float *g, const float *f, const float *theta, float phi, float axis, int sz,
+                          int ncz, int n, int nz, int rh, int nproj)
 {
-    int tx = blockDim.x * blockIdx.x + threadIdx.x;
-    int ty = blockDim.y * blockIdx.y + threadIdx.y;
-    int tz = blockDim.z * blockIdx.z + threadIdx.z;
-    // cos/sin(theta[t]) cached once per block, identical for every voxel
-    // (mirrors backprojection_ker). Filled before the bounds guard so every
-    // thread reaches __syncthreads.
-    extern __shared__ float ssc[]; // [0,nproj)=cos, [nproj,2*nproj)=sin
-    {
-        int tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
-        int nthreads = blockDim.x * blockDim.y * blockDim.z;
-        for (int t = tid; t < nproj; t += nthreads)
-        {
-            ssc[t] = __cosf(theta[t]);
-            ssc[nproj + t] = __sinf(theta[t]);
-        }
-    }
-    __syncthreads();
-    if (tx >= n || ty >= n || tz >= ncz)
-        return;
+    __shared__ float ssc[2 * FWD_TC]; // [0,FWD_TC)=cos, [FWD_TC,2*FWD_TC)=sin of the chunk
+    __shared__ float patch[FWD_P * FWD_P];
+    const int tid = threadIdx.x + FWD_X * threadIdx.y;
+    const int x0 = blockIdx.x * FWD_X, y0 = blockIdx.y * FWD_Y, z0 = blockIdx.z * FWD_G;
+    const int tx = x0 + threadIdx.x, ty = y0 + threadIdx.y;
+    const int xe = min(x0 + FWD_X, n) - 1, ye = min(y0 + FWD_Y, n) - 1;
+    // Volume z centred on rh/2 (the volume's own midpoint), detector row on
+    // nz/2 — the taps of backprojection_ker, through the same helpers.
+    const int h = n / 2, cnt = min(FWD_G, ncz - z0), zb = z0 + sz - rh / 2;
+    const float cphi = __cosf(phi), sphi = __sinf(phi);
+    const size_t zs = (size_t)n * nproj; // g's detector-row stride
 
     // Same (un-flipped) row and centre as the back-projector's accumulation index.
-    float val = f[tx + ty * n + tz * n * n];
-    if (val == 0.0f)
-        return; // a zero voxel scatters nothing
-
-    float cphi = __cosf(phi);
-    float sphi = __sinf(phi);
-    const int h = n / 2;
-    for (int t = 0; t < nproj; t++)
+    float val[FWD_G];
+    bool any = false;
+#pragma unroll
+    for (int z = 0; z < FWD_G; z++)
     {
-        float ctheta = ssc[t];
-        float stheta = ssc[nproj + t];
-        float u = proj_u(ctheta, stheta, tx, ty, h, axis);
-        // Volume z centred on rh/2 (the volume's own midpoint), detector row on
-        // nz/2 — the taps of backprojection_ker, through the same helpers.
-        float v = lam_v(lam_vxy(ctheta, stheta, cphi, tx, ty, h), sphi, tz + sz - rh / 2, nz);
+        val[z] = (tx < n && ty < n && z < cnt) ? f[tx + (size_t)ty * n + (size_t)(z0 + z) * n * n] : 0.f;
+        any |= val[z] != 0.f;
+    }
+    if (!__syncthreads_or(any))
+        return; // a zero tile scatters nothing
+    for (int i = tid; i < FWD_P * FWD_P; i += FWD_X * FWD_Y)
+        patch[i] = 0.f;
 
-        int ur = proj_tap(u);
-        int vr = proj_tap(v);
-
-        // Same in-bounds guard as the gather; out-of-bounds taps contribute 0.
-        // (int) truncates toward zero, so the lower bound tests u and v, with the
-        // 1e-5 margin the tap gives the upper one: u in (-1, 0) would otherwise
-        // land on column 0 with a weight above 1.
-        if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
+    for (int t0 = 0; t0 < nproj; t0 += FWD_TC)
+    {
+        // The previous angle's closing __syncthreads ordered its reads of ssc.
+        const int tn = min(FWD_TC, nproj - t0);
+        for (int i = tid; i < tn; i += FWD_X * FWD_Y)
         {
-            float fu = u - ur;
-            float fv = v - vr;
-            // Transpose of the 4-tap bilinear gather: scatter val into the same
-            // taps with the same weights.
-            atomicAdd(&g[ur + 0 + t * n + (vr + 0) * n * nproj], val * (1 - fu) * (1 - fv));
-            atomicAdd(&g[ur + 1 + t * n + (vr + 0) * n * nproj], val * (0 + fu) * (1 - fv));
-            atomicAdd(&g[ur + 0 + t * n + (vr + 1) * n * nproj], val * (1 - fu) * (0 + fv));
-            atomicAdd(&g[ur + 1 + t * n + (vr + 1) * n * nproj], val * (0 + fu) * (0 + fv));
+            ssc[i] = __cosf(theta[t0 + i]);
+            ssc[FWD_TC + i] = __sinf(theta[t0 + i]);
+        }
+        __syncthreads();
+        for (int k = 0; k < tn; k++)
+        {
+            const int t = t0 + k;
+            const float c = ssc[k], s = ssc[FWD_TC + k];
+            // u and v are monotone in x, y and z, so the tile's smallest taps,
+            // the patch origin, come from its corners.
+            const float um = fminf(fminf(proj_u(c, s, x0, y0, h, axis), proj_u(c, s, xe, y0, h, axis)),
+                                   fminf(proj_u(c, s, x0, ye, h, axis), proj_u(c, s, xe, ye, h, axis)));
+            const float vm = fminf(fminf(lam_vxy(c, s, cphi, x0, y0, h), lam_vxy(c, s, cphi, xe, y0, h)),
+                                   fminf(lam_vxy(c, s, cphi, x0, ye, h), lam_vxy(c, s, cphi, xe, ye, h)));
+            const int u0 = proj_tap(um);
+            const int v0 = proj_tap(fminf(lam_v(vm, sphi, zb, nz), lam_v(vm, sphi, zb + cnt - 1, nz)));
+            const float u = proj_u(c, s, tx, ty, h, axis);
+            const int ur = proj_tap(u);
+            // Same in-bounds guard as the gather; out-of-bounds taps contribute 0.
+            // (int) truncates toward zero, so the lower bound tests u and v, with
+            // the 1e-5 margin the tap gives the upper one: u in (-1, 0) would
+            // otherwise land on column 0 with a weight above 1.
+            if (any & (u > -1e-5f) & (ur < n - 1))
+            {
+                const float fu = u - ur, vxy = lam_vxy(c, s, cphi, tx, ty, h);
+                const int pu = ur - u0;
+                // Adds detector cells (ur, r) and (ur+1, r).
+                auto emit = [&](int r, float wa, float wb) {
+                    const int pv = r - v0;
+                    if ((pu >= 0) & (pu < FWD_P - 1) & (pv >= 0) & (pv < FWD_P))
+                    {
+                        float *q = patch + pu + pv * FWD_P;
+                        atomicAdd(q, wa);
+                        atomicAdd(q + 1, wb);
+                    }
+                    else
+                    {
+                        float *q = g + ur + (size_t)t * n + (size_t)r * zs;
+                        atomicAdd(q, wa);
+                        atomicAdd(q + 1, wb);
+                    }
+                };
+                // (r0a, r0b) hold row `row`, (r1a, r1b) row `row`+1. v is
+                // monotone in z, so a row the taps have moved past is complete.
+                int row = -2;
+                float r0a = 0.f, r0b = 0.f, r1a = 0.f, r1b = 0.f;
+#pragma unroll
+                for (int z = 0; z < FWD_G; z++)
+                {
+                    const float v = lam_v(vxy, sphi, zb + z, nz);
+                    const int vr = proj_tap(v);
+                    if ((val[z] != 0.f) & (v > -1e-5f) & (vr < nz - 1))
+                    {
+                        if (vr == row + 1)
+                        {
+                            emit(row, r0a, r0b);
+                            r0a = r1a, r0b = r1b, r1a = 0.f, r1b = 0.f;
+                        }
+                        else if (vr == row - 1)
+                        {
+                            emit(row + 1, r1a, r1b);
+                            r1a = r0a, r1b = r0b, r0a = 0.f, r0b = 0.f;
+                        }
+                        else if (vr != row)
+                        {
+                            if (row >= 0)
+                            {
+                                emit(row, r0a, r0b);
+                                emit(row + 1, r1a, r1b);
+                            }
+                            r0a = 0.f, r0b = 0.f, r1a = 0.f, r1b = 0.f;
+                        }
+                        row = vr;
+                        // Transpose of the 4-tap bilinear gather: val into the
+                        // same taps with the same weights.
+                        const float fv = v - vr, a = val[z];
+                        r0a += a * (1 - fu) * (1 - fv);
+                        r0b += a * (0 + fu) * (1 - fv);
+                        r1a += a * (1 - fu) * (0 + fv);
+                        r1b += a * (0 + fu) * (0 + fv);
+                    }
+                }
+                if (row >= 0)
+                {
+                    emit(row, r0a, r0b);
+                    emit(row + 1, r1a, r1b);
+                }
+            }
+            __syncthreads();
+            for (int i = tid; i < FWD_P * FWD_P; i += FWD_X * FWD_Y)
+            {
+                const float a = patch[i];
+                if (a != 0.f)
+                {
+                    patch[i] = 0.f;
+                    atomicAdd(&g[(u0 + i % FWD_P) + (size_t)t * n + (size_t)(v0 + i / FWD_P) * zs], a);
+                }
+            }
+            __syncthreads();
         }
     }
 }
@@ -263,10 +356,8 @@ extern "C" int tomoxide_forwardproject(void *g, const void *f, const float *thet
         }
         return (int)cudaGetLastError();
     }
-    dim3 dimBlock(32, 32, 1);
-    dim3 grid((unsigned)ceil(n / 32.0), (unsigned)ceil(n / 32.0), (unsigned)ncz);
-    size_t shmem = 2 * (size_t)nproj * sizeof(float); // cos/sin(theta) cache
-    forwardprojection_ker<<<grid, dimBlock, shmem, st>>>(
+    dim3 grid((n + FWD_X - 1) / FWD_X, (n + FWD_Y - 1) / FWD_Y, (ncz + FWD_G - 1) / FWD_G);
+    forwardprojection_ker<<<grid, dim3(FWD_X, FWD_Y), 0, st>>>(
         (float *)g, (const float *)f, theta, phi, axis, sz, ncz, n, nz, rh, nproj);
     return (int)cudaGetLastError();
 }

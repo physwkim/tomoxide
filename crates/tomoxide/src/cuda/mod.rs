@@ -283,9 +283,10 @@ pub fn median3d(
 }
 
 /// A band held on the device for [`lamino_reproject`] at any number of angle
-/// chunks, uploaded once. The kernel's `int` indexing and its per-angle shared
-/// cache bound one [`project`](Self::project) to 6144 angles and fewer than
-/// 2^31 elements on either side; split `theta` to stay inside. CUDA-only.
+/// chunks, uploaded once. One [`project`](Self::project) takes at most 6144
+/// angles and fewer than 2^31 elements on either side, the bounds of the
+/// kernel's former per-angle shared cache and `int` indexing (now conservative);
+/// split `theta` to stay inside. CUDA-only.
 pub struct LaminoReprojector {
     #[cfg(feature = "cuda")]
     inner: cuda_impl::LaminoReprojector,
@@ -3467,8 +3468,8 @@ mod cuda_impl {
 
         pub(super) fn project(&self, theta: &[f32]) -> Result<Array3<f32>> {
             let (n, rows, nproj) = (self.n, self.rows, theta.len());
-            // The launch caches cos/sin per angle in 48 KiB of shared memory, and
-            // a launch that asks for more fails without reaching the sync.
+            // Conservative since the forward kernel caches cos/sin FWD_TC angles at
+            // a time and indexes 64-bit; these were its 48 KiB-cache and int bounds.
             if nproj == 0 || nproj > 6144 || rows * nproj * n > i32::MAX as usize {
                 return Err(Error::InvalidParam(format!(
                     "lamino reprojection takes 1..=6144 angles of {rows}x{n} under 2^31 \
