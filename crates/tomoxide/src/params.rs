@@ -174,11 +174,11 @@ pub struct ReconParams {
     pub dtype: crate::dtype::Dtype,
     /// Laminography reconstruction height (number of output z-slices). `None`
     /// uses tomocupy's auto height `ceil(nz / cos(lamino_angle) / 2) * 2`. Only
-    /// consumed when the geometry's beam is [`crate::geometry::Beam::Laminography`],
-    /// and only by the analytic methods: the iterative solvers reconstruct `nz`
-    /// slices and reject any other height.
+    /// consumed when the geometry's beam is [`crate::geometry::Beam::Laminography`];
+    /// every method resolves it through [`ReconParams::volume_height`].
     pub lamino_rh: Option<usize>,
-    /// Optional warm-start volume (`[nz, n, n]`): the initial iterate for an
+    /// Optional warm-start volume (`[rh, n, n]`, `rh` from
+    /// [`ReconParams::volume_height`]): the initial iterate for an
     /// iterative method, replacing its built-in default (SIRT/GRAD/TIKH/TV → 0,
     /// the EM methods MLEM/OSEM/PML/OSPML → 1). Enables algorithm chaining — e.g.
     /// FBP → SIRT, or OSEM → MLEM — where one method's output seeds the next.
@@ -219,6 +219,28 @@ impl Default for ReconParams {
             lamino_rh: None,
             init: None,
             ext_pad: false,
+        }
+    }
+}
+
+impl ReconParams {
+    /// Output z-slices of a laminography reconstruction of `nz` detector rows
+    /// at `tilt_deg`: `lamino_rh`, else tomocupy's auto height
+    /// [`crate::cuda::lamino_recon_height`].
+    pub fn lamino_height(&self, nz: usize, tilt_deg: f32) -> usize {
+        self.lamino_rh
+            .unwrap_or_else(|| crate::cuda::lamino_recon_height(nz, tilt_deg))
+    }
+
+    /// Output z-slices for `nz` detector rows under `beam`: `nz` unless the beam
+    /// is tilted, then [`Self::lamino_height`]. Analytic and iterative methods
+    /// both size their volume by it, so one method's output seeds another.
+    pub fn volume_height(&self, nz: usize, beam: crate::geometry::Beam) -> usize {
+        match beam {
+            crate::geometry::Beam::Laminography { phi } => {
+                self.lamino_height(nz, crate::geometry::lamino_tilt_deg(phi))
+            }
+            _ => nz,
         }
     }
 }

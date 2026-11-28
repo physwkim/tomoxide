@@ -9,10 +9,8 @@
 //! (flat/dark + minus-log, no phase/stripe) before the solve, and prints the
 //! per-stage wall times.
 //!
-//! NOTE on volume height: the generic solvers reconstruct at volume-height =
-//! detector rows (`nz`), NOT the tilt-extended analytic recon-height `rh`
-//! (`ceil(nz/cos(tilt)/2)*2`). So run the analytic baseline with
-//! `--lamino_rh <nz>` to get a matching-height, z-aligned comparison.
+//! The volume is as tall as the analytic recon-height `rh`
+//! (`ceil(nz/cos(tilt)/2)*2`), so it is z-aligned with the analytic baseline.
 //!
 //!   cargo run --release --features cuda --example lamino_iterative_demo -- \
 //!       <input.h5> <sirt|tv|mlem> <num_iter> <center> <tilt_deg> <reg_par> <out.h5>
@@ -65,7 +63,6 @@ fn main() -> tomoxide::Result<()> {
         "input={input} nproj={nproj} nz={nz} nx={nx} center={center} tilt={tilt_deg}° \
          algo={algorithm:?} num_iter={num_iter} reg_par={reg_par}"
     );
-    println!("  volume height = nz = {nz} (iterative laminography reconstructs the detector rows)");
 
     let mut ds = reader.read_all()?;
 

@@ -60,22 +60,35 @@ fn grid_size(sino: &Tomo<f32>, params: &ReconParams) -> usize {
     params.num_gridx.unwrap_or_else(|| sino.n_cols())
 }
 
+/// Output volume `[rh, n, n]` of a whole-volume iterative solve: `rh` from
+/// [`ReconParams::volume_height`] (the detector rows unless the beam is
+/// tilted), `n` from [`grid_size`].
+fn volume_dims(sino: &Tomo<f32>, geom: &Geometry, params: &ReconParams) -> (usize, usize, usize) {
+    let n = grid_size(sino, params);
+    (params.volume_height(sino.n_rows(), geom.beam), n, n)
+}
+
 /// Starting iterate for an iterative solver: the warm-start `params.init` volume
-/// when provided (validated to `[nz, n, n]`), else a constant-`default` volume
+/// when provided (validated to `dims`), else a constant-`default` volume
 /// (SIRT/TV seed with 0, the EM methods with 1). This is the single site that
 /// turns a caller's chained reconstruction into an initial guess.
-fn init_volume(params: &ReconParams, nz: usize, n: usize, default: f32) -> Result<Volume<f32>> {
+fn init_volume(
+    params: &ReconParams,
+    dims: (usize, usize, usize),
+    default: f32,
+) -> Result<Volume<f32>> {
+    let (nz, ny, nx) = dims;
     match &params.init {
         Some(v) => {
-            if v.dims() != (nz, n, n) {
+            if v.dims() != dims {
                 return Err(Error::ShapeMismatch {
-                    expected: format!("init volume [{nz}, {n}, {n}]"),
+                    expected: format!("init volume [{nz}, {ny}, {nx}]"),
                     found: format!("{:?}", v.dims()),
                 });
             }
             Ok(v.clone())
         }
-        None => Ok(Volume::new(Array3::from_elem((nz, n, n), default))),
+        None => Ok(Volume::new(Array3::from_elem(dims, default))),
     }
 }
 
@@ -185,18 +198,6 @@ fn iterative(
         return Err(Error::InvalidParam(
             "warm-start `init` is not supported for row-action ART/BART".into(),
         ));
-    }
-
-    // An iterative laminography volume is as tall as the detector (the device
-    // projector pair is built on rh == nz); refuse another height, not ignore it.
-    let nz = sino.n_rows();
-    if let Some(rh) = params.lamino_rh.filter(|&rh| rh != nz) {
-        if matches!(geom.beam, Beam::Laminography { .. }) {
-            return Err(Error::InvalidParam(format!(
-                "iterative laminography reconstructs the {nz} detector rows; lamino_rh {rh} is \
-                 not supported"
-            )));
-        }
     }
 
     // Truncated-projection support extension: solve on an edge-replicate
@@ -323,7 +324,7 @@ fn ext_pad_solve(
 ) -> Result<Volume<f32>> {
     let b = sino.as_layout(Layout::Sinogram);
     let (nz, nang, ncols) = (b.n_rows(), b.n_angles(), b.n_cols());
-    let n = grid_size(sino, params);
+    let (nv, n, _) = volume_dims(sino, geom, params);
     let pad = (ncols / 4).max(1);
     let ncols_ext = ncols + 2 * pad;
     let n_ext = n + 2 * pad;
@@ -356,12 +357,12 @@ fn ext_pad_solve(
         Center::PerRow(v) => Center::PerRow(v.iter().map(|c| c + pad as f32).collect()),
     };
 
-    // Embed an `[nz, n, n]` volume centered in the `[nz, n_ext, n_ext]` grid.
+    // Embed an `[nv, n, n]` volume centered in the `[nv, n_ext, n_ext]` grid.
     // (`slice_axis`, not the `s![]` macro — the macro expands with an
     // `allow(unsafe_code)` that this module's `forbid` rejects.)
     let core = ndarray::Slice::from(pad..pad + n);
     let embed = |src: &Array3<f32>| -> Array3<f32> {
-        let mut out = Array3::<f32>::zeros((nz, n_ext, n_ext));
+        let mut out = Array3::<f32>::zeros((nv, n_ext, n_ext));
         let mut view = out.slice_axis_mut(Axis(1), core);
         view.slice_axis_mut(Axis(2), core).assign(src);
         out
@@ -371,17 +372,17 @@ fn ext_pad_solve(
     params_ext.num_gridx = Some(n_ext);
     params_ext.num_gridy = params.num_gridy.map(|_| n_ext);
     if let Some(v) = &params.init {
-        if v.dims() != (nz, n, n) {
+        if v.dims() != (nv, n, n) {
             return Err(Error::ShapeMismatch {
-                expected: format!("init volume [{nz}, {n}, {n}]"),
+                expected: format!("init volume [{nv}, {n}, {n}]"),
                 found: format!("{:?}", v.dims()),
             });
         }
         params_ext.init = Some(Volume::new(embed(&v.array)));
     }
-    if params.reg_data.len() == nz * n * n {
+    if params.reg_data.len() == nv * n * n {
         let prior =
-            Array3::from_shape_vec((nz, n, n), params.reg_data.clone()).expect("len checked above");
+            Array3::from_shape_vec((nv, n, n), params.reg_data.clone()).expect("len checked above");
         params_ext.reg_data = embed(&prior).into_raw_vec_and_offset().0;
     }
 
@@ -408,14 +409,14 @@ fn sirt(
     proj: &dyn ForwardProject,
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
-    let n = grid_size(sino, params);
+    let dims = volume_dims(sino, geom, params);
     let nz = sino.n_rows();
     let b = sino.as_layout(Layout::Sinogram);
     let nang = b.n_angles();
     let ncols = b.n_cols();
 
     // Ray-length weights R = 1 / A(1).
-    let ones_img = Volume::new(Array3::from_elem((nz, n, n), 1.0));
+    let ones_img = Volume::new(Array3::from_elem(dims, 1.0));
     let mut ray = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
     proj.project(&ones_img, geom, &mut ray)?;
     let rw = ray
@@ -424,15 +425,15 @@ fn sirt(
 
     // Sensitivity weights C = 1 / Aᵀ(1).
     let ones_sino = Tomo::new(Array3::from_elem((nz, nang, ncols), 1.0), Layout::Sinogram);
-    let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+    let mut sens = Volume::new(Array3::zeros(dims));
     bp.backproject(&ones_sino, geom, &mut sens)?;
     let cw = sens
         .array
         .mapv(|v| if v.abs() > 1e-6 { 1.0 / v } else { 0.0 });
 
-    let mut vol = init_volume(params, nz, n, 0.0)?;
+    let mut vol = init_volume(params, dims, 0.0)?;
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
-    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
         proj.project(&vol, geom, &mut ax)?; // A x
         let mut resid = &b.array - &ax.array; // b − A x
@@ -456,7 +457,7 @@ fn mlem(
     proj: &dyn ForwardProject,
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
-    let n = grid_size(sino, params);
+    let dims = volume_dims(sino, geom, params);
     let nz = sino.n_rows();
     let b = sino.as_layout(Layout::Sinogram);
     let nang = b.n_angles();
@@ -464,12 +465,12 @@ fn mlem(
 
     // Sensitivity Aᵀ(1).
     let ones_sino = Tomo::new(Array3::from_elem((nz, nang, ncols), 1.0), Layout::Sinogram);
-    let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+    let mut sens = Volume::new(Array3::zeros(dims));
     bp.backproject(&ones_sino, geom, &mut sens)?;
 
-    let mut vol = init_volume(params, nz, n, 1.0)?; // positive init (or warm-start)
+    let mut vol = init_volume(params, dims, 1.0)?; // positive init (or warm-start)
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
-    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
         proj.project(&vol, geom, &mut ax)?; // A x
         let mut ratio = b.array.clone();
@@ -517,7 +518,7 @@ pub(crate) fn ordered_subsets(nang: usize, params: &ReconParams) -> Vec<Vec<usiz
 }
 
 /// One ordered subset: its sub-geometry, measured sinogram slice `[nz, len,
-/// ncols]`, and the iteration-invariant sensitivity `Aₛᵀ(1)` `[nz, n, n]`.
+/// ncols]`, and the iteration-invariant sensitivity `Aₛᵀ(1)` `[rh, n, n]`.
 struct OsSubset {
     geom: Geometry,
     b: Array3<f32>,
@@ -531,7 +532,7 @@ struct OsSubset {
 fn build_subsets(
     b: &Tomo<f32>,
     geom: &Geometry,
-    n: usize,
+    dims: (usize, usize, usize),
     block_params: &ReconParams,
     bp: &dyn FilteredBackproject,
 ) -> Result<Vec<OsSubset>> {
@@ -553,7 +554,7 @@ fn build_subsets(
             .as_standard_layout()
             .into_owned();
         let ones = Tomo::new(Array3::from_elem((nz, len, ncols), 1.0), Layout::Sinogram);
-        let mut sens = Volume::new(Array3::zeros((nz, n, n)));
+        let mut sens = Volume::new(Array3::zeros(dims));
         bp.backproject(&ones, &sub_geom, &mut sens)?;
         subsets.push(OsSubset {
             geom: sub_geom,
@@ -574,7 +575,7 @@ fn subset_em_correction(
     bp: &dyn FilteredBackproject,
     corr: &mut Volume<f32>,
 ) -> Result<()> {
-    let nz = vol.dims().0;
+    let nz = sub.b.shape()[0];
     let len = sub.geom.angles.0.len();
     let ncols = sub.b.shape()[2];
     let mut ax = Tomo::new(Array3::zeros((nz, len, ncols)), Layout::Sinogram);
@@ -604,13 +605,12 @@ fn osem(
     proj: &dyn ForwardProject,
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
-    let n = grid_size(sino, params);
+    let dims = volume_dims(sino, geom, params);
     let b = sino.as_layout(Layout::Sinogram);
-    let nz = b.n_rows();
-    let subsets = build_subsets(&b, geom, n, params, bp)?;
+    let subsets = build_subsets(&b, geom, dims, params, bp)?;
 
-    let mut vol = init_volume(params, nz, n, 1.0)?; // positive init (or warm-start)
-    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    let mut vol = init_volume(params, dims, 1.0)?; // positive init (or warm-start)
+    let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
             subset_em_correction(&vol, sub, proj, bp, &mut corr)?;
@@ -727,9 +727,8 @@ fn ospml(
     block_count: usize,
     delta: Option<f32>,
 ) -> Result<Volume<f32>> {
-    let n = grid_size(sino, params);
+    let dims = volume_dims(sino, geom, params);
     let b = sino.as_layout(Layout::Sinogram);
-    let nz = b.n_rows();
     let reg = params.reg_par.first().copied().unwrap_or(0.0);
 
     // Reuse the ordering rule but force the requested block count (pml_* ⇒ 1).
@@ -737,14 +736,14 @@ fn ospml(
         num_block: block_count,
         ..params.clone()
     };
-    let subsets = build_subsets(&b, geom, n, &block_params, bp)?;
+    let subsets = build_subsets(&b, geom, dims, &block_params, bp)?;
 
-    let mut vol = init_volume(params, nz, n, 1.0)?; // positive init (or warm-start)
-    let mut corr = Volume::new(Array3::zeros((nz, n, n)));
+    let mut vol = init_volume(params, dims, 1.0)?; // positive init (or warm-start)
+    let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
             subset_em_correction(&vol, sub, proj, bp, &mut corr)?; // Aₛᵀ(b ⊘ Aₛ x)
-            for z in 0..nz {
+            for z in 0..dims.0 {
                 penalized_ml_update(
                     &mut vol.array.index_axis_mut(Axis(0), z),
                     &corr.array.index_axis(Axis(0), z),
@@ -801,7 +800,7 @@ fn gradient_descent(
     let fixed_step = params.reg_par.first().copied().unwrap_or(1.0);
 
     // r-scaled domain (physical = r · iterate); a warm-start seed enters as init / r.
-    let mut vol = init_volume(params, nz, n, 0.0)?;
+    let mut vol = init_volume(params, (nz, n, n), 0.0)?;
     vol.array.mapv_inplace(|v| v / r);
     let mut recon0 = vol.array.clone();
     let mut grad0 = Array3::<f32>::zeros((nz, n, n));
@@ -961,7 +960,7 @@ fn cgls(
         acc as f32
     }
 
-    let mut vol = init_volume(params, nz, n, 0.0)?; // x = x0 (0, or warm-start)
+    let mut vol = init_volume(params, (nz, n, n), 0.0)?; // x = x0 (0, or warm-start)
 
     // r = b − A x0.
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
@@ -1046,7 +1045,8 @@ fn tv(
     proj: &dyn ForwardProject,
     bp: &dyn FilteredBackproject,
 ) -> Result<Volume<f32>> {
-    let n = grid_size(sino, params);
+    let dims = volume_dims(sino, geom, params);
+    let (nv, n) = (dims.0, dims.1);
     let b = sino.as_layout(Layout::Sinogram);
     let nz = b.n_rows();
     let nang = b.n_angles();
@@ -1058,14 +1058,14 @@ fn tv(
 
     // The iterate lives in the r-scaled domain (physical = r · iterate; the final
     // `xbar × r` unscales), so a warm-start seed enters as init / r.
-    let mut xbar = init_volume(params, nz, n, 0.0)?; // extrapolated primal (recon)
+    let mut xbar = init_volume(params, dims, 0.0)?; // extrapolated primal (recon)
     xbar.array.mapv_inplace(|v| v / r);
     let mut x = xbar.array.clone(); // primal iterate (update)
-    let mut p0x = Array3::<f32>::zeros((nz, n, n)); // TV dual, x-gradient
-    let mut p0y = Array3::<f32>::zeros((nz, n, n)); // TV dual, y-gradient
+    let mut p0x = Array3::<f32>::zeros(dims); // TV dual, x-gradient
+    let mut p0y = Array3::<f32>::zeros(dims); // TV dual, y-gradient
     let mut pd = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram); // data dual
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
-    let mut bpv = Volume::new(Array3::zeros((nz, n, n)));
+    let mut bpv = Volume::new(Array3::zeros(dims));
 
     for _ in 0..params.num_iter.max(1) {
         proj.project(&xbar, geom, &mut ax)?; // R x̄
@@ -1077,7 +1077,7 @@ fn tv(
             .for_each(|q, &a, &d| *q = (*q + C * r * a - C * d) / (1.0 + C));
         bp.backproject(&pd, geom, &mut bpv)?; // Rᵀ(pᵈ)
 
-        for z in 0..nz {
+        for z in 0..nv {
             // TV dual ascent on x̄, then project onto the λ-ball (interior stencil;
             // the last row/col of pᵀᵛ stay 0, matching tomopy's loop bounds).
             let xb = xbar.array.index_axis(Axis(0), z);

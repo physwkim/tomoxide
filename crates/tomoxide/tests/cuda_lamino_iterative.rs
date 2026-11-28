@@ -5,12 +5,12 @@
 //! falls through to the generic solvers, which drive the lamino-capable
 //! capabilities.
 //!
-//! Data-consistent recovery: a phantom volume `[nz,n,n]` is forward-projected
-//! through the *same* tilted forward operator the solver's `A` uses, so a
-//! converged least-squares solve must recover the phantom (an inverse crime that
-//! isolates solver+projector correctness — physical fidelity vs tomocupy is the
-//! analytic path's job). Reconstructs at volume-height = detector rows (`nz`);
-//! a distinct recon-height `rh` is a separate solver change.
+//! Data-consistent recovery: a phantom volume `[rh,n,n]` is forward-projected
+//! onto `nz` detector rows through the *same* tilted forward operator the
+//! solver's `A` uses, so a converged least-squares solve must recover the
+//! phantom (an inverse crime that isolates solver+projector correctness —
+//! physical fidelity vs tomocupy is the analytic path's job). `rh` is the
+//! analytic methods' auto height, so the volume is taller than the detector.
 //!
 //! Own test binary (touches CUDA device state) per the suite convention.
 #![cfg(feature = "cuda")]
@@ -19,6 +19,11 @@ use tomoxide::{
     recon, Algorithm, Angles, Beam, Center, CudaBackend, Detector, ForwardProject, Geometry,
     Layout, ReconParams, Tomo, Volume,
 };
+
+const NZ: usize = 32;
+const TILT_DEG: f32 = 20.0;
+// tomocupy's auto height `ceil(nz / cos(tilt) / 2) * 2` at nz 32, 20°.
+const RH: usize = 36;
 
 fn pearson(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len() as f64;
@@ -47,9 +52,8 @@ fn setup() -> Option<Setup> {
         }
     };
 
-    let (n, nproj, nz) = (64usize, 120usize, 32usize);
-    let lamino_angle_deg = 20.0f32;
-    let phi = std::f32::consts::FRAC_PI_2 + lamino_angle_deg * std::f32::consts::PI / 180.0;
+    let (n, nproj, nz, rh) = (64usize, 120usize, NZ, RH);
+    let phi = std::f32::consts::FRAC_PI_2 + TILT_DEG * std::f32::consts::PI / 180.0;
     let angles = Angles::uniform(nproj, 0.0, std::f32::consts::PI);
     let geom = Geometry {
         angles,
@@ -62,11 +66,11 @@ fn setup() -> Option<Setup> {
         },
     };
 
-    // Phantom volume [nz,n,n]: two offset solid cubes (bounded support well
+    // Phantom volume [rh,n,n]: two offset solid cubes (bounded support well
     // inside the field so the tilt keeps it on the detector).
-    let mut vol = ndarray::Array3::<f32>::zeros((nz, n, n));
+    let mut vol = ndarray::Array3::<f32>::zeros((rh, n, n));
     let mut cube = |cz: usize, cy: usize, cx: usize, r: usize, val: f32| {
-        for z in cz.saturating_sub(r)..(cz + r).min(nz) {
+        for z in cz.saturating_sub(r)..(cz + r).min(rh) {
             for y in cy.saturating_sub(r)..(cy + r).min(n) {
                 for x in cx.saturating_sub(r)..(cx + r).min(n) {
                     vol[[z, y, x]] = val;
@@ -74,8 +78,8 @@ fn setup() -> Option<Setup> {
             }
         }
     };
-    cube(nz / 2, n / 2 - 6, n / 2 - 6, 5, 1.0);
-    cube(nz / 2 + 4, n / 2 + 6, n / 2 + 4, 4, 0.6);
+    cube(rh / 2, n / 2 - 6, n / 2 - 6, 5, 1.0);
+    cube(rh / 2 + 4, n / 2 + 6, n / 2 + 4, 4, 0.6);
     let phantom = Volume::new(vol);
 
     let mut sino = Tomo::new(ndarray::Array3::zeros((nz, nproj, n)), Layout::Sinogram);
@@ -146,5 +150,36 @@ fn cuda_lamino_rejects_per_slice() {
             r.is_err(),
             "{algo:?} must be rejected for laminography, got Ok"
         );
+    }
+}
+
+// Every method sizes a laminography volume by one rule, so an analytic
+// reconstruction seeds an iterative one (the CLI's `--algorithm fbp,sirt`) and
+// an explicit `lamino_rh` reaches the iterative solvers too.
+#[test]
+fn cuda_lamino_iterative_height_matches_analytic() {
+    let Some((cuda, geom, sino, _)) = setup() else {
+        return;
+    };
+    let n = sino.n_cols();
+    let fbp = recon::recon(&sino, &geom, Algorithm::Fbp, &ReconParams::default(), &cuda).unwrap();
+    assert_eq!(fbp.dims(), (RH, n, n));
+    for algo in [Algorithm::Sirt, Algorithm::Mlem, Algorithm::Tv] {
+        let params = ReconParams {
+            num_iter: 2,
+            init: Some(fbp.clone()),
+            ..Default::default()
+        };
+        let rec = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
+        assert_eq!(rec.dims(), (RH, n, n), "{algo:?} warm-started from fbp");
+    }
+    for rh in [NZ, RH + 6] {
+        let params = ReconParams {
+            num_iter: 2,
+            lamino_rh: Some(rh),
+            ..Default::default()
+        };
+        let rec = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
+        assert_eq!(rec.dims(), (rh, n, n), "lamino_rh {rh}");
     }
 }

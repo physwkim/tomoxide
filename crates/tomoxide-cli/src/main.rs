@@ -136,10 +136,9 @@ enum Command {
         /// tilted projector pair. Omit for ordinary parallel-beam tomography.
         #[arg(long)]
         lamino_angle: Option<f32>,
-        /// Laminography reconstruction height (output z-slices) of the analytic
-        /// methods. Omit for tomocupy's auto height
-        /// `ceil(nz / cos(lamino_angle) / 2) * 2`. The iterative methods
-        /// reconstruct the `nz` detector rows and reject any other height.
+        /// Laminography reconstruction height (output z-slices), the same for
+        /// every method. Omit for tomocupy's auto height
+        /// `ceil(nz / cos(lamino_angle) / 2) * 2`.
         #[arg(long)]
         lamino_rh: Option<usize>,
     },
@@ -1096,9 +1095,7 @@ fn main() -> anyhow::Result<()> {
                     // still forces the *input* to be read whole (lamino can't band
                     // its detector rows); banded is always false for lamino
                     // (row_band rejects it), so tiles map 1:1 to the output rows.
-                    let rh = params
-                        .lamino_rh
-                        .unwrap_or_else(|| tomoxide::cuda::lamino_recon_height(nz_total, deg));
+                    let rh = params.lamino_height(nz_total, deg);
                     let mut writer = maybe_progress(
                         tomoxide::io::create_writer(&out, save_format)?,
                         common.progress_json,
