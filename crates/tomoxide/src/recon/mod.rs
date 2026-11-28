@@ -187,6 +187,18 @@ fn iterative(
         ));
     }
 
+    // An iterative laminography volume is as tall as the detector (the device
+    // projector pair is built on rh == nz); refuse another height, not ignore it.
+    let nz = sino.n_rows();
+    if let Some(rh) = params.lamino_rh.filter(|&rh| rh != nz) {
+        if matches!(geom.beam, Beam::Laminography { .. }) {
+            return Err(Error::InvalidParam(format!(
+                "iterative laminography reconstructs the {nz} detector rows; lamino_rh {rh} is \
+                 not supported"
+            )));
+        }
+    }
+
     // Truncated-projection support extension: solve on an edge-replicate
     // extended lane + wider grid, return the central crop. Sits above the
     // backend dispatch so CPU, CUDA, and wgpu all see the identical extended

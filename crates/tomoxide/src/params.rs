@@ -174,7 +174,9 @@ pub struct ReconParams {
     pub dtype: crate::dtype::Dtype,
     /// Laminography reconstruction height (number of output z-slices). `None`
     /// uses tomocupy's auto height `ceil(nz / cos(lamino_angle) / 2) * 2`. Only
-    /// consumed when the geometry's beam is [`crate::geometry::Beam::Laminography`].
+    /// consumed when the geometry's beam is [`crate::geometry::Beam::Laminography`],
+    /// and only by the analytic methods: the iterative solvers reconstruct `nz`
+    /// slices and reject any other height.
     pub lamino_rh: Option<usize>,
     /// Optional warm-start volume (`[nz, n, n]`): the initial iterate for an
     /// iterative method, replacing its built-in default (SIRT/GRAD/TIKH/TV → 0,

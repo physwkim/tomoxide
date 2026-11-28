@@ -12,7 +12,9 @@
 //! energy (tikh ridge), and ordered subsets accelerate convergence (OSEM, BART).
 
 use ndarray::{Array2, Axis};
-use tomoxide::{recon, sim, Algorithm, Angles, CpuBackend, Geometry, ReconParams, Volume};
+use tomoxide::{
+    recon, sim, Algorithm, Angles, Beam, CpuBackend, Error, Geometry, ReconParams, Volume,
+};
 
 fn pearson_disk(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) -> f32 {
     let c = (n as f32 - 1.0) / 2.0;
@@ -343,6 +345,29 @@ fn warmstart_rejected_for_unsupported() {
         err.is_err(),
         "ART silently accepted an unsupported warm-start init"
     );
+}
+
+/// An iterative laminography volume is as tall as the detector; a requested
+/// recon height other than that is refused, not silently dropped.
+#[test]
+fn iterative_laminography_rejects_other_heights() {
+    let (n, nang, nz) = (16usize, 30usize, 4usize);
+    let cpu = CpuBackend::new();
+    let mut geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, nz, 1.0);
+    let sino = sim::project(&Volume::new(ndarray::Array3::ones((nz, n, n))), &geom, &cpu).unwrap();
+    geom.beam = Beam::laminography(30.0);
+    let params = ReconParams {
+        num_iter: 1,
+        lamino_rh: Some(nz + 2),
+        ..Default::default()
+    };
+    match recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cpu) {
+        Err(Error::InvalidParam(m)) if m.contains("lamino_rh") => {}
+        other => panic!(
+            "lamino_rh {} on {nz} rows was not refused: {other:?}",
+            nz + 2
+        ),
+    }
 }
 
 #[test]
