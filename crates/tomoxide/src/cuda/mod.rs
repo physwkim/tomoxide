@@ -124,6 +124,14 @@ pub fn lamino_recon_height(nz: usize, lamino_angle_deg: f32) -> usize {
     (((nz as f32 / c) / 2.0).ceil() as usize) * 2
 }
 
+/// Whether CUDA's analytic laminography reconstruction — the one that streams
+/// the `rh` volume tile by tile — takes `algorithm`. The iterative methods
+/// reconstruct laminography through the device-resident solvers instead.
+pub fn lamino_streams(algorithm: crate::Algorithm) -> bool {
+    use crate::Algorithm::{Fbp, Fourierrec, Linerec};
+    matches!(algorithm, Fbp | Linerec | Fourierrec)
+}
+
 /// Reconstruct the single output slice `sz` at every tilt in `tilts_deg`, in one
 /// pass over the filtered projection stack. Returns `[tilts_deg.len(), n, n]`,
 /// one candidate image per tilt, in the row order given.
@@ -8345,7 +8353,7 @@ mod cuda_impl {
             )?;
             return Ok((rh, n, n));
         }
-        if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
+        if !super::lamino_streams(algorithm) {
             return Err(Error::InvalidParam(format!(
                 "cuda laminography supports Fbp/Linerec/Fourierrec only; got {algorithm:?}"
             )));
@@ -8537,7 +8545,7 @@ mod cuda_impl {
                             .map_err(|e| Error::InvalidParam(format!("cuda volume shape: {e}")))?,
                     ));
                 }
-                if !matches!(algorithm, Algorithm::Fbp | Algorithm::Linerec) {
+                if !super::lamino_streams(algorithm) {
                     return Err(Error::InvalidParam(format!(
                         "cuda laminography supports Fbp/Linerec/Fourierrec only; got {algorithm:?}"
                     )));

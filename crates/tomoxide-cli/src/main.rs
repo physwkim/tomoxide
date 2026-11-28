@@ -130,13 +130,16 @@ enum Command {
         #[arg(long)]
         end_row: Option<usize>,
         /// Laminography tilt angle in DEGREES (tomocupy `--lamino-angle`). When
-        /// set, the rotation axis is tilted by this angle and the whole-stack
-        /// laminography back-projection is used (CUDA fbp/linerec, f32 only).
-        /// Omit for ordinary parallel-beam tomography.
+        /// set, the rotation axis is tilted by this angle and the whole stack is
+        /// reconstructed at once (CUDA, f32 only): fbp/linerec/fourierrec by the
+        /// streaming laminography back-projection, the iterative methods by the
+        /// tilted projector pair. Omit for ordinary parallel-beam tomography.
         #[arg(long)]
         lamino_angle: Option<f32>,
-        /// Laminography reconstruction height (output z-slices). Omit for
-        /// tomocupy's auto height `ceil(nz / cos(lamino_angle) / 2) * 2`.
+        /// Laminography reconstruction height (output z-slices) of the analytic
+        /// methods. Omit for tomocupy's auto height
+        /// `ceil(nz / cos(lamino_angle) / 2) * 2`. The iterative methods
+        /// reconstruct the `nz` detector rows and reject any other height.
         #[arg(long)]
         lamino_rh: Option<usize>,
     },
@@ -1084,8 +1087,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 let nz_total = geom.detector.height;
                 geom.detector.height = z1 - z0;
-                if let Some(deg) = lamino_angle.filter(|_| engine.name() == "cuda") {
-                    // Laminography on CUDA: disk-stream the OUTPUT. Reconstruct the
+                if let Some(deg) = lamino_angle.filter(|_| {
+                    engine.name() == "cuda" && tomoxide::cuda::lamino_streams(plan.algo)
+                }) {
+                    // Analytic laminography on CUDA: disk-stream the OUTPUT. Reconstruct the
                     // rh volume tile-by-tile and write each tile as it lands, so
                     // the whole [rh, n, n] volume never sits in host RAM. The tilt
                     // still forces the *input* to be read whole (lamino can't band
