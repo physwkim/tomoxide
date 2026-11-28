@@ -43,12 +43,13 @@ fn argmax(v: &[f64]) -> usize {
 }
 
 /// A 2-slice bright slab at volume z `z0`, forward-projected with the tilted
-/// geometry, reconstructs with its z-energy peak back at `z0` — in BOTH the
-/// linerec back-projection and the independent Fourier/USFFT algorithm, and the
-/// two peaks agree. `rh − nz = 16`, so the pre-fix `nz/2` centring would land
-/// the Linerec peak 8 slices away from both `z0` and the Fourierrec peak.
+/// geometry, reconstructs with its z-energy peak back at `z0` — in the linerec
+/// back-projection, the independent Fourier/USFFT algorithm and the iterative
+/// solvers, and the peaks agree. `rh − nz = 16`, so the pre-fix `nz/2`
+/// centring would land the Linerec peak 8 slices away from both `z0` and the
+/// Fourierrec peak.
 #[test]
-fn cuda_lamino_linerec_and_fourierrec_agree_on_the_feature_z() {
+fn cuda_lamino_every_algorithm_agrees_on_the_feature_z() {
     let cuda = match CudaBackend::new() {
         Ok(b) => b,
         Err(e) => {
@@ -112,6 +113,28 @@ fn cuda_lamino_linerec_and_fourierrec_agree_on_the_feature_z() {
         "Linerec (z {zl}) and Fourierrec (z {zf}) place the same feature at \
          different volume z — the (rh−nz)/2 convention offset is back"
     );
+
+    // The iterative solvers' own projector pair, sized and centred at the
+    // same `rh`; 30 iterations so the z blur of the first few cannot mask an
+    // offset. The peak is taken over the middle `nz` slices: the z-edge
+    // voxels are reached only by edge rows at a few angles, so MLEM leaves
+    // them near its init of 1 (≈5× the slab's energy).
+    let band = (rh - nz) / 2..(rh + nz) / 2;
+    for algo in [Algorithm::Sirt, Algorithm::Mlem, Algorithm::Tv] {
+        let p = ReconParams {
+            num_iter: 30,
+            ..params.clone()
+        };
+        let rec = recon::recon(&sino, &geom, algo, &p, &cuda).unwrap();
+        assert_eq!(rec.array.dim(), (rh, n, n), "{algo:?}");
+        let zi = band.start + argmax(&z_profile(&rec.array)[band.clone()]);
+        eprintln!("{algo:?} peak z = {zi}");
+        assert!(
+            (zi as i64 - zf as i64).unsigned_abs() <= 1,
+            "{algo:?} (z {zi}) and Fourierrec (z {zf}) place the same feature at \
+             different volume z"
+        );
+    }
 }
 
 /// The centre probe's `sz` is the SAME volume z the reconstruction's slice
