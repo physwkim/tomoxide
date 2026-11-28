@@ -8,7 +8,7 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::{s, Array2, Array3, Axis};
-use tomoxide::backend::{make_fbp_filter, RampShape};
+use tomoxide::backend::make_fbp_filter;
 use tomoxide::{
     cuda, recon, sim, Algorithm, Angles, Beam, Center, Complex32, CpuBackend, CudaBackend,
     Detector, Fft, FilterName, Geometry, Layout, ReconParams, Tomo, Volume,
@@ -158,7 +158,7 @@ fn cuda_lamino_reprojector_chunks_are_the_whole() {
 /// padded to the filter's length, centred, unshifted.
 fn filtered_derivatives(frames: &Array3<f32>, filter: FilterName) -> [Array3<f32>; 2] {
     let (nproj, rows, n) = frames.dim();
-    let w = make_fbp_filter(filter, n, RampShape::Wint).unwrap();
+    let w = make_fbp_filter(filter, n).unwrap();
     let (ne, pad) = (w.len(), w.len() / 2 - n / 2);
     let dcol = Array3::from_shape_fn((nproj, rows, n), |(t, r, c)| {
         let (l, h) = (c.saturating_sub(1), (c + 1).min(n - 1));

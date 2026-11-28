@@ -51,7 +51,7 @@
 //! differs from tomocupy's raw fourierrec by a global sign only. The self-consistent
 //! fwd/adj pair and the `fft2d_inv(fft2d_fwd) == id` round-trip are unaffected.
 
-use crate::backend::{make_fbp_filter, Fft, RampShape};
+use crate::backend::{make_fbp_filter, Fft};
 use crate::dtype::Complex32;
 use crate::error::Result;
 use crate::geometry::lamino_phi;
@@ -685,10 +685,9 @@ fn wrap2d(fdee: &mut [Complex32], n0: usize, n1: usize, m0: usize, m1: usize, ad
 /// The projection filter every lamino backend applies, and the left edge pad
 /// that centres a `detw` line in it. tomocupy filters lamino projections with
 /// its FBP filter (`FBPFilter(4·detw)`: `_wint` ramp, `ne//2 − detw//2` edge
-/// pad), so this is [`make_fbp_filter`] with [`RampShape::Wint`] on every
-/// backend, not only CUDA.
+/// pad), which is [`make_fbp_filter`].
 pub(crate) fn projection_filter(filter: FilterName, detw: usize) -> Result<(Vec<f32>, usize)> {
-    let w = make_fbp_filter(filter, detw, RampShape::Wint)?;
+    let w = make_fbp_filter(filter, detw)?;
     let pad = w.len() / 2 - detw / 2;
     Ok((w, pad))
 }

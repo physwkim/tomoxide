@@ -7,9 +7,9 @@
 //! the CPU path: fbp/linerec back-project at `π/nproj` (was tomocupy's `4/nproj`),
 //! the tomocupy filter ½-gain is removed, fourierrec normalizes its unnormalized
 //! cuFFT inverse by `(2n)²`, and lprec matches directly. So this test now asserts
-//! both `cuda == cpu` orientation (Pearson) AND `cuda/cpu ≈ 1` scale; the residual
-//! ~1.6 % is the ramp-SHAPE gap (CUDA `_wint` order-12 quadrature ramp vs the CPU
-//! linear ramp) plus the fourierrec USFFT deapodization, not a convention scale.
+//! both `cuda == cpu` orientation (Pearson) AND `cuda/cpu ≈ 1` scale. Every backend
+//! builds the same FBP filter, so fbp/linerec/lprec agree to the f32 floor; the
+//! ~0.2 % fourierrec residual is its USFFT deapodization, not a convention scale.
 //! See `cuda/mod.rs` (`cfunc_linerec` doc) and `docs/ARCHITECTURE.md`.
 //!
 //! Laminography is deliberately NOT exercised here: the CUDA lamino path
@@ -69,8 +69,8 @@ fn pearson_disk(a: &Array2<f32>, b: &Array2<f32>, n: usize, radius_frac: f32) ->
 
 /// Best-fit scale `a` minimizing `||cuda − a·cpu||` over the disk. After the scale
 /// unification (Phase 2) this is `≈ 1` for every path (fbp/linerec/fourierrec/
-/// lprec), so `check` asserts it; the residual ~1.6 % is the ramp-shape + USFFT
-/// deapodization gap, not a convention scale. (Pre-unification it was 2/π for
+/// lprec), so `check` asserts it; the ~0.2 % fourierrec residual is its USFFT
+/// deapodization, not a convention scale. (Pre-unification it was 2/π for
 /// fbp/linerec, ≈4·n² for fourierrec, ½ for lprec.)
 fn fit_scale(cuda: &Array2<f32>, cpu: &Array2<f32>, n: usize, radius_frac: f32) -> f64 {
     let c = (n as f32 - 1.0) / 2.0;
@@ -179,12 +179,13 @@ fn check(algorithm: Algorithm, flipped: bool) {
          orientation pin is ineffective for this phantom"
     );
     // (3) Scale pin (Phase 2): CUDA emits the same amplitude as CPU, `cuda/cpu ≈ 1`.
-    //     The ~1.6 % residual is the ramp-shape + USFFT-deapodization gap; the 5 %
-    //     bar is far below any convention regression (½, 2/π ≈ 0.64, ≈4n²) so those
-    //     fail here instead of hiding behind the scale-invariant Pearson.
+    //     The shared filter leaves only fourierrec's ~0.2 % USFFT deapodization;
+    //     the 1 % bar is far below any convention regression (½, 2/π ≈ 0.64, ≈4n²)
+    //     and below a per-backend ramp split (~1.8 %), so those fail here instead
+    //     of hiding behind the scale-invariant Pearson.
     assert!(
-        (scale - 1.0).abs() < 0.05,
-        "{algorithm:?}: CUDA/CPU scale = {scale:.5}, expected ≈ 1 (|Δ| < 0.05). A \
+        (scale - 1.0).abs() < 0.01,
+        "{algorithm:?}: CUDA/CPU scale = {scale:.5}, expected ≈ 1 (|Δ| < 0.01). A \
          per-algorithm convention scale has re-appeared — the Phase 2 unification \
          regressed."
     );

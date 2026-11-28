@@ -207,8 +207,7 @@ convention unification the analytic and iterative solvers share **one
 orientation and scale convention on every backend** (CPU/wgpu/CUDA all follow
 tomopy — see `docs/ARCHITECTURE.md §4.1`). So an analytic seed drops straight
 into an iterative solver on CUDA too: a CUDA `Fbp → Sirt` warm-start is
-convention-matched out of the box, up to the deterministic ~1.6% `_wint`-ramp
-shape residual (not a scale). The only exception is **laminography**, whose CUDA
+convention-matched out of the box. The only exception is **laminography**, whose CUDA
 and CPU paths are different algorithms and are not convention-comparable (do not
 warm-start one from the other). Warm-start is honoured on both the host solvers
 and the CUDA device-resident path (the seed is uploaded once), verified by the

@@ -7,7 +7,7 @@
 
 use crate::backend::{
     make_fbp_filter, Elementwise, FbpFilter, Fft, FilteredBackproject, ForwardProject,
-    FourierReconstruct, LpRecReconstruct, RampShape, RankFilter,
+    FourierReconstruct, LpRecReconstruct, RankFilter,
 };
 use crate::data::{Frames, Layout, Tomo, Volume};
 use crate::dtype::Complex32;
@@ -805,11 +805,9 @@ impl Fft for WgpuBackend {
 
 impl FbpFilter for WgpuBackend {
     /// Build the FBP apodized ramp filter on the host via the shared
-    /// [`make_fbp_filter`] with [`RampShape::Linear`] — wgpu is a portable
-    /// fallback that mirrors the CPU (tomopy) ramp, not the CUDA (tomocupy)
-    /// `_wint` ramp.
+    /// [`make_fbp_filter`].
     fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
-        make_fbp_filter(name, n, RampShape::Linear)
+        make_fbp_filter(name, n)
     }
 
     /// Apply `filter` to every projection of `sino` on the GPU. Each detector

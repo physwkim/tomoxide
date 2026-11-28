@@ -688,8 +688,8 @@ mod cuda_impl {
     use super::{ffi, BandFrames, CudaBackend};
     use crate::backend::{
         make_fbp_filter, parallel_ray_rows, Elementwise, FbpFilter, FilteredBackproject,
-        ForwardProject, FourierReconstruct, IterativeReconstruct, LpRecReconstruct, RampShape,
-        RayProject, RayRow, StreamingAnalytic,
+        ForwardProject, FourierReconstruct, IterativeReconstruct, LpRecReconstruct, RayProject,
+        RayRow, StreamingAnalytic,
     };
     use crate::data::{Frames, Layout, Tomo, Volume};
     use crate::error::{Error, Result};
@@ -2808,9 +2808,7 @@ mod cuda_impl {
     /// additionally normalizes its unnormalized cuFFT inverse by `(2n)²`. The
     /// laminography path also reads this filter but is a *different algorithm* from
     /// CPU USFFT lamino and is excluded from the unification (its cuda/cpu scale +
-    /// sign difference is documented, not unified). The residual ~1.6% on the
-    /// unified paths is the `make_fbp_filter` `_wint` quadrature ramp SHAPE (vs the
-    /// CPU linear ramp), not scale.
+    /// sign difference is documented, not unified).
     fn build_filter_w(
         filter: &[f32],
         geom: &Geometry,
@@ -3230,7 +3228,7 @@ mod cuda_impl {
             }
         };
 
-        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let filter = make_fbp_filter(params.filter_name, ncols)?;
         let pad = filter.len();
         let pad_side = pad / 2 - ncols / 2;
         let w = build_filter_w(&filter, geom, nz, ncols, pad);
@@ -3764,7 +3762,7 @@ mod cuda_impl {
                 },
                 "mask upload",
             )?;
-            let filter = make_fbp_filter(filter, n, RampShape::Wint)?;
+            let filter = make_fbp_filter(filter, n)?;
             let pad = filter.len();
             let nfreq = pad / 2 + 1;
             let dsz = std::mem::size_of::<f64>();
@@ -4228,7 +4226,7 @@ mod cuda_impl {
         // The rotation center rides in the filter (as every analytic CUDA path
         // does), so it comes from `geom`; only the tilt is swept here, and
         // `geom.beam` is ignored because these tilts replace it.
-        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let filter = make_fbp_filter(params.filter_name, ncols)?;
         let pad = filter.len();
         let pad_side = pad / 2 - ncols / 2;
         let w = build_filter_w(&filter, geom, nz, ncols, pad);
@@ -8365,7 +8363,7 @@ mod cuda_impl {
                 "cuda laminography fused normalization (LamNorm) is Fourierrec-only".into(),
             ));
         }
-        let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+        let filter = make_fbp_filter(params.filter_name, ncols)?;
         let pad = filter.len();
         let pad_side = pad / 2 - ncols / 2;
         let w = build_filter_w(&filter, geom, nz, ncols, pad);
@@ -8480,7 +8478,7 @@ mod cuda_impl {
                 .as_slice()
                 .ok_or_else(|| Error::InvalidParam("non-contiguous sinogram".into()))?;
 
-            let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+            let filter = make_fbp_filter(params.filter_name, ncols)?;
             let pad = filter.len();
             let pad_side = pad / 2 - ncols / 2;
             let w = build_filter_w(&filter, geom, nz, ncols, pad);
@@ -8836,7 +8834,7 @@ mod cuda_impl {
             // `make_fbp_filter` pads to `(4·ncols).next_power_of_two()`, always a
             // power of two, so the f16 half-cuFFT width constraint holds by
             // construction (mirrors the assert in `reconstruct`).
-            let filter = make_fbp_filter(params.filter_name, ncols, RampShape::Wint)?;
+            let filter = make_fbp_filter(params.filter_name, ncols)?;
             let devices = selected_devices();
             ck(
                 unsafe { ffi::tomoxide_cuda_set_device(*devices.first().unwrap_or(&0)) },
@@ -8864,12 +8862,9 @@ mod cuda_impl {
     }
 
     impl FbpFilter for CudaBackend {
-        /// FBP filter via the shared [`make_fbp_filter`] with
-        /// [`RampShape::Wint`] — the CUDA backend ports tomocupy, so it builds
-        /// tomocupy's `_wint` quadrature ramp (the CPU/wgpu backends build
-        /// tomopy's linear ramp). Apodization/padding/layout are shared.
+        /// FBP filter via the shared [`make_fbp_filter`].
         fn make_filter(&self, name: FilterName, n: usize) -> Result<Vec<f32>> {
-            make_fbp_filter(name, n, RampShape::Wint)
+            make_fbp_filter(name, n)
         }
 
         /// FBP filtering on the GPU via tomocupy's `cfunc_filter` (cuFFT R2C →
