@@ -2119,7 +2119,7 @@ mod cuda_impl {
         let null = std::ptr::null_mut::<c_void>();
 
         let subs = build_dev_subsets(&s, geom, pair, subsets_idx)?;
-        let vol_d = seed_buf(init, 1.0, nvol, 1.0)?; // positive init (or warm-start)
+        let vol_d = seed_buf(init, crate::recon::EM_INIT, nvol, 1.0)?; // positive init (or warm-start)
         let corr_d = DevBuf::zeroed(vbytes)?;
         unsafe {
             for _ in 0..num_iter.max(1) {
@@ -2185,7 +2185,7 @@ mod cuda_impl {
         };
 
         let subs = build_dev_subsets(&s, geom, pair, subsets_idx)?;
-        let vol_d = seed_buf(init, 1.0, nvol, 1.0)?; // positive init (or warm-start)
+        let vol_d = seed_buf(init, crate::recon::EM_INIT, nvol, 1.0)?; // positive init (or warm-start)
         let old_d = DevBuf::zeroed(vbytes)?; // pre-update snapshot for the stencil
         let corr_d = DevBuf::zeroed(vbytes)?;
         unsafe {

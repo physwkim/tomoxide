@@ -116,18 +116,23 @@ fn cuda_lamino_every_algorithm_agrees_on_the_feature_z() {
 
     // The iterative solvers' own projector pair, sized and centred at the
     // same `rh`; 30 iterations so the z blur of the first few cannot mask an
-    // offset. The peak is taken over the middle `nz` slices: the z-edge
-    // voxels are reached only by edge rows at a few angles, so MLEM leaves
-    // them near its init of 1 (≈5× the slab's energy).
-    let band = (rh - nz) / 2..(rh + nz) / 2;
-    for algo in [Algorithm::Sirt, Algorithm::Mlem, Algorithm::Tv] {
+    // offset. The peak is taken over the whole volume: the z-edge corners no
+    // ray reaches keep the solver's init, which with an EM init of 1 (not
+    // tomopy's 1e-6) out-weighed the slab and put the MLEM/PML peak at z 47.
+    for (algo, reg_par) in [
+        (Algorithm::Sirt, vec![]),
+        (Algorithm::Mlem, vec![]),
+        (Algorithm::PmlQuad, vec![0.1]),
+        (Algorithm::Tv, vec![]),
+    ] {
         let p = ReconParams {
             num_iter: 30,
+            reg_par,
             ..params.clone()
         };
         let rec = recon::recon(&sino, &geom, algo, &p, &cuda).unwrap();
         assert_eq!(rec.array.dim(), (rh, n, n), "{algo:?}");
-        let zi = band.start + argmax(&z_profile(&rec.array)[band.clone()]);
+        let zi = argmax(&z_profile(&rec.array));
         eprintln!("{algo:?} peak z = {zi}");
         assert!(
             (zi as i64 - zf as i64).unsigned_abs() <= 1,

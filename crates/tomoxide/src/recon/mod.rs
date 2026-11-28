@@ -68,10 +68,16 @@ fn volume_dims(sino: &Tomo<f32>, geom: &Geometry, params: &ReconParams) -> (usiz
     (params.volume_height(sino.n_rows(), geom.beam), n, n)
 }
 
+/// Default starting value of the EM family (MLEM/OSEM/PML/OSPML): tomopy
+/// `_init_recon`'s `1e-6`. The multiplicative update needs it positive, and a
+/// voxel no ray reaches (`Aᵀ1 = 0`) is never updated, so it ends at this value
+/// and must read as empty, as SIRT's 0 does.
+pub(crate) const EM_INIT: f32 = 1e-6;
+
 /// Starting iterate for an iterative solver: the warm-start `params.init` volume
 /// when provided (validated to `dims`), else a constant-`default` volume
-/// (SIRT/TV seed with 0, the EM methods with 1). This is the single site that
-/// turns a caller's chained reconstruction into an initial guess.
+/// (SIRT/TV seed with 0, the EM methods with [`EM_INIT`]). This is the single
+/// site that turns a caller's chained reconstruction into an initial guess.
 fn init_volume(
     params: &ReconParams,
     dims: (usize, usize, usize),
@@ -468,7 +474,7 @@ fn mlem(
     let mut sens = Volume::new(Array3::zeros(dims));
     bp.backproject(&ones_sino, geom, &mut sens)?;
 
-    let mut vol = init_volume(params, dims, 1.0)?; // positive init (or warm-start)
+    let mut vol = init_volume(params, dims, EM_INIT)?; // positive init (or warm-start)
     let mut ax = Tomo::new(Array3::zeros((nz, nang, ncols)), Layout::Sinogram);
     let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
@@ -609,7 +615,7 @@ fn osem(
     let b = sino.as_layout(Layout::Sinogram);
     let subsets = build_subsets(&b, geom, dims, params, bp)?;
 
-    let mut vol = init_volume(params, dims, 1.0)?; // positive init (or warm-start)
+    let mut vol = init_volume(params, dims, EM_INIT)?; // positive init (or warm-start)
     let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
@@ -738,7 +744,7 @@ fn ospml(
     };
     let subsets = build_subsets(&b, geom, dims, &block_params, bp)?;
 
-    let mut vol = init_volume(params, dims, 1.0)?; // positive init (or warm-start)
+    let mut vol = init_volume(params, dims, EM_INIT)?; // positive init (or warm-start)
     let mut corr = Volume::new(Array3::zeros(dims));
     for _ in 0..params.num_iter.max(1) {
         for sub in &subsets {
