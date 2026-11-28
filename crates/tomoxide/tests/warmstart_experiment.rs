@@ -2,15 +2,10 @@
 //! does feeding one method's output as the initial iterate of another improve
 //! quality or convergence speed, the way ptychography chains DM/RAAR → ML?
 //!
-//! Runs on the CPU backend so the analytic (FBP) and iterative solvers share one
-//! orientation/scale convention. (The CUDA analytic path is no longer the odd one
-//! out — the Phase 1/2 unification gave it the CPU handedness and the `π/nproj`
-//! dθ weight, see `docs/ARCHITECTURE.md` §4.1 — but keeping the seed and the
-//! solver on one backend keeps the comparison clear of the ~1.6 % cross-backend
-//! ramp-shape residual, which would otherwise ride on the warm-start seed.) A
-//! Shepp–Logan phantom is the ground truth; it is forward-projected at a
-//! sparse-ish angle count with additive Gaussian measurement noise, then
-//! reconstructed. Quality is NRMSE / Pearson vs the ground truth over a disk.
+//! Runs on the CPU backend so the analytic (FBP) seed and the iterative solver
+//! share one backend. A Shepp–Logan phantom is the ground truth; it is
+//! forward-projected at a sparse-ish angle count with additive Gaussian
+//! measurement noise, then reconstructed. Quality is NRMSE / Pearson vs the ground truth over a disk.
 //!
 //! Ignored by default:
 //!   cargo test -p tomoxide --release --test warmstart_experiment -- --ignored --nocapture

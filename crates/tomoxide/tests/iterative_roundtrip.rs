@@ -1077,3 +1077,45 @@ fn cgls_reconstructs_and_beats_sirt_convergence() {
          CGLS {cgls_res:.3} >= SIRT {sirt_res:.3}"
     );
 }
+
+/// CGLS's first step is `x₁ = α·Aᵀb`, `α = ‖Aᵀb‖² / ‖A Aᵀb‖²`. The solver's
+/// per-slice dot products must yield that α; a running f32 sum over the slice
+/// drifts by ~1e-5 here (~1e-3 at 800²) and the step inherits the drift.
+#[test]
+fn cgls_first_step_has_exact_alpha() {
+    use ndarray::Array3;
+    use tomoxide::{Backend, Layout, Tomo};
+    let (n, nang) = (256, 180);
+    let cpu = CpuBackend::new();
+    let vol = Volume::new(sim::shepp2d(n).unwrap().insert_axis(Axis(0)));
+    let geom = Geometry::parallel(Angles::uniform(nang, 0.0, std::f32::consts::PI), n, 1, 1.0);
+    let sino = sim::project(&vol, &geom, &cpu).unwrap();
+    let params = ReconParams {
+        num_gridx: Some(n),
+        num_iter: 1,
+        ..Default::default()
+    };
+    let x1 = recon::recon(&sino, &geom, Algorithm::Cgls, &params, &cpu).unwrap();
+
+    let mut z = Volume::new(Array3::zeros((1, n, n)));
+    cpu.backprojector()
+        .unwrap()
+        .backproject(&sino, &geom, &mut z)
+        .unwrap();
+    let mut w = Tomo::new(Array3::zeros((1, nang, n)), Layout::Sinogram);
+    cpu.projector().unwrap().project(&z, &geom, &mut w).unwrap();
+    let dot = |a: &Array3<f32>, b: &Array3<f32>| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&u, &v)| f64::from(u) * f64::from(v))
+            .sum()
+    };
+    let alpha = dot(&z.array, &z.array) / dot(&w.array, &w.array);
+    let step = dot(&x1.array, &z.array) / dot(&z.array, &z.array);
+    let rel = (step / alpha - 1.0).abs();
+    eprintln!("CGLS first step: solver {step:.9e}, exact {alpha:.9e}, rel {rel:.2e}");
+    assert!(
+        rel < 1e-6,
+        "CGLS step drifted from the exact alpha: rel {rel:.2e}"
+    );
+}

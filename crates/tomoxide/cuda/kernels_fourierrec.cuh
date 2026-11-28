@@ -1,4 +1,5 @@
 #include "defs.cuh"
+#include "projgeom.cuh"
 #define PI 3.1415926535f
 
 void __global__ divphi(real2 *g, real2 *f, float mu, int n, int nz, int nproj, int m)
@@ -38,8 +39,10 @@ void __global__ takexy(float *x, float *y, float *theta, int n, int nproj)
 
   if (tx >= n || ty >= nproj)
     return;
-  x[tx + ty * n] = (tx - n / 2) / (float)n * __cosf(theta[ty]);
-  y[tx + ty * n] = -(tx - n / 2) / (float)n * __sinf(theta[ty]);
+  float c, s;
+  theta_cs(theta[ty], &c, &s);
+  x[tx + ty * n] = (tx - n / 2) / (float)n * c;
+  y[tx + ty * n] = -(tx - n / 2) / (float)n * s;
   if (x[tx + ty * n] >= 0.5f)
     x[tx + ty * n] = 0.5f - 1e-5;
   if (y[tx + ty * n] >= 0.5f)

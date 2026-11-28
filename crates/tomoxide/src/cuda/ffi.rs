@@ -192,14 +192,18 @@ unsafe extern "C" {
     pub fn tomoxide_linerec_free(handle: *mut c_void);
 
     // --- forward projection (adjoint of cfunc_linerec back-projection) ---
-    /// Parallel-beam forward projection (Radon), the exact discrete transpose of
+    /// Forward projection (Radon), the exact discrete transpose of
     /// `tomoxide_linerec_backproject`. `g` (output sinogram `[nz, nproj, n]`)
-    /// must be pre-zeroed; the kernel only `atomicAdd`s into it. `f` is the input
-    /// volume `[nz, n, n]`, `phi = π/2` for parallel beam. `rh` = full
-    /// reconstruction height the volume z is centred on (see
-    /// [`tomoxide_linerec_backproject`]); must match the back-projection's `rh`
-    /// so the pair stays an exact adjoint, and so must `axis`, the detector
-    /// column voxel column `n/2` lands on (the rotation centre).
+    /// is accumulated into, so it must be pre-zeroed. `f` is the input volume
+    /// `[ncz, n, n]`, `phi = π/2` for parallel beam. `rh` = full reconstruction
+    /// height the volume z is centred on (see [`tomoxide_linerec_backproject`]);
+    /// must match the back-projection's `rh` so the pair stays an exact
+    /// adjoint, and so must `axis`, the detector column voxel column `n/2`
+    /// lands on (the rotation centre). `scratch` (`scratch_bytes`, device)
+    /// feeds the parallel-beam gather, which runs over chunks of as many volume
+    /// slices as it holds; [`tomoxide_forwardproject_scratch_bytes`] gives the
+    /// size it uses. A tilted axis, or scratch smaller than one slice, runs the
+    /// atomic scatter.
     #[must_use]
     pub fn tomoxide_forwardproject(
         g: *mut c_void,
@@ -213,8 +217,13 @@ unsafe extern "C" {
         n: i32,
         rh: i32,
         nproj: i32,
+        scratch: *mut c_void,
+        scratch_bytes: usize,
         stream: *mut c_void,
     ) -> i32;
+    /// Scratch bytes [`tomoxide_forwardproject`] uses for this geometry
+    /// (bounded to a few hundred MiB); 0 when it needs none.
+    pub fn tomoxide_forwardproject_scratch_bytes(phi: f32, n: i32, ncz: i32) -> usize;
     /// `d` `[2, nframes, rows, n]`: each frame of `m` `[nframes, rows, n]`
     /// differentiated along its columns, then along its rows, as numpy's
     /// `gradient`.

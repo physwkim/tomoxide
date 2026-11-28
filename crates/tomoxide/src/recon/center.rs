@@ -710,11 +710,7 @@ pub fn lamino_tilt_scan(
     // The same depth rule the streaming reconstruction applies; verified against
     // its actual depth below, because the band is mapped with this value before
     // the first tile arrives.
-    let rh_for = |tilt_deg: f32| {
-        params
-            .lamino_rh
-            .unwrap_or_else(|| crate::cuda::lamino_recon_height(geom.detector.height, tilt_deg))
-    };
+    let rh_for = |tilt_deg: f32| params.lamino_height(geom.detector.height, tilt_deg);
     let mut out = Vec::with_capacity(tilts_deg.len());
     for &tilt_deg in tilts_deg {
         crate::pipeline::check_cancel(cancel)?;

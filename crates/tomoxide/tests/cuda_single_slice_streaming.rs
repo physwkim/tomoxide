@@ -1,12 +1,10 @@
 //! Single-slice regression for the CUDA analytic paths: a GUI preview (and a
 //! `recon --start_row R --end_row R+1` CLI run) reconstructs ONE slice with
-//! chunk = 1, but the device kernels have batch-domain minimums — the
-//! z-bilinear back-projection (kernels_linerec.cuh `vr < nz-1`) back-projects
-//! a 1-slice batch to zeros, and `cfunc_fourierrec` packs slice pairs so it
-//! needs an even count. `streaming()` and the one-shot `reconstruct` now pad
-//! the batch with zero rows to the kernel domain (≥2 slices, even for
-//! Fourierrec) and drop the pad rows; these tests pin that a single slice
-//! comes out non-zero and equal to the same slice of a multi-slice run.
+//! chunk = 1. The back-projection's row taps are zero off the detector, so a
+//! 1-slice batch reads its one row; `cfunc_fourierrec` packs slice pairs, so
+//! `streaming()` and the one-shot `reconstruct` pad an odd Fourierrec batch
+//! with a zero row and drop it. These tests pin that a single slice comes out
+//! non-zero and equal to the same slice of a multi-slice run.
 //!
 //! Sets process-global CUDA device state, so it lives in its own test binary.
 
@@ -158,14 +156,14 @@ fn check_single_slice_matches_whole(algorithm: Algorithm, min_r: f32) {
 
 #[test]
 fn cuda_fbp_single_slice_matches_whole() {
-    // fbp/linerec share cfunc_linerec — the z-bilinear ≥2-slice kernel.
+    // fbp/linerec share cfunc_linerec's back-projection.
     check_single_slice_matches_whole(Algorithm::Fbp, 0.999);
 }
 
 #[test]
 fn cuda_fourierrec_single_slice_matches_whole() {
-    // Streaming with max_nz = 1 must round the capacity up to an even ≥2
-    // (this configuration previously fell back or errored).
+    // Streaming with max_nz = 1 must round the capacity up to 2 (this
+    // configuration previously fell back or errored).
     check_single_slice_matches_whole(Algorithm::Fourierrec, 0.999);
 }
 
@@ -174,13 +172,10 @@ fn cuda_lprec_single_slice_matches_whole() {
     check_single_slice_matches_whole(Algorithm::Lprec, 0.999);
 }
 
-/// Iterative single slice: the device-resident solvers share the z-bilinear
-/// forward/back-projection kernel pair, so a 1-slice problem forward-projected
-/// to zero and never converged (a GUI Tune preview of sirt/tv showed garbage).
-/// `IterativeReconstruct::solve` now duplicates the slice into a 2-slice
-/// problem (exact: interpolation weights sum to 1 on identical rows) and drops
-/// the duplicate. Slices are independent in parallel beam, so the 1-slice
-/// solve must match the same slice of a multi-slice solve.
+/// Iterative single slice: a 1-slice problem once forward-projected to zero
+/// and never converged (a GUI Tune preview of sirt/tv showed garbage).
+/// Slices are independent in parallel beam, so the 1-slice solve must match
+/// the same slice of a multi-slice solve.
 #[test]
 fn cuda_iterative_single_slice_matches_multi() {
     let Some(engine) = cuda_engine() else { return };

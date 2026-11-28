@@ -303,8 +303,8 @@ fn invert_matrix(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
 /// overlapping `order`-point windows of `t` with the overlap-compensation
 /// weights `p`, plus tomocupy's 40-sample linear endpoint correction. Versus a
 /// plain linear ramp this deviates ≈1% near DC/Nyquist; matching it is what
-/// closes the residual scale between tomoxide's analytic CUDA output and
-/// tomocupy beyond the leading filter normalization. `iv`, `u`, `W1`, `W2`, `p`
+/// closes the residual scale between tomoxide's analytic output and tomocupy
+/// beyond the leading filter normalization. `iv`, `u`, `W1`, `W2`, `p`
 /// depend only on `order`; only the window loop reads `t`.
 fn wint_ramp(order: usize, t: &[f64]) -> Vec<f64> {
     let n = order;
@@ -378,35 +378,13 @@ fn wint_ramp(order: usize, t: &[f64]) -> Vec<f64> {
     w
 }
 
-/// Which base ramp shape [`make_fbp_filter`] builds — the one knob on which the
-/// CPU/wgpu and CUDA backends deliberately diverge, so each matches its own
-/// reference library.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RampShape {
-    /// tomopy's classic straight-line ramp `r = 2·fk/pad`. The CPU and wgpu
-    /// backends port tomopy, so they build this shape.
-    Linear,
-    /// tomocupy's degree-12 `_wint` quadrature ramp (`wint_ramp`). The CUDA
-    /// backend ports tomocupy, so it builds this shape, as does `recon::lamino`
-    /// on every backend (tomocupy is its only reference); combined with the
-    /// `0.5/pad` gain in `build_filter_w` it reproduces tomocupy's net FBP
-    /// filter bit-for-bit.
-    Wint,
-}
-
 /// Build the full frequency-domain apodized ramp filter for a projection of
 /// width `n`.
 ///
-/// Backend-agnostic apodization and layout: the windowing, padding, clamp and
-/// symmetric FFT layout are pure host arithmetic identical on every device, so
-/// all [`FbpFilter`] implementations build the filter through this one function
-/// — only [`FbpFilter::apply`] differs by backend. The single exception is the
-/// base ramp *shape* ([`RampShape`]): the CPU/wgpu backends pass
-/// [`RampShape::Linear`] (tomopy), the CUDA backend [`RampShape::Wint`]
-/// (tomocupy), because the two reference libraries genuinely differ on the ramp
-/// and each tomoxide backend ports a different one. Keeping the apodization,
-/// padding and layout in a single definition means the backends cannot drift on
-/// anything *except* that one deliberate, documented ramp-shape axis.
+/// Backend-agnostic: the ramp, windowing, padding, clamp and symmetric FFT
+/// layout are pure host arithmetic identical on every device, so all
+/// [`FbpFilter`] implementations (and `recon::lamino`) build the filter through
+/// this one function — only [`FbpFilter::apply`] differs by backend.
 ///
 /// The returned kernel has length `pad = (4·n).next_power_of_two()` — the
 /// projection is edge-replicate-padded to `pad` and centred before
@@ -420,20 +398,20 @@ pub enum RampShape {
 /// any width).
 ///
 /// The base ramp is the physical inversion filter `|ω|` in cycles/pixel, so it
-/// runs `0` at DC to `0.5` at Nyquist and `name` apodizes it.
-/// [`RampShape::Linear`] is the plain `k/pad` line (tomopy's ramp shape);
-/// [`RampShape::Wint`] is `pad·wint(t)` (`wint_ramp`, tomocupy's degree-12
-/// quadrature ramp). Both tomopy and tomocupy carry an extra factor `2` here
-/// (their ramp peaks at `1` at Nyquist), which puts every analytic
-/// reconstruction at `2×` the physical attenuation μ; tomoxide drops it so the
-/// analytic output is μ per pixel-unit — the same scale the iterative solvers
-/// converge to. Either way tomocupy's
-/// post-processing is mirrored: the windowed ramp is clamped to `≥0` and the DC
-/// bin is doubled (a no-op here since the ramp is `0` at DC). A grid too short
-/// for the order-12 rule falls back to the linear ramp even when `Wint` is
-/// requested (tomocupy's `_wint` is itself undefined there). The window set
+/// runs `0` at DC to `0.5` at Nyquist and `name` apodizes it. Its samples are
+/// `pad·wint(t)` (`wint_ramp`, tomocupy's degree-12 quadrature ramp): each bin
+/// carries the integral of `|ω|` over its cell, so the DC bin is not zero. A
+/// point-sampled `k/pad` line (tomopy's ramp) drops that DC cell and biases the
+/// whole reconstruction low — about 1.8 % on a known-μ disk phantom, where the
+/// quadrature ramp lands within 3e-5. Both tomopy and tomocupy carry an extra
+/// factor `2` here (their ramp peaks at `1` at Nyquist), which puts every
+/// analytic reconstruction at `2×` the physical attenuation μ; tomoxide drops
+/// it so the analytic output is μ per pixel-unit — the same scale the
+/// iterative solvers converge to. tomocupy's post-processing is mirrored: the
+/// windowed ramp is clamped to `≥0` and the DC bin is doubled. A grid too short for the order-12 rule falls back to the
+/// linear ramp (tomocupy's `_wint` is itself undefined there). The window set
 /// matches tomopy/tomocupy.
-pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<Vec<f32>> {
+pub fn make_fbp_filter(name: FilterName, n: usize) -> Result<Vec<f32>> {
     if n == 0 {
         return Err(crate::error::Error::InvalidParam(
             "filter length must be > 0".into(),
@@ -451,14 +429,13 @@ pub fn make_fbp_filter(name: FilterName, n: usize, shape: RampShape) -> Result<V
     const WINT_MIN: usize = 2 * ORDER - 1;
     // Half-spectrum base ramp: the physical `|ω|` inversion filter in
     // cycles/pixel (0 at DC, 0.5 at Nyquist). tomocupy's degree-12 `_wint`
-    // quadrature ramp (`pad·wint(t) ≈ t`) for `Wint`, else the plain linear ramp
-    // `k/pad` — also the fallback when the grid is too short for the order-12
-    // rule. Both upstreams double this (peak 1 at Nyquist), putting analytic
+    // quadrature ramp (`pad·wint(t) ≈ t`), or the plain linear ramp `k/pad` when
+    // the grid is too short for the order-12 rule. Both upstreams double this (peak 1 at Nyquist), putting analytic
     // output at 2×μ; we drop the factor 2 to land on the physical μ. `None`
     // carries no ramp, so skip.
     let ramp_half: Vec<f32> = if name == FilterName::None {
         Vec::new()
-    } else if shape == RampShape::Wint && nhalf >= WINT_MIN {
+    } else if nhalf >= WINT_MIN {
         let t: Vec<f64> = (0..nhalf).map(|k| k as f64 / pad as f64).collect();
         wint_ramp(ORDER, &t)
             .iter()
@@ -674,6 +651,22 @@ pub trait RayProject {
     fn ray_rows(&self, geom: &Geometry, n: usize) -> Result<Vec<Vec<RayRow>>>;
 }
 
+/// The linear taps of detector coordinate `t` over samples `0..n`: sample `⌊t⌋`
+/// with weight `1 − frac` and `⌊t⌋ + 1` with weight `frac`, a sample off the
+/// detector being zero and so left out. Every pixel-driven parallel projector —
+/// CPU, wgpu (`backproject.wgsl`, `project.wgsl`) and CUDA (`proj_tap` in
+/// `cuda/projgeom.cuh`) — uses this one rule, so they agree at the detector
+/// edges too.
+#[inline(always)]
+pub(crate) fn linear_taps(t: f32, n: usize) -> impl Iterator<Item = (usize, f32)> {
+    let t0 = t.floor();
+    let i0 = t0 as isize;
+    let frac = t - t0;
+    [(i0, 1.0 - frac), (i0 + 1, frac)]
+        .into_iter()
+        .filter_map(move |(i, w)| usize::try_from(i).ok().filter(|&i| i < n).map(|i| (i, w)))
+}
+
 /// Parallel-beam row-action rows for an `n × n` grid — the shared,
 /// backend-independent geometry behind every [`RayProject`] implementation.
 ///
@@ -681,7 +674,8 @@ pub trait RayProject {
 /// rows: each pixel `(iy, ix)` projects to
 /// `t = (ix − n/2)·cosθ + (iy − n/2)·sinθ + center` and splits linearly between
 /// detector columns `⌊t⌋` and `⌊t⌋+1`, so `rows[p][⌊t⌋]` gains weight `1 − frac`
-/// and `rows[p][⌊t⌋+1]` gains `frac`. These are exactly the rows of the same
+/// and `rows[p][⌊t⌋+1]` gains `frac` ([`linear_taps`]: a column off the
+/// detector gains nothing). These are exactly the rows of the same
 /// operator `R` the simultaneous methods use. A single `center` (row 0) is used
 /// for all slices, matching tomopy `art`.
 ///
@@ -711,17 +705,10 @@ pub(crate) fn parallel_ray_rows(geom: &Geometry, n: usize) -> Result<Vec<Vec<Ray
             let gy = iy as f32 - c0;
             for ix in 0..n {
                 let gx = ix as f32 - c0;
-                let t = gx * cs + gy * sn + center;
-                let t0 = t.floor();
-                let i0 = t0 as isize;
-                if i0 >= 0 && (i0 as usize) + 1 < ncols {
-                    let frac = t - t0;
-                    let pix = (iy * n + ix) as u32;
-                    let d0 = i0 as usize;
-                    arows[d0].pixels.push(pix);
-                    arows[d0].weights.push(1.0 - frac);
-                    arows[d0 + 1].pixels.push(pix);
-                    arows[d0 + 1].weights.push(frac);
+                let pix = (iy * n + ix) as u32;
+                for (d, w) in linear_taps(gx * cs + gy * sn + center, ncols) {
+                    arows[d].pixels.push(pix);
+                    arows[d].weights.push(w);
                 }
             }
         }

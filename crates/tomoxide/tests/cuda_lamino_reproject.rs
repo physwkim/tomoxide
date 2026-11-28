@@ -8,7 +8,7 @@
 #![cfg(feature = "cuda")]
 
 use ndarray::{s, Array2, Array3, Axis};
-use tomoxide::backend::{make_fbp_filter, RampShape};
+use tomoxide::backend::make_fbp_filter;
 use tomoxide::{
     cuda, recon, sim, Algorithm, Angles, Beam, Center, Complex32, CpuBackend, CudaBackend,
     Detector, Fft, FilterName, Geometry, Layout, ReconParams, Tomo, Volume,
@@ -158,7 +158,7 @@ fn cuda_lamino_reprojector_chunks_are_the_whole() {
 /// padded to the filter's length, centred, unshifted.
 fn filtered_derivatives(frames: &Array3<f32>, filter: FilterName) -> [Array3<f32>; 2] {
     let (nproj, rows, n) = frames.dim();
-    let w = make_fbp_filter(filter, n, RampShape::Wint).unwrap();
+    let w = make_fbp_filter(filter, n).unwrap();
     let (ne, pad) = (w.len(), w.len() / 2 - n / 2);
     let dcol = Array3::from_shape_fn((nproj, rows, n), |(t, r, c)| {
         let (l, h) = (c.saturating_sub(1), (c + 1).min(n - 1));
@@ -264,11 +264,12 @@ fn cuda_lamino_reproject_centre_moves_the_frames_along_the_detector() {
     }
 }
 
-/// A voxel that projects left of column 0 or above row 0 adds nothing. `(int)`
-/// truncates toward zero, so such a sample once landed on column (row) 0 with
-/// weight 1.5 and on column (row) 1 with −0.5.
+/// A voxel that projects half a column left of column 0 (half a row above row
+/// 0) adds its weight-½ tap to column (row) 0 and nothing else: the tap off the
+/// detector is zero padding. `(int)` truncation once put weight 1.5 on column
+/// (row) 0 and −0.5 on column (row) 1.
 #[test]
-fn cuda_lamino_reproject_drops_a_sample_left_of_column_0_or_above_row_0() {
+fn cuda_lamino_reproject_zero_pads_left_of_column_0_and_above_row_0() {
     if cuda_or_skip().is_none() {
         return;
     }
@@ -280,20 +281,49 @@ fn cuda_lamino_reproject_drops_a_sample_left_of_column_0_or_above_row_0() {
         vol[[z, n / 2, x]] = 1.0f32;
         cuda::lamino_reproject(vol.view(), 0, depth, &[0.0], tilt, center, rows).unwrap()
     };
-    let left = one(depth / 2, 0, 20.0, n as f32 / 2.0 - 0.5);
-    assert!(
-        left.iter().all(|&v| v == 0.0),
-        "column −0.5 scattered {:?}",
-        left.slice(s![0, rows / 2, ..2])
+    let only = |frame: &Array3<f32>, at: (usize, usize, usize), what: &str| {
+        for (i, &v) in frame.indexed_iter() {
+            let want = if i == at { 0.5 } else { 0.0 };
+            assert!((v - want).abs() < 1e-5, "{what}: {i:?} = {v}, want {want}");
+        }
+    };
+    only(
+        &one(depth / 2, 0, 20.0, n as f32 / 2.0 - 0.5),
+        (0, rows / 2, 0),
+        "column −0.5",
     );
     // cos(tilt) = 12.5/16 puts z = 0 on row −0.5.
     let tilt = (12.5f32 / 16.0).acos().to_degrees();
-    let above = one(0, n / 2, tilt, n as f32 / 2.0);
-    assert!(
-        above.iter().all(|&v| v == 0.0),
-        "row −0.5 scattered {:?}",
-        above.slice(s![0, ..2, n / 2])
+    only(
+        &one(0, n / 2, tilt, n as f32 / 2.0),
+        (0, 0, n / 2),
+        "row −0.5",
     );
+}
+
+/// A one-row detector is the middle row of a three-row one: rows off the
+/// detector are zero padding, so there is no two-row minimum.
+#[test]
+fn cuda_lamino_reproject_one_row_is_the_middle_of_three() {
+    if cuda_or_skip().is_none() {
+        return;
+    }
+    let (n, nproj, depth, tilt) = (32usize, 12usize, 24usize, 30.0f32);
+    let vol = blobs(depth, n, &[(12.0, 14.0, 17.0, 3.0), (5.0, 20.0, 10.0, 2.0)]);
+    let theta = Angles::uniform(nproj, 0.0, 2.0 * std::f32::consts::PI).0;
+    let at = |rows| cuda::lamino_reproject(vol.view(), 0, depth, &theta, tilt, 16.0, rows).unwrap();
+    // The detector centre is rows/2: row 0 of 1 is row 1 of 3.
+    let (one, three) = (at(1), at(3));
+    let mid = three.slice(s![.., 1..2, ..]);
+    let peak = mid.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(peak > 0.0);
+    for ((k, r, j), &v) in one.indexed_iter() {
+        let want = mid[[k, r, j]];
+        assert!(
+            (v - want).abs() < 1e-5 * peak,
+            "[{k},{r},{j}] {v} want {want}"
+        );
+    }
 }
 
 /// Every frame's centroid is where the blob's centroid projects: column

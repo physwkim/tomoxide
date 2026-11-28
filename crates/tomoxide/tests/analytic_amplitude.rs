@@ -80,3 +80,26 @@ fn analytic_recon_is_physical_mu() {
         );
     }
 }
+
+/// FBP's ramp carries the DC cell (`make_fbp_filter`'s quadrature ramp), so
+/// the disk core lands on μ itself. A point-sampled `k/pad` ramp zeroes the DC
+/// bin and reads the whole slice low, which the 5 % bar above cannot see.
+#[test]
+fn fbp_core_has_no_dc_bias() {
+    let params = ReconParams {
+        num_gridx: Some(N),
+        filter_name: FilterName::Ramp,
+        ..Default::default()
+    };
+    let vol = recon(
+        &analytic_disk_sino(),
+        &geom(),
+        Algorithm::Fbp,
+        &params,
+        &CpuBackend::new(),
+    )
+    .unwrap();
+    let m = core_mean(&vol);
+    eprintln!("fbp core mean {m}");
+    assert!((m - 1.0).abs() < 1e-3, "FBP core mean {m} ≠ 1.0");
+}

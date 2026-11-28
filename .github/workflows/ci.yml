@@ -28,6 +28,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      # tomoxide-gui is excluded from the workspace, so --all skips it.
+      - run: cargo fmt --manifest-path crates/tomoxide-gui/Cargo.toml --check
 
   # --- default (CPU) build: clippy + tests, per platform -------------------
   # macOS is arm64 only (aarch64-apple-darwin); Windows and Linux are x86_64

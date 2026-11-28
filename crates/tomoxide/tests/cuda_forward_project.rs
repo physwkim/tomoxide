@@ -60,11 +60,11 @@ impl Backend for PerIterCuda<'_> {
 }
 
 /// Pearson + NRMSE + max|Δ| of the device-resident vs per-iteration CUDA volume
-/// over the interior slices `1..nz` (slice 0 is dropped by the ≥2-slice rule).
-/// Same kernels & orientation ⇒ no flip; differences are the atomic-add floor.
-fn compare_interior(rd: &Volume<f32>, rp: &Volume<f32>, nz: usize) -> (f64, f64, f64) {
+/// over every slice. Same kernels & orientation ⇒ no flip; differences are the
+/// atomic-add floor.
+fn compare_slices(rd: &Volume<f32>, rp: &Volume<f32>, nz: usize) -> (f64, f64, f64) {
     let (mut a, mut b) = (Vec::new(), Vec::new());
-    for z in 1..nz {
+    for z in 0..nz {
         for (x, y) in rd
             .array
             .index_axis(Axis(0), z)
@@ -139,17 +139,9 @@ fn flipud(v: &Array3<f32>) -> Array3<f32> {
     out
 }
 
-/// Values of a sinogram over interior slices `1..nz` (CUDA drops slice 0 by the
-/// shared `vr < nz-1` boundary guard — the documented ≥2-slice rule).
-fn interior(sino: &Tomo<f32>) -> Vec<f64> {
-    let nz = sino.array.dim().0;
-    let mut out = Vec::new();
-    for z in 1..nz {
-        for v in sino.array.index_axis(Axis(0), z).iter() {
-            out.push(*v as f64);
-        }
-    }
-    out
+/// Values of a sinogram over every slice.
+fn sino_values(sino: &Tomo<f32>) -> Vec<f64> {
+    sino.array.iter().map(|v| *v as f64).collect()
 }
 
 #[test]
@@ -189,8 +181,10 @@ fn cuda_forward_is_adjoint_of_backproject() {
         .sum();
     let rel = (lhs - rhs).abs() / lhs.abs().max(rhs.abs()).max(1e-12);
     eprintln!("adjoint: <Ax,y> = {lhs:.6}, <x,Aᵀy> = {rhs:.6}, rel = {rel:.2e}");
+    // The pair computes its taps through the same helpers (projgeom.cuh), so
+    // only f32 accumulation rounding separates the two sides.
     assert!(
-        rel < 2e-3,
+        rel < 1e-6,
         "forward projector is not the transpose of the back-projector: \
          <Ax,y>={lhs:.6}, <x,Aᵀy>={rhs:.6}, rel={rel:.2e}"
     );
@@ -219,18 +213,18 @@ fn cuda_forward_matches_cpu() {
     let cpu_sino = sim::project(&vol, &geom, &cpu).unwrap();
     let cpu_sino_flip = sim::project(&vol_flip, &geom, &cpu).unwrap(); // wrong handedness
 
-    let g = interior(&cuda_sino);
-    let r_ok = pearson(&g, &interior(&cpu_sino));
-    let r_wrong = pearson(&g, &interior(&cpu_sino_flip));
+    let g = sino_values(&cuda_sino);
+    let r_ok = pearson(&g, &sino_values(&cpu_sino));
+    let r_wrong = pearson(&g, &sino_values(&cpu_sino_flip));
 
-    // Best-fit scale cuda/cpu over the interior. Both forwards are the plain
+    // Best-fit scale cuda/cpu over every slice. Both forwards are the plain
     // line-integral Radon transform (no gain — the iterative-pair convention;
     // tests/iterative_amplitude.rs pins the CPU side absolutely), so this is
     // ≈ 1.0, not the pre-unification 4/nproj. Asserted below so a scale
     // regression (a gain reintroduced in forwardproj.cu) is caught — the
     // r-check above is Pearson, which is scale-invariant and would silently
     // pass such a regression.
-    let p = interior(&cpu_sino);
+    let p = sino_values(&cpu_sino);
     let (num, den): (f64, f64) = g
         .iter()
         .zip(p.iter())
@@ -263,6 +257,40 @@ fn cuda_forward_matches_cpu() {
     );
 }
 
+/// SIRT divides by the ray sums A·1, and an edge bin sees only a corner of the
+/// grid, so its sum is small and a tap shift there is amplified. Over a full
+/// turn (θ up to 2π, where a fast sin/cos drifts most) the CUDA ray sums must
+/// match the CPU's bin for bin, corners included.
+#[test]
+fn cuda_ray_sums_match_cpu_over_a_full_turn() {
+    let cuda = match CudaBackend::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let (n, nproj, nz) = (256usize, 720usize, 2usize);
+    let geom = Geometry::parallel(Angles::uniform(nproj, 0.0, 2.0 * PI), n, nz, 1.0);
+    let ones = Volume::new(Array3::from_elem((nz, n, n), 1.0f32));
+    let g = sim::project(&ones, &geom, &cuda).unwrap();
+    let c = sim::project(&ones, &geom, &cpu).unwrap();
+    let peak = c.array.iter().fold(0.0f32, |m, &v| m.max(v));
+    let worst = g
+        .array
+        .iter()
+        .zip(c.array.iter())
+        .filter(|&(_, &b)| b > 1e-3 * peak)
+        .map(|(&a, &b)| ((a - b) / b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("ray sums cuda vs cpu: worst relative difference {worst:.3e}");
+    assert!(
+        worst < 2e-5,
+        "CUDA ray sums leave the CPU's: worst relative difference {worst:.3e}"
+    );
+}
+
 #[test]
 fn cuda_sirt_recovers_phantom() {
     let cuda = match CudaBackend::new() {
@@ -289,10 +317,9 @@ fn cuda_sirt_recovers_phantom() {
     };
     let rec = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
 
-    // Interior slices only (slice 0 has a zero sinogram from the ≥2-slice rule).
     let mut rv = Vec::new();
     let mut pv = Vec::new();
-    for z in 1..nz {
+    for z in 0..nz {
         for (a, b) in rec
             .array
             .index_axis(Axis(0), z)
@@ -331,8 +358,8 @@ fn cuda_pair_follows_geom_center() {
     let vol = Volume::new(stack(&sim::shepp2d(n).unwrap(), nz));
     let cpu_sino = sim::project(&vol, &geom, &cpu).unwrap();
     let r_fwd = pearson(
-        &interior(&sim::project(&vol, &geom, &cuda).unwrap()),
-        &interior(&cpu_sino),
+        &sino_values(&sim::project(&vol, &geom, &cuda).unwrap()),
+        &sino_values(&cpu_sino),
     );
 
     let y = Tomo::new(rand_arr((nz, nproj, n), 0x9abc_def0), Layout::Sinogram);
@@ -345,7 +372,7 @@ fn cuda_pair_follows_geom_center() {
         v
     };
     let (rb, cb) = (bp(&cuda), bp(&cpu));
-    let (_, r_back, _) = compare_interior(&rb, &cb, nz);
+    let (_, r_back, _) = compare_slices(&rb, &cb, nz);
 
     let params = ReconParams {
         num_iter: 120,
@@ -354,7 +381,7 @@ fn cuda_pair_follows_geom_center() {
     };
     let rg = recon::recon(&cpu_sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
     let rc = recon::recon(&cpu_sino, &geom, Algorithm::Sirt, &params, &cpu).unwrap();
-    let (_, r_sirt, _) = compare_interior(&rg, &rc, nz);
+    let (_, r_sirt, _) = compare_slices(&rg, &rc, nz);
 
     eprintln!("centre n/2+5.5: forward r = {r_fwd:.6}, back r = {r_back:.6}, SIRT r = {r_sirt:.6}");
     assert!(
@@ -407,10 +434,9 @@ fn cuda_sirt_matches_cpu() {
     let rc = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cpu).unwrap();
     let rg = recon::recon(&sino, &geom, Algorithm::Sirt, &params, &cuda).unwrap();
 
-    // Interior slices only (slice 0 is dropped by the CUDA ≥2-slice rule); same
-    // orientation on both backends now, so compare directly.
+    // Same orientation on both backends now, so compare directly.
     let (mut cv, mut gv) = (Vec::new(), Vec::new());
-    for z in 1..nz {
+    for z in 0..nz {
         let sc = rc.array.index_axis(Axis(0), z);
         let sg = rg.array.index_axis(Axis(0), z);
         for iy in 0..n {
@@ -459,7 +485,7 @@ fn cuda_em_matches_per_iteration() {
         };
         let rd = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
         let rp = recon::recon(&sino, &geom, algo, &params, &periter).unwrap();
-        let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+        let (nrmse, r, mx) = compare_slices(&rd, &rp, nz);
         eprintln!(
             "{algo:?} device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}"
         );
@@ -507,7 +533,7 @@ fn cuda_ospml_matches_per_iteration() {
         };
         let rd = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
         let rp = recon::recon(&sino, &geom, algo, &params, &periter).unwrap();
-        let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+        let (nrmse, r, mx) = compare_slices(&rd, &rp, nz);
         eprintln!(
             "{algo:?} device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}"
         );
@@ -547,7 +573,7 @@ fn cuda_tv_matches_per_iteration() {
     };
     let rd = recon::recon(&sino, &geom, Algorithm::Tv, &params, &cuda).unwrap();
     let rp = recon::recon(&sino, &geom, Algorithm::Tv, &params, &periter).unwrap();
-    let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+    let (nrmse, r, mx) = compare_slices(&rd, &rp, nz);
     eprintln!("Tv device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}");
     assert!(r > 0.9999, "Tv device-resident diverges: r={r:.6}");
     assert!(nrmse < 5e-3, "Tv NRMSE too large: {nrmse:.3e}");
@@ -592,7 +618,7 @@ fn cuda_grad_tikh_matches_per_iteration() {
         };
         let rd = recon::recon(&sino, &geom, algo, &params, &cuda).unwrap();
         let rp = recon::recon(&sino, &geom, algo, &params, &periter).unwrap();
-        let (nrmse, r, mx) = compare_interior(&rd, &rp, nz);
+        let (nrmse, r, mx) = compare_slices(&rd, &rp, nz);
         eprintln!(
             "{algo:?} device-resident vs per-iter CUDA: r={r:.6} NRMSE={nrmse:.3e} max|Δ|={mx:.3e}"
         );
@@ -652,28 +678,19 @@ fn cuda_iterative_suite_runs() {
         let rec = recon::recon(&sino, &geom, algo, &params, &cuda)
             .unwrap_or_else(|e| panic!("{algo:?} failed on CUDA: {e}"));
 
-        // Finite everywhere, and non-degenerate (nonzero variance) on the
-        // interior slices the ≥2-slice rule actually reconstructs.
+        // Finite and non-degenerate (nonzero variance) everywhere.
         assert!(
             rec.array.iter().all(|v| v.is_finite()),
             "{algo:?}: produced non-finite values on CUDA"
         );
-        let interior: Vec<f64> = (1..nz)
-            .flat_map(|z| {
-                rec.array
-                    .index_axis(Axis(0), z)
-                    .iter()
-                    .map(|v| *v as f64)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mean = interior.iter().sum::<f64>() / interior.len() as f64;
-        let var = interior.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+        let vals: Vec<f64> = rec.array.iter().map(|v| *v as f64).collect();
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
         assert!(
             var > 1e-12,
             "{algo:?}: degenerate (near-constant) recon on CUDA (var = {var:.3e})"
         );
-        eprintln!("{algo:?}: ran on CUDA, interior var = {var:.3e}");
+        eprintln!("{algo:?}: ran on CUDA, var = {var:.3e}");
     }
 }
 
@@ -768,10 +785,9 @@ fn cuda_warmstart_split_sirt_matches_continuous() {
     )
     .unwrap();
 
-    // Interior slices only (slice 0 dropped by the CUDA ≥2-slice rule); both are in
-    // the same device convention, so compare directly with no flip.
+    // Both are in the same device convention, so compare directly with no flip.
     let (mut cv, mut sv) = (Vec::new(), Vec::new());
-    for z in 1..nz {
+    for z in 0..nz {
         let sc = cont.array.index_axis(Axis(0), z);
         let ss = split.array.index_axis(Axis(0), z);
         for iy in 0..n {

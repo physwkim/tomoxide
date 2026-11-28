@@ -10,6 +10,9 @@
 
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stddef.h>
+
+#include "projgeom.cuh"
 
 #define SPLINE_PAD 12 // prep::alignment::SPLINE_PAD
 
@@ -169,10 +172,7 @@ static __global__ void framedot3_ker(double *out, const float *r, const float *h
     __shared__ float sc[FD_ANG], ss[FD_ANG];
     __shared__ double red[3 * FD_ANG][32];
     if (tid < FD_ANG && t0 + tid < nproj)
-    {
-        sc[tid] = __cosf(theta[t0 + tid]);
-        ss[tid] = __sinf(theta[t0 + tid]);
-    }
+        theta_cs(theta[t0 + tid], &sc[tid], &ss[tid]);
     __syncthreads();
 
     float acc[3 * FD_ANG];
@@ -181,9 +181,9 @@ static __global__ void framedot3_ker(double *out, const float *r, const float *h
         acc[k] = 0.0f;
     if (tx < n && ty < n)
     {
-        float cphi = __cosf(phi);
-        float sphi = __sinf(phi);
-        size_t nn = (size_t)n * nproj;
+        const int h = n / 2, zb = sz - rh / 2; // zz of slice tz is zb + tz
+        const float cphi = __cosf(phi), sphi = __sinf(phi);
+        const size_t nn = (size_t)n * nproj;
         for (int tz = 0; tz < ncz; tz++)
         {
             float val = r[tx + ty * n + (size_t)tz * n * n];
@@ -194,28 +194,16 @@ static __global__ void framedot3_ker(double *out, const float *r, const float *h
             {
                 if (t0 + a >= nproj)
                     continue;
-                // backprojection_ker's u, v, tap and guard, term for term.
-                float ctheta = sc[a];
-                float stheta = ss[a];
-                float R0 = ctheta, R1 = stheta;
-                float R3 = stheta * cphi, R4 = -ctheta * cphi, R5 = sphi;
-                float u = R0 * (tx - n / 2) + R1 * (ty - n / 2) + axis;
-                float v = R3 * (tx - n / 2) + R4 * (ty - n / 2) + R5 * (tz + sz - rh / 2) + nz / 2;
-                int ur = (int)(u - 1e-5f);
-                int vr = (int)(v - 1e-5f);
-                if ((u > -1e-5f) & (ur < n - 1) & (v > -1e-5f) & (vr < nz - 1))
+                // backprojection_ker's taps, read through its lam_bilerp.
+                const float c = sc[a], s = ss[a];
+                const Tap cu = proj_tap(proj_u(c, s, tx, ty, h, axis), n);
+                const Tap rv = proj_tap(lam_v(lam_vxy(c, s, cphi, tx, ty, h), sphi, zb + tz, nz), nz);
+                if (tap_any(cu) & tap_any(rv))
                 {
-                    float fu = u - ur;
-                    float fv = v - vr;
-                    size_t o = (size_t)vr * nn + (size_t)(t0 + a) * n + ur;
-                    float w00 = (1 - fu) * (1 - fv), w10 = fu * (1 - fv);
-                    float w01 = (1 - fu) * fv, w11 = fu * fv;
-                    acc[3 * a] += val * (w00 * __ldg(hx + o) + w10 * __ldg(hx + o + 1) +
-                                         w01 * __ldg(hx + o + nn) + w11 * __ldg(hx + o + nn + 1));
-                    acc[3 * a + 1] += val * (w00 * __ldg(hy + o) + w10 * __ldg(hy + o + 1) +
-                                             w01 * __ldg(hy + o + nn) + w11 * __ldg(hy + o + nn + 1));
-                    acc[3 * a + 2] += val * (w00 * __ldg(hc + o) + w10 * __ldg(hc + o + 1) +
-                                             w01 * __ldg(hc + o + nn) + w11 * __ldg(hc + o + nn + 1));
+                    const ptrdiff_t o = (ptrdiff_t)rv.i * (ptrdiff_t)nn + (ptrdiff_t)(t0 + a) * n + cu.i;
+                    acc[3 * a] += val * lam_bilerp(hx + o, nn, cu, rv);
+                    acc[3 * a + 1] += val * lam_bilerp(hy + o, nn, cu, rv);
+                    acc[3 * a + 2] += val * lam_bilerp(hc + o, nn, cu, rv);
                 }
             }
         }

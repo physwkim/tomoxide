@@ -273,14 +273,12 @@ disk reconstructs to core mean ≈ 1.0). This is a deliberate departure from bot
 upstreams, whose absolute analytic amplitude is itself convention-dependent
 (tomopy gridrec ≈ 1.16×μ via an empirical `winv` fudge; tomocupy ≈ 4/π×μ).
 
-**Ramp shape (the remaining cuda/cpu residual).** The base ramp still differs per
-backend: CPU/wgpu build tomopy's plain linear ramp (`k/pad`), CUDA builds
-tomocupy's degree-12 `_wint` quadrature ramp (`pad·wint(t)`), selected via
-`backend::RampShape` (`Linear` for CPU/wgpu, `Wint` for CUDA and for
-`recon::lamino` on every backend) in the single shared `make_fbp_filter`. This leaves
-a deterministic **~1.6%** amplitude residual on the unified paths (the measured
-`cuda/cpu` scale is ≈1.016, not exactly 1); Pearson stays ≈1.0 because the shape
-difference is small and smooth. This is a shape convention, not a numerical error.
+**Ramp shape.** Every backend (and `recon::lamino`) builds tomocupy's degree-12
+`_wint` quadrature ramp (`pad·wint(t)`) in the shared `make_fbp_filter`, so
+fbp/linerec/lprec agree across backends to the f32 floor. Each quadrature bin
+carries the integral of `|ω|` over its cell, DC included; tomopy's point-sampled
+`k/pad` line zeroes the DC bin and reads a known-μ disk phantom ~1.8 % low
+(the quadrature ramp lands within 3e-5), which is why it is not used.
 
 **Laminography is excluded from the *scale* unification** — but not from the
 orientation one. The CUDA lamino path (`cfunc_linerec` tilted back-projector) and

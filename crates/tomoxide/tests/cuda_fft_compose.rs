@@ -159,21 +159,12 @@ fn cuda_lprec_matches_cpu() {
     };
     let rc = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cpu).unwrap();
     let rg = recon::recon(&s, &geom, Algorithm::Lprec, &params, &cuda).unwrap();
-    // Since the convention unification lprec matches CPU directly (same scale, same
-    // orientation — lprec never flipped). The only residual is the ramp *shape*: the
-    // CPU backend ports tomopy (plain linear ramp) and the CUDA backend ports
-    // tomocupy (the degree-12 `_wint` quadrature ramp); they diverge ~0.6% near
-    // DC/Nyquist. This is the deliberate per-backend split (see `backend::RampShape`,
-    // `cuda/mod.rs::build_filter_w`, `docs/ARCHITECTURE.md` §4.1), not a bug, so the
-    // bar accommodates it. It still sits far below the gross-bug signatures this test
-    // exists to catch (the pre-fix theta-order bug gave rel ≈ 1.0, the vertical-flip
-    // bug ≈ 0.58); the legitimate ramp-shape residual is a deterministic 5.6e-3.
+    // lprec matches CPU directly (same scale, orientation and FBP filter), so the
+    // bar is the f32/cuFFT floor (measured 4.2e-7); the theta-order bug gave
+    // rel ≈ 1.0, the vertical-flip bug ≈ 0.58, a per-backend ramp split 5.6e-3.
     let d = max_rel(rc.array.as_slice().unwrap(), rg.array.as_slice().unwrap());
     eprintln!("lprec cuda ↔ cpu max rel = {d:e}");
-    assert!(
-        d < 1.5e-2,
-        "lprec GPU≠CPU (beyond the wint/linear ramp gap): rel {d}"
-    );
+    assert!(d < 1e-5, "lprec GPU≠CPU: rel {d}");
 }
 
 #[test]

@@ -3,18 +3,14 @@
 //! high-noise / large-axis-wobble regime where iterative regularization is
 //! expected to help.
 //!
-//! The CLI routes CUDA laminography through `reconstruct_lamino_streaming`,
-//! which only implements the analytic methods (fourierrec/fbp/linerec). The
-//! ported iterative laminography (SIRT/MLEM/OSEM/PML/TV) lives behind the
-//! generic host solvers composed over the tilted CUDA projector pair
-//! (`recon::recon` → `iterative`), which the CLI does not expose. This example
-//! drives that path directly, replicating `pipeline::reconstruct`'s prep
-//! (flat/dark + minus-log, no phase/stripe) before the solve.
+//! The CLI reconstructs iterative laminography too (`tomoxide recon
+//! --algorithm sirt --lamino_angle <deg>`); this example drives the same
+//! `recon::recon` path directly, replicating `pipeline::reconstruct`'s prep
+//! (flat/dark + minus-log, no phase/stripe) before the solve, and prints the
+//! per-stage wall times.
 //!
-//! NOTE on volume height: the generic solvers reconstruct at volume-height =
-//! detector rows (`nz`), NOT the tilt-extended analytic recon-height `rh`
-//! (`ceil(nz/cos(tilt)/2)*2`). So run the analytic baseline with
-//! `--lamino_rh <nz>` to get a matching-height, z-aligned comparison.
+//! The volume is as tall as the analytic recon-height `rh`
+//! (`ceil(nz/cos(tilt)/2)*2`), so it is z-aligned with the analytic baseline.
 //!
 //!   cargo run --release --features cuda --example lamino_iterative_demo -- \
 //!       <input.h5> <sirt|tv|mlem> <num_iter> <center> <tilt_deg> <reg_par> <out.h5>
@@ -67,7 +63,6 @@ fn main() -> tomoxide::Result<()> {
         "input={input} nproj={nproj} nz={nz} nx={nx} center={center} tilt={tilt_deg}° \
          algo={algorithm:?} num_iter={num_iter} reg_par={reg_par}"
     );
-    println!("  volume height = nz = {nz} (generic solver ignores tilt-extended rh)");
 
     let mut ds = reader.read_all()?;
 

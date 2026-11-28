@@ -38,9 +38,12 @@ void cfunc_linerec::ensure_texture() {
     resDesc.resType = cudaResourceTypeArray;
     resDesc.res.array.array = tex_array;
 
+    // Border (borderColor zeroed by `= {}`) reads 0 off the detector: the
+    // zero-padded tap of projgeom.cuh. Every fp16 caller builds ncz == nz, so
+    // the texture's rows are the detector rows.
     cudaTextureDesc texDesc = {};
-    texDesc.addressMode[0] = cudaAddressModeClamp;
-    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.addressMode[0] = cudaAddressModeBorder;
+    texDesc.addressMode[1] = cudaAddressModeBorder;
     texDesc.filterMode = cudaFilterModeLinear;
     texDesc.readMode = cudaReadModeElementType;
     texDesc.normalizedCoords = 0;
@@ -73,7 +76,15 @@ int cfunc_linerec::backprojection(size_t f_, size_t g_, size_t theta_, float phi
     // converges to the physical μ.
     backprojection_tex_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, tex_obj, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
 #else
-    backprojection_ker <<<GS3d0, dimBlock, shmem, stream>>> (f, g, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
+    if (is_parallel_tilt(phi)) {
+        dim3 parBlock(32, 16, 1);
+        dim3 parGrid(ceil(n / 32.0), ceil(n / 16.0), (ncz + PAR_G - 1) / PAR_G);
+        backprojection_par_ker<<<parGrid, parBlock, shmem, stream>>>(f, g, theta, axis, gain, sz, ncz, n, nz, rh, ncproj);
+    } else {
+        dim3 lamBlock(32, 16, 1);
+        dim3 lamGrid(ceil(n / 32.0), ceil(n / 16.0), (ncz + LAM_G - 1) / LAM_G);
+        backprojection_ker<<<lamGrid, lamBlock, shmem, stream>>>(f, g, theta, phi, axis, gain, sz, ncz, n, nz, rh, ncproj);
+    }
 #endif
     return (int)cudaGetLastError();
 }

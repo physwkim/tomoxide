@@ -69,9 +69,7 @@ fn cuda_fbp_matches_cpu_and_phantom() {
         ..Default::default()
     };
 
-    // cfunc_linerec interpolates vertically across slices, so it needs ≥2 rows
-    // (a single slice yields zeros). Stack the phantom into a few identical
-    // slices and compare an interior one.
+    // Stack the phantom into a few identical slices and compare one.
     let nz = 4usize;
     let phantom = sim::shepp2d(n).unwrap();
     let mut stack = ndarray::Array3::<f32>::zeros((nz, n, n));
@@ -242,8 +240,8 @@ fn cuda_fused_equals_per_stage() {
     // multi-GPU host the fused path splits the z-stack across devices, so its cuFFT
     // filter batch (nz_chunk·nproj) is smaller than the per-stage whole-stack batch
     // and cuFFT picks a different algorithm per batch size (documented in the cuda
-    // module). The tolerance sits ~5 orders below the output scale, so the all-zero
-    // regression that a <2-slice linerec chunk produces still trips it.
+    // module). The tolerance sits ~5 orders below the output scale, so an all-zero
+    // chunk still trips it.
     use tomoxide::backend::Backend;
     use tomoxide::{Layout, Tomo, Volume};
     let cuda = match CudaBackend::new() {
