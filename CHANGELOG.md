@@ -6,6 +6,84 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-28
+
+### Added
+
+- **`cuda::median3d` takes a volume's median over a `size³` cube, among a
+  mask's voxels alone.** scipy's `median_filter` with `reflect` ends, `size`
+  odd up to 9. With a mask only its non-zero voxels are ranked and the rest
+  come back NaN, so a particle's median never takes the background in.
+
+- **`ReconParams::volume_height` gives a method's output z-slices.** `nz`
+  in parallel beam; under a tilt `ReconParams::lamino_height`, which is
+  `lamino_rh` or tomocupy's auto height. Analytic and iterative methods
+  both size their volume by it.
+
+### Changed
+
+- **The CUDA linerec projector kernels are faster.** Parallel-beam
+  back-projection reads one row and reuses a column tap for eight slices
+  (kernel time on 2048² x 1500 angles 1996 → 514 ms), and parallel-beam
+  forward projection gathers instead of scattering, so it is deterministic
+  (CGLS, 10 iterations on 2048² x 1500 angles x 32 rows: 47.0 → 11.0 s).
+  The tilted pair runs eight slices per thread and sums the forward
+  projection through a shared detector patch; on the pouch volume (1024² x
+  1800 angles, rh 1424) back-projection takes 28.5 → 8.4 s, forward
+  projection 265.5 → 18.2 s, and two-GPU SIRT 215 → 49 s.
+
+- **Breaking (ffi): `tomoxide_forwardproject` takes `scratch` and
+  `scratch_bytes`** for the parallel-beam gather;
+  `tomoxide_forwardproject_scratch_bytes` gives the size it uses. A tilted
+  axis, or scratch smaller than one slice, runs the atomic scatter.
+
+- **Breaking: `make_fbp_filter` takes no ramp shape, and `RampShape` is
+  gone.** Every backend builds tomocupy's `_wint` quadrature ramp. The CPU
+  and wgpu backends sampled tomopy's `k/pad` line, which zeroes the DC
+  cell and reads a known-µ disk 1.8% low (the quadrature ramp lands within
+  3e-5); that split was the 0.137 gap between CPU and CUDA FBP.
+
+- **Breaking (behaviour): iterative laminography reconstructs the
+  `[rh, n, n]` volume of `ReconParams::volume_height`.** It built a volume
+  as tall as the detector and dropped `lamino_rh`, so its slices did not
+  line up with the analytic volume and an `fbp,sirt` chain failed
+  `ShapeMismatch` on the init. Device SIRT no longer allocates an all-ones
+  volume and sinogram beside its weights, so the pouch auto-height SIRT
+  fits two GPUs (the three-GPU peak drops 30.4 → 24.6 GiB).
+
+- **Breaking (behaviour): MLEM, OSEM, PML and OSPML start at tomopy's
+  1e-6, not 1.** A voxel no ray reaches (the laminography z-edge corners
+  when rh > nz) is never updated, so it kept the 1 and out-weighed the
+  reconstruction. MLEM and OSEM do not depend on a constant start
+  elsewhere (4e-7 apart on a 128² phantom); PML and OSPML move by about
+  1e-4, to tomopy's.
+
+### Fixed
+
+- **Projector taps off the detector read as zero (`proj_tap`,
+  `backend::linear_taps`).** The CUDA tap truncated `t - 1e-5` and needed
+  both taps on the detector, so a chunk of over 256 slices lost its last
+  slice (SIRT and CGLS zeroed the last slice of a taller stack) and a
+  sample within a pixel of the detector edge was dropped, as the CPU and
+  wgpu projectors dropped the last column. The one-slice pads and the
+  two-row minimum are gone.
+
+- **An infinite edge sample back-projects to inf, not NaN
+  (`par_accumulate`).**
+
+- **Per-slice solver dot products sum in f64.** CPU and CUDA CGLS drifted
+  2.2e-2 apart after 20 iterations on real data; now 2.7e-5.
+
+- **CUDA projections take cos/sin θ from `sincosf`.** `__cosf`/`__sinf`
+  moved a 1024² corner tap by ~2e-4 px, which SIRT's 1/A(1) blows up in
+  the sparse edge bins: the CPU-CUDA gap in the corners after 10 SIRT
+  iterations drops 4.1e-3 → 9.5e-7.
+
+- **`tomoxide recon --lamino_angle` runs SIRT, TV and MLEM on CUDA.** It
+  sent every laminography method to the streamer, which takes only the
+  analytic ones, and errored; `cuda::lamino_streams` names the streamed
+  set.
+
 ## [0.14.0] - 2026-11-12
 
 ### Added
@@ -1184,7 +1262,8 @@ Initial release: tri-backend (CPU / CUDA / wgpu) tomographic reconstruction
 toolkit porting tomopy and tomocupy, with the CPU `libtomo` algorithm set and
 the first CUDA FBP back-projection.
 
-[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/physwkim/tomoxide/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/physwkim/tomoxide/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/physwkim/tomoxide/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/physwkim/tomoxide/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/physwkim/tomoxide/compare/v0.11.0...v0.12.0

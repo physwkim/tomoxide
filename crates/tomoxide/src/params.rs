@@ -180,8 +180,9 @@ pub struct ReconParams {
     /// Optional warm-start volume (`[rh, n, n]`, `rh` from
     /// [`ReconParams::volume_height`]): the initial iterate for an
     /// iterative method, replacing its built-in default (SIRT/GRAD/TIKH/TV → 0,
-    /// the EM methods MLEM/OSEM/PML/OSPML → 1). Enables algorithm chaining — e.g.
-    /// FBP → SIRT, or OSEM → MLEM — where one method's output seeds the next.
+    /// the EM methods MLEM/OSEM/PML/OSPML → tomopy's 1e-6). Enables algorithm
+    /// chaining — e.g. FBP → SIRT, or OSEM → MLEM — where one method's output
+    /// seeds the next.
     /// Honoured by every iterative method except the row-action pair (ART/BART),
     /// which reject a non-`None` init rather than silently ignoring it; analytic
     /// methods ignore it. Consumed on both the host and the CUDA device-resident
