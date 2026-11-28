@@ -1754,8 +1754,6 @@ mod cuda_impl {
         let theta_d = DevBuf::from_host_f32(theta)?;
         let tp = theta_d.ptr as *const f32;
         let b_d = DevBuf::from_host_f32(sino_slice)?;
-        let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
-        let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsino])?;
         let vol_d = seed_buf(init, 0.0, nvol, 1.0)?; // x (init 0 or warm-start)
         let ax_d = DevBuf::zeroed(sbytes)?; // A x, reused as the weighted residual
         let corr_d = DevBuf::zeroed(vbytes)?; // Aᵀ(…)
@@ -1767,12 +1765,16 @@ mod cuda_impl {
         // All ops on the per-thread default stream (null) → FIFO-ordered, so one
         // sync before the download suffices.
         unsafe {
-            pair.forward(ax_d.ptr, ones_v.ptr, tp, nproj)?; // A(1)
+            // The ones of A(1) / Aᵀ(1) ride in cw_d / ax_d before those hold C
+            // and A x: no extra volume or sinogram on the device.
+            cw_d.copy_from_host_f32(&vec![1.0f32; nvol])?;
+            pair.forward(ax_d.ptr, cw_d.ptr, tp, nproj)?; // A(1)
             ck(
                 ffi::tomoxide_iter_recip_thresh(rw_d.ptr, ax_d.ptr, 1e-6, nsino, null),
                 "iter_recip_thresh",
             )?; // R
-            pair.adjoint(&handle, corr_d.ptr, ones_s.ptr, tp)?; // Aᵀ(1)
+            ax_d.copy_from_host_f32(&vec![1.0f32; nsino])?;
+            pair.adjoint(&handle, corr_d.ptr, ax_d.ptr, tp)?; // Aᵀ(1)
             ck(
                 ffi::tomoxide_iter_recip_thresh(cw_d.ptr, corr_d.ptr, 1e-6, nvol, null),
                 "iter_recip_thresh",
@@ -1945,26 +1947,24 @@ mod cuda_impl {
                         let handle = pair.handle(len)?;
 
                         // Ray weights R = 1/A(1) — local (each ray is on one GPU).
-                        {
-                            let ones_v = DevBuf::from_host_f32(&vec![1.0f32; nvol])?;
-                            unsafe {
-                                pair.forward(ax_d.ptr, ones_v.ptr, tp, len)?;
-                                ck(
-                                    ffi::tomoxide_iter_recip_thresh(
-                                        rw_d.ptr, ax_d.ptr, 1e-6, nsub, null,
-                                    ),
-                                    "iter_recip_thresh",
-                                )?;
-                            }
+                        // The ones ride in cw_d / ax_d before those hold C and
+                        // A x, as in sirt_device.
+                        cw_d.copy_from_host_f32(&vec![1.0f32; nvol])?;
+                        unsafe {
+                            pair.forward(ax_d.ptr, cw_d.ptr, tp, len)?;
+                            ck(
+                                ffi::tomoxide_iter_recip_thresh(
+                                    rw_d.ptr, ax_d.ptr, 1e-6, nsub, null,
+                                ),
+                                "iter_recip_thresh",
+                            )?;
                         }
                         // Partial sensitivity Aᵀₘ(1) → corr_d, then all-reduce → C.
-                        {
-                            let ones_s = DevBuf::from_host_f32(&vec![1.0f32; nsub])?;
-                            unsafe {
-                                pair.adjoint(&handle, corr_d.ptr, ones_s.ptr, tp)?;
-                                if ffi::tomoxide_cuda_sync() != 0 {
-                                    return Err(Error::Backend("cuda sync failed".into()));
-                                }
+                        ax_d.copy_from_host_f32(&vec![1.0f32; nsub])?;
+                        unsafe {
+                            pair.adjoint(&handle, corr_d.ptr, ax_d.ptr, tp)?;
+                            if ffi::tomoxide_cuda_sync() != 0 {
+                                return Err(Error::Backend("cuda sync failed".into()));
                             }
                         }
                         {
